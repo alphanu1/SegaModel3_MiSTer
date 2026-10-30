@@ -1304,3 +1304,11 @@ reset, and a repeated run inherited the previous run's values). Full MiSTer buil
 Template_MiSTer framework (`Model3.sv`), CPU at 75 MHz: 9,990 ALM, 123 M10K, 36 DSP,
 setup and hold met on every clock (CPU clock +0.082 ns). Quartus 17 rejected `parameter
 string` for `$readmemh` file names; untyped parameters work.
+
+**R25 — The 603e core runs correctly on the board.** The CPU bring-up build
+(`7e11353`, RBF md5 32835d1a…) on the DE10-Nano at 75 MHz, captured over ttyS1 for
+20 s: 1,394 complete reports, every one identical to the simulation in all ten values,
+3,355 cycles, 1,539 instructions and retire signature E1058DC4 each run. The core's
+behaviour on silicon, its MLAB register file included, matches the model-checked
+simulation exactly for this program. CPI 2.18 on this random program is not a
+real-code figure: 39% of its cycles wait on divides.

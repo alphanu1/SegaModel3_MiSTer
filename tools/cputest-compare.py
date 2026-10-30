@@ -29,7 +29,8 @@ def reports(path):
             continue
         cur[k] = v
         if k == 10:
-            out.append(cur)
+            if len(cur) == 11:          # a capture can start partway through a report
+                out.append(cur)
             cur = {}
     return out
 
