@@ -37,22 +37,25 @@ reports.
    on the 3D side has to move to DDR3 with the 3D layer, or measured RAM sizes have to come
    in smaller than the address windows. Open question 2. `[CALC]`
 5. **Decided: everything in fabric, 3D layer drawn into DDR3 (D-1, D-2).** The same
-   approach as my Model 2 core. On the *carried-over* Model 2A estimates, everything
-   except the PowerPC totals 37.5K–60.5K ALM against 41.9K, about 4.4K left for the CPU
-   in the best case. Those rows are estimates; the Model 2 fit report gives measured
-   figures for most of them, and gate M0-G swaps them in. M10K is the other binding
-   resource: Model 2 fits at 553/553. `[EST]`
+   approach as my Model 2 core. With Model 2's measured figures in place (M0-G, 8.1),
+   everything except the PowerPC comes to about 29K–37K ALM, leaving roughly 4K–12K for
+   the CPU under a practical 41K ceiling. My i960KB with its FPU measures 7.6K. The
+   carried-over paper estimates had said 37.5K–60.5K, which left nothing. M10K is the
+   other binding resource: Model 2 fits at 551/553. `[EST]` on the Model 3 deltas only.
 6. **The PowerPC 603e is a new core.** None of my CPUs is a PowerPC; the i960KB in the
    Model 2 core is the only CPU I have built. The 603e is the largest unknown, and gate
    M0-A comes first. Clock plan (D-3): CPU 100 MHz, SDRAM 100 MHz, Real3D 50 MHz,
    integer ratios to keep clock-domain crossings down. Tight, and nothing in it is
    measured yet.
-7. **Bring-up title: Get Bass (upright).** Smallest ROM set, and MAME's own status note
-   lists it as the one Step 1.0 set that works. `[SRC]`
+7. **Bring-up title: Virtua Fighter 3 (D-5).** It is the title that matters, and it
+   exercises the 53C810 single-step quirk and the full 106.5 MiB ROM set from the start.
+   That makes the SDRAM gap (7.3) a bring-up blocker, not a later problem: M0-B's Real3D
+   RAM footprint has to be known before M1. Get Bass upright stays as the fallback
+   reference, since it is the one set MAME runs cleanly. `[SRC]`
 
-The partition is settled (section 14). What is not settled is whether it fits. The first
-two gates, M0-A (CPU size) and M0-G (measured ALM and M10K from the Model 2 fit report),
-answer that before any integration work starts.
+The partition is settled (section 14). M0-G (done, 8.1) says the non-CPU blocks leave
+room for a CPU about the size of the i960. What is not settled is the CPU itself: M0-A
+answers that before any integration work starts.
 
 ---
 
@@ -434,43 +437,92 @@ on Model 2, and only where it has to.
 The 6 MiB `ROM_COPY` mirror of CROM0 into the fixed window is address decoding, not
 storage.
 
-### 7.2 Working state `[CALC]`
+### 7.2 Working state `[CALC]`, measured for VF3 (M0-B)
 
-| Item | MiB |
-|---|---|
-| Main RAM | 8 |
-| Culling RAM | 4 |
-| Display list RAM | 1 |
-| Polygon RAM (1 MiB CPU window in MAME, 4 MiB allocated) | 1–4 |
-| Texture FIFO | 1 |
-| Texture sheets (2 × 2048 × 1024 × 16 bit) | 8 |
-| Tile pattern RAM + name tables + palette | 1.1 |
-| Backup SRAM | 0.1 |
-| Sound RAM (2 × 512 KiB) | 1 |
-| **Total** | **25.2–28.2** |
-| 3D colour buffer (496 × 384 × 32 bit) | 0.73, **in DDR3 (D-2)** |
-| 3D Z buffer, same size | 0.73 if not banded; placement `[OPEN]` |
+The "window" column is the address space. The "VF3" column is what VF3 actually writes
+over boot, attract and five minutes of play (M0-B, R13), rounded up to an allocation.
+
+| Item | Window MiB | VF3 MiB | VF3 measured |
+|---|---|---|---|
+| Main RAM | 8 | 8 | — |
+| Culling RAM | 4 | 2 | highest word 0x0778F7, 1.87 MiB span, 889 KiB distinct |
+| Display list RAM | 1 | 0.125 | 108.5 KiB span |
+| Polygon RAM | 1–4 | 1.125 | highest word 0x040571, 1.005 MiB span |
+| Texture FIFO | 1 | 0.125 | at most 64 K texels (128 KiB) uploaded per frame |
+| Texture sheets (2 × 2048 × 1024 × 16 bit) | 8 | 8 | not measured |
+| Tile pattern RAM + name tables | 1 | 1 | — |
+| Palette | 0.125 | 0 | lives in M10K (7.4) |
+| Backup SRAM | 0.125 | 0.125 | — |
+| Sound RAM (2 × 512 KiB) | 1 | 1 | — |
+| **Total** | **25.2–28.2** | **21.5** | |
+| 3D colour buffer (496 × 384 × 32 bit) | 0.73, **in DDR3 (D-2)** | | |
+| 3D Z buffer, same size | placement `[OPEN]`, see 8.3 | | |
 
 ### 7.3 Totals against a 128 MiB module
 
 | | ROM | State | **Total** | Margin |
 |---|---|---|---|---|
-| VF3 family | 106.5 | 25.2–28.2 | **131.7–134.7** | **3.7–6.7 MiB over** |
-| Bass Fishing | 90.5 | 25.2–28.2 | **115.7–118.7** | 9.3–12.3 MiB spare |
+| VF3, full windows | 106.5 | 25.2–28.2 | 131.7–134.7 | 3.7–6.7 MiB over |
+| **VF3, measured footprint** | 106.5 | 21.5 | **128.0** | **zero** |
+| VF3, measured, texture sheets in DDR3 | 106.5 | 13.5 | 120.0 | 8 MiB spare |
+| Bass Fishing, full windows | 90.5 | 25.2–28.2 | 115.7–118.7 | 9.3–12.3 MiB spare |
 
-Bass Fishing, the bring-up title, fits with everything in SDRAM. VF3 does not, by a few
-MiB. Ways to close it, in order of preference:
+Measured, VF3 fits a 128 MiB module with nothing to spare. That is not a plan: VF3 Team
+Battle and the other revisions are not measured, and one more allocation granule tips
+it over. Ways to get margin:
 
-1. **Measure what the Real3D RAMs really use.** The `9C000000` buffer registers suggest
-   the games touch far less than the 4 MiB culling and polygon windows. If the measured
-   footprint plus a margin is under ~21 MiB of state, VF3 fits as it is. M0-B.
-2. **Move the texture sheets (8 MiB) to DDR3 with the 3D layer.** They are 3D rendering
-   data, read only by the rasteriser through its texture cache, so they belong on the
-   3D side of the D-2 split. This also takes the rasteriser's texture-cache fills off the
-   SDRAM port.
-3. Keep the texture FIFO short in M10K and stream uploads into the sheets as they
-   arrive, instead of buffering 1 MiB. Saves 1 MiB; whether the FIFO's contents are ever
-   read back is `[OPEN]`.
+The Real3D's own RAMs are 3D rendering data in the D-4 sense: the CPU and the 53C810
+write them, and only the Real3D reads them. My Model 1 core keeps its polygon payload in
+DDR3 (`m1_ddram_payload`, Model 1 `9c05b79`) because the 16-bit SDRAM was the contended
+bus and prefetch hides DDR3 latency up to ~400 cycles. The question for Model 3 is
+bandwidth: the core's DDR3 port gives about **100 MB/s** usable.
+
+DDR3 demand at 57.52 Hz `[CALC from M0-B]`:
+
+| Client | MB/s, 16-bit layer | MB/s, 32-bit layer |
+|---|---|---|
+| 3D layer writes, each pixel once (Z on chip, 8.3) | 21.9 | 43.8 |
+| 3D layer scan-out | 21.9 | 43.8 |
+| **3D layer total** | **43.8** | **87.6** |
+| Polygon RAM reads (41% of polygon fetch), 16 K / 32 K polygons a frame | 28 / 56 | 28 / 56 |
+| Texture FIFO, in and out | 15 | 15 |
+| Texture sheets (texture-cache fills) | not measured | not measured |
+
+Latency, client by client. Polygon RAM is read model by model, in order, and the culling
+walk names each model before its vertices are needed, so reads can be issued ahead
+exactly as Model 1 does: latency is not the problem there. The culling walk itself is a
+chain of dependent reads, so DDR3 latency lands on every node. Texture fetch is the
+worst case: every cache miss stalls the pixel pipe, which is why Model 2 kept textures
+in SDRAM. A per-polygon texture prefetch (the texture rectangle is known at setup, ahead
+of the fill) could hide it, but nothing of mine has done that yet.
+
+Bandwidth: the 3D layer alone takes 44–88% of the port. Polygon RAM fits only at the measured 16 K
+peak with a 16-bit layer and fills the port completely at VF3's quoted 32 K. Texture
+sheets were already ruled out for DDR3 on my Model 2 core (Model 2 R557): texture fetch
+is latency-bound and HPS DDR3 latency lengthens every miss. The FIFO frees only
+0.125 MiB.
+
+My Model 1 core settles the 3D layer and the polygon pattern (R15): it draws the 3D at
+60 Hz into on-chip bands, flushes each finished band to DDR3 at 16 bits a pixel, scans
+out from DDR3, and keeps its polygon payload in DDR3 on the same port. That is about
+45–50 MB/s of DDR3 traffic on the board. Model 3 with a 16-bit layer plus polygon RAM is
+72 MB/s at the measured peak and 100 at 32 K polygons: the same pattern at 1.5–2× the
+traffic.
+
+**Decision D-6: polygon RAM and the texture FIFO go to DDR3 with the 3D layer; texture
+sheets and culling RAM stay in SDRAM.** M0-C confirms the traffic on the board before
+RTL depends on it. VF3 is then 126.75 MiB in SDRAM, 1.25 MiB spare. Ways to get more
+margin:
+
+1. **Pack the SDRAM to the measured footprint, not allocation granules.** Exact spans
+   (culling 1.87, polygon 1.006, display list 0.106 MiB) save about 0.27 MiB. Not enough
+   alone, and VF3 Team Battle is unmeasured.
+2. **Measure the texture sheet footprint.** If VF3 leaves part of the 8 MiB unused, that
+   is the largest saving left in SDRAM. Next census item.
+3. **Dual SDRAM.** My Model 2 study (R35) records the Jaguar core's answer to the same
+   problem: DDR3 failed on latency, dual SDRAM worked. A second SDRAM for the Real3D
+   (VROM, texture sheets, culling and polygon RAM) solves capacity and SDRAM bandwidth
+   at once, at the cost of requiring the dual-SDRAM add-on.
 
 ### 7.4 M10K ledger (691 KiB total) `[CALC]` / `[EST]`
 
@@ -496,32 +548,49 @@ behind line buffers.
 
 ## 8. Fabric budget and partition options
 
-### 8.1 Pure-fabric ledger `[EST]`
+### 8.1 Fabric ledger — measured where Model 2 has the block (M0-G)
 
-Ranges carry over from `model2a-design-study.md` section 5 where the block is the same.
-Real3D geometry is new.
+Measured figures are "ALMs needed" from the Model 2 fitter's per-entity table: `main`
+seed s1633 (39,272 / 41,910 ALM, 551 / 553 M10K, 101 / 112 DSP) and, for the SCSP, the 2C
+seed s1629 (39,340 ALM). Rows marked `[EST]` are where Model 3 differs, with the measured
+Model 2 block they start from.
 
 | Block | Optimistic | Pessimistic | Basis |
 |---|---|---|---|
-| `sys/` framework | 5,000 | 5,000 | Model 2A study |
-| 68000 | 3,000 | 4,000 | Model 2A study |
-| 2 × SCSP | 6,000 | 10,000 | 2 × the 3,000-5,000 Model 2A figure |
-| Tile generator | 2,000 | 3,000 | S24TILE proxy |
-| I/O, i8251, NVRAM, 53C810 SCRIPTS | 500 | 1,500 | Model 2A figure plus a small interpreter |
-| Real3D geometry (traversal, matrix stack, decode, transform, clip, light) | 6,000 | 12,000 | Model 2's pipelined MB86234 was 4,000-6,000; this stage needs a clipper and a divider on top |
-| Rasteriser and texturing | 15,000 | 25,000 | Model 2A study's early range. For comparison, the N64 RDP (textured, Z-buffered, mipmapped, bilinear and trilinear) measured 8,347 ALM on this part (Model 2 M2-E) |
-| **Total without CPU** | **37,500** | **60,500** | |
-| PowerPC 603e core (new build) | ? | ? | `[OPEN]` — no figure. No PPC core exists; M0-A2's spike produces the first measured number |
+| Framework: `sys/` (scaler, OSD, audio out, HDMI PLL) + `hps_io` | 6,025 | 6,025 | Measured: sys_top minus emu 5,399 + hps_io 626 |
+| 68000 (fx68k) | 1,859 | 1,859 | Measured |
+| 2 × SCSP | 3,857 | 3,857 | Measured: m2_scsp 1,928 each on 2C |
+| Sound board glue (bank latch, i8251 link, mixing) | 357 | 600 | Measured: 2A sound board 4,136 minus fx68k and SCSP |
+| Tile generator, 4 layers | 1,100 | 2,000 | `[EST]` from Model 2's tilemap, 1,087 measured |
+| SDRAM controller and arbiter, more clients | 750 | 1,500 | `[EST]` from m2_sdram, 754 measured |
+| DDR3 path outside the rasteriser | 200 | 300 | Measured: m2_ddr3, arbiters, frame-buffer read ≈ 200 |
+| CPU bus bridge (MPC105 decode, PCI windows) | 600 | 1,000 | `[EST]` from m2_cpu_bridge, 613 measured |
+| I/O, i8251, NVRAM, RTC, 53C810 SCRIPTS | 500 | 1,500 | `[EST]`; Model 2's I/O is a Z80 board (1,206) and not comparable |
+| Real3D command, status, texture upload | 300 | 800 | `[EST]`, no Model 2 equivalent |
+| Real3D geometry (traversal, matrix stack, decode, transform, clip, light, project) | 6,000 | 8,000 | `[EST]` from Model 2 geometry, 5,896 measured (m2_geometry 5,401 incl. clipper 1,657, + m2_geo 494) |
+| Rasteriser and texturing, with Z test | 7,500 | 10,000 | `[EST]` from m2_raster3d, 8,021 measured, of which the quad store is 1,689. A Z-buffer removes the depth sort; Z test and eight texel formats are added |
+| **Total without CPU** | **29,048** | **37,441** | |
+| PowerPC 603e core (new build) | ? | ? | `[OPEN]` — M0-A2. For scale, my i960KB measures 7,559 ALM, 11 M10K, 7 DSP including its FPU |
 
-Against 41,910 ALM the optimistic case leaves **about 4.4K for the CPU**. The Model 2A
-study's i960KB was 7,000-13,500. A 603e with FPU and MMU is not smaller. On these
-carried-over numbers the build does not close even optimistically.
+Model 2 has been fitted at 41,415 ALM used, so ~41,000 is a working ceiling. Against it
+the optimistic total leaves **about 12,000 ALM for the CPU** and the pessimistic one
+**about 3,500**. An i960-sized 603e fits the optimistic case with room; it does not fit
+the pessimistic one. The rows that decide it are the rasteriser and geometry deltas,
+which M0-B's polygon and overdraw numbers narrow, and the CPU itself, which M0-A2
+measures.
 
-**These numbers are not the best source.** The rasteriser row came from an early estimate
-with no reference; the RDP measurement alone says it is pessimistic. The Model 2 core
-draws into DDR3 (D-2) and has a fit report. Gate M0-G replaces every `[EST]` row with the
-measured ALM, DSP and M10K from that report. Until then, read this table as a paper worst
-case, not a verdict.
+M0-B (R13) moves weight between the two Real3D rows: geometry needs only two multipliers
+at 50 MHz, which puts it at or below the low end, while the rasteriser needs two pixels
+per clock for the p99 frame, which puts it at or above the high end. The total is not
+re-estimated until the rasteriser has a design.
+
+The first draft of this table, carried over from the Model 2A paper estimates, totalled
+37,500–60,500 and left nothing for a CPU (R10).
+
+M10K from the same reports: framework 51, i960 11, fx68k 6, Model 2 tilemap 16,
+texture path 37 (bilinear texel 28 + span 9), quad store 151. A Z-buffered Real3D
+needs a short triangle FIFO rather than a 151-block sorted store; that is the largest
+single M10K saving available, and the Z traffic it costs goes to DDR3 (open question 1).
 
 ### 8.2 Partition — decided (D-1, D-2)
 
@@ -595,6 +664,38 @@ Instrument MAME's PPC core across the eight sets, boot to attract, and log:
 Output: the spec for the new core, the instruction-cache requirement, and the
 instructions per second the games need.
 
+*Results, VF3 only (2026-10-30, R12).* Tooling in `tools/mame-census/`. Three runs: 10 s
+and 180 s boot plus attract, and 360 s with a coin and play from frame 5,200 (14.9
+billion instructions over 20,709 frames).
+- **ISA:** 134 distinct opcode classes. Integer core plus `lmw`/`stmw`, `lwbrx`/`stwbrx`
+  (PCI byte swaps), `lwarx`/`stwcx.`, `divw`, `mullw`, condition-register logic, `rfi`,
+  `isync`, `sync`. No string instructions and no cache-block instructions seen.
+- **MMU on.** 99.2% of instructions run with IR = DR = 1. All 16 BAT registers and SDR1
+  are written at boot. VF3 also takes **software data-TLB misses**: `tlbld` 68,878 times
+  in 180 s (about 7 per frame), with DMISS (SPR 976) read and RPA (SPR 982) written by
+  the handler, plus `mfsrin`. No `tlbli`, so instruction fetch stays inside BATs. The
+  core needs BATs, a small data TLB, the 603e miss exceptions and `tlbld`.
+- **Timebase and decrementer used:** `mftb` about 950 per frame; DEC read in a wait
+  loop, written about once per second.
+- **Code runs from RAM.** Of 14.9 billion instructions, all but 2.6 million (the reset
+  vector at `FFF00000`) execute from main RAM. CROM is never executed after boot; it is
+  read as data. Total code footprint 138 KiB.
+- **I-cache working set:** distinct 32-byte lines per frame p50 1,323 (41 KiB), p99 1,591
+  (50 KiB), max 2,017 (63 KiB). Well beyond the real part's 16 KiB.
+- **FP:** single-precision ops per frame p99 150,440 (about 8.7 M/s). Double-precision
+  p99 4,177 per frame, and real: `frsqrte` → `fmul` → `fnmsub` is a double Newton-Raphson
+  reciprocal square root, and 97% of those `fmul` results are not representable in
+  single. A single-only FPU would change those results. The double rate is low enough
+  for a slow, iterative double path.
+- **Throughput:** MAME charges 1,147,344 cycles per frame (66 MHz ÷ 57.52). Busy
+  instructions per frame, excluding VF3's vblank and decrementer wait loops: p50
+  307,703, p90 500,804, p99 1,073,777, max 1,177,370. At 57.52 Hz the p99 frame needs
+  61.8 M instructions/s; a 100 MHz core needs CPI ≤ 1.6 for that frame and ≤ 3.5 for
+  the p90 frame. Instruction counts are the game's own path and hold on hardware; MAME's
+  cycle charging does not, and is not used here.
+- **Interrupt rate:** about 420 `rfi` per frame, from MAME's per-scanline IRQ, which
+  its own comment calls a guess. Real rate `[OPEN]`.
+
 **M0-A2 — Core spike.**
 Build the integer pipeline and the FPU datapath for the census subset only, no MMU yet.
 Report ALM, DSP, M10K and Fmax against the 100 MHz target. Run a slice of the MAME trace
@@ -614,6 +715,30 @@ overdraw and every read of the Real3D status packet. Run VF3 and Get Bass attrac
 Output: the real numbers behind section 5.3, the overdraw factor, and the Real3D RAM
 footprint behind 7.3. Pass: peak polygons per frame and VROM bytes per frame fit the
 bandwidth SDRAM and DDR3 can supply.
+
+*Results, VF3 only (2026-10-30, R13).* Same 360 s run, 7,447 rendered frames in play.
+- **Render cadence:** MAME renders every second frame (6,495 of 7,446 gaps are 2). The
+  hardware renders every frame: VF3 runs at 60 Hz on the cabinet, and Sega Retro quotes
+  about 32,000 polygons a scene at 60 fps on one stage. MAME's 30 Hz is an emulation
+  artefact (it flags VF3 "too slow in gameplay"; Supermodel ties VF3 slow motion to the
+  53C810 DMA). Every rate below is at one image per frame, 57.52 Hz.
+- **Coverage caveat:** the run's peak is 16,283 polygons, half the 32,000 Sega Retro
+  quotes, so the scripted play did not reach VF3's heaviest stage. Budget geometry for
+  32 K polygons: about 96 K new vertices at worst, four multipliers at 50 MHz.
+- **Real3D RAM footprint:** in 7.2. Culling 1.87 MiB, polygon 1.005 MiB, display list
+  108.5 KiB, against 4 + 1–4 + 1 MiB windows.
+- **Geometry:** per rendered frame, polygons p50 about 13 K, max 16,283; new vertices max
+  47,415; triangles after clip p99 15,607, max 16,200. MAME's 65 K cap is never close.
+  At 57.52 Hz the vertex peak is 2.73 M vertices/s, about 101 M multiplies/s at 37 per
+  vertex: **two multipliers at 50 MHz cover it**, against the 8–16 the study assumed.
+- **Model fetch:** 59% of polygons come straight from VROM, the rest from polygon RAM.
+  Peak 1.19 MB of polygon data per frame, 68 MB/s at 57.52 Hz, all from SDRAM.
+- **Texture uploads:** at most 64 K texels (128 KiB) per frame.
+- **Overdraw** (summed triangle area ÷ 496 × 384, every pixel that is Z-tested): p50
+  3.51×, p90 5.60×, p99 8.27×, max 12.28×. At 57.52 Hz, p99 is 90.6 M pixels/s.
+  **One pixel per clock at 50 MHz (4.56×) covers about the median frame only; two pixels
+  per clock (9.1×) covers p99.**
+- Matrix stack depth and status-packet reads are not logged yet.
 
 **M0-C — Memory plan.**
 Prove the D-4 layout. On SDRAM: build the arbiter budget from M0-A1 and M0-B traffic and
@@ -638,7 +763,7 @@ Capture the SCRIPTS programs VF3 and Get Bass run (MAME can log DSP and the inst
 stream). Pass: the list of distinct opcodes is within the subset in 5.2. Resolve VF3's
 single-step quirk.
 
-**M0-G — Measured budget.**
+**M0-G — Measured budget. Done 2026-10-30, results in 8.1.**
 From the Model 2 fitter report, pull measured ALM, DSP and M10K for the i960KB, MB86234,
 renderer, 68000, SCSP, tile block, DDR3 path and I/O. Replace every `[EST]` row in
 sections 7.4 and 8.1 with the measured figure, leaving a row `[EST]` only where Model 3
@@ -651,10 +776,13 @@ the Model 2 reports already on disk, so it can run first.
 
 | Milestone | Work | Exit |
 |---|---|---|
-| M1 | CPU, bridge, board RAM, tile generator, sound stub, Real3D status handshake stub | Boots to the service menu on `getbassur` |
-| M2 | Real3D traversal and decode (fabric) emitting triangle lists | Triangle list matches MAME's, frame for frame, over a Get Bass attract. Do not start the rasteriser before this diff is clean |
-| M3 | Rasteriser, textures, Z, alpha | Get Bass attract image within tolerance of Supermodel; then VF3 |
-| M4 | Sound, MIDI path, I/O, `getbass` I/O CPU, full set | All eight sets boot; VF3 and Get Bass playable with sound |
+| M1 | CPU, bridge, board RAM, 53C810 DMA, tile generator, sound stub, Real3D status handshake stub | Boots to the service menu on `vf3` |
+| M2 | Real3D traversal and decode (fabric) emitting triangle lists | Triangle list matches MAME's, frame for frame, over a VF3 attract. Do not start the rasteriser before this diff is clean |
+| M3 | Rasteriser, textures, Z, alpha | VF3 attract image within tolerance of Supermodel |
+| M4 | Sound, MIDI path, I/O, Bass Fishing sets, `getbass` I/O CPU | All eight sets boot; VF3 and Get Bass playable with sound |
+
+VF3 needs the 7.3 SDRAM gap closed before M1 can load it, so M0-B's RAM footprint is on
+the critical path.
 
 The order of M2 before M3 repeats the Model 1 lesson: every rasteriser bug chased before
 the geometry diff is clean turns out to be a geometry bug.
@@ -738,15 +866,24 @@ This is a follow-on, not a Step 1.0 deliverable.
 | D-2 | The 3D layer is drawn into DDR3, the same approach as the Model 2 core. |
 | D-3 | Clock plan: CPU 100 MHz, SDRAM 100 MHz, Real3D 50 MHz (100/100/50, integer ratios to reduce clock-domain crossings). A design target; no CPU of mine has closed above 40 MHz. |
 | D-4 | ROMs and all board state live in SDRAM. DDR3 is used only for 3D rendering, and only where it has to be. ROMs in DDR3 (the earlier DM-1 proposal) is rejected. |
+| D-5 | Bring-up title is Virtua Fighter 3 (`vf3`). Get Bass upright is the fallback reference. |
+| D-6 | DDR3 holds the 3D layer (drawn in on-chip bands, 16 bits a pixel, as Model 1), polygon RAM and the texture FIFO. Texture sheets and culling RAM stay in SDRAM (latency). Confirmed on the board by M0-C. |
 
 ### Open
 
-1. Where does the 3D Z buffer live: DDR3, or banded on chip? Illustratively, per layer of
-   overdraw where every pixel passes, colour-only traffic is 10.96 M pixels/s × 4 B =
-   43.8 MB/s, and adding a Z read and a Z write makes it 12 B per pixel, 131 MB/s, three
-   times as much. `[CALC]` Rejected pixels still cost a 4 B Z read.
-2. VF3 is 3.7–6.7 MiB over a 128 MiB module (7.3). Does the measured Real3D RAM footprint
-   close it, or do the texture sheets move to DDR3 with the 3D layer?
+1. Where does the 3D Z buffer live: DDR3, or banded on chip? M0-B's p99 frame is 90.6 M
+   Z-tested pixels/s. With Z in DDR3 that is a 4 B Z read per pixel plus a Z and colour
+   write per passing pixel, up to 12 B, about 1.09 GB/s. `[CALC]` That is beyond what a
+   shared DDR3 port should be asked for, so the measurement leans hard towards Z (and
+   colour) held on chip per band, with finished bands written to DDR3.
+2. With D-6, VF3 has 1.25 MiB of SDRAM margin (7.3). Enough, or does it need tight
+   packing, a smaller texture-sheet footprint, or dual SDRAM? Needs the texture-sheet
+   footprint and the texel fetch rate (M0-B, next), and VF3 Team Battle measured.
+4. SDRAM bandwidth, not only capacity. VROM model fetch (40 MB/s at the measured peak),
+   CPU cache misses on a 63 KiB per-frame working set, tile fetch (44 MB/s worst) and
+   texture-cache fills all land on one 16-bit SDRAM with ~120–140 MB/s usable. Texture
+   fills are unmeasured and could exceed the rest combined. M0-C, and the strongest
+   argument for option 3 in 7.3.
 3. Can the PowerPC core, FPU included, close at 100 MHz? The i960 closes at 40 MHz and the
    FP units at 80. That is what M0-A2 tests. If it only closes lower, the throughput
    margin in 5.1 shrinks, and below about 66 MHz × the real chip's IPC it disappears.
@@ -798,3 +935,53 @@ were missing.
 
 **R9 — Speed grade.** The first draft called the I7 part the slowest grade. Cyclone V
 grades run 6 to 8, with 8 the slowest; I7 is the middle grade at industrial temperature.
+
+**R10 — M0-G: the paper budget was 8K–23K ALM too pessimistic.** The 8.1 ledger carried
+the Model 2A paper ranges and totalled 37,500–60,500 ALM without a CPU, which left no
+room at all. Model 2's measured per-entity figures (s1633 main, s1629 2C) put the same
+blocks at 29,048–37,441. The biggest corrections: rasteriser 15,000–25,000 → 8,021
+measured on Model 2 (7,500–10,000 with the Model 3 deltas); 68000 3,000–4,000 → 1,859;
+SCSP 3,000–5,000 each → 1,928. The framework went the other way, 5,000 → 6,025. The CPU
+now has about 3,500–12,000 ALM, against the i960's measured 7,559.
+
+**R11 — Bring-up moved from Get Bass to VF3 (D-5).** Get Bass was picked because it is
+the smallest set and the one MAME runs. VF3 is the title that matters. The cost is that
+the SDRAM gap (7.3) and VF3's 53C810 single-step quirk (5.2) are now on the bring-up
+path instead of after it. VF3 ROMs verified against MAME 0.289.
+
+**R12 — M0-A1 on VF3: MMU, double precision and RAM-resident code are all real.** I had
+hoped for a small ISA subset with no MMU and single-precision FP. VF3 runs with
+translation on, uses BATs plus software data-TLB reloads (`tlbld`, about 7 per frame),
+and computes a double-precision reciprocal square root whose results single precision
+cannot reproduce. On the other side, code never executes from CROM, so instruction fetch
+is from main RAM only, and peak demand is 1.18 M instructions per frame (CPI ≤ 1.6 at
+100 MHz for p99). Established with the census patch in `tools/mame-census/`, VF3 only.
+
+**R13 — M0-B on VF3: geometry is cheap, pixels are not.** The study sized geometry at
+8–16 multipliers and treated 4.56× overdraw as probably enough. Measured: 47 K new
+vertices per frame at peak needs two multipliers at 50 MHz, while overdraw reaches 8.27×
+at p99, which needs two pixels per clock. The area balance moves from geometry to the
+rasteriser, and Z-buffer bandwidth rules out Z in DDR3. Real3D RAM use is 3 MiB of the
+7–10 MiB windows, which brings VF3 to exactly 128 MiB in SDRAM. MAME renders VF3 at 30 Hz;
+the cabinet runs at 60 Hz, so MAME's cadence is an artefact and the pixel figures stand
+at 57.52 Hz. The run's polygon peak (16 K) is half the 32 K quoted for VF3's heaviest
+stage, so the geometry figures are a floor.
+
+**R14 — DDR3 has room for the 3D layer and nothing else.** I had listed the texture
+sheets, polygon RAM and texture FIFO as DDR3 candidates to give VF3 9.25 MiB of SDRAM
+margin. The core's DDR3 port gives about 100 MB/s. The 3D layer's own writes and
+scan-out take 43.8 MB/s at 16 bits a pixel and 87.6 at 32; polygon RAM reads add 28 MB/s
+at the measured peak and 56 at VF3's quoted 32 K polygons; texture fetch was already
+rejected for DDR3 on latency (Model 2 R557). On latency alone, polygon RAM
+would be fine (prefetchable, as on Model 1); it is bandwidth that rules it out. Texture
+sheets and culling RAM fail on latency. On that reading none of the three went to DDR3,
+which left VF3 at zero SDRAM margin. Superseded in part by R15.
+
+**R15 — Model 1 already runs the Model 3 DDR3 pattern at 60 Hz.** R14 ruled polygon RAM
+out of DDR3 on bandwidth. My Model 1 core draws its 3D at 60 Hz in on-chip bands,
+flushes them to DDR3 at 16 bits a pixel, scans out from DDR3 and keeps its polygon
+payload on the same port, with prefetch hiding latency (Model 1 `311710f`, `9c05b79`).
+Model 3's 16-bit layer plus polygon RAM is 72–100 MB/s against Model 1's ~45–50, the same
+pattern at 1.5–2× the load. Polygon RAM and the texture FIFO go to DDR3 (D-6), checked
+on the board by M0-C. Texture sheets and culling RAM stay in SDRAM on latency. VF3 margin
+in SDRAM: 1.25 MiB.

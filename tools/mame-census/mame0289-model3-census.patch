@@ -1,0 +1,542 @@
+diff --git a/src/devices/cpu/powerpc/ppc.h b/src/devices/cpu/powerpc/ppc.h
+index dd0dd039..094942d0 100644
+--- a/src/devices/cpu/powerpc/ppc.h
++++ b/src/devices/cpu/powerpc/ppc.h
+@@ -279,6 +279,14 @@ public:
+ 	void ppccom_get_dsisr();
+ 	void ppccom_fcmp_vx();
+ 
++	// Model 3 census: enabled by M3CENSUS=<output prefix>
++	struct census_state;
++	census_state *m_census = nullptr;
++	void census_init();
++	void census_step();
++	void census_frame();
++	void census_dump();
++
+ protected:
+ 	// device_t implementation
+ 	virtual void device_start() override ATTR_COLD;
+@@ -335,6 +343,7 @@ protected:
+ 	struct internal_ppc_state
+ 	{
+ 		uint32_t pc;
++		uint32_t census_op;
+ 		uint32_t r[32];
+ 		double f[32];
+ 		uint32_t cr[8];
+diff --git a/src/devices/cpu/powerpc/ppccom.cpp b/src/devices/cpu/powerpc/ppccom.cpp
+index fe846ace..831d4706 100644
+--- a/src/devices/cpu/powerpc/ppccom.cpp
++++ b/src/devices/cpu/powerpc/ppccom.cpp
+@@ -556,6 +556,8 @@ static inline int is_snan_double(double x)
+ 
+ void ppc_device::device_start()
+ {
++	census_init();
++
+ 	// allocate the core from the near cache
+ 	m_cache.allocate_cache(mconfig().options().drc_rwx());
+ 	m_core = m_cache.alloc_near<internal_ppc_state>();
+@@ -1208,6 +1210,7 @@ void ppc_device::state_string_export(const device_state_entry &entry, std::strin
+ 
+ void ppc_device::device_stop()
+ {
++	census_dump();
+ }
+ 
+ 
+@@ -3241,3 +3244,237 @@ void ppc4xx_device::ppc4xx_set_dcr_write_handler(write32sm_delegate dcr_write_fu
+ {
+ 	m_dcr_write_func = dcr_write_func;
+ }
++
++
++/***************************************************************************
++    MODEL 3 CENSUS
++    Enabled by M3CENSUS=<output prefix>. Counts every executed instruction
++    by opcode, SPR traffic, MSR translation state, PC region and per-frame
++    I-cache line footprint, and checks whether double-precision FP results
++    are exactly representable in single precision.
++***************************************************************************/
++
++#include <cmath>
++#include <fstream>
++#include <map>
++
++struct ppc_device::census_state
++{
++	std::string prefix;
++	std::vector<uint64_t> op_count = std::vector<uint64_t>(65536);
++	std::vector<uint32_t> op_sample = std::vector<uint32_t>(65536);
++	std::map<uint32_t, std::pair<uint64_t, uint64_t>> fpd;  // key -> {checked, not single-exact}
++	uint64_t spr_read[1024] = {}, spr_write[1024] = {}, tbr_read[1024] = {};
++	uint64_t msr_irdr[4] = {};
++	uint32_t msr_or = 0, msr_and = ~0U;
++	uint64_t region_total[4] = {};
++	std::vector<uint64_t> pc_ram = std::vector<uint64_t>(0x800000 / 4);
++	std::vector<uint64_t> pc_crom = std::vector<uint64_t>(0x1000000 / 4);
++	std::vector<uint32_t> line_stamp = std::vector<uint32_t>(0x40000 + 0x80000);
++	uint32_t pending_key = 0, pending_d = 0;
++	uint32_t frame = 0;
++	uint64_t last_cycles = 0;
++	uint64_t f_insn = 0, f_region[4] = {}, f_lines[4] = {}, f_fps = 0, f_fpd = 0;
++	uint64_t max_lines = 0;
++	std::vector<std::pair<uint32_t, uint32_t>> idle;  // M3IDLE=lo-hi,... busy-wait PC ranges
++	uint64_t f_idle = 0;
++	std::ofstream frames;
++};
++
++static inline uint32_t census_key(uint32_t op)
++{
++	uint32_t const p = op >> 26;
++	uint32_t x = 0;
++	if (p == 19 || p == 31)
++		x = (op >> 1) & 0x3ff;
++	else if (p == 59)
++		x = (op >> 1) & 0x1f;
++	else if (p == 63)
++	{
++		uint32_t const x5 = (op >> 1) & 0x1f;
++		x = (x5 >= 18 && x5 != 19 && x5 != 24 && x5 != 27) ? (992 + x5) : ((op >> 1) & 0x3ff);
++	}
++	return p * 1024 + x;
++}
++
++void ppc_device::census_step()
++{
++	census_state &c = *m_census;
++	uint32_t const op = m_core->census_op;
++	uint32_t const pc = m_core->pc;
++
++	// the previous instruction has now executed: check its double result
++	if (c.pending_key)
++	{
++		double const v = m_core->f[c.pending_d];
++		auto &e = c.fpd[c.pending_key];
++		e.first++;
++		if (!std::isnan(v) && double(float(v)) != v)
++			e.second++;
++		c.pending_key = 0;
++	}
++
++	uint32_t const key = census_key(op);
++	if (c.op_count[key]++ == 0)
++		c.op_sample[key] = op;
++
++	uint32_t const p = op >> 26;
++	if (p == 59)
++		c.f_fps++;
++	else if (p == 63)
++	{
++		uint32_t const x5 = (op >> 1) & 0x1f;
++		if (x5 >= 18 && x5 != 19 && x5 != 24 && x5 != 27)
++		{
++			c.pending_key = key;
++			c.pending_d = (op >> 21) & 31;
++			c.f_fpd++;
++		}
++	}
++	else if (p == 31)
++	{
++		uint32_t const xo = (op >> 1) & 0x3ff;
++		uint32_t const spr = ((op >> 16) & 0x1f) | ((op >> 6) & 0x3e0);
++		if (xo == 339) c.spr_read[spr]++;
++		else if (xo == 467) c.spr_write[spr]++;
++		else if (xo == 371) c.tbr_read[spr]++;
++	}
++
++	uint32_t const msr = m_core->msr;
++	c.msr_or |= msr;
++	c.msr_and &= msr;
++	c.msr_irdr[(msr >> 4) & 3]++;
++
++	int r = 3;
++	int64_t line = -1;
++	if (pc < 0x800000)
++	{
++		r = 0;
++		c.pc_ram[pc >> 2]++;
++		line = pc >> 5;
++	}
++	else if (pc >= 0xff000000)
++	{
++		r = (pc >= 0xff800000) ? 1 : 2;
++		c.pc_crom[(pc - 0xff000000) >> 2]++;
++		line = 0x40000 + ((pc - 0xff000000) >> 5);
++	}
++	c.region_total[r]++;
++	c.f_region[r]++;
++	if (line >= 0 && c.line_stamp[line] != c.frame + 1)
++	{
++		c.line_stamp[line] = c.frame + 1;
++		c.f_lines[r]++;
++	}
++	for (auto const &r : c.idle)
++		if (pc >= r.first && pc <= r.second)
++		{
++			c.f_idle++;
++			break;
++		}
++	c.f_insn++;
++}
++
++void ppc_device::census_frame()
++{
++	if (!m_census)
++		return;
++	census_state &c = *m_census;
++	uint64_t const cyc = total_cycles();
++	uint64_t const lines = c.f_lines[0] + c.f_lines[1] + c.f_lines[2];
++	c.max_lines = std::max(c.max_lines, lines);
++	c.frames << c.frame << ',' << (cyc - c.last_cycles) << ',' << c.f_insn << ','
++			<< c.f_region[0] << ',' << c.f_region[1] << ',' << c.f_region[2] << ',' << c.f_region[3] << ','
++			<< c.f_lines[0] << ',' << c.f_lines[1] << ',' << c.f_lines[2] << ','
++			<< c.f_fps << ',' << c.f_fpd << ',' << c.f_idle << '\n';
++	c.last_cycles = cyc;
++	c.f_insn = c.f_fps = c.f_fpd = c.f_idle = 0;
++	std::fill(std::begin(c.f_region), std::end(c.f_region), 0);
++	std::fill(std::begin(c.f_lines), std::end(c.f_lines), 0);
++	c.frame++;
++}
++
++void ppc_device::census_dump()
++{
++	if (!m_census)
++		return;
++	census_state &c = *m_census;
++	c.frames.close();
++	std::ofstream o(c.prefix + ".txt");
++	auto dasm = [this](uint32_t pc, uint32_t op) { std::ostringstream s; m_dasm.dasm_one(s, pc, op); return s.str(); };
++
++	uint64_t total = 0;
++	for (auto n : c.op_count) total += n;
++	o << "frames " << c.frame << "\ninstructions " << total << "\n\n";
++
++	o << "== opcode classes by count (key, count, share, sample)\n";
++	std::vector<uint32_t> keys;
++	for (uint32_t k = 0; k < 65536; k++) if (c.op_count[k]) keys.push_back(k);
++	std::sort(keys.begin(), keys.end(), [&c](uint32_t a, uint32_t b) { return c.op_count[a] > c.op_count[b]; });
++	o << "distinct " << keys.size() << '\n';
++	for (auto k : keys)
++		o << util::string_format("%2u/%-4u %14u %8.4f%%  %08X  %s\n", k >> 10, k & 1023, c.op_count[k], 100.0 * c.op_count[k] / total, c.op_sample[k], dasm(0, c.op_sample[k]));
++
++	o << "\n== double-precision results (key, checked, not exactly single, sample)\n";
++	for (auto &e : c.fpd)
++		o << util::string_format("%2u/%-4u %14u %14u  %s\n", e.first >> 10, e.first & 1023, e.second.first, e.second.second, dasm(0, c.op_sample[e.first]));
++
++	o << "\n== SPR (number, mfspr, mtspr)\n";
++	for (int i = 0; i < 1024; i++)
++		if (c.spr_read[i] || c.spr_write[i])
++			o << util::string_format("%4d %14u %14u\n", i, c.spr_read[i], c.spr_write[i]);
++	o << "\n== TBR reads (mftb)\n";
++	for (int i = 0; i < 1024; i++)
++		if (c.tbr_read[i])
++			o << util::string_format("%4d %14u\n", i, c.tbr_read[i]);
++
++	o << util::string_format("\n== MSR  or %08X  and %08X\n", c.msr_or, c.msr_and);
++	o << util::string_format("IR=0 DR=0 %u\nIR=0 DR=1 %u\nIR=1 DR=0 %u\nIR=1 DR=1 %u\n", c.msr_irdr[0], c.msr_irdr[1], c.msr_irdr[2], c.msr_irdr[3]);
++
++	static const char *const rname[4] = { "RAM", "fixed CROM", "banked CROM", "other" };
++	o << "\n== PC regions (instructions, distinct words, footprint KiB)\n";
++	for (int r = 0; r < 4; r++)
++	{
++		uint64_t words = 0;
++		if (r == 0) for (auto n : c.pc_ram) words += n != 0;
++		if (r == 1) for (size_t i = 0x800000 / 4; i < c.pc_crom.size(); i++) words += c.pc_crom[i] != 0;
++		if (r == 2) for (size_t i = 0; i < 0x800000 / 4; i++) words += c.pc_crom[i] != 0;
++		o << util::string_format("%-12s %14u %10u %8.1f\n", rname[r], c.region_total[r], words, words * 4 / 1024.0);
++	}
++	o << "max distinct 32-byte I-lines in one frame " << c.max_lines << " (" << c.max_lines * 32 / 1024.0 << " KiB)\n";
++
++	o << "\n== hottest PCs\n";
++	std::vector<std::pair<uint64_t, uint32_t>> hot;
++	for (size_t i = 0; i < c.pc_ram.size(); i++) if (c.pc_ram[i]) hot.emplace_back(c.pc_ram[i], uint32_t(i * 4));
++	for (size_t i = 0; i < c.pc_crom.size(); i++) if (c.pc_crom[i]) hot.emplace_back(c.pc_crom[i], uint32_t(0xff000000 + i * 4));
++	std::partial_sort(hot.begin(), hot.begin() + std::min<size_t>(60, hot.size()), hot.end(), std::greater<>());
++	for (size_t i = 0; i < std::min<size_t>(60, hot.size()); i++)
++	{
++		uint32_t const pc = hot[i].second;
++		o << util::string_format("%08X %14u %8.4f%%  %s\n", pc, hot[i].first, 100.0 * hot[i].first / total, dasm(pc, m_program->read_dword(pc)));
++	}
++
++	delete m_census;
++	m_census = nullptr;
++}
++
++void ppc_device::census_init()
++{
++	if (char const *const prefix = getenv("M3CENSUS"))
++	{
++		m_census = new census_state;
++		m_census->prefix = prefix;
++		m_census->frames.open(m_census->prefix + "_frames.csv");
++		m_census->frames << "frame,cycles,insn,ram,fixed_crom,banked_crom,other,lines_ram,lines_fixed,lines_banked,fp_single,fp_double,idle\n";
++		if (char const *const idle = getenv("M3IDLE"))
++		{
++			std::istringstream in(idle);
++			std::string range;
++			while (std::getline(in, range, ','))
++			{
++				auto const dash = range.find('-');
++				m_census->idle.emplace_back(std::stoul(range.substr(0, dash), nullptr, 16), std::stoul(range.substr(dash + 1), nullptr, 16));
++			}
++		}
++	}
++}
+diff --git a/src/devices/cpu/powerpc/ppcdrc.cpp b/src/devices/cpu/powerpc/ppcdrc.cpp
+index 41467674..02cffe8d 100644
+--- a/src/devices/cpu/powerpc/ppcdrc.cpp
++++ b/src/devices/cpu/powerpc/ppcdrc.cpp
+@@ -501,6 +501,11 @@ void ppc_device::ppc_cfunc_printf_debug()
+     state and return
+ -------------------------------------------------*/
+ 
++static void cfunc_census(ppc_device &ppc)
++{
++	ppc.census_step();
++}
++
+ static void cfunc_printf_probe(ppc_device &ppc)
+ {
+ 	ppc.ppc_cfunc_printf_probe();
+@@ -1834,6 +1839,16 @@ void ppc_device::generate_sequence_instruction(drcuml_block &block, compiler_sta
+ 	// update the icount map variable
+ 	UML_MAPVAR(block, MAPVAR_CYCLES, compiler->cycles);                                     // mapvar  CYCLES,compiler->cycles
+ 
++	// Model 3 census: one callback per executed instruction
++	if (m_census)
++	{
++		UML_MOV(block, mem(&m_core->pc), desc->pc);
++		save_fast_iregs(block);
++		save_fast_fregs(block);
++		UML_MOV(block, mem(&m_core->census_op), desc->opptr);
++		UML_CALLC(block, cfunc_census, this);
++	}
++
+ 	// if we want a probe, add it here
+ 	if (desc->pc == PROBE_ADDRESS)
+ 	{
+diff --git a/src/mame/sega/model3.cpp b/src/mame/sega/model3.cpp
+index 72e41977..d6754734 100644
+--- a/src/mame/sega/model3.cpp
++++ b/src/mame/sega/model3.cpp
+@@ -1288,12 +1288,16 @@ TIMER_CALLBACK_MEMBER(model3_state::real3d_dma_timer_callback)
+     Un-syncing the interrupts breaks the progress bar in magtruck
+ */
+ 
++void m3b_frame_tick();
++
+ TIMER_CALLBACK_MEMBER(model3_state::scan_timer_tick)
+ {
+ 	int scanline = param;
+ 
+ 	if (scanline == 384)
+ 	{
++		m_maincpu->census_frame();
++		m3b_frame_tick();
+ 		set_irq_line(0x02, ASSERT_LINE);
+ 	}
+ 	else
+diff --git a/src/mame/sega/model3_v.cpp b/src/mame/sega/model3_v.cpp
+index fac2dfb6..ee4808b4 100644
+--- a/src/mame/sega/model3_v.cpp
++++ b/src/mame/sega/model3_v.cpp
+@@ -6,6 +6,96 @@
+ 
+ #include "endianness.h"
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++/* Model 3 census (M0-B): enabled by M3CENSUS=<output prefix>. Real3D RAM
++   footprint, per-frame polygon, vertex, triangle, texture-upload and
++   triangle-area counts. */
++namespace {
++struct m3b_census
++{
++	bool on = false;
++	std::FILE *f = nullptr;
++	std::string prefix;
++	std::vector<uint8_t> dl_w, cull_w, poly_w;
++	uint32_t dl_max = 0, cull_max = 0, poly_max = 0;
++	uint64_t models = 0, polys = 0, polys_vrom = 0, verts_new = 0, verts_reused = 0, fetch_bytes = 0;
++	uint64_t tris_opaque = 0, tris_alpha = 0, tex_uploads = 0, tex_texels = 0, renders = 0;
++	double area = 0;
++	uint64_t frame = 0;
++	double max_area = 0;
++	uint64_t max_polys = 0, max_tris = 0, max_fetch = 0, max_texels = 0;
++
++	m3b_census()
++	{
++		if (char const *const p = std::getenv("M3CENSUS"))
++		{
++			on = true;
++			prefix = p;
++			f = std::fopen((prefix + "_real3d.csv").c_str(), "w");
++			std::fprintf(f, "frame,renders,models,polys,polys_vrom,verts_new,verts_reused,fetch_bytes,tris_opaque,tris_alpha,area_px,tex_uploads,tex_texels,dl_max,cull_max,poly_max\n");
++			dl_w.resize(0x40000);
++			cull_w.resize(0x100000);
++			poly_w.resize(0x100000);
++		}
++	}
++	~m3b_census()
++	{
++		if (!on)
++			return;
++		std::fclose(f);
++		auto count = [](std::vector<uint8_t> const &v) { uint64_t n = 0; for (auto b : v) n += b; return n; };
++		std::FILE *o = std::fopen((prefix + "_real3d.txt").c_str(), "w");
++		std::fprintf(o, "frames %llu\n", (unsigned long long)frame);
++		std::fprintf(o, "display list RAM: highest word written 0x%06X (%.1f KiB span), distinct words %llu (%.1f KiB)\n", dl_max, (dl_max + 1) * 4 / 1024.0, (unsigned long long)count(dl_w), count(dl_w) * 4 / 1024.0);
++		std::fprintf(o, "culling RAM:      highest word written 0x%06X (%.1f KiB span), distinct words %llu (%.1f KiB)\n", cull_max, (cull_max + 1) * 4 / 1024.0, (unsigned long long)count(cull_w), count(cull_w) * 4 / 1024.0);
++		std::fprintf(o, "polygon RAM:      highest word written 0x%06X (%.1f KiB span), distinct words %llu (%.1f KiB)\n", poly_max, (poly_max + 1) * 4 / 1024.0, (unsigned long long)count(poly_w), count(poly_w) * 4 / 1024.0);
++		std::fprintf(o, "per-frame peaks: polys %llu, triangles %llu, fetch bytes %llu, texels uploaded %llu, triangle area %.0f px (%.2fx of 496x384)\n",
++				(unsigned long long)max_polys, (unsigned long long)max_tris, (unsigned long long)max_fetch, (unsigned long long)max_texels, max_area, max_area / (496.0 * 384.0));
++		std::fclose(o);
++	}
++	void mark(std::vector<uint8_t> &v, uint32_t &mx, uint32_t i)
++	{
++		if (i < v.size()) { v[i] = 1; if (i > mx) mx = i; }
++	}
++	void tick()
++	{
++		if (!on)
++			return;
++		std::fprintf(f, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.0f,%llu,%llu,%u,%u,%u\n",
++				(unsigned long long)frame, (unsigned long long)renders, (unsigned long long)models, (unsigned long long)polys, (unsigned long long)polys_vrom,
++				(unsigned long long)verts_new, (unsigned long long)verts_reused, (unsigned long long)fetch_bytes,
++				(unsigned long long)tris_opaque, (unsigned long long)tris_alpha, area,
++				(unsigned long long)tex_uploads, (unsigned long long)tex_texels, dl_max, cull_max, poly_max);
++		max_polys = std::max(max_polys, polys);
++		max_tris = std::max(max_tris, tris_opaque + tris_alpha);
++		max_fetch = std::max(max_fetch, fetch_bytes);
++		max_texels = std::max(max_texels, tex_texels);
++		max_area = std::max(max_area, area);
++		renders = models = polys = polys_vrom = verts_new = verts_reused = fetch_bytes = 0;
++		tris_opaque = tris_alpha = tex_uploads = tex_texels = 0;
++		area = 0;
++		frame++;
++	}
++};
++m3b_census g_m3b;
++
++double m3b_area(m3_triangle const *t, int n)
++{
++	double a = 0;
++	for (int i = 0; i < n; i++)
++	{
++		auto const &v = t[i].v;
++		a += std::abs((v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[2].x - v[0].x) * (v[1].y - v[0].y)) * 0.5;
++	}
++	return a;
++}
++} // anonymous namespace
++
++void m3b_frame_tick() { g_m3b.tick(); }
++
+ /*
+     TODO:
+     - Tilemap flash effect
+@@ -954,10 +1044,12 @@ void model3_state::real3d_display_list_w(offs_t offset, uint64_t data, uint64_t
+ 	if (ACCESSING_BITS_32_63)
+ 	{
+ 		m_display_list_ram[offset*2] = BYTE_REVERSE32((uint32_t)(data >> 32));
++		if (g_m3b.on) g_m3b.mark(g_m3b.dl_w, g_m3b.dl_max, offset*2);
+ 	}
+ 	if (ACCESSING_BITS_0_31)
+ 	{
+ 		m_display_list_ram[(offset*2)+1] = BYTE_REVERSE32((uint32_t)(data));
++		if (g_m3b.on) g_m3b.mark(g_m3b.dl_w, g_m3b.dl_max, (offset*2)+1);
+ 	}
+ }
+ 
+@@ -966,10 +1058,12 @@ void model3_state::real3d_polygon_ram_w(offs_t offset, uint64_t data, uint64_t m
+ 	if (ACCESSING_BITS_32_63)
+ 	{
+ 		m_polygon_ram[offset*2] = BYTE_REVERSE32((uint32_t)(data >> 32));
++		if (g_m3b.on) g_m3b.mark(g_m3b.poly_w, g_m3b.poly_max, offset*2);
+ 	}
+ 	if (ACCESSING_BITS_0_31)
+ 	{
+ 		m_polygon_ram[(offset*2)+1] = BYTE_REVERSE32((uint32_t)(data));
++		if (g_m3b.on) g_m3b.mark(g_m3b.poly_w, g_m3b.poly_max, (offset*2)+1);
+ 	}
+ }
+ 
+@@ -1098,6 +1192,8 @@ void model3_state::real3d_upload_texture(uint32_t header, uint32_t *data)
+ 	int ypos    = ((header >> 7) & 0x1f) * 32;
+ 	int page    = (header >> 20) & 0x1;
+ 	int bitdepth = (header >> 23) & 0x1;
++	g_m3b.tex_uploads++;
++	g_m3b.tex_texels += width * height;
+ 	int upper_byte = (header >> 22) & 0x1;
+ 	int lower_byte = (header >> 21) & 0x1;
+ 
+@@ -1214,6 +1310,7 @@ void model3_state::real3d_display_list_end()
+ 
+ 	reset_triangle_buffers();
+ 	real3d_traverse_display_list();
++	g_m3b.renders++;
+ 
+ 	for (int i=0; i < 4; i++)
+ 	{
+@@ -1231,6 +1328,9 @@ void model3_state::real3d_display_list_end()
+ 			tiacount = m_tri_alpha_buffer_ptr - tia;
+ 		}
+ 
++		g_m3b.tris_opaque += std::max(ticount, 0);
++		g_m3b.tris_alpha += std::max(tiacount, 0);
++		if (g_m3b.on) g_m3b.area += m3b_area(&m_tri_buffer[ti], ticount) + m3b_area(&m_tri_alpha_buffer[tia], tiacount);
+ 		if (ticount > 0 || tiacount > 0)
+ 		{
+ 			m_renderer->clear_zb();
+@@ -1252,6 +1352,7 @@ void model3_state::real3d_display_list1_dma(uint32_t src, uint32_t dst, int leng
+ 		if (byteswap)
+ 			w = BYTE_REVERSE32(w);
+ 
++		if (g_m3b.on) g_m3b.mark(g_m3b.dl_w, g_m3b.dl_max, d);
+ 		m_display_list_ram[d++] = w;
+ 		src += 4;
+ 	}
+@@ -1268,6 +1369,7 @@ void model3_state::real3d_display_list2_dma(uint32_t src, uint32_t dst, int leng
+ 		if (byteswap)
+ 			w = BYTE_REVERSE32(w);
+ 
++		if (g_m3b.on) g_m3b.mark(g_m3b.cull_w, g_m3b.cull_max, d);
+ 		m_culling_ram[d++] = w;
+ 		src += 4;
+ 	}
+@@ -1321,6 +1423,7 @@ void model3_state::real3d_polygon_ram_dma(uint32_t src, uint32_t dst, int length
+ 		if (byteswap)
+ 			w = BYTE_REVERSE32(w);
+ 
++		if (g_m3b.on) g_m3b.mark(g_m3b.poly_w, g_m3b.poly_max, d);
+ 		m_polygon_ram[d++] = w;
+ 		src += 4;
+ 	}
+@@ -1495,6 +1598,7 @@ void model3_state::draw_model(uint32_t addr)
+ {
+ 	// Polygon RAM is mapped to the low 4MB of VROM
+ 	uint32_t *model = (addr >= 0x100000) ? &m_vrom[addr] :  &m_polygon_ram[addr];
++	g_m3b.models++;
+ 
+ 	uint32_t header[7];
+ 	int index = 0;
+@@ -1555,6 +1659,15 @@ void model3_state::draw_model(uint32_t addr)
+ 			return;
+ 
+ 		num_vertices = (header[0] & 0x40) ? 4 : 3;
++		{
++			int reused = 0;
++			for (int rv = 0; rv < 4; rv++) reused += (header[0] >> rv) & 1;
++			g_m3b.polys++;
++			g_m3b.polys_vrom += addr >= 0x100000;
++			g_m3b.verts_reused += reused;
++			g_m3b.verts_new += num_vertices - reused;
++			g_m3b.fetch_bytes += 28 + 16 * (num_vertices - reused);
++		}
+ 
+ 		/* texture coordinates are 16.0 or 13.3 fixed-point */
+ 		texture_coord_scale = (header[1] & 0x40) ? 1.0f : (1.0f / 8.0f);
