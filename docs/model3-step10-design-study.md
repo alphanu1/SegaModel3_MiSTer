@@ -199,8 +199,10 @@ reaches the SCSPs is `[OPEN]` (check with a MAME trace of the 68000 writes).
 ### 5.1 Main CPU — PowerPC 603e
 
 **No PowerPC core exists in my stable.** My only CPU is the i960KB in the Model 2 core,
-which runs at 40 MHz (Model 2 R744), so the 603e is a new build and the largest unknown
-in the project. Section 8.1 carries no ALM figure for it, deliberately.
+which runs at 40 MHz (Model 2 R744). One open 603e exists: SloPPC603
+(github.com/kdedon/SloPPC603, GPL-2.0-or-later, reviewed at `419d8a4`). It has the MMU
+VF3 needs but not the speed or the area (R21), so the 603e here is written from scratch
+with SloPPC603 as a reference only (D-13), and is the largest unknown in the project. Section 8.1 carries no ALM figure for it, deliberately.
 
 Clock plan (D-3): **CPU 100 MHz, SDRAM 100 MHz, Real3D 50 MHz.** 100 MHz is 1.5 times the
 66 MHz the real chip runs at. That headroom is what lets a single-issue core match a part
@@ -648,6 +650,40 @@ Three places carry the risk, in order of how little I can say about them today.
 
 ---
 
+### 8.4 Area techniques carried from Model 1 and Model 2
+
+Third-party cores are measured as their authors built them. My Model 1 and Model 2 cores
+found room no other core's IP takes, all cycle-identical on their benches. Every Model 3
+block, the CPU first, is designed with these from the start, and any third-party figure
+(SloPPC603's 10,415 ALM included) is read as a ceiling these can cut, not a floor.
+
+| Technique | Measured | Where |
+|---|---|---|
+| Register file in MLAB: a bank per write port, a copy per read port, a live-value table and a one-clock bypass | −796 ALM, −716 registers | Model 1 `7d95cdd` (V60) |
+| Whole-word register writes, merged before the write, instead of per-bit write masks | ~1,030 ALM of a 2,289 ALM file | Model 1 `957fba3`; −547 ALM fitted, `a7abcbf` |
+| Small storage out of flip-flops: stacks, EEPROM, FIFOs into MLAB or M10K | 1,920 / 1,024 / 272 flops each | Model 1 `a5c905c`, `e643842`, `29a5fa0` |
+| Duplicated arithmetic built once: one multiplier, one barrel shifter, one FP pack, address adders shared across instruction groups that never overlap | 12 DSP; several hundred ALM | Model 1 `86927fb` |
+| Idle registers shared between groups that are never live together | in `86927fb` | Model 1 |
+| Converters and operators time-shared where the schedule has idle cycles; Quartus merges identical expressions but cannot see a schedule | −1,507 ALM on 2A, −1,359 on 2C | Model 2 R952 |
+| One shared FP pool for several units; the reciprocal on the pool | −652 ALM for the reciprocal | Model 1 `640eb4e`; Model 2 `m2_fp_pool` |
+| MLAB and M10K traded against each other as whichever binds | 330 ALM of MLAB moved to M10K | Model 1 `29a5fa0` |
+| Per-game or per-board logic behind compile-time parameters so unused decode folds away | — | Model 2 R948 |
+
+What does not work, also measured: registers alone buy about nothing (they share ALMs
+with logic, Model 2 R952); small multiplies forced into logic cost 1,650 ALM and failed
+timing (Model 2 R975); a DSP reciprocal square root was not worth 199 ALM at 98% full
+(Model 1 `746bfbc`).
+
+Method, from the same work: measure each change with `quartus_map` on the full design and
+a standalone map and fit of the changed module; prove identity with an old-against-new
+miter on every cycle; and run real-code traces, because per-opcode fuzzing passed a SET1
+that corrupted 31 of 32 bits (Model 1 `a7abcbf`).
+
+For the 603e this points at: GPRs and FPRs in MLAB with a live-value table; BATs,
+segment registers and SPRs in MLAB; one shared adder and shifter across the integer
+groups; the FP datapath on a shared pool with single precision fast and double precision
+iterated through the same multiplier; TLB and caches in M10K.
+
 ## 9. Milestones and gates
 
 M0 gates are independent and need no integration. Each reports numbers, not opinions.
@@ -912,17 +948,91 @@ This is a follow-on, not a Step 1.0 deliverable.
 
 ## 13. Sources
 
-- MAME `src/mame/sega/model3.cpp`, `model3.h`, `model3_pci.cpp/.h`, `model3_render.cpp/.h`,
-  `model3_v.cpp` (BSD-3-Clause; R. Belmont, Ville Linde).
-- Supermodel (Team Supermodel; Bart Trzynadlowski, Ville Linde, Stefano Teso):
-  `Config/Games.xml`, `Src/Model3/Model3.cpp`, `Real3D.cpp`, `53C810.cpp`,
-  `Docs/README.txt` (GPL-3-or-later). Repository: github.com/trzy/Supermodel
-- MAME `model3.cpp` Guru-Readme PCB notes (Model 3 board IDs, CPU clock evidence).
-- `model2a-design-study.md` (sega-model2-mister) — ranges carried over in section 8;
-  R744 for the Model 2 clocks; M2-E for the N64 RDP measurement.
-- Model 2 fit report s1246: 41,415 / 41,910 ALM, 553 / 553 M10K, 90 / 112 DSP.
-- Still to read: LSI53C810A Technical Manual v2.1 (cited by Supermodel), and the MPC105
-  and PowerPC 603e user manuals. The CPU section will be stronger with them.
+Everything this study measures or cites, linked so the work can be checked. Emulators
+and reverse-engineered notes describe behaviour; the manuals are the authority for the
+CPU and bridge.
+
+### Emulators (the behaviour references)
+
+- **MAME 0.289**, tag `mame0289` (`f34f0250`), BSD-3-Clause; R. Belmont, Ville Linde:
+  [`model3.cpp`](https://github.com/mamedev/mame/blob/mame0289/src/mame/sega/model3.cpp)
+  (machine configs, memory maps, ROM lists, the Guru-Readme PCB notes),
+  [`model3.h`](https://github.com/mamedev/mame/blob/mame0289/src/mame/sega/model3.h),
+  [`model3_v.cpp`](https://github.com/mamedev/mame/blob/mame0289/src/mame/sega/model3_v.cpp)
+  (Real3D traversal, decode, renderer),
+  [`model3_m.cpp`](https://github.com/mamedev/mame/blob/mame0289/src/mame/sega/model3_m.cpp),
+  [PowerPC core](https://github.com/mamedev/mame/tree/mame0289/src/devices/cpu/powerpc).
+- **Supermodel** at [`036af1c`](https://github.com/trzy/Supermodel/tree/036af1c8d6640c5a60709c1f99144635ed82a184),
+  GPL-3-or-later; Bart Trzynadlowski, Ville Linde, Stefano Teso, Ian Curtis:
+  [`Real3D.cpp`](https://github.com/trzy/Supermodel/blob/036af1c8d6640c5a60709c1f99144635ed82a184/Src/Model3/Real3D.cpp),
+  [`Model3.cpp`](https://github.com/trzy/Supermodel/blob/036af1c8d6640c5a60709c1f99144635ed82a184/Src/Model3/Model3.cpp),
+  [`53C810.cpp`](https://github.com/trzy/Supermodel/blob/036af1c8d6640c5a60709c1f99144635ed82a184/Src/Model3/53C810.cpp),
+  [`Games.xml`](https://github.com/trzy/Supermodel/blob/036af1c8d6640c5a60709c1f99144635ed82a184/Config/Games.xml),
+  [`Docs/README.txt`](https://github.com/trzy/Supermodel/blob/036af1c8d6640c5a60709c1f99144635ed82a184/Docs/README.txt).
+- The census patches that instrument both, and how to run them:
+  [`tools/mame-census/`](../tools/mame-census/README.md).
+
+### CPU and bridge (public manuals, the authority)
+
+- MPC603e RISC Microprocessor User's Manual: [Rev 1, 1997 (bitsavers)](https://ftp.mirrorservice.org/sites/www.bitsavers.org/components/motorola/PowerPC/1997_MPC603EUM_MPC603e_EC603e_Users_Manual_Rev_1.pdf),
+  [1995 edition (bitsavers)](https://bitsavers.mirrorservice.org/components/motorola/PowerPC/1995_MPC603EUM_PowerPC_603e_Users_Manual.pdf),
+  [Rev 3, 2002 (Hackaday mirror)](https://cdn.hackaday.io/files/1665357125033440/MPC603e-manual.pdf).
+- [IBM PID6 603e hardware specification (bitsavers)](https://bitsavers.mirrorservice.org/components/ibm/powerpc/G522-0268-00_PID6-603eHSr1_199612.pdf).
+- Not yet linked here: the 32-bit PowerPC Programming Environments Manual (NXP
+  MPCFPE32B), the MPC105 and MPC106 bridge user's manuals, and the LSI53C810A Technical
+  Manual v2.1 (cited by Supermodel).
+
+### Real3D (no programming manual is public)
+
+- [R3D/PRO-1000 specification sheet (textfiles.com)](http://textfiles.com/computers/DOCUMENTATION/r3dspec.txt):
+  one geometry processor with one, two or four pixel processors; 750 K polygons/s per unit;
+  **50 M pixels/s per pixel processor**; 16-bit texels (4/8-bit mono, 16-bit colour with
+  4-bit translucency or 1-bit contour), maps 32×32 to 512×512; trilinear MIP-mapping with
+  microtexture; **22-bit floating-point Z (6-bit exponent, 16-bit mantissa)**; S-buffer
+  edge anti-aliasing; per-pixel fog; flat, Gouraud and specular shading with a sun vector.
+  A [product overview](http://textfiles.com/computers/DOCUMENTATION/r3d_prod.txt) sits beside it.
+- [R3D/100 Architecture Overview, Nov 1996 (vgamuseum.info)](https://vgamuseum.info/images/doc/unreleased/r3d-100_architecture_overview_nov96.pdf),
+  the PC chip set from the same family: 33.33 MHz crystal with on-chip PLLs; a separate
+  texture-memory controller over up to 8 MB of CDRAM "with a proprietary caching approach
+  that minimizes cache misses"; bilinear one memory cycle per pixel at 16 bits a texel;
+  worst-case RAS cycles up to four memory cycles per texel; frame/depth buffer in MDRAM.
+- Patents it lists (GE Aerospace, the Real3D lineage):
+  [4821212](https://patents.google.com/patent/US4821212),
+  [4825391](https://patents.google.com/patent/US4825391),
+  [4855937](https://patents.google.com/patent/US4855937),
+  [4868771](https://patents.google.com/patent/US4868771),
+  [4888711](https://patents.google.com/patent/US4888711),
+  [4896265](https://patents.google.com/patent/US4896265),
+  [4905164](https://patents.google.com/patent/US4905164),
+  [4910665](https://patents.google.com/patent/US4910665),
+  [5191642](https://patents.google.com/patent/US5191642). Not yet read.
+- [Mitsubishi's 1996 press release on the R3D/PRO-1000's graphics memory (Sega Retro)](https://segaretro.org/Press_release:_1996-08-06:_Mitsubishi%27s_Graphics_Memory_Products_Power_REAL_3D%27s_R3D/PRO-1000_Graphics_Engine).
+- [Real3D: from tank simulators to graphics cards (CPU Shack)](https://www.cpushack.com/?p=19606), for the company history.
+
+### Games
+
+- [Virtua Fighter 3 (Sega Retro)](https://segaretro.org/Virtua_Fighter_3): 60 fps, about
+  32,000 polygons a scene on its heaviest stage.
+
+### CPU cores reviewed
+
+- [SloPPC603](https://github.com/kdedon/SloPPC603/tree/419d8a484366dad43f74079c054304e6d2e6b00c),
+  Kevin Dedon, GPL-2.0-or-later, reviewed at `419d8a4`: a reference only (D-13, R21).
+- [Microwatt](https://github.com/antonblanchard/microwatt): 64-bit Power ISA 3.0, read for
+  decode only.
+
+### My earlier cores
+
+- [Sega Model 1 core](https://github.com/alphanu1/sega-model1-mister) and
+  [Sega Model 2 core](https://github.com/alphanu1/sega-model2-mister): the measured area,
+  clocks and DDR3 figures in sections 6–8, the area techniques in 8.4, and
+  `docs/model2a-design-study.md` (R744 clocks, R952 room savings, M2-E N64 RDP
+  measurement, R557 on textures and DDR3, R35 on dual SDRAM).
+- Model 2 fit reports used for M0-G: s1633 (`main`, 39,272 / 41,910 ALM, 551 / 553 M10K)
+  and s1629 (2C).
+
+Local copies of the Real3D documents, for reading only and not committed:
+`sm3-builds/refs/`.
 
 ## 14. Decisions and open questions
 
@@ -942,6 +1052,8 @@ This is a follow-on, not a Step 1.0 deliverable.
 | D-10 | Daytona USA 2 (Step 2.1) is a target for this core, at a reduced frame rate (20–30 fps) if that is what it takes. It needs the dual-SDRAM build (D-9), sound left out (D-8), and the Step 2.x deltas: MPC106 bridge, Real3D DMA device in place of the 53C810, 13.11 vertex format, full culling-node layout, three-word texture port, 315-5881 security board. |
 | D-11 | Two second SDRAM modules are on order (rated to 150 MHz). The dual-SDRAM build is the main target for VF3 and Daytona 2; single-SDRAM builds stay possible with heavy frames slipping (R17). |
 | D-12 | Build now, before the second SDRAM arrives: a single-SDRAM proof of concept running VF3 with sound left out (D-8). VF3 then needs 117.25 MiB of SDRAM (126.75 less 9.5 MiB of sound), 10.75 MiB spare. Heavy frames may slip on texture bandwidth (R17) until the dual-SDRAM build. |
+| D-13 | The 603e is written from scratch, designed around the 8.4 area techniques. SloPPC603 is a reference only: read to understand the 603e's corner cases and to cross-check, never copied. Confirmed against the CPI model before RTL starts. |
+| D-14 | One core for every step, driven by the game ID, as the Model 2 core is. Run-time selection: vertex format (17.7 / 13.11), culling-node layout, Real3D PCI ID, MPC105 or MPC106 register map, the SDRAM layout from the MRA. Compile-time parameters, with the game ID choosing inside what is built: 53C810 SCRIPTS and the Real3D DMA engine, the 315-5881 decrypter, the second SDRAM, sound. The CPU runs at 100 MHz for every step: the timebase and decrementer count from the 66 MHz bus on all steps, so only performance changes with the CPU clock. |
 
 ### Open
 
@@ -1121,3 +1233,17 @@ for geometry on four multipliers and 85% for the rasteriser at two pixels a cloc
 texture fills of 109 MB/s at p99. Attract mode only, so racing with traffic may be
 heavier. Its 168 MiB of non-sound ROM needs the second SDRAM (D-9, D-11). The Step 2.x
 hardware deltas are listed in D-10.
+
+**R21 — An open 603e exists, but not one that meets VF3 on this part.** The study said no
+PowerPC core exists. SloPPC603 (Kevin Dedon, GPL-2.0-or-later, `419d8a4`, 2026-10-20) is a
+603e-compatible SystemVerilog core fitted on the same 5CSEBA6U23I7 with Quartus 17. By its
+own records: integer core 10,415 ALM, 52 M10K, 2 DSP, 68.5 MHz; with its COMPACT FPU
+28,789 ALM at 50 MHz, FULL FPU 40,664 ALM and failing timing; CPI about 4.4 on nbench
+and Embench. It implements BATs, segments, the page TLB with 603e software refill, 16 KiB
+instruction and data caches, and verifies against DingusPPC. VF3 needs 33–66 M
+instructions/s (R19), against its ~15 M/s, and the CPU budget is 3.5K–12K ALM (8.1).
+The serialized load/store unit, single outstanding fetch and full double-precision FPU
+are design choices for exactness, not tuning gaps. Decided (D-13): the CPU is
+written from scratch for 100 MHz and CPI ≈ 1.3–1.5, with the 8.4 area techniques from
+the start; SloPPC603 is a reference only, read to find faults and corner cases, never
+copied.

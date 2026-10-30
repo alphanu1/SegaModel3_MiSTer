@@ -7,6 +7,7 @@
   //   sm3-builds/mame289-m3   MAME 0.289 clone carrying the census patch
   //                           (tools/mame-census). Measurement only.
   //   sm3-builds/supermodel   Supermodel clone, the Real3D reference.
+  //   tools/sloppc603-ref     SloPPC603, a GPL-2.0+ 603e core under review.
   //   tools/*-ref             read-only reference clones of other cores.
   //   third_party/*           upstream clones, never vendored.
   //
@@ -14,7 +15,8 @@
   // one of them does not bring its repository back into Source Control.
   "git.ignoredRepositories": [
     "sm3-builds/mame289-m3",
-    "sm3-builds/supermodel"
+    "sm3-builds/supermodel",
+    "tools/sloppc603-ref"
   ],
   "git.repositoryScanIgnoredFolders": [
     "node_modules",
