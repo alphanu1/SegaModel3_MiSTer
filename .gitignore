@@ -1,0 +1,97 @@
+CLAUDE.md
+
+# ---- Reference material, not part of this project ----
+# Read-only clones of other cores and upstream dependencies.
+tools/*-ref/
+third_party/
+
+# ---- ROMs and ROM-derived data ----
+# .mra files are fine (they describe a layout); the bytes are not.
+*.zip
+*.7z
+*.rom
+*.bin
+*.ic*
+*.mpr
+*.epr
+roms/
+rom/
+
+# ---- Quartus build output ----
+db/
+incremental_db/
+output_files/
+simulation/
+greybox_tmp/
+build_flow.log
+jtag.cdf
+c5_pin_model_dump.txt
+cr_ie_info.json
+PLLJ_PLLSPE_INFO.txt
+timing/
+tmp-clearbox/
+hc_output/
+hps_isw_handoff/
+.qsys_edit/
+*.qws
+*.rpt
+*.summary
+*.smsg
+*.sof
+*.pof
+*.rbf
+*.jdi
+*.pin
+*.done
+*.qar
+*.qarlog
+*.sopcinfo
+*.bak
+build_id.v
+build/
+
+# Build worktrees: one checkout per seed sweep or bisect point.
+sm3-builds/
+
+# ---- Simulation output ----
+obj_*/
+*.o
+*.d
+*.a
+*.vcd
+*.fst
+*.wlf
+transcript
+work/
+verilator.log
+__pycache__/
+
+# ---- MAME / Supermodel output ----
+# nvram/ holds EEPROM and backup RAM dumped from the game: ROM-derived data.
+cfg/
+nvram/
+sta/
+snap/
+diff/
+inp/
+memcard/
+comment/
+ui/
+mame.ini
+ui.ini
+error.log
+debug.log
+*.tr
+
+# ---- Editor / OS ----
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/settings.json
+
+# ---- releases/ IS PUBLISHED ----
+# Must stay last: the blanket *.rbf above would otherwise swallow the release.
+!/releases/
+!/releases/*.rbf
