@@ -318,10 +318,10 @@ index 41467674..02cffe8d 100644
  	if (desc->pc == PROBE_ADDRESS)
  	{
 diff --git a/src/mame/sega/model3.cpp b/src/mame/sega/model3.cpp
-index 72e41977..d6754734 100644
+index 72e41977..d4f8d040 100644
 --- a/src/mame/sega/model3.cpp
 +++ b/src/mame/sega/model3.cpp
-@@ -1288,12 +1288,16 @@ TIMER_CALLBACK_MEMBER(model3_state::real3d_dma_timer_callback)
+@@ -1288,12 +1288,17 @@ TIMER_CALLBACK_MEMBER(model3_state::real3d_dma_timer_callback)
      Un-syncing the interrupts breaks the progress bar in magtruck
  */
  
@@ -334,21 +334,56 @@ index 72e41977..d6754734 100644
  	if (scanline == 384)
  	{
 +		m_maincpu->census_frame();
++		m3b_replay_frame();
 +		m3b_frame_tick();
  		set_irq_line(0x02, ASSERT_LINE);
  	}
  	else
+diff --git a/src/mame/sega/model3.h b/src/mame/sega/model3.h
+index 383b0fe6..302de201 100644
+--- a/src/mame/sega/model3.h
++++ b/src/mame/sega/model3.h
+@@ -44,6 +44,7 @@ struct cached_texture
+ 	uint8_t       format;
+ 	uint8_t       alpha;
+ 	std::unique_ptr<rgb_t[]> data;
++	int           page = 0, texx = 0, texy = 0;  // sheet position, for the census
+ };
+ 
+ struct m3_vertex
+@@ -77,6 +78,7 @@ struct model3_polydata
+ 	uint32_t texture_param;
+ 	int transparency;
+ 	int intensity;
++	uint32_t triidx = 0;  // submission order, for the census
+ };
+ 
+ class model3_state;
+@@ -424,6 +426,8 @@ private:
+ 	void draw_viewport(int pri, uint32_t address);
+ 	void real3d_traverse_display_list();
+ 	void real3d_display_list_end();
++	void m3b_replay_frame();  // census: render Real3D memory dumped from Supermodel
++	bool m3b_replaying = false;
+ 	void real3d_display_list1_dma(uint32_t src, uint32_t dst, int length, int byteswap);
+ 	void real3d_display_list2_dma(uint32_t src, uint32_t dst, int length, int byteswap);
+ 	void real3d_vrom_texture_dma(uint32_t src, uint32_t dst, int length, int byteswap);
 diff --git a/src/mame/sega/model3_v.cpp b/src/mame/sega/model3_v.cpp
-index fac2dfb6..ee4808b4 100644
+index fac2dfb6..b10c4bc6 100644
 --- a/src/mame/sega/model3_v.cpp
 +++ b/src/mame/sega/model3_v.cpp
-@@ -6,6 +6,96 @@
+@@ -6,6 +6,225 @@
  
  #include "endianness.h"
  
 +#include <cstdio>
 +#include <cstdlib>
 +#include <vector>
++#include <algorithm>
++#include <filesystem>
++#include <string>
++#include <zlib.h>
++#include <cstring>
 +
 +/* Model 3 census (M0-B): enabled by M3CENSUS=<output prefix>. Real3D RAM
 +   footprint, per-frame polygon, vertex, triangle, texture-upload and
@@ -362,10 +397,55 @@ index fac2dfb6..ee4808b4 100644
 +	std::vector<uint8_t> dl_w, cull_w, poly_w;
 +	uint32_t dl_max = 0, cull_max = 0, poly_max = 0;
 +	uint64_t models = 0, polys = 0, polys_vrom = 0, verts_new = 0, verts_reused = 0, fetch_bytes = 0;
-+	uint64_t tris_opaque = 0, tris_alpha = 0, tex_uploads = 0, tex_texels = 0, renders = 0;
++	uint64_t tris_opaque = 0, tris_alpha = 0, tex_uploads = 0, tex_texels = 0, renders = 0, bad_uploads = 0, bad_addresses = 0;
 +	double area = 0;
 +	uint64_t frame = 0;
 +	double max_area = 0;
++
++	// textures: sheet tiles written (8x8 texels), and a texel-cache model
++	std::vector<uint8_t> tile_w = std::vector<uint8_t>(2 * 256 * 128);
++	std::vector<uint8_t> blk_r = std::vector<uint8_t>(2 * 512 * 256);   // 4x4 blocks ever read
++	std::vector<uint32_t> blk_stamp = std::vector<uint32_t>(2 * 512 * 256);
++	uint64_t texel_fetches = 0, blocks_touched = 0, max_texel_fetches = 0, max_blocks = 0;
++	struct cache
++	{
++		int kib, ways, setbits, xbits;
++		std::vector<uint32_t> tag, age;
++		uint64_t misses = 0, max_misses = 0, total_misses = 0;
++		cache(int k, int w) : kib(k), ways(w)
++		{
++			int const sets = k * 1024 / 32 / w;
++			setbits = 0;
++			while ((1 << setbits) < sets) setbits++;
++			xbits = (setbits + 1) / 2;
++			tag.assign(sets * w, ~0U);
++			age.assign(sets * w, 0);
++		}
++		void access(uint32_t blk, uint32_t bx, uint32_t by, uint32_t page, uint32_t now)
++		{
++			uint32_t const set = ((bx & ((1 << xbits) - 1)) | ((by ^ (page << 3)) << xbits)) & ((1 << setbits) - 1);
++			uint32_t *t = &tag[set * ways], *a = &age[set * ways];
++			int victim = 0;
++			for (int w = 0; w < ways; w++)
++			{
++				if (t[w] == blk) { a[w] = now; return; }
++				if (a[w] < a[victim]) victim = w;
++			}
++			t[victim] = blk;
++			a[victim] = now;
++			misses++;
++		}
++	};
++	std::vector<cache> caches = { cache(8, 4), cache(16, 4), cache(32, 4), cache(64, 4), cache(128, 4) };
++	uint32_t clock = 0;
++
++	// Z pre-pass model: opaque textured pixels fetch only for the final winner of each
++	// pass, in band order (8 rows), triangle order within a band
++	struct deferred { cached_texture const *t = nullptr; uint32_t tri = 0; uint16_t u1, u2, v1, v2; };
++	std::vector<deferred> defer = std::vector<deferred>(496 * 384);
++	std::vector<cache> caches_d = { cache(8, 4), cache(16, 4), cache(32, 4), cache(64, 4), cache(128, 4) };
++	uint64_t fetches_d = 0, max_fetches_d = 0;
++	uint32_t tri_seq = 0;
 +	uint64_t max_polys = 0, max_tris = 0, max_fetch = 0, max_texels = 0;
 +
 +	m3b_census()
@@ -375,7 +455,7 @@ index fac2dfb6..ee4808b4 100644
 +			on = true;
 +			prefix = p;
 +			f = std::fopen((prefix + "_real3d.csv").c_str(), "w");
-+			std::fprintf(f, "frame,renders,models,polys,polys_vrom,verts_new,verts_reused,fetch_bytes,tris_opaque,tris_alpha,area_px,tex_uploads,tex_texels,dl_max,cull_max,poly_max\n");
++			std::fprintf(f, "frame,renders,models,polys,polys_vrom,verts_new,verts_reused,fetch_bytes,tris_opaque,tris_alpha,area_px,tex_uploads,tex_texels,dl_max,cull_max,poly_max,texel_fetches,blocks_touched,miss8k,miss16k,miss32k,miss64k,miss128k,zp_fetches,zp_miss8k,zp_miss16k,zp_miss32k,zp_miss64k,zp_miss128k\n");
 +			dl_w.resize(0x40000);
 +			cull_w.resize(0x100000);
 +			poly_w.resize(0x100000);
@@ -388,13 +468,81 @@ index fac2dfb6..ee4808b4 100644
 +		std::fclose(f);
 +		auto count = [](std::vector<uint8_t> const &v) { uint64_t n = 0; for (auto b : v) n += b; return n; };
 +		std::FILE *o = std::fopen((prefix + "_real3d.txt").c_str(), "w");
-+		std::fprintf(o, "frames %llu\n", (unsigned long long)frame);
++		std::fprintf(o, "frames %llu\nunknown texture uploads skipped %llu\ninvalid traversal addresses %llu\n", (unsigned long long)frame, (unsigned long long)bad_uploads, (unsigned long long)bad_addresses);
 +		std::fprintf(o, "display list RAM: highest word written 0x%06X (%.1f KiB span), distinct words %llu (%.1f KiB)\n", dl_max, (dl_max + 1) * 4 / 1024.0, (unsigned long long)count(dl_w), count(dl_w) * 4 / 1024.0);
 +		std::fprintf(o, "culling RAM:      highest word written 0x%06X (%.1f KiB span), distinct words %llu (%.1f KiB)\n", cull_max, (cull_max + 1) * 4 / 1024.0, (unsigned long long)count(cull_w), count(cull_w) * 4 / 1024.0);
 +		std::fprintf(o, "polygon RAM:      highest word written 0x%06X (%.1f KiB span), distinct words %llu (%.1f KiB)\n", poly_max, (poly_max + 1) * 4 / 1024.0, (unsigned long long)count(poly_w), count(poly_w) * 4 / 1024.0);
 +		std::fprintf(o, "per-frame peaks: polys %llu, triangles %llu, fetch bytes %llu, texels uploaded %llu, triangle area %.0f px (%.2fx of 496x384)\n",
 +				(unsigned long long)max_polys, (unsigned long long)max_tris, (unsigned long long)max_fetch, (unsigned long long)max_texels, max_area, max_area / (496.0 * 384.0));
++		uint64_t tw0 = 0, tw1 = 0, br = 0;
++		for (size_t i = 0; i < tile_w.size(); i++) (i < tile_w.size() / 2 ? tw0 : tw1) += tile_w[i];
++		for (auto b : blk_r) br += b;
++		std::fprintf(o, "texture sheets: 8x8 tiles written page 0 %llu, page 1 %llu of 32768 each (%.2f MiB of 8 written); 4x4 blocks ever read %llu (%.2f MiB)\n",
++				(unsigned long long)tw0, (unsigned long long)tw1, (tw0 + tw1) * 128 / 1048576.0, (unsigned long long)br, br * 32 / 1048576.0);
++		std::fprintf(o, "texel fetches per frame peak %llu; distinct 4x4 blocks per frame peak %llu\n", (unsigned long long)max_texel_fetches, (unsigned long long)max_blocks);
++		for (auto const &c : caches)
++			std::fprintf(o, "cache %3d KiB %d-way, 32 B lines: total misses %llu, per-frame peak %llu (%.1f MB/s at 57.52 Hz)\n",
++					c.kib, c.ways, (unsigned long long)c.total_misses, (unsigned long long)c.max_misses, c.max_misses * 32 * 57.52 / 1e6);
++		std::fprintf(o, "Z pre-pass model: texel fetches per frame peak %llu\n", (unsigned long long)max_fetches_d);
++		for (auto const &c : caches_d)
++			std::fprintf(o, "Z pre-pass cache %3d KiB %d-way: total misses %llu, per-frame peak %llu (%.1f MB/s at 57.52 Hz)\n",
++					c.kib, c.ways, (unsigned long long)c.total_misses, (unsigned long long)c.max_misses, c.max_misses * 32 * 57.52 / 1e6);
 +		std::fclose(o);
++	}
++	void texel(cached_texture const *t, uint32_t u, uint32_t v)
++	{
++		texel_to(t, u, v, caches);
++		texel_fetches++;
++	}
++	void fetch(cached_texture const *t, uint32_t u1, uint32_t u2, uint32_t v1, uint32_t v2, bool defer_it, int y, int x, uint32_t tri)
++	{
++		texel(t, u1, v1); texel(t, u2, v1); texel(t, u1, v2); texel(t, u2, v2);
++		if (defer_it)
++		{
++			if (y >= 0 && y < 384 && x >= 0 && x < 496)
++				defer[y * 496 + x] = deferred{ t, tri, uint16_t(u1), uint16_t(u2), uint16_t(v1), uint16_t(v2) };
++		}
++		else
++		{
++			texel_to(t, u1, v1, caches_d); texel_to(t, u2, v1, caches_d); texel_to(t, u1, v2, caches_d); texel_to(t, u2, v2, caches_d);
++			fetches_d += 4;
++		}
++	}
++	void defer_clear(int y, int x)
++	{
++		if (y >= 0 && y < 384 && x >= 0 && x < 496)
++			defer[y * 496 + x].t = nullptr;
++	}
++	void defer_flush()
++	{
++		std::vector<std::pair<uint64_t, uint32_t>> order;
++		for (uint32_t i = 0; i < defer.size(); i++)
++			if (defer[i].t)
++			{
++				uint32_t const y = i / 496, x = i % 496;
++				order.emplace_back((uint64_t(y >> 3) << 40) | (uint64_t(defer[i].tri & 0xfffff) << 20) | ((y & 7) << 9) | x, i);
++			}
++		std::sort(order.begin(), order.end());
++		for (auto const &o : order)
++		{
++			deferred &d = defer[o.second];
++			texel_to(d.t, d.u1, d.v1, caches_d); texel_to(d.t, d.u2, d.v1, caches_d); texel_to(d.t, d.u1, d.v2, caches_d); texel_to(d.t, d.u2, d.v2, caches_d);
++			fetches_d += 4;
++			d.t = nullptr;
++		}
++		tri_seq = 0;
++	}
++	void texel_to(cached_texture const *t, uint32_t u, uint32_t v, std::vector<cache> &cs)
++	{
++		uint32_t const pw = 32 << t->width, ph = 32 << t->height;
++		uint32_t const sx = t->texx * 32 + (u < pw ? u : 2 * pw - 1 - u);
++		uint32_t const sy = t->texy * 32 + (v < ph ? v : 2 * ph - 1 - v);
++		uint32_t const bx = (sx >> 2) & 511, by = (sy >> 2) & 255, page = t->page & 1;
++		uint32_t const blk = (page << 17) | (by << 9) | bx;
++		blk_r[blk] = 1;
++		if (&cs == &caches && blk_stamp[blk] != frame + 1) { blk_stamp[blk] = frame + 1; blocks_touched++; }
++		clock++;
++		for (auto &c : cs) c.access(blk, bx, by, page, clock);
 +	}
 +	void mark(std::vector<uint8_t> &v, uint32_t &mx, uint32_t i)
 +	{
@@ -404,11 +552,21 @@ index fac2dfb6..ee4808b4 100644
 +	{
 +		if (!on)
 +			return;
-+		std::fprintf(f, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.0f,%llu,%llu,%u,%u,%u\n",
++		std::fprintf(f, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%.0f,%llu,%llu,%u,%u,%u",
 +				(unsigned long long)frame, (unsigned long long)renders, (unsigned long long)models, (unsigned long long)polys, (unsigned long long)polys_vrom,
 +				(unsigned long long)verts_new, (unsigned long long)verts_reused, (unsigned long long)fetch_bytes,
 +				(unsigned long long)tris_opaque, (unsigned long long)tris_alpha, area,
 +				(unsigned long long)tex_uploads, (unsigned long long)tex_texels, dl_max, cull_max, poly_max);
++		std::fprintf(f, ",%llu,%llu", (unsigned long long)texel_fetches, (unsigned long long)blocks_touched);
++		for (auto &c : caches) { std::fprintf(f, ",%llu", (unsigned long long)c.misses); c.max_misses = std::max(c.max_misses, c.misses); c.total_misses += c.misses; c.misses = 0; }
++		std::fprintf(f, ",%llu", (unsigned long long)fetches_d);
++		for (auto &c : caches_d) { std::fprintf(f, ",%llu", (unsigned long long)c.misses); c.max_misses = std::max(c.max_misses, c.misses); c.total_misses += c.misses; c.misses = 0; }
++		max_fetches_d = std::max(max_fetches_d, fetches_d);
++		fetches_d = 0;
++		std::fprintf(f, "\n");
++		max_texel_fetches = std::max(max_texel_fetches, texel_fetches);
++		max_blocks = std::max(max_blocks, blocks_touched);
++		texel_fetches = blocks_touched = 0;
 +		max_polys = std::max(max_polys, polys);
 +		max_tris = std::max(max_tris, tris_opaque + tris_alpha);
 +		max_fetch = std::max(max_fetch, fetch_bytes);
@@ -435,11 +593,23 @@ index fac2dfb6..ee4808b4 100644
 +} // anonymous namespace
 +
 +void m3b_frame_tick() { g_m3b.tick(); }
++constexpr bool m3b_defer = false;  // overridden in the opaque textured scanline functions
 +
  /*
      TODO:
      - Tilemap flash effect
-@@ -954,10 +1044,12 @@ void model3_state::real3d_display_list_w(offs_t offset, uint64_t data, uint64_t
+@@ -543,6 +762,10 @@ cached_texture *model3_state::get_texture(int page, int texx, int texy, int texw
+ 	/* create a new texture */
+ 	tex = new cached_texture(texwidth, texheight, format);
+ 
++	tex->page = page;
++	tex->texx = texx;
++	tex->texy = texy;
++
+ 	/* set the new texture */
+ 	tex->next = m_texcache[page][texy][texx];
+ 	m_texcache[page][texy][texx] = tex;
+@@ -954,10 +1177,12 @@ void model3_state::real3d_display_list_w(offs_t offset, uint64_t data, uint64_t
  	if (ACCESSING_BITS_32_63)
  	{
  		m_display_list_ram[offset*2] = BYTE_REVERSE32((uint32_t)(data >> 32));
@@ -452,7 +622,7 @@ index fac2dfb6..ee4808b4 100644
  	}
  }
  
-@@ -966,10 +1058,12 @@ void model3_state::real3d_polygon_ram_w(offs_t offset, uint64_t data, uint64_t m
+@@ -966,10 +1191,12 @@ void model3_state::real3d_polygon_ram_w(offs_t offset, uint64_t data, uint64_t m
  	if (ACCESSING_BITS_32_63)
  	{
  		m_polygon_ram[offset*2] = BYTE_REVERSE32((uint32_t)(data >> 32));
@@ -465,7 +635,23 @@ index fac2dfb6..ee4808b4 100644
  	}
  }
  
-@@ -1098,6 +1192,8 @@ void model3_state::real3d_upload_texture(uint32_t header, uint32_t *data)
+@@ -1006,6 +1233,7 @@ inline void model3_state::write_texture16(int xpos, int ypos, int width, int hei
+ 		for(x=xpos; x < xpos+width; x+=8)
+ 		{
+ 			uint16_t *texture = &m_texture_ram[page][y*2048+x];
++			if (g_m3b.on) g_m3b.tile_w[((page & 1) << 15) | (((y >> 3) & 127) << 8) | ((x >> 3) & 255)] = 1;
+ 			int b = 0;
+ 			for(j=y; j < y+8; j++) {
+ 				for(i=x; i < x+8; i++) {
+@@ -1028,6 +1256,7 @@ inline void model3_state::write_texture8(int xpos, int ypos, int width, int heig
+ 		for(x=xpos; x < xpos+width; x+=8)
+ 		{
+ 			uint16_t *texture = &m_texture_ram[page][y*2048+x];
++			if (g_m3b.on) g_m3b.tile_w[((page & 1) << 15) | (((y >> 3) & 127) << 8) | ((x >> 3) & 255)] = 1;
+ 			int b = 0;
+ 			for(j=y; j < y+8; j++)
+ 			{
+@@ -1098,6 +1327,8 @@ void model3_state::real3d_upload_texture(uint32_t header, uint32_t *data)
  	int ypos    = ((header >> 7) & 0x1f) * 32;
  	int page    = (header >> 20) & 0x1;
  	int bitdepth = (header >> 23) & 0x1;
@@ -474,7 +660,81 @@ index fac2dfb6..ee4808b4 100644
  	int upper_byte = (header >> 22) & 0x1;
  	int lower_byte = (header >> 21) & 0x1;
  
-@@ -1214,6 +1310,7 @@ void model3_state::real3d_display_list_end()
+@@ -1189,13 +1420,72 @@ void model3_state::real3d_upload_texture(uint32_t header, uint32_t *data)
+ 		case 0x80:      /* Gamma-table ? */
+ 			break;
+ 		default:
+-			fatalerror("Unknown texture type: %02X (%08X)\n", header >> 24, header);
++			if (!g_m3b.on)
++				fatalerror("Unknown texture type: %02X (%08X)\n", header >> 24, header);
++			g_m3b.bad_uploads++;  // census runs count and skip it
+ 			break;
+ 	}
+ }
+ 
++void model3_state::m3b_replay_frame()
++{
++	static char const *const dir = std::getenv("M3REPLAY");
++	static std::vector<std::string> files;
++	static size_t next = 0;
++	static bool listed = false;
++	if (!dir)
++		return;
++	if (!listed)
++	{
++		for (auto const &e : std::filesystem::directory_iterator(dir))
++			if (e.path().extension() == ".gz")
++				files.push_back(e.path().string());
++		std::sort(files.begin(), files.end());
++		listed = true;
++		osd_printf_info("census replay: %u dumps from %s\n", unsigned(files.size()), dir);
++	}
++	if (next >= files.size())
++	{
++		machine().schedule_exit();
++		return;
++	}
++	// gzip file, inflated with the raw zlib API (MAME's zlib has no gz* functions)
++	std::FILE *fp = std::fopen(files[next++].c_str(), "rb");
++	if (!fp)
++		return;
++	std::vector<uint8_t> in;
++	uint8_t buf[65536];
++	size_t n;
++	while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0)
++		in.insert(in.end(), buf, buf + n);
++	std::fclose(fp);
++	std::vector<uint8_t> out(0x400000 + 0x100000 + 0x400000 + 0x800000);
++	z_stream z = {};
++	inflateInit2(&z, 16 + MAX_WBITS);
++	z.next_in = in.data();
++	z.avail_in = uInt(in.size());
++	z.next_out = out.data();
++	z.avail_out = uInt(out.size());
++	inflate(&z, Z_FINISH);
++	inflateEnd(&z);
++	uint8_t const *p = out.data();
++	std::memcpy(m_culling_ram.get(), p, 0x400000); p += 0x400000;
++	std::memcpy(m_display_list_ram.get(), p, 0x100000); p += 0x100000;
++	std::memcpy(m_polygon_ram.get(), p, 0x400000); p += 0x400000;
++	std::memcpy(m_texture_ram[0].get(), p, 0x400000); p += 0x400000;
++	std::memcpy(m_texture_ram[1].get(), p, 0x400000);
++	invalidate_texture(0, 0, 0, 6, 5);
++	invalidate_texture(1, 0, 0, 6, 5);
++	m_texture_fifo_pos = 0;
++	m3b_replaying = true;
++	real3d_display_list_end();
++	m3b_replaying = false;
++}
++
+ void model3_state::real3d_display_list_end()
+ {
++	if (std::getenv("M3REPLAY") && !m3b_replaying)
++		return;  // census replay: the game's own frames are not drawn
+ 	/* upload textures if there are any in the FIFO */
+ 	if (m_texture_fifo_pos > 0)
+ 	{
+@@ -1214,6 +1504,7 @@ void model3_state::real3d_display_list_end()
  
  	reset_triangle_buffers();
  	real3d_traverse_display_list();
@@ -482,7 +742,7 @@ index fac2dfb6..ee4808b4 100644
  
  	for (int i=0; i < 4; i++)
  	{
-@@ -1231,6 +1328,9 @@ void model3_state::real3d_display_list_end()
+@@ -1231,12 +1522,16 @@ void model3_state::real3d_display_list_end()
  			tiacount = m_tri_alpha_buffer_ptr - tia;
  		}
  
@@ -492,7 +752,14 @@ index fac2dfb6..ee4808b4 100644
  		if (ticount > 0 || tiacount > 0)
  		{
  			m_renderer->clear_zb();
-@@ -1252,6 +1352,7 @@ void model3_state::real3d_display_list1_dma(uint32_t src, uint32_t dst, int leng
+ 			m_renderer->draw_opaque_triangles(&m_tri_buffer[ti], ticount);
+ 			m_renderer->draw_alpha_triangles(&m_tri_alpha_buffer[tia], tiacount);
+ 			m_renderer->wait_for_polys();
++			if (g_m3b.on) g_m3b.defer_flush();
+ 		}
+ 	}
+ }
+@@ -1252,6 +1547,7 @@ void model3_state::real3d_display_list1_dma(uint32_t src, uint32_t dst, int leng
  		if (byteswap)
  			w = BYTE_REVERSE32(w);
  
@@ -500,7 +767,7 @@ index fac2dfb6..ee4808b4 100644
  		m_display_list_ram[d++] = w;
  		src += 4;
  	}
-@@ -1268,6 +1369,7 @@ void model3_state::real3d_display_list2_dma(uint32_t src, uint32_t dst, int leng
+@@ -1268,6 +1564,7 @@ void model3_state::real3d_display_list2_dma(uint32_t src, uint32_t dst, int leng
  		if (byteswap)
  			w = BYTE_REVERSE32(w);
  
@@ -508,7 +775,7 @@ index fac2dfb6..ee4808b4 100644
  		m_culling_ram[d++] = w;
  		src += 4;
  	}
-@@ -1321,6 +1423,7 @@ void model3_state::real3d_polygon_ram_dma(uint32_t src, uint32_t dst, int length
+@@ -1321,6 +1618,7 @@ void model3_state::real3d_polygon_ram_dma(uint32_t src, uint32_t dst, int length
  		if (byteswap)
  			w = BYTE_REVERSE32(w);
  
@@ -516,7 +783,7 @@ index fac2dfb6..ee4808b4 100644
  		m_polygon_ram[d++] = w;
  		src += 4;
  	}
-@@ -1495,6 +1598,7 @@ void model3_state::draw_model(uint32_t addr)
+@@ -1495,6 +1793,7 @@ void model3_state::draw_model(uint32_t addr)
  {
  	// Polygon RAM is mapped to the low 4MB of VROM
  	uint32_t *model = (addr >= 0x100000) ? &m_vrom[addr] :  &m_polygon_ram[addr];
@@ -524,7 +791,7 @@ index fac2dfb6..ee4808b4 100644
  
  	uint32_t header[7];
  	int index = 0;
-@@ -1555,6 +1659,15 @@ void model3_state::draw_model(uint32_t addr)
+@@ -1555,6 +1854,15 @@ void model3_state::draw_model(uint32_t addr)
  			return;
  
  		num_vertices = (header[0] & 0x40) ? 4 : 3;
@@ -540,3 +807,76 @@ index fac2dfb6..ee4808b4 100644
  
  		/* texture coordinates are 16.0 or 13.3 fixed-point */
  		texture_coord_scale = (header[1] & 0x40) ? 1.0f : (1.0f / 8.0f);
+@@ -1774,14 +2082,22 @@ uint32_t *model3_state::get_memory_pointer(uint32_t address)
+ 	if (address & 0x800000)
+ 	{
+ 		if (address >= 0x840000) {
+-			fatalerror("get_memory_pointer: invalid display list memory address %08X\n", address);
++			if (!g_m3b.on)
++				fatalerror("get_memory_pointer: invalid display list memory address %08X\n", address);
++			g_m3b.bad_addresses++;  // census runs count it and read zeros
++			static uint32_t zeros[64] = {};
++			return zeros;
+ 		}
+ 		return &m_display_list_ram[address & 0x7fffff];
+ 	}
+ 	else
+ 	{
+ 		if (address >= 0x100000) {
+-			fatalerror("get_memory_pointer: invalid node ram address %08X\n", address);
++			if (!g_m3b.on)
++				fatalerror("get_memory_pointer: invalid node ram address %08X\n", address);
++			g_m3b.bad_addresses++;  // census runs count it and read zeros
++			static uint32_t zeros[64] = {};
++			return zeros;
+ 		}
+ 		return &m_culling_ram[address];
+ 	}
+@@ -2067,6 +2383,7 @@ void model3_renderer::draw_opaque_triangles(const m3_triangle* tris, int num_tri
+ 			extra.transparency = tri->transparency;
+ 			extra.texture_param = tri->param;
+ 			extra.color = tri->color;
++			extra.triidx = g_m3b.tri_seq++;
+ 
+ 			if (tri->param & TRI_PARAM_ALPHA_TEST)
+ 			{
+@@ -2176,6 +2493,7 @@ void model3_renderer::draw_scanline_solid(int32_t scanline, const extent_t &exte
+ 
+ 			fb[x] = 0xff000000 | c.to_rgba_clamp();
+ 			zb[x] = z;
++			if (g_m3b.on) g_m3b.defer_clear(scanline, x);
+ 		}
+ 
+ 		in += inz;
+@@ -2238,6 +2556,7 @@ do {
+ 	uint32_t v1 = (v >> 8) & vmask;                                               \
+ 	uint32_t u2 = (u1 + 1) & umask;                                               \
+ 	uint32_t v2 = (v1 + 1) & vmask;                                               \
++	if (g_m3b.on) g_m3b.fetch(texture, u1, u2, v1, v2, m3b_defer, scanline, x, polydata.triidx); \
+ 	uint32_t pix00 = texture->data[(v1 << width) + u1];                           \
+ 	uint32_t pix01 = texture->data[(v1 << width) + u2];                           \
+ 	uint32_t pix10 = texture->data[(v2 << width) + u1];                           \
+@@ -2253,6 +2572,7 @@ do {
+ 
+ void model3_renderer::draw_scanline_tex(int32_t scanline, const extent_t &extent, const model3_polydata &polydata, int threadid)
+ {
++	constexpr bool m3b_defer = true;
+ 	uint32_t *const fb = &m_fb->pix(scanline);
+ 	float *const zb = (float*)&m_zb->pix(scanline);
+ 	const cached_texture *texture = polydata.texture;
+@@ -2297,6 +2617,7 @@ void model3_renderer::draw_scanline_tex(int32_t scanline, const extent_t &extent
+ 
+ void model3_renderer::draw_scanline_tex_colormod(int32_t scanline, const extent_t &extent, const model3_polydata &polydata, int threadid)
+ {
++	constexpr bool m3b_defer = true;
+ 	uint32_t *const fb = &m_fb->pix(scanline);
+ 	float *const zb = (float*)&m_zb->pix(scanline);
+ 	const cached_texture *texture = polydata.texture;
+@@ -2383,6 +2704,7 @@ void model3_renderer::draw_scanline_tex_contour(int32_t scanline, const extent_t
+ 
+ 				fb[x] = 0xff000000 | color.to_rgba_clamp();
+ 				zb[x] = z;
++			if (g_m3b.on) g_m3b.defer_clear(scanline, x);
+ 			}
+ 		}
+ 

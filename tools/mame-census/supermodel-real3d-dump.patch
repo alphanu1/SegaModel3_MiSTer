@@ -1,0 +1,187 @@
+diff --git a/Src/CPU/PowerPC/ppc603.c b/Src/CPU/PowerPC/ppc603.c
+index a5290eb..77994fc 100644
+--- a/Src/CPU/PowerPC/ppc603.c
++++ b/Src/CPU/PowerPC/ppc603.c
+@@ -260,6 +260,97 @@ void ppc_add_cycles(int cycles)
+ 	ppc.icount -= cycles;
+ }
+ 
++/*
++ * Model 3 census: M3CPU=<prefix> counts every executed instruction, per frame,
++ * with M3IDLE=lo-hi,... busy-wait PC ranges counted separately. Run with
++ * -no-idle-skip so the wait loops are executed rather than skipped.
++ */
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <algorithm>
++
++namespace {
++struct m3cpu_census
++{
++	bool on = false;
++	std::string prefix;
++	std::FILE *f = nullptr;
++	std::vector<std::pair<UINT32, UINT32>> idle;
++	std::vector<uint64_t> pc_ram = std::vector<uint64_t>(0x800000 / 4);
++	std::vector<UINT32> op_ram = std::vector<UINT32>(0x800000 / 4);
++	uint64_t f_insn = 0, f_idle = 0, f_rom = 0, total = 0, frame = 0;
++	m3cpu_census()
++	{
++		const char *p = std::getenv("M3CPU");
++		if (!p)
++			return;
++		on = true;
++		prefix = p;
++		f = std::fopen((prefix + "_cpu_frames.csv").c_str(), "w");
++		std::fprintf(f, "frame,insn,idle,rom\n");
++		if (const char *s = std::getenv("M3IDLE"))
++		{
++			std::string list(s), item;
++			size_t pos = 0;
++			while (pos <= list.size())
++			{
++				size_t comma = list.find(',', pos);
++				if (comma == std::string::npos) comma = list.size();
++				item = list.substr(pos, comma - pos);
++				size_t dash = item.find('-');
++				if (dash != std::string::npos)
++					idle.emplace_back(std::stoul(item.substr(0, dash), nullptr, 16), std::stoul(item.substr(dash + 1), nullptr, 16));
++				pos = comma + 1;
++			}
++		}
++	}
++	~m3cpu_census()
++	{
++		if (!on)
++			return;
++		std::fclose(f);
++		std::FILE *o = std::fopen((prefix + "_cpu.txt").c_str(), "w");
++		std::fprintf(o, "frames %llu\ninstructions %llu\n\nhottest RAM PCs\n", (unsigned long long)frame, (unsigned long long)total);
++		std::vector<std::pair<uint64_t, UINT32>> hot;
++		for (size_t i = 0; i < pc_ram.size(); i++)
++			if (pc_ram[i]) hot.emplace_back(pc_ram[i], UINT32(i * 4));
++		size_t n = std::min<size_t>(60, hot.size());
++		std::partial_sort(hot.begin(), hot.begin() + n, hot.end(), std::greater<>());
++		for (size_t i = 0; i < n; i++)
++			std::fprintf(o, "%08X %14llu %8.4f%%  %08X\n", hot[i].second, (unsigned long long)hot[i].first, 100.0 * hot[i].first / total, op_ram[hot[i].second >> 2]);
++		std::fclose(o);
++	}
++	inline void step(UINT32 pc, UINT32 op)
++	{
++		f_insn++;
++		if (pc < 0x800000)
++		{
++			pc_ram[pc >> 2]++;
++			op_ram[pc >> 2] = op;
++		}
++		else
++			f_rom++;
++		for (auto const &r : idle)
++			if (pc >= r.first && pc <= r.second) { f_idle++; break; }
++	}
++	void tick()
++	{
++		if (!on)
++			return;
++		std::fprintf(f, "%llu,%llu,%llu,%llu\n", (unsigned long long)frame, (unsigned long long)f_insn, (unsigned long long)f_idle, (unsigned long long)f_rom);
++		total += f_insn;
++		f_insn = f_idle = f_rom = 0;
++		frame++;
++	}
++};
++m3cpu_census g_m3cpu;
++}
++
++void m3cpu_frame() { g_m3cpu.tick(); }
++
+ int ppc_execute(int cycles)
+ {
+ 	UINT32 opcode;
+@@ -334,6 +425,9 @@ int ppc_execute(int cycles)
+ 			default:	optable[opcode >> 26](opcode); break;
+ 		}
+ 
++		if (g_m3cpu.on)
++			g_m3cpu.step(ppc.pc, opcode);
++
+ 		ppc.icount--;
+ 		
+ 		// <= rather than ==, as ppc_add_cycles() can step over the trigger cycle
+diff --git a/Src/Model3/Real3D.cpp b/Src/Model3/Real3D.cpp
+index cd4accd..af2e440 100644
+--- a/Src/Model3/Real3D.cpp
++++ b/Src/Model3/Real3D.cpp
+@@ -256,6 +256,9 @@
+ #include "Util/BitCast.h"
+ #include <cstring>
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <zlib.h>
+ 
+ // Macros that divide memory regions into pages and mark them as dirty when they are written to
+ #define PAGE_WIDTH 12
+@@ -604,7 +607,40 @@ void CReal3D::BeginFrame(void)
+ 
+ void CReal3D::RenderFrame(void)
+ {
+-    Render3D->RenderFrame();
++  // Model 3 census: M3DUMP_DIR saves the Real3D memories every M3DUMP_EVERY frames
++  // from M3DUMP_START, for replay through MAME's renderer. M3DUMP_EXIT ends the run.
++  // Run with -no-gpu-thread so the live arrays are the ones being drawn.
++  static const char *dumpDir = std::getenv("M3DUMP_DIR");
++  static const int every = std::getenv("M3DUMP_EVERY") ? std::atoi(std::getenv("M3DUMP_EVERY")) : 30;
++  static const int start = std::getenv("M3DUMP_START") ? std::atoi(std::getenv("M3DUMP_START")) : 0;
++  static const int stop = std::getenv("M3DUMP_EXIT") ? std::atoi(std::getenv("M3DUMP_EXIT")) : 0;
++  static int frame = 0;
++  if (dumpDir && frame >= start && (frame - start) % every == 0)
++  {
++    char name[512];
++    std::snprintf(name, sizeof(name), "%s/f%06d.bin.gz", dumpDir, frame);
++    if (gzFile f = gzopen(name, "wb1"))
++    {
++      gzwrite(f, cullingRAMLo, 0x400000);   // 8C000000, MAME m_culling_ram
++      gzwrite(f, cullingRAMHi, 0x100000);   // 8E000000, MAME m_display_list_ram
++      gzwrite(f, polyRAM, 0x400000);
++      gzwrite(f, textureRAM, 0x800000);     // 2048 x 2048, page 1 from row 1024
++      gzclose(f);
++    }
++  }
++  static const char *shotDir = std::getenv("M3SHOT_DIR");
++  static const int shotEvery = std::getenv("M3SHOT_EVERY") ? std::atoi(std::getenv("M3SHOT_EVERY")) : 600;
++  if (shotDir && frame % shotEvery == 0)
++  {
++    extern void M3Shot(const char *, int);
++    M3Shot(shotDir, frame);
++  }
++  extern void m3cpu_frame();
++  m3cpu_frame();
++  frame++;
++  if (stop && frame >= stop)
++    std::exit(0);
++  Render3D->RenderFrame();
+ }
+ 
+ void CReal3D::EndFrame(void)
+diff --git a/Src/OSD/SDL/Main.cpp b/Src/OSD/SDL/Main.cpp
+index 789a60f..10a9d7b 100644
+--- a/Src/OSD/SDL/Main.cpp
++++ b/Src/OSD/SDL/Main.cpp
+@@ -551,6 +551,14 @@ static void SaveFrameBuffer(const std::string& file)
+     Util::WriteSurfaceToBMP<Util::RGBA8>(file, pixels.get(), totalXRes, totalYRes, true);
+ }
+ 
++// Model 3 census: numbered frame grab, called from CReal3D::RenderFrame (M3SHOT_DIR)
++void M3Shot(const char *dir, int frame)
++{
++    char name[512];
++    std::snprintf(name, sizeof(name), "%s/shot_%06d.bmp", dir, frame);
++    SaveFrameBuffer(name);
++}
++
+ void Screenshot()
+ {
+     // Make a screenshot

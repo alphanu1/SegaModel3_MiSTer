@@ -1,0 +1,53 @@
+{
+  // Several git repositories live under this workspace and only one of them is
+  // this project. VS Code auto-detects every nested .git and lists them all in
+  // Source Control, and the panel then switches between them, so another
+  // project's history appears under this one.
+  //
+  //   sm3-builds/mame289-m3   MAME 0.289 clone carrying the census patch
+  //                           (tools/mame-census). Measurement only.
+  //   sm3-builds/supermodel   Supermodel clone, the Real3D reference.
+  //   tools/*-ref             read-only reference clones of other cores.
+  //   third_party/*           upstream clones, never vendored.
+  //
+  // Listed explicitly as well as excluded from the scan, so opening a file in
+  // one of them does not bring its repository back into Source Control.
+  "git.ignoredRepositories": [
+    "sm3-builds/mame289-m3",
+    "sm3-builds/supermodel"
+  ],
+  "git.repositoryScanIgnoredFolders": [
+    "node_modules",
+    "sm3-builds",
+    "third_party",
+    "build"
+  ],
+
+  // sm3-builds/ holds MAME and Supermodel trees, census output and build
+  // worktrees: gigabytes the watcher has no reason to follow. Kept out of search
+  // too; grep the MAME tree directly when it is the reference being read.
+  "files.watcherExclude": {
+    "**/sm3-builds/**": true,
+    "**/third_party/**": true,
+    "**/tools/*-ref/**": true,
+    "**/obj_*/**": true,
+    "**/db/**": true,
+    "**/incremental_db/**": true,
+    "**/output_files/**": true,
+    "**/build/**": true
+  },
+  "search.exclude": {
+    "**/sm3-builds/**": true
+  },
+
+  "[systemverilog]": {
+    "editor.insertSpaces": true,
+    "editor.tabSize": 2
+  },
+  "[verilog]": {
+    "editor.insertSpaces": true,
+    "editor.tabSize": 2
+  },
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true
+}

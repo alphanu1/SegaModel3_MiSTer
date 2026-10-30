@@ -693,6 +693,11 @@ billion instructions over 20,709 frames).
   61.8 M instructions/s; a 100 MHz core needs CPI ≤ 1.6 for that frame and ≤ 3.5 for
   the p90 frame. Instruction counts are the game's own path and hold on hardware; MAME's
   cycle charging does not, and is not used here.
+- **Throughput at 60 Hz** (R19). MAME renders VF3 at 30 Hz, which halves the per-frame
+  game work above. Supermodel renders every frame; its PowerPC census (idle-skip off,
+  the same wait loops excluded) gives busy instructions per frame p50 566,640, p90
+  685,758, p99 1,147,344 (the whole frame: at least 1% of frames never reach the wait
+  loop). A 100 MHz core needs CPI ≤ 3.07 at p50, ≤ 2.54 at p90 and ≤ 1.52 at p99.
 - **Interrupt rate:** about 420 `rfi` per frame, from MAME's per-scanline IRQ, which
   its own comment calls a guess. Real rate `[OPEN]`.
 
@@ -738,6 +743,69 @@ bandwidth SDRAM and DDR3 can supply.
   3.51×, p90 5.60×, p99 8.27×, max 12.28×. At 57.52 Hz, p99 is 90.6 M pixels/s.
   **One pixel per clock at 50 MHz (4.56×) covers about the median frame only; two pixels
   per clock (9.1×) covers p99.**
+- **Texture sheets:** 7.5 of the 8 MiB written (8×8 tiles: page 0 31,395, page 1 30,030
+  of 32,768); 5.93 MiB ever read. No SDRAM to be saved there.
+- **Texel fetches** (four per bilinear pixel, Z-passing pixels only, MAME's draw order):
+  per frame p50 1.38 M, p99 3.08 M. Distinct 4×4-texel blocks per frame p50 39,212
+  (1.2 MiB), p99 62,357 (1.9 MiB): the per-frame texture working set is bigger than all
+  the M10K on the part.
+- **Texture-cache fills**, 4-way, 32-byte lines (4×4 texels), MB/s at 57.52 Hz:
+
+  | Cache | p50 | p90 | p99 | max |
+  |---|---|---|---|---|
+  | 8 KiB | 186 | 259 | 508 | 892 |
+  | 16 KiB | 135 | 246 | 429 | 650 |
+  | 32 KiB | 114 | 194 | 304 | 475 |
+  | 64 KiB | 94 | 174 | 200 | 365 |
+  | 128 KiB | 80 | 154 | 174 | 183 |
+
+  Even the floor, every distinct block fetched once a frame, is 72 MB/s at p50 and
+  115 MB/s at p99. (R16)
+- **Z pre-pass model** (R17): opaque textured pixels fetch texels only for the final
+  winner of each priority pass, band by band (8 rows), triangle order within a band;
+  alpha-tested and translucent polygons fetch as they draw. Fetches per frame p50
+  0.80 M, p90 1.11 M, p99 1.72 M (from 1.38, 2.60, 3.08 M). Cache fills, MB/s at
+  57.52 Hz:
+
+  | Cache | p50 | p90 | p99 | max |
+  |---|---|---|---|---|
+  | 32 KiB | 72 | 153 | 253 | 447 |
+  | 64 KiB | 59 | 139 | 163 | 345 |
+  | 128 KiB | 53 | 119 | 146 | 151 |
+- **Other sets** (R18). VF3 Team Battle in MAME, and Bass Fishing Deluxe through
+  Supermodel replay (attract only; MAME stalls on its I/O board). Rendered frames:
+
+  | Set | Polys p50 / p99 | Overdraw p50 / p99 | Fills 64 KiB p50 / p99 | Z pre-pass 64 KiB p50 / p99 | Z pre-pass 128 KiB p50 / p99 |
+  |---|---|---|---|---|---|
+  | vf3, MAME, play | 13,612 / 15,903 | 3.62 / 5.20 | 94 / 200 | 59 / 163 | 53 / 146 |
+  | vf3, Supermodel replay, attract | 13,691 / 16,642 | 3.58 / 11.43 | 90 / 331 | 57 / 304 | 51 / 145 |
+  | vf3, MAME, attract | 14,952 / 16,712 | 2.90 / 11.10 | 99 / 331 | 63 / 309 | 57 / 124 |
+  | vf3tb, MAME, play | 13,892 / 15,644 | 3.35 / 7.17 | 105 / 267 | 60 / 159 | 50 / 135 |
+  | bassdx, Supermodel replay, attract | 8,995 / 24,048 | 1.66 / 4.40 | 17 / 121 | 8 / 62 | 4 / 50 |
+
+  Fills in MB/s at 57.52 Hz. VF3 Team Battle's ROMs (106.5 MiB) and Real3D RAM
+  footprint match VF3's, so the 7.3 budget covers it. Bass Fishing is light on pixels
+  and textures but peaks at 24 K polygons, above anything VF3 reached in these runs.
+- **Daytona USA 2** is Step 2.1 (`model3_21_5881`: PPC603R at 166 MHz, MPC106,
+  315-5881, DSB2). MAME stops after 8 frames. Supermodel runs it once the test menu's
+  link setting is Single (saved in its NVRAM); without that it waits on the link and
+  never uploads a texture. Measured through Supermodel (attract, R20):
+
+  | | VF3 (play) | Daytona 2 (attract) |
+  |---|---|---|
+  | Busy instructions per frame p50 / p99 / max | 566,640 / 1,147,344 / 1,147,344 | 589,353 / 759,773 / 859,813 |
+  | CPI needed at 100 MHz for 57.5 fps, p99 | 1.52 | 2.29 |
+  | Polygons per frame p99 | 15,903 | 21,545 |
+  | New vertices per frame p99 | 46,298 | 67,664 |
+  | Overdraw p50 / p99 | 3.62 / 5.20 | 3.32 / 7.76 |
+  | Texture fills, Z pre-pass, 64 KiB, p50 / p99 MB/s | 59 / 163 | 51 / 109 |
+  | Geometry cycles p99, 4 multipliers at 50 MHz, share of a frame | 49% | 72% |
+  | Rasteriser cycles p99, 2 pixels a clock at 50 MHz, share of a frame | 57% | 85% |
+
+  Daytona 2's game work is lighter than VF3's: its 166 MHz CPU sits in the vblank wait
+  three quarters of the time. Its 3D is heavier but inside the 50 MHz budget at p99.
+  ROMs are the obstacle: 200.3 MiB, of which 104 MiB CROM, 64 MiB VROM, 32 MiB sound.
+  Without sound that is 168 MiB, which needs two SDRAMs.
 - Matrix stack depth and status-packet reads are not logged yet.
 
 **M0-C — Memory plan.**
@@ -868,6 +936,12 @@ This is a follow-on, not a Step 1.0 deliverable.
 | D-4 | ROMs and all board state live in SDRAM. DDR3 is used only for 3D rendering, and only where it has to be. ROMs in DDR3 (the earlier DM-1 proposal) is rejected. |
 | D-5 | Bring-up title is Virtua Fighter 3 (`vf3`). Get Bass upright is the fallback reference. |
 | D-6 | DDR3 holds the 3D layer (drawn in on-chip bands, 16 bits a pixel, as Model 1), polygon RAM and the texture FIFO. Texture sheets and culling RAM stay in SDRAM (latency). Confirmed on the board by M0-C. |
+| D-7 | The SDRAM may run at 120 MHz (the module goes to 140, but 120 is the working ceiling). Usable bandwidth scales from ~120–140 MB/s at 100 MHz to ~145–170 MB/s. 120 is 6:5 against the 100 MHz CPU, so the SDRAM controller sits in its own clock domain with FIFOs at its ports, as Model 2's `m2_sdram` already does (Model 2 R568). Taken only if the M0-C budget needs it. |
+| D-8 | Sound may be left out of the first builds if SDRAM space, SDRAM bandwidth or fabric needs it. That frees 9.5 MiB of SDRAM (8 MiB samples, 1 MiB sound RAM, 0.5 MiB program), the sound-RAM traffic, and about 6,000 ALM (2 × SCSP, 68000, glue). |
+| D-9 | The Real3D memories sit behind a compile-time memory-placement parameter, so the texture sheets (and anything else the budget says) move to a second SDRAM once I have the dual-SDRAM add-on. Single-SDRAM remains the default build. |
+| D-10 | Daytona USA 2 (Step 2.1) is a target for this core, at a reduced frame rate (20–30 fps) if that is what it takes. It needs the dual-SDRAM build (D-9), sound left out (D-8), and the Step 2.x deltas: MPC106 bridge, Real3D DMA device in place of the 53C810, 13.11 vertex format, full culling-node layout, three-word texture port, 315-5881 security board. |
+| D-11 | Two second SDRAM modules are on order (rated to 150 MHz). The dual-SDRAM build is the main target for VF3 and Daytona 2; single-SDRAM builds stay possible with heavy frames slipping (R17). |
+| D-12 | Build now, before the second SDRAM arrives: a single-SDRAM proof of concept running VF3 with sound left out (D-8). VF3 then needs 117.25 MiB of SDRAM (126.75 less 9.5 MiB of sound), 10.75 MiB spare. Heavy frames may slip on texture bandwidth (R17) until the dual-SDRAM build. |
 
 ### Open
 
@@ -882,8 +956,23 @@ This is a follow-on, not a Step 1.0 deliverable.
 4. SDRAM bandwidth, not only capacity. VROM model fetch (40 MB/s at the measured peak),
    CPU cache misses on a 63 KiB per-frame working set, tile fetch (44 MB/s worst) and
    texture-cache fills all land on one 16-bit SDRAM with ~120–140 MB/s usable. Texture
-   fills are unmeasured and could exceed the rest combined. M0-C, and the strongest
-   argument for option 3 in 7.3.
+   fills are now measured (R16): 94 MB/s typical and 200 MB/s at p99 with a 64 KiB
+   cache, on their own more than one SDRAM carries. Options, not exclusive:
+   - **Dual SDRAM, textures on the second module.** Gives texture fills a whole SDRAM
+     and moves 8 MiB off the first (VF3 margin 1.25 → 9.25 MiB). Still short at p99
+     unless combined with the next item or a faster SDRAM clock.
+   - **Z pre-pass per band.** Z is on chip per band anyway (8.3). Rasterising each band
+     twice, Z only and then texture only where Z matches, cuts texture-cache fills by
+     about a third typically and a fifth at p99 (64 KiB: 94 → 59 MB/s p50, 200 → 163
+     p99; R17). Costs a second rasterising pass per band.
+   - **Where that leaves a single SDRAM at 120 MHz** (D-7, ~145–170 MB/s usable): with
+     the pre-pass and a 64 KiB cache, textures take 59 MB/s on a typical frame, beside
+     VROM model fetch (40 MB/s peak), tile fetch (up to 44) and CPU misses. The typical
+     frame just fits; the p90 frame (139 MB/s for textures alone) does not, and slips.
+     On a second SDRAM of its own (D-9), the texture path fits through p99 at 128 KiB
+     (146 MB/s) and nearly at 64 KiB (163).
+   - Bigger texture cache: 128 KiB costs about 105 M10K and still leaves p99 at
+     174 MB/s.
 3. Can the PowerPC core, FPU included, close at 100 MHz? The i960 closes at 40 MHz and the
    FP units at 80. That is what M0-A2 tests. If it only closes lower, the throughput
    margin in 5.1 shrinks, and below about 66 MHz × the real chip's IPC it disappears.
@@ -985,3 +1074,50 @@ Model 3's 16-bit layer plus polygon RAM is 72–100 MB/s against Model 1's ~45�
 pattern at 1.5–2× the load. Polygon RAM and the texture FIFO go to DDR3 (D-6), checked
 on the board by M0-C. Texture sheets and culling RAM stay in SDRAM on latency. VF3 margin
 in SDRAM: 1.25 MiB.
+
+**R16 — Texture fetch does not fit one SDRAM.** Texture traffic had been listed as
+unmeasured. Simulating a 4-way texel cache over VF3 gameplay (7,447 rendered frames,
+32-byte lines of 4×4 texels): 64 KiB gives 94 MB/s at p50 and 200 MB/s at p99; 128 KiB
+gives 80 and 174. The per-frame working set is 1.2–1.9 MiB of distinct blocks, so no
+on-chip cache removes it; fetching each block once a frame is 72–115 MB/s. One 16-bit
+SDRAM at 100 MHz has 120–140 MB/s usable for everything. Texture sheets in DDR3 were
+already out on latency. The texture sheets are 7.5 of 8 MiB written, so they give back
+no SDRAM either. This makes dual SDRAM (textures alone on the second module) and a
+per-band Z pre-pass the two levers worth measuring next. Established with the census in
+`tools/mame-census/` at `-numprocessors 1`.
+
+**R17 — A Z pre-pass helps, but does not put textures on one SDRAM.** Modelled in the
+census: opaque texels fetched only for each pass's final winner, band by band. Texel
+fetches drop 42% at p50 and 44% at p99; with a 64 KiB cache, fills drop from 94 to
+59 MB/s at p50 and from 200 to 163 MB/s at p99. That makes the typical frame fit a
+shared 120 MHz SDRAM and leaves heavy frames slipping. With textures on a second SDRAM
+(D-9) and a 128 KiB cache, p99 is 146 MB/s, inside one module's budget. Plan: Z pre-pass
+in the rasteriser from the start; single-SDRAM builds accept slips on heavy frames until
+the dual-SDRAM build exists.
+
+**R18 — Supermodel replay agrees with MAME, and the other Step 1.0 sets are no heavier
+than VF3 on textures.** MAME cannot run Bass Fishing or Daytona 2, and Supermodel's
+OpenGL renderer cannot count texels, so Supermodel now saves the Real3D memories every
+30th frame and MAME's renderer replays them with the census on. Checked on VF3 attract
+mode: Supermodel's frames through MAME give overdraw p99 11.4× against MAME's own 11.1×,
+and 64 KiB texture fills of 90 against 99 MB/s typical and 331 against 331 at p99.
+VF3 Team Battle matches VF3 in ROM size, RAM footprint and texture load. Bass Fishing
+Deluxe in attract is a third of VF3's texture traffic but reaches 24 K polygons a frame.
+Daytona 2 (Step 2.1) is not measured.
+
+**R19 — VF3's CPU load is twice what MAME showed.** M0-A1 put VF3's busy instructions at
+p50 307,703 per frame. MAME renders VF3 at 30 Hz, so the game's per-frame work was spread
+over two frames. Supermodel renders at 60 Hz, as the cabinet does; counting its
+interpreter with idle-skip off and the same wait loops excluded gives p50 566,640 and
+p99 1,147,344, the whole frame. The p99 requirement (CPI ≤ 1.52 at 100 MHz) is unchanged;
+the typical frame needs CPI ≤ 3.07, not 6. The same counting found the identical wait
+loops in both emulators, which supports the method.
+
+**R20 — Daytona 2 fits the CPU and the 3D budget; only memory stands in the way.** I had
+assumed a Step 2.1 game at 166 MHz was out of reach for a 100 MHz core. Measured through
+Supermodel with the link set to Single: its busy instructions per frame are p99 759,773,
+lighter than VF3 (CPI ≤ 2.29 at 100 MHz), and its 3D at p99 takes 72% of a 50 MHz frame
+for geometry on four multipliers and 85% for the rasteriser at two pixels a clock, with
+texture fills of 109 MB/s at p99. Attract mode only, so racing with traffic may be
+heavier. Its 168 MiB of non-sound ROM needs the second SDRAM (D-9, D-11). The Step 2.x
+hardware deltas are listed in D-10.
