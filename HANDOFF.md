@@ -53,6 +53,18 @@ Decisions added: D-7 (SDRAM up to 120 MHz, own clock domain), D-8 (sound may be 
 out of first builds), D-9 (Real3D memory placement as a compile-time parameter for a
 second SDRAM).
 
+## CPU (M0-A2), 2026-10-30
+
+- `rtl/cpu/`: in-order integer core, checked against `sim/cpu/ppc_iss.h` (`make test_cpu`,
+  20,000 seeds clean). Standalone fit 2,513 ALM, 77.2 MHz (R23). Next: timing pass to
+  100 MHz (forwarding selects in ID, CR0 in MEM), then branch prediction, MMU, caches, FPU.
+- CPU bring-up build (R24): `Model3.sv` + `rtl/dbg/m3_cputest.sv` run a generated program
+  at 75 MHz and report cycles, stall counters and a retire signature on the debug UART.
+  Build: `make cputest_hex test_cputest`, then `quartus_sh --flow compile Model3`
+  (write `build_id.v` first if only running analysis). Board: `tools/cputest-capture.sh`,
+  then `tools/cputest-compare.py capture.txt`. Built and timing-clean; **not yet run on
+  the board.**
+
 ## What remains
 
 - Bass Fishing gameplay (needs input injection in Supermodel) and the `getbass`

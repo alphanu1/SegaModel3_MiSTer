@@ -59,6 +59,8 @@ uint32_t B(int32_t off, int aa = 0, int lk = 0) { return (18u << 26) | (uint32_t
 uint32_t BC(int bo, int bi, int32_t off, int lk = 0) { return (16u << 26) | (bo << 21) | (bi << 16) | (uint32_t(off) & 0xFFFC) | lk; }
 
 constexpr uint32_t CODE = 0x1000, DATA = 0x100000, END_INSN = 0x48000000;
+// data span the programs use: 64 KiB in the bench, 16 KiB for the board's RAM (--emit)
+uint32_t g_span = 0x10000;
 
 // --------------------------------------------------------------- program
 struct Gen {
@@ -135,28 +137,28 @@ struct Gen {
       bool isld = rnd(2);
       int op = isld ? ld[rnd(4)] : st[rnd(3)];
       int sz = (op & 8) ? 2 : (op & 2) ? 1 : 4;
-      uint32_t off = (r32() % 0x7F00) & ~uint32_t(sz - 1);
+      uint32_t off = (r32() % (g_span / 2 - 0x100)) & ~uint32_t(sz - 1);
       emit(D(op, isld ? dst() : src(), base, off));
     } else if (k < 8) {                                  // update forms through r6
       static const int ops[] = {33, 35, 41, 43, 37, 39, 45};
       int op = ops[rnd(7)];
       int sz = (op & 8) ? 2 : (op & 2) ? 1 : 4;
-      li32(6, DATA + ((r32() % 0x7000) & ~3u));
+      li32(6, DATA + ((r32() % (g_span / 2 - 0x800)) & ~3u));
       int rt = dst(); if (rt == 6) rt = 7;
       emit(D(op, (op & 4) ? src() : rt, 6, (r32() % 0x400) & ~uint32_t(sz - 1)));
     } else if (k < 11) {                                 // indexed through r3
       static const int ops[] = {23, 87, 279, 343, 151, 215, 407, 534, 790, 662, 918};
       int x = ops[rnd(11)];
       bool isst = (x == 151 || x == 215 || x == 407 || x == 662 || x == 918);
-      emit(D(14, 3, 0, (r32() % 0x3F00) & ~3u));        // li r3, aligned offset
+      emit(D(14, 3, 0, (r32() % (g_span / 4 - 0x100)) & ~3u));   // li r3, aligned offset
       emit(X(isst ? src() : dst(), base, 3, x));
     } else if (k < 12) {                                 // lwarx / stwcx.
-      emit(D(14, 3, 0, (r32() % 0x3F00) & ~3u));
+      emit(D(14, 3, 0, (r32() % (g_span / 4 - 0x100)) & ~3u));
       if (rnd(2)) emit(X(dst(), base, 3, 20));
       emit(X(src(), base, 3, 150, 1));
     } else {                                             // lmw / stmw
       int r = 24 + rnd(8);
-      emit(D(rnd(2) ? 46 : 47, r, 1, (r32() % 0x7000) & ~3u));
+      emit(D(rnd(2) ? 46 : 47, r, 1, (r32() % (g_span / 2 - 0x800)) & ~3u));
     }
   }
   void muldiv() {
@@ -210,9 +212,15 @@ struct Gen {
 
   void build(int len) {
     for (int r = 0; r < 32; r++) if (r != 1 && r != 2 && r != 3) li32(r, edge());
-    li32(1, DATA); li32(2, DATA + 0x8000); emit(D(14, 3, 0, 0x100));
+    li32(1, DATA); li32(2, DATA + g_span / 2); emit(D(14, 3, 0, 0x100));
     li32(12, r32()); emit(SPR(12, 9, 467)); emit(SPR(12, 8, 467));
     li32(12, r32() & 0xE000007F); emit(SPR(12, 1, 467));
+    // SPRs other than LR/CTR/XER are undefined at reset, on the 603e and in the
+    // core; write every one a program may read, so a run cannot depend on the
+    // previous one (the board test repeats the program without a power cycle)
+    for (int n : {272, 273, 274, 275, 18, 19, 25, 1008, 976, 982, 528, 535, 543, 26, 27}) {
+      li32(12, r32()); emit(SPR(12, n, 467));
+    }
     while (int(code.size()) < len) {
       int k = rnd(100);
       if      (k < 20) alu_imm();
@@ -233,7 +241,7 @@ struct Gen {
 };
 
 void install(Mem &m, const std::vector<uint32_t> &code, std::mt19937 &rng) {
-  for (uint32_t a = DATA; a < DATA + 0x10000; a++) m.wr8(a, uint8_t(rng()));
+  for (uint32_t a = DATA; a < DATA + g_span; a++) m.wr8(a, uint8_t(rng()));
   m.wr32(0xFFF00100, B(CODE, 1));                                 // ba CODE
   for (uint32_t base : {0x00000000u, 0xFFF00000u}) {
     // program exception: skip the faulting instruction
@@ -316,7 +324,7 @@ bool run(uint32_t seed, int len, int max_wait, uint64_t &insns, uint64_t &cycles
       return false;
     }
     if (top.rt_insn == END_INSN) {
-      for (uint32_t a = DATA; a < DATA + 0x10000; a++)
+      for (uint32_t a = DATA; a < DATA + g_span; a++)
         if (rtl_mem.rd8(a) != iss_mem.rd8(a)) { printf("seed %u: memory %08X rtl %02X model %02X\n", seed, a, rtl_mem.rd8(a), iss_mem.rd8(a)); return false; }
       return true;
     }
@@ -341,8 +349,37 @@ bool run(uint32_t seed, int len, int max_wait, uint64_t &insns, uint64_t &cycles
 
 } // namespace
 
+// --emit <seed> <length> <dir>: the board test's program (rtl/dbg/m3_cputest.sv).
+// Writes cputest_code.hex (32 KiB: code and vectors) and cputest_data.hex
+// (16 KiB), after checking the program against the model like any other seed.
+int emit(uint32_t seed, int len, const char *dir) {
+  g_span = 0x4000;
+  uint64_t insns = 0, cyc = 0;
+  if (!run(seed, len, 1, insns, cyc)) { printf("emit: seed %u fails the model check\n", seed); return 1; }
+  Gen g(seed);
+  g.build(len);
+  Mem m;
+  std::mt19937 a(seed * 7 + 1);
+  install(m, g.code, a);
+  for (uint32_t off : {0x100u, 0x700u, 0x704u, 0x708u, 0x70Cu, 0xC00u})   // high vectors share the ROM
+    m.wr32(off, m.rd32(0xFFF00000u + off));
+  char path[512];
+  snprintf(path, sizeof(path), "%s/cputest_code.hex", dir);
+  FILE *f = fopen(path, "w");
+  for (uint32_t w = 0; w < 8192; w++) fprintf(f, "%08X\n", m.rd32(4 * w));
+  fclose(f);
+  snprintf(path, sizeof(path), "%s/cputest_data.hex", dir);
+  f = fopen(path, "w");
+  for (uint32_t w = 0; w < 4096; w++) fprintf(f, "%08X\n", m.rd32(DATA + 4 * w));
+  fclose(f);
+  printf("emit: seed %u, %zu words of code, %llu instructions checked, files in %s\n", seed, g.code.size(), (unsigned long long)insns, dir);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
+  if (argc > 1 && !strcmp(argv[1], "--emit"))
+    return emit(argc > 2 ? strtoul(argv[2], nullptr, 0) : 1, argc > 3 ? atoi(argv[3]) : 1500, argc > 4 ? argv[4] : ".");
   int seeds = argc > 1 ? atoi(argv[1]) : 200;
   uint32_t first = argc > 2 ? strtoul(argv[2], nullptr, 0) : 1;
   int len = argc > 3 ? atoi(argv[3]) : 1500;

@@ -1072,6 +1072,7 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-13 | The 603e is written from scratch, designed around the 8.4 area techniques. SloPPC603 is a reference only: read to understand the 603e's corner cases and to cross-check, never copied. Confirmed against the CPI model before RTL starts. |
 | D-14 | One core for every step, driven by the game ID, as the Model 2 core is. Run-time selection: vertex format (17.7 / 13.11), culling-node layout, Real3D PCI ID, MPC105 or MPC106 register map, the SDRAM layout from the MRA. Compile-time parameters, with the game ID choosing inside what is built: 53C810 SCRIPTS and the Real3D DMA engine, the 315-5881 decrypter, the second SDRAM, sound. The CPU runs at 100 MHz for every step: the timebase and decrementer count from the 66 MHz bus on all steps, so only performance changes with the CPU clock. |
 | D-15 | CPU target from the CPI model (R22): scalar in-order pipeline at 100 MHz with forwarding and static branch prediction; 16 KiB 4-way instruction and data caches, 32-byte lines, data write-back; a store buffer; critical-word-first fills with early restart; single-precision FP pipelined, double multiply iterated through the same multiplier. 32 KiB caches buy 1–4% and are not worth the M10K. |
+| D-16 | The SDRAM controller starts from the Model 2 core's `m2_sdram` at CAS latency 2, as the Model 1 and Model 2 cores run. |
 
 ### Open
 
@@ -1289,3 +1290,17 @@ module-level signals read by a forwarding function, reporting them unread (caugh
 analysis pass before the fit). Standalone fit (`quartus/cpu_spike`, seed 1): 2,513 ALM,
 1,128 registers, 0 M10K, 3 DSP, Fmax 77.2 MHz slow 100 °C (−2.946 ns at 100 MHz). Worst
 path: CR-bit select and operand forwarding through the adder's zero detect into CR0.
+
+**R24 — The CPU bring-up build: monitoring over the board's UART.** The core now
+exposes eight performance events, and `rtl/dbg/m3_cpu_mon.sv` counts them with cycles
+and a CRC-32 retire signature, printing a report on the debug UART (ttyS1, 115200) as
+the Model 2 core's stream does. `m3_cputest` runs one generated program from on-chip
+memory again and again; its memories answer in one cycle as the simulation's do, so the
+board must reproduce the simulated report exactly (`make test_cputest` →
+`build/cputest/expected.txt`; `tools/cputest-capture.sh` and `tools/cputest-compare.py`).
+Seed 1: 3,355 cycles, 1,539 instructions, signature E1058DC4, identical across runs once
+the generated programs write every SPR they read (the 603e leaves them undefined at
+reset, and a repeated run inherited the previous run's values). Full MiSTer build on the
+Template_MiSTer framework (`Model3.sv`), CPU at 75 MHz: 9,990 ALM, 123 M10K, 36 DSP,
+setup and hold met on every clock (CPU clock +0.082 ns). Quartus 17 rejected `parameter
+string` for `$readmemh` file names; untyped parameters work.

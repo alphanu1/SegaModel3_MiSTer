@@ -59,6 +59,12 @@ module ppc_core
 
   input  logic        tb_tick,      // timebase / decrementer enable (bus clock / 4)
 
+  // performance events, one bit each per cycle, for rtl/dbg/m3_cpu_mon.sv:
+  //   0 instruction retired   1 uop retired     2 decode starved (fetch)
+  //   3 load-use bubble       4 mul/div wait    5 data memory wait
+  //   6 redirect (branch, exception)            7 fetch waiting on memory
+  output logic [7:0]  ev,
+
   // retire trace: one record per uop leaving WB, with the special registers it
   // committed. Unconnected in the core build, so it costs nothing there.
   output logic        rt_valid,
@@ -675,6 +681,16 @@ module ppc_core
       wb2_val   <= wb_result;
     end
   end
+
+  // =================================================================== events
+  assign ev[0] = wb_valid && wb_last;
+  assign ev[1] = wb_valid;
+  assign ev[2] = !id_valid && !ex_hold && !redirect;
+  assign ev[3] = id_valid && load_use && !ex_hold;
+  assign ev[4] = md_wait && !mem_hold;
+  assign ev[5] = mem_hold;
+  assign ev[6] = redirect;
+  assign ev[7] = f_out && !i_valid;
 
   // ==================================================================== trace
   logic [31:0] tr_cr, tr_xer, tr_lr, tr_ctr, tr_msr, tr_srr0, tr_srr1;
