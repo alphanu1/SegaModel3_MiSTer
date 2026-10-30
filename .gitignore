@@ -91,6 +91,10 @@ debug.log
 .vscode/*
 !.vscode/settings.json
 
+# Quartus logs from the standalone CPU fit
+quartus/cpu_spike/*.log
+quartus/cpu_spike/worst_paths.txt
+
 # ---- releases/ IS PUBLISHED ----
 # Must stay last: the blanket *.rbf above would otherwise swallow the release.
 !/releases/

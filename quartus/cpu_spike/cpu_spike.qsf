@@ -1,0 +1,20 @@
+# Standalone fit of the 603e core (M0-A2). Quartus Prime Lite 17.0.
+set_global_assignment -name FAMILY "Cyclone V"
+set_global_assignment -name DEVICE 5CSEBA6U23I7
+set_global_assignment -name TOP_LEVEL_ENTITY cpu_spike_top
+set_global_assignment -name LAST_QUARTUS_VERSION "17.0.0 Lite Edition"
+set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+set_global_assignment -name SDC_FILE cpu_spike.sdc
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_pkg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_decode.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_alu.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_muldiv.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_regfile.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_core.sv
+set_global_assignment -name SYSTEMVERILOG_FILE cpu_spike_top.sv
+set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"
+set_global_assignment -name SEED 1
+set_instance_assignment -name VIRTUAL_PIN ON -to rst
+set_instance_assignment -name VIRTUAL_PIN ON -to i_*
+set_instance_assignment -name VIRTUAL_PIN ON -to d_*
+set_instance_assignment -name VIRTUAL_PIN ON -to tb_tick

@@ -1274,3 +1274,18 @@ stream, with its load and store addresses, the pipeline alone gives CPI 1.36 (VF
 2.25 and push 2.6% of VF3's frames over budget; cache size barely matters (32 KiB: 1.91).
 A store buffer and early restart bring it back to 1.52 and 1.79 with no frame over budget,
 and keep it there with a 40-cycle fill. The CPU design follows (D-15).
+
+**R23 — M0-A2, first slice: the integer pipeline fits in 2,513 ALM and runs at 77 MHz.**
+`rtl/cpu/`: a five-stage in-order integer core (no MMU, caches, FPU or interrupts yet)
+with GPRs and SPRs in MLAB (8.4) and every two-result instruction cracked so the
+register file needs one write port. Checked against an independent reference model
+written from the manual (`sim/cpu/ppc_iss.h`): 20,000 random programs, 39.9 M
+instructions compared on every retirement, with up to 9 memory wait states, no
+difference. Three planted faults were caught; one (a deleted forwarding path) only after
+the register file's simulation was made to return the old value on a same-edge write, as
+the MLAB built without read-during-write logic may. Found on the way: an arithmetic
+shift inside a conditional became logical (caught by the model), and Quartus 17 dropped
+module-level signals read by a forwarding function, reporting them unread (caught by the
+analysis pass before the fit). Standalone fit (`quartus/cpu_spike`, seed 1): 2,513 ALM,
+1,128 registers, 0 M10K, 3 DSP, Fmax 77.2 MHz slow 100 °C (−2.946 ns at 100 MHz). Worst
+path: CR-bit select and operand forwarding through the adder's zero detect into CR0.
