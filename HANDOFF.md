@@ -44,6 +44,11 @@ Supermodel clone at `sm3-builds/supermodel` (036af1c) with the dump patch from
   (link set to Single in Supermodel's test menu, saved in its NVRAM) busy p99 760K,
   3D inside a 50 MHz frame at p99, 168 MiB of non-sound ROM (R20, D-10).
 
+- **CPI model** — in-order scalar 603e at 100 MHz: CPI 1.52 (VF3), 1.79 (Daytona 2), no
+  frame over budget with 16 KiB 4-way caches, a store buffer and early restart. Study R22,
+  D-15. SloPPC603 reviewed as a reference only (R21, D-13). One core for every step,
+  driven by the game ID (D-14).
+
 Decisions added: D-7 (SDRAM up to 120 MHz, own clock domain), D-8 (sound may be left
 out of first builds), D-9 (Real3D memory placement as a compile-time parameter for a
 second SDRAM).
@@ -56,7 +61,8 @@ second SDRAM).
   16 K).
 - M0-C on the board: Model 3's DDR3 traffic (3D layer + polygon RAM, 72–100 MB/s) on
   the Model 1 DDR3 path; SDRAM arbiter budget.
-- M0-A2: PowerPC 603e core spike to the census spec.
+- M0-A2: PowerPC 603e core spike to D-15, written from scratch with the 8.4 area
+  techniques; SloPPC603 at `tools/sloppc603-ref` as a reference only.
 - Daytona 2 in gameplay (input injection in Supermodel), and the Step 2.x deltas (D-10).
 - Dual-SDRAM memory map once the modules arrive (D-11).
 - M0-D (sound), M0-E (tile generator), M0-F (53C810 SCRIPTS).

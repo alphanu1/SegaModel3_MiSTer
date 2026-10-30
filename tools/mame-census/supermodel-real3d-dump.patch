@@ -1,8 +1,67 @@
+diff --git a/Src/CPU/PowerPC/ppc.cpp b/Src/CPU/PowerPC/ppc.cpp
+index 18ef2cd..fb69b93 100644
+--- a/Src/CPU/PowerPC/ppc.cpp
++++ b/Src/CPU/PowerPC/ppc.cpp
+@@ -322,43 +322,54 @@ static void ppc_change_pc(UINT32 newpc)
+ 	ppc.fatalError = true;
+ }
+ 
++// Model 3 census: every load and store address, for the CPI model (ppc603.c)
++static void m3cpu_mem(UINT32 address, unsigned size, bool write);
++
+ static inline UINT8 READ8(UINT32 address)
+ {
++	m3cpu_mem(address, 1, false);
+ 	return Bus->Read8(address);
+ }
+ 
+ static inline UINT16 READ16(UINT32 address)
+ {
++	m3cpu_mem(address, 2, false);
+ 	return Bus->Read16(address);
+ }
+ 
+ static inline UINT32 READ32(UINT32 address)
+ {
++	m3cpu_mem(address, 4, false);
+ 	return Bus->Read32(address);
+ }
+ 
+ static inline UINT64 READ64(UINT32 address)
+ {
++	m3cpu_mem(address, 8, false);
+ 	return Bus->Read64(address);
+ }
+ 
+ static inline void WRITE8(UINT32 address, UINT8 data)
+ {
++	m3cpu_mem(address, 1, true);
+ 	Bus->Write8(address,data);
+ }
+ 
+ static inline void WRITE16(UINT32 address, UINT16 data)
+ {
++	m3cpu_mem(address, 2, true);
+ 	Bus->Write16(address,data);
+ }
+ 
+ static inline void WRITE32(UINT32 address, UINT32 data)
+ {
++	m3cpu_mem(address, 4, true);
+ 	Bus->Write32(address,data);
+ }
+ 
+ static inline void WRITE64(UINT32 address, UINT64 data)
+ {
++	m3cpu_mem(address, 8, true);
+ 	Bus->Write64(address,data);
+ }
+ 
 diff --git a/Src/CPU/PowerPC/ppc603.c b/Src/CPU/PowerPC/ppc603.c
-index a5290eb..77994fc 100644
+index a5290eb..c006edd 100644
 --- a/Src/CPU/PowerPC/ppc603.c
 +++ b/Src/CPU/PowerPC/ppc603.c
-@@ -260,6 +260,97 @@ void ppc_add_cycles(int cycles)
+@@ -260,6 +260,350 @@ void ppc_add_cycles(int cycles)
  	ppc.icount -= cycles;
  }
  
@@ -19,6 +78,243 @@ index a5290eb..77994fc 100644
 +#include <algorithm>
 +
 +namespace {
++
++/*
++ * CPI model for a scalar in-order 603e at 100 MHz (M3CPI=1 with M3CPU). Fed the busy
++ * instruction stream with its load/store addresses: a register scoreboard with
++ * load-use, multiply, divide and FP latencies, static branch prediction, 4-way
++ * instruction and data caches with 32-byte lines (blocking, write-back), uncached
++ * MMIO with posted stores. Several cache sizes and miss penalties run side by side.
++ */
++struct m3cpi_cache
++{
++	int ways, sets;
++	std::vector<UINT32> tag;
++	std::vector<uint8_t> dirty;
++	std::vector<uint32_t> age;
++	uint32_t clk = 0;
++	m3cpi_cache(int kib, int w) : ways(w), sets(kib * 1024 / 32 / w), tag(sets * w, ~0u), dirty(sets * w, 0), age(sets * w, 0) {}
++	int access(UINT32 addr, bool write)	// 0 hit, 1 miss, 2 miss with dirty victim
++	{
++		UINT32 const line = addr >> 5;
++		int const set = line % sets;
++		UINT32 *t = &tag[set * ways];
++		uint32_t *a = &age[set * ways];
++		uint8_t *d = &dirty[set * ways];
++		clk++;
++		int victim = 0;
++		for (int w = 0; w < ways; w++)
++		{
++			if (t[w] == line) { a[w] = clk; d[w] |= write; return 0; }
++			if (a[w] < a[victim]) victim = w;
++		}
++		int const r = d[victim] ? 2 : 1;
++		t[victim] = line; a[victim] = clk; d[victim] = write;
++		return r;
++	}
++};
++
++struct m3cpi_config
++{
++	const char *name;
++	int penalty;			// line fill, cycles
++	int stall;			// cycles a load or fetch miss waits (early restart: first word)
++	bool storebuf;			// store misses and castouts go through a write buffer
++	m3cpi_cache ic, dc;
++	uint64_t last = 0, ready[72] = {}, fpu_free = 0, div_free = 0, frame_start = 0;
++	int pending_bubbles = 0;
++	m3cpi_config(const char *n, int kib, int pen, int st = -1, bool sb = false) : name(n), penalty(pen), stall(st < 0 ? pen : st), storebuf(sb), ic(kib, 4), dc(kib, 4) {}
++};
++
++enum { R_CR = 64, R_LR, R_CTR, R_NONE = 127 };
++
++struct m3cpi_decoded
++{
++	int src[4] = { R_NONE, R_NONE, R_NONE, R_NONE };
++	int dst[3] = { R_NONE, R_NONE, R_NONE };
++	int lat = 1;			// result latency
++	int busy = 0;			// cycles the FP or divide unit stays occupied
++	int unit = 0;			// 1 FPU, 2 divider
++	int extra = 0;			// extra issue cycles (lmw/stmw, sync, rfi)
++	int is_load = 0;
++};
++
++static inline void m3cpi_decode(UINT32 op, m3cpi_decoded &d)
++{
++	int const p = op >> 26, rd = (op >> 21) & 31, ra = (op >> 16) & 31, rb = (op >> 11) & 31, rc = (op >> 6) & 31;
++	int const xo10 = (op >> 1) & 0x3ff, xo5 = (op >> 1) & 0x1f;
++	bool const rcbit = op & 1;
++	auto S = [&](int i, int r) { d.src[i] = r; };
++	auto D = [&](int i, int r) { d.dst[i] = r; };
++	switch (p)
++	{
++	case 7: S(0, ra); D(0, rd); d.lat = 3; break;					// mulli
++	case 8: case 12: S(0, ra); D(0, rd); break;
++	case 13: S(0, ra); D(0, rd); D(1, R_CR); break;
++	case 14: case 15: if (ra) S(0, ra); D(0, rd); break;
++	case 10: case 11: S(0, ra); D(0, R_CR); break;
++	case 24: case 25: case 26: case 27: S(0, rd); D(0, ra); break;
++	case 28: case 29: S(0, rd); D(0, ra); D(1, R_CR); break;
++	case 20: S(0, rd); S(1, ra); D(0, ra); if (rcbit) D(1, R_CR); break;
++	case 21: S(0, rd); D(0, ra); if (rcbit) D(1, R_CR); break;
++	case 23: S(0, rd); S(1, rb); D(0, ra); if (rcbit) D(1, R_CR); break;
++	case 16: S(0, R_CR); S(1, R_CTR); if (!(rd & 4)) D(0, R_CTR); if (op & 1) D(1, R_LR); break;
++	case 18: if (op & 1) D(0, R_LR); break;
++	case 17: d.extra = 4; break;
++	case 19:
++		if (xo10 == 16) { S(0, R_LR); S(1, R_CR); S(2, R_CTR); if (op & 1) D(0, R_LR); }
++		else if (xo10 == 528) { S(0, R_CTR); S(1, R_CR); if (op & 1) D(0, R_LR); }
++		else if (xo10 == 50) d.extra = 4;			// rfi
++		else if (xo10 == 150) d.extra = 2;			// isync
++		else { S(0, R_CR); D(0, R_CR); }
++		break;
++	case 32: case 34: case 40: case 42: if (ra) S(0, ra); D(0, rd); d.lat = 2; d.is_load = 1; break;
++	case 33: case 35: case 41: case 43: S(0, ra); D(0, rd); D(1, ra); d.lat = 2; d.is_load = 1; break;
++	case 46: if (ra) S(0, ra); d.extra = 31 - rd; D(0, rd); d.lat = 2; d.is_load = 1; break;
++	case 36: case 38: case 44: S(0, rd); if (ra) S(1, ra); break;
++	case 37: case 39: case 45: S(0, rd); S(1, ra); D(0, ra); break;
++	case 47: S(0, rd); if (ra) S(1, ra); d.extra = 31 - rd; break;
++	case 48: case 50: if (ra) S(0, ra); D(0, 32 + rd); d.lat = 2; d.is_load = 1; break;
++	case 49: case 51: S(0, ra); D(0, 32 + rd); D(1, ra); d.lat = 2; d.is_load = 1; break;
++	case 52: case 54: S(0, 32 + rd); if (ra) S(1, ra); break;
++	case 53: case 55: S(0, 32 + rd); S(1, ra); D(0, ra); break;
++	case 31:
++		switch (xo10)
++		{
++		case 23: case 87: case 279: case 343: case 534: case 790: case 20:
++			if (ra) S(0, ra); S(1, rb); D(0, rd); d.lat = 2; d.is_load = 1; break;
++		case 55: case 119: case 311: case 375:
++			S(0, ra); S(1, rb); D(0, rd); D(1, ra); d.lat = 2; d.is_load = 1; break;
++		case 535: case 599: if (ra) S(0, ra); S(1, rb); D(0, 32 + rd); d.lat = 2; d.is_load = 1; break;
++		case 567: case 631: S(0, ra); S(1, rb); D(0, 32 + rd); D(1, ra); d.lat = 2; d.is_load = 1; break;
++		case 151: case 215: case 407: case 662: case 918: case 150:
++			S(0, rd); if (ra) S(1, ra); S(2, rb); if (xo10 == 150) D(0, R_CR); break;
++		case 183: case 247: case 439: S(0, rd); S(1, ra); S(2, rb); D(0, ra); break;
++		case 663: case 727: case 983: S(0, 32 + rd); if (ra) S(1, ra); S(2, rb); break;
++		case 695: case 759: S(0, 32 + rd); S(1, ra); S(2, rb); D(0, ra); break;
++		case 28: case 60: case 124: case 284: case 316: case 412: case 444: case 476: case 24: case 536: case 792:
++			S(0, rd); S(1, rb); D(0, ra); if (rcbit) D(1, R_CR); break;
++		case 824: case 26: case 922: case 954: S(0, rd); D(0, ra); if (rcbit) D(1, R_CR); break;
++		case 0: case 32: S(0, ra); S(1, rb); D(0, R_CR); break;
++		case 339: case 371: D(0, rd); { int spr = ((op >> 16) & 31) | ((op >> 6) & 0x3e0); if (spr == 8) S(0, R_LR); if (spr == 9) S(0, R_CTR); } break;
++		case 467: S(0, rd); { int spr = ((op >> 16) & 31) | ((op >> 6) & 0x3e0); if (spr == 8) D(0, R_LR); if (spr == 9) D(0, R_CTR); } break;
++		case 19: S(0, R_CR); D(0, rd); break;
++		case 144: S(0, rd); D(0, R_CR); break;
++		case 83: D(0, rd); break;
++		case 146: S(0, rd); d.extra = 2; break;
++		case 235: case 75: case 11: S(0, ra); S(1, rb); D(0, rd); d.lat = 3; if (rcbit) D(1, R_CR); break;
++		case 491: case 459: S(0, ra); S(1, rb); D(0, rd); d.lat = 20; d.busy = 19; d.unit = 2; if (rcbit) D(1, R_CR); break;
++		case 598: case 854: d.extra = 2; break;	// sync, eieio
++		default: S(0, ra); S(1, rb); D(0, rd); if (rcbit) D(1, R_CR); break;
++		}
++		break;
++	case 59:	// single precision
++		S(0, 32 + ra); S(1, 32 + rb); S(2, 32 + rc); D(0, 32 + rd); d.unit = 1;
++		if (xo5 == 18) { d.lat = 18; d.busy = 17; } else d.lat = 3;
++		if (rcbit) D(1, R_CR);
++		break;
++	case 63:	// double precision and FP moves/compares
++		S(0, 32 + ra); S(1, 32 + rb); S(2, 32 + rc); d.unit = 1;
++		if (xo5 >= 18 && xo5 != 19 && xo5 != 24 && xo5 != 27)
++		{
++			D(0, 32 + rd);
++			if (xo5 == 18) { d.lat = 33; d.busy = 32; }
++			else if (xo5 == 25 || xo5 >= 28) { d.lat = 9; d.busy = 8; }	// iterated through the single multiplier
++			else if (xo5 == 26) d.lat = 3;
++			else d.lat = 4;
++		}
++		else if (xo10 == 0 || xo10 == 32 || xo10 == 64) { D(0, R_CR); d.lat = 2; }
++		else { D(0, 32 + rd); d.lat = 2; }
++		if (rcbit) D(1, R_CR);
++		break;
++	default: break;
++	}
++}
++
++struct m3cpi_model
++{
++	bool on = false;
++	std::vector<m3cpi_config> cfg;
++	struct memop { UINT32 addr; unsigned size; bool write; };
++	memop mem[128];
++	int nmem = 0;
++	UINT32 prev_pc = 0, prev_op = 0, prev_npc = 0;
++	bool have_prev = false;
++
++	void init()
++	{
++		on = true;
++		cfg.emplace_back("perfect", 32, 0);
++		cfg.emplace_back("16k_p24", 16, 24);
++		cfg.emplace_back("16k_p24_sb", 16, 24, 24, true);
++		cfg.emplace_back("16k_p24_er12_sb", 16, 24, 12, true);
++		cfg.emplace_back("32k_p24_er12_sb", 32, 24, 12, true);
++		cfg.emplace_back("16k_p40_er20_sb", 16, 40, 20, true);
++		cfg.emplace_back("32k_p40_er20_sb", 32, 40, 20, true);
++	}
++	static bool cacheable(UINT32 a) { return a < 0x00800000 || a >= 0xff000000; }
++
++	int branch_bubbles(UINT32 pc, UINT32 op, UINT32 npc)
++	{
++		bool const taken = npc != pc + 4;
++		int const p = op >> 26;
++		if (p == 18) return 1;
++		if (p == 16)
++		{
++			int const bo = (op >> 21) & 31;
++			if ((bo & 0x14) == 0x14) return 1;
++			bool const backward = (op & 0x8000) != 0;
++			bool const predict = backward ^ ((bo & 1) != 0);
++			if (taken == predict) return taken ? 1 : 0;
++			return 2;
++		}
++		if (p == 19 && (((op >> 1) & 0x3ff) == 16 || ((op >> 1) & 0x3ff) == 528)) return taken ? 2 : 0;
++		return 0;
++	}
++
++	void step(UINT32 pc, UINT32 op, UINT32 npc, bool idle)
++	{
++		if (idle) { nmem = 0; have_prev = false; for (auto &c : cfg) c.pending_bubbles = 0; return; }
++		int redirect = 0;
++		if (have_prev && pc != prev_npc) redirect = 4;	// exception or interrupt entry
++		m3cpi_decoded d;
++		m3cpi_decode(op, d);
++		int const bub = branch_bubbles(pc, op, npc);
++		for (auto &c : cfg)
++		{
++			uint64_t t = c.last + 1 + c.pending_bubbles + redirect;
++			if (c.penalty && c.ic.access(pc, false)) t += c.stall;
++			for (int s : d.src) if (s != R_NONE && c.ready[s] > t) t = c.ready[s];
++			if (d.unit == 1 && c.fpu_free > t) t = c.fpu_free;
++			if (d.unit == 2 && c.div_free > t) t = c.div_free;
++			for (int i = 0; i < nmem; i++)
++			{
++				if (!cacheable(mem[i].addr)) { t += mem[i].write ? 2 : 20; continue; }
++				if (!c.penalty) continue;
++				for (UINT32 a = mem[i].addr & ~31u; a <= ((mem[i].addr + mem[i].size - 1) & ~31u); a += 32)
++				{
++					int r = c.dc.access(a, mem[i].write);
++					if (!r) continue;
++					if (c.storebuf && mem[i].write) continue;	// write buffer absorbs it
++					t += c.stall + (r == 2 && !c.storebuf ? c.penalty / 2 : 0);
++				}
++			}
++			t += d.extra;
++			for (int x : d.dst) if (x != R_NONE) c.ready[x] = t + d.lat;
++			if (d.unit == 1 && d.busy) c.fpu_free = t + d.busy;
++			if (d.unit == 2) c.div_free = t + d.busy;
++			c.last = t;
++			c.pending_bubbles = bub;
++		}
++		prev_pc = pc; prev_op = op; prev_npc = npc; have_prev = true;
++		nmem = 0;
++	}
++	void record(UINT32 addr, unsigned size, bool write)
++	{
++		if (nmem < 128) mem[nmem++] = memop{ addr, size, write };
++	}
++};
++
 +struct m3cpu_census
 +{
 +	bool on = false;
@@ -28,6 +324,7 @@ index a5290eb..77994fc 100644
 +	std::vector<uint64_t> pc_ram = std::vector<uint64_t>(0x800000 / 4);
 +	std::vector<UINT32> op_ram = std::vector<UINT32>(0x800000 / 4);
 +	uint64_t f_insn = 0, f_idle = 0, f_rom = 0, total = 0, frame = 0;
++	m3cpi_model cpi;
 +	m3cpu_census()
 +	{
 +		const char *p = std::getenv("M3CPU");
@@ -36,7 +333,11 @@ index a5290eb..77994fc 100644
 +		on = true;
 +		prefix = p;
 +		f = std::fopen((prefix + "_cpu_frames.csv").c_str(), "w");
-+		std::fprintf(f, "frame,insn,idle,rom\n");
++		if (std::getenv("M3CPI"))
++			cpi.init();
++		std::fprintf(f, "frame,insn,idle,rom");
++		for (auto const &c : cpi.cfg) std::fprintf(f, ",cyc_%s", c.name);
++		std::fprintf(f, "\n");
 +		if (const char *s = std::getenv("M3IDLE"))
 +		{
 +			std::string list(s), item;
@@ -69,7 +370,7 @@ index a5290eb..77994fc 100644
 +			std::fprintf(o, "%08X %14llu %8.4f%%  %08X\n", hot[i].second, (unsigned long long)hot[i].first, 100.0 * hot[i].first / total, op_ram[hot[i].second >> 2]);
 +		std::fclose(o);
 +	}
-+	inline void step(UINT32 pc, UINT32 op)
++	inline void step(UINT32 pc, UINT32 op, UINT32 npc)
 +	{
 +		f_insn++;
 +		if (pc < 0x800000)
@@ -79,14 +380,19 @@ index a5290eb..77994fc 100644
 +		}
 +		else
 +			f_rom++;
++		bool is_idle = false;
 +		for (auto const &r : idle)
-+			if (pc >= r.first && pc <= r.second) { f_idle++; break; }
++			if (pc >= r.first && pc <= r.second) { f_idle++; is_idle = true; break; }
++		if (cpi.on)
++			cpi.step(pc, op, npc, is_idle);
 +	}
 +	void tick()
 +	{
 +		if (!on)
 +			return;
-+		std::fprintf(f, "%llu,%llu,%llu,%llu\n", (unsigned long long)frame, (unsigned long long)f_insn, (unsigned long long)f_idle, (unsigned long long)f_rom);
++		std::fprintf(f, "%llu,%llu,%llu,%llu", (unsigned long long)frame, (unsigned long long)f_insn, (unsigned long long)f_idle, (unsigned long long)f_rom);
++		for (auto &c : cpi.cfg) { std::fprintf(f, ",%llu", (unsigned long long)(c.last - c.frame_start)); c.frame_start = c.last; }
++		std::fprintf(f, "\n");
 +		total += f_insn;
 +		f_insn = f_idle = f_rom = 0;
 +		frame++;
@@ -97,15 +403,21 @@ index a5290eb..77994fc 100644
 +
 +void m3cpu_frame() { g_m3cpu.tick(); }
 +
++static void m3cpu_mem(UINT32 address, unsigned size, bool write)
++{
++	if (g_m3cpu.cpi.on)
++		g_m3cpu.cpi.record(address, size, write);
++}
++
  int ppc_execute(int cycles)
  {
  	UINT32 opcode;
-@@ -334,6 +425,9 @@ int ppc_execute(int cycles)
+@@ -334,6 +678,9 @@ int ppc_execute(int cycles)
  			default:	optable[opcode >> 26](opcode); break;
  		}
  
 +		if (g_m3cpu.on)
-+			g_m3cpu.step(ppc.pc, opcode);
++			g_m3cpu.step(ppc.pc, opcode, ppc.npc);
 +
  		ppc.icount--;
  		

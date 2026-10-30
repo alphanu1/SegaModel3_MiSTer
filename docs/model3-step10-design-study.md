@@ -734,6 +734,23 @@ billion instructions over 20,709 frames).
   the same wait loops excluded) gives busy instructions per frame p50 566,640, p90
   685,758, p99 1,147,344 (the whole frame: at least 1% of frames never reach the wait
   loop). A 100 MHz core needs CPI ≤ 3.07 at p50, ≤ 2.54 at p90 and ≤ 1.52 at p99.
+- **CPI model** (R22): an in-order scalar 603e at 100 MHz, run on the busy instruction
+  stream with its real load and store addresses (Supermodel, 18,900 frames each).
+  Register scoreboard with load-use, multiply (3), divide (20), FP single (3), double
+  multiply iterated (9) latencies; static branch prediction; 4-way caches, 32-byte lines;
+  uncached I/O stores posted (2 cycles), loads 20.
+
+  | Configuration | VF3 CPI / heaviest frame / frames over | Daytona 2 CPI / heaviest / over |
+  |---|---|---|
+  | Perfect caches | 1.36 / 90% / 0% | 1.48 / 73% / 0% |
+  | 16 KiB, 24-cycle fill, blocking | 1.95 / 139% / 2.58% | 2.25 / 121% / 0.17% |
+  | 16 KiB, + store buffer | 1.68 / 106% / 0.03% | 2.11 / 99% / 0% |
+  | **16 KiB, + store buffer, early restart (12 to first word)** | **1.52 / 96% / 0%** | **1.79 / 86% / 0%** |
+  | 32 KiB, same | 1.50 / 94% / 0% | 1.72 / 83% / 0% |
+  | 16 KiB, 40-cycle fill, 20 to first word, store buffer | 1.62 / 103% / 0.02% | 2.00 / 95% / 0% |
+
+  Not modelled: SDRAM contention from the Real3D and tile clients (covered by the
+  40-cycle rows), TLB-miss handlers (about 7 a frame), CR fields as separate registers.
 - **Interrupt rate:** about 420 `rfi` per frame, from MAME's per-scanline IRQ, which
   its own comment calls a guess. Real rate `[OPEN]`.
 
@@ -1054,6 +1071,7 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-12 | Build now, before the second SDRAM arrives: a single-SDRAM proof of concept running VF3 with sound left out (D-8). VF3 then needs 117.25 MiB of SDRAM (126.75 less 9.5 MiB of sound), 10.75 MiB spare. Heavy frames may slip on texture bandwidth (R17) until the dual-SDRAM build. |
 | D-13 | The 603e is written from scratch, designed around the 8.4 area techniques. SloPPC603 is a reference only: read to understand the 603e's corner cases and to cross-check, never copied. Confirmed against the CPI model before RTL starts. |
 | D-14 | One core for every step, driven by the game ID, as the Model 2 core is. Run-time selection: vertex format (17.7 / 13.11), culling-node layout, Real3D PCI ID, MPC105 or MPC106 register map, the SDRAM layout from the MRA. Compile-time parameters, with the game ID choosing inside what is built: 53C810 SCRIPTS and the Real3D DMA engine, the 315-5881 decrypter, the second SDRAM, sound. The CPU runs at 100 MHz for every step: the timebase and decrementer count from the 66 MHz bus on all steps, so only performance changes with the CPU clock. |
+| D-15 | CPU target from the CPI model (R22): scalar in-order pipeline at 100 MHz with forwarding and static branch prediction; 16 KiB 4-way instruction and data caches, 32-byte lines, data write-back; a store buffer; critical-word-first fills with early restart; single-precision FP pipelined, double multiply iterated through the same multiplier. 32 KiB caches buy 1–4% and are not worth the M10K. |
 
 ### Open
 
@@ -1247,3 +1265,12 @@ are design choices for exactness, not tuning gaps. Decided (D-13): the CPU is
 written from scratch for 100 MHz and CPI ≈ 1.3–1.5, with the 8.4 area techniques from
 the start; SloPPC603 is a reference only, read to find faults and corner cases, never
 copied.
+
+**R22 — A scalar in-order 603e at 100 MHz carries VF3 and Daytona 2, if misses are cheap.**
+SloPPC603's CPI of 4.4 (R21) raised the question of whether a simple core can reach the
+CPI ≤ 1.52 VF3's heaviest frames need (R19). Modelled on each game's real instruction
+stream, with its load and store addresses, the pipeline alone gives CPI 1.36 (VF3) and
+1.48 (Daytona 2). Blocking 16 KiB caches with a 24-cycle line fill lift that to 1.95 and
+2.25 and push 2.6% of VF3's frames over budget; cache size barely matters (32 KiB: 1.91).
+A store buffer and early restart bring it back to 1.52 and 1.79 with no frame over budget,
+and keep it there with a 40-cycle fill. The CPU design follows (D-15).

@@ -99,3 +99,11 @@ Daytona 2 `4C754-4C760,4C73C-4C744,4C6CC-4C6D4,541C-5428`.
 `M3SHOT_DIR` (with `M3SHOT_EVERY`) saves numbered framebuffer grabs. They are taken
 before the 3D is drawn, so they show the 2D layers only. Supermodel's BMP header has a
 wrong file size; read them with `magick -define bmp:ignore-filesize=true`.
+
+### CPI model
+
+`M3CPI=1` (with `M3CPU` and `M3IDLE`) runs an in-order scalar 603e model over the busy
+instruction stream, with every load and store address taken from Supermodel's memory
+accessors. Each configuration (cache size, line fill, first-word latency, store buffer)
+runs side by side and adds a `cyc_<name>` column per frame to `_cpu_frames.csv`.
+Configurations are listed in `m3cpi_model::init()` in `ppc603.c`.
