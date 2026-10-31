@@ -7,7 +7,7 @@ VERILATOR ?= verilator
 QUARTUS   ?= /home/ben/intelFPGA_lite/17.0/quartus/bin
 
 CPU_RTL = rtl/cpu/ppc_pkg.sv rtl/cpu/ppc_decode.sv rtl/cpu/ppc_alu.sv \
-          rtl/cpu/ppc_muldiv.sv rtl/cpu/ppc_regfile.sv rtl/cpu/ppc_core.sv
+          rtl/cpu/ppc_muldiv.sv rtl/cpu/ppc_regfile.sv rtl/cpu/ppc_fetchq.sv rtl/cpu/ppc_core.sv
 DBG_RTL = rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/dbg/m3_cputest.sv
 
 # The board test program: seed and length (tb_ppc_core --emit)

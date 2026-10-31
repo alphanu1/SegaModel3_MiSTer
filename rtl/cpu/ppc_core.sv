@@ -19,14 +19,16 @@
 //   MEM data access; special registers commit as the instruction leaves MEM
 //   WB  GPR write
 //
-// Forwarding into EX: the MEM stage's ALU result, the WB stage's result (ALU or
-// load), and wb2, the value written to the register file on the previous edge.
-// A load is followed by one bubble when its consumer is next in line.
+// Forwarding goes into the operand registers as a uop enters EX (the MEM or WB
+// producer's value, else the register file read in ID); EX itself only takes
+// MEM's result, for a producer one step ahead. A load is followed by one
+// bubble when its consumer is next in line.
 //
-// Branches resolve in EX and redirect fetch; prediction is a later step (the
-// CPI model assumes static prediction in ID, study R22). sc, rfi, mtmsr, traps
-// and illegal instructions redirect from EX the same way and commit their
-// special-register writes at MEM exit, so nothing younger has issued by then.
+// Branches are predicted at fetch (static, the 603e's rule) and resolved in EX,
+// which redirects only on a mispredict. sc, rfi, mtmsr and illegal
+// instructions redirect from EX and commit their special-register writes at
+// MEM exit; a fired trap commits and redirects from WB. Every redirect is
+// registered before it reaches fetch.
 //
 // Not yet here: address translation, caches, floating point, external and
 // decrementer interrupts, misaligned accesses (forced aligned for now).
@@ -120,6 +122,10 @@ module ppc_core
     logic [31:0] srr0, srr1;
     logic        res_set, res_clr;
     logic        rc0;                                  // CR0 from the result, formed in MEM
+    logic [31:0] crm;                                  // CR bits this uop writes (cr holds their values)
+    logic        cmp_we;                               // cmp / cmpl: the field goes in at MEM
+    logic [3:0]  cmpv;
+    logic [2:0]  crf;
     logic        is_trap;                              // tw / twi: the compare runs in MEM
     logic [4:0]  to;
     logic [31:0] ta, tb;
@@ -130,98 +136,192 @@ module ppc_core
   logic        wb_valid, wb_last, wb_rd_we;
   logic [4:0]  wb_rd;
   logic [31:0] wb_result, wb_pc, wb_insn;
-  logic        wb2_we;
-  logic [4:0]  wb2_rd;
-  logic [31:0] wb2_val;
 
   // ==================================================================== fetch
+  // Four-entry queue, packed so it stays in flip-flops (Quartus made an indexed
+  // array into a RAM block). A request is issued whenever four slots would hold
+  // it without counting this cycle's pop, so decode and hazards are off the
+  // request path (R23 timing).
+  //
+  // Branches are predicted here, as each word arrives: b is taken; bc is taken
+  // when its condition is always true, otherwise backward-taken with the y bit
+  // reversing it (the 603e's static rule); bclr and bcctr are predicted not
+  // taken for now. A predicted-taken branch is a soft redirect: fetch moves to
+  // its target and anything in flight is discarded, but the queue keeps the
+  // branch and what came before it. The prediction travels with the word to EX,
+  // which redirects only on a mispredict.
+  //
+  // Hard redirects (WB: a fired trap; EX: mispredict, sc, rfi, mtmsr, illegal)
+  // also clear the queue and hold ID for a cycle. Every redirect is registered
+  // (redir_q); the next request takes its address from redir_pc_q, and that
+  // request was always going out the cycle after the decision, so the register
+  // costs no fetch latency.
   logic [31:0] f_pc;
   logic        f_out, f_discard;
-  logic [31:0] q_insn [0:1];
-  logic [31:0] q_pc   [0:1];
-  logic        q_head;
-  logic [1:0]  q_cnt;
+  logic [2:0]  q_cnt;
 
-  logic        redirect;
+  logic        redirect;                               // hard, decided this cycle
   logic [31:0] redirect_pc;
+  logic        redir_q, redir_hard_q;
+  logic [31:0] redir_pc_q;
+  // A redirect's address is chosen a cycle late from two registered candidates,
+  // so a branch's taken bit lands in one flip-flop, not on 32 (R23 timing).
+  logic [31:0] redir_a_q, redir_b_q, redir_s_q;     // hard taken / fall-through / soft
+  logic [1:0]  redir_k_q;                            // which: 0 a, 1 b, 2 soft
+  logic [31:0] redirect_pc_b;
+  logic        redirect_sel;
   logic        id_take;                                // ID consumed the queue head
 
-  // A redirect is decided late in EX, so it is kept off the queue's write
-  // enables and the memory request (study R23 timing): a response is always
-  // written, and a redirect clears the count, which makes the write dead; a
-  // request issued in a redirect cycle is marked to be discarded.
   wire  rsp     = f_out && i_valid;
-  wire  rsp_use = rsp && !f_discard;
-  wire  [1:0] q_cnt_after = q_cnt + {1'b0, rsp_use} - {1'b0, id_take};
+  wire  rsp_use = rsp && !f_discard && !redir_q;
+  assign redir_pc_q = (redir_k_q == 2'd0) ? redir_a_q : (redir_k_q == 2'd1) ? redir_b_q : redir_s_q;
+  wire  [31:0] fetch_pc = redir_q ? redir_pc_q : f_pc;
 
-  assign i_addr = f_pc;
-  assign i_req  = !rst && (!f_out || rsp) && (q_cnt_after < 2'd2);
+  // prediction from the arriving word
+  logic [31:0] f_rsp_pc;
+  wire  [5:0]  pw_op   = i_data[31:26];
+  wire  [4:0]  pw_bo   = i_data[25:21];
+  wire  [31:0] pw_disp = (pw_op == 6'd18) ? {{6{i_data[25]}}, i_data[25:2], 2'b00}
+                                          : {{16{i_data[15]}}, i_data[15:2], 2'b00};
+  wire         pw_pred = (pw_op == 6'd18) ||
+                         (pw_op == 6'd16 && ((pw_bo[4] && pw_bo[2]) || (i_data[15] ^ pw_bo[0])));
+  wire  [31:0] pw_tgt  = (i_data[1] ? 32'd0 : f_rsp_pc) + pw_disp;
+  wire         f_soft  = rsp_use && pw_pred;
+
+  assign i_addr = fetch_pc;
+  assign i_req  = !rst && (!f_out || rsp) && (redir_hard_q || ({1'b0, q_cnt} + {3'd0, rsp_use} < 4'd4));
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      f_pc      <= RESET_PC;
-      f_out     <= 1'b0;
-      f_discard <= 1'b0;
-      q_cnt     <= 2'd0;
-      q_head    <= 1'b0;
+      f_pc         <= RESET_PC;
+      f_out        <= 1'b0;
+      f_discard    <= 1'b0;
+      redir_q      <= 1'b0;
+      redir_hard_q <= 1'b0;
     end else begin
-      if (redirect) begin
-        f_pc      <= redirect_pc;
-        q_cnt     <= 2'd0;
-        f_out     <= (f_out && !i_valid) || i_req;
-        f_discard <= (f_out && !i_valid) || i_req;       // anything still in flight is wrong-path
+      redir_q      <= redirect || f_soft;
+      redir_hard_q <= redirect;
+      // the candidates load every cycle; only the 2-bit choice waits on the
+      // redirect decision (R23 timing)
+      redir_a_q    <= redirect_pc;
+      redir_b_q    <= redirect_pc_b;
+      redir_s_q    <= pw_tgt;
+      redir_k_q    <= !redirect ? 2'd2 : redirect_sel ? 2'd0 : 2'd1;
+      if (i_req)        f_pc <= fetch_pc + 32'd4;
+      else if (redir_q) f_pc <= redir_pc_q;
+      if (redir_q) begin
+        f_out     <= i_req || (f_out && !i_valid);
+        f_discard <= f_out && !i_valid;              // an older request still in flight
       end else begin
         if (rsp) begin
           f_out     <= 1'b0;
           f_discard <= 1'b0;
         end
-        if (i_req) begin
-          f_out <= 1'b1;
-          f_pc  <= f_pc + 32'd4;
-        end
-        q_cnt <= q_cnt_after;
-        if (id_take) q_head <= !q_head;
+        if (i_req) f_out <= 1'b1;
       end
     end
   end
 
   // Queue writes go to the slot after the live entries, counted before any pop.
-  logic [31:0] f_rsp_pc;
-  always_ff @(posedge clk) begin
-    if (i_req) f_rsp_pc <= f_pc;
-    if (rsp_use) begin
-      q_insn[q_head ^ q_cnt[0]] <= i_data;
-      q_pc  [q_head ^ q_cnt[0]] <= f_rsp_pc;
-    end
-  end
+  logic [31:0] q_hi, q_hp;
+  logic        q_hd;
+  always_ff @(posedge clk) if (i_req) f_rsp_pc <= fetch_pc;
+
+  // Predecode as the word arrives, so the queue's pop needs no decoder (R23
+  // timing): which of rA, rB, rS the first uop reads, and how it cracks
+  // (0 single uop, 1 update form, 2 lmw / stmw). A second decoder instance;
+  // all but these few outputs are trimmed.
+  uop_t        pd_u;
+  logic [4:0]  pd_w, q_pd;
+  ppc_decode u_pdec (.insn (i_data), .pc (32'd0), .step (5'd0), .u (pd_u));
+  wire  [5:0]  pd_op = i_data[31:26];
+  wire  [9:0]  pd_x  = i_data[10:1];
+  wire  [1:0]  pd_crack =
+          (pd_op == 6'd46 || pd_op == 6'd47) ? 2'd2 :
+          (pd_op == 6'd33 || pd_op == 6'd35 || pd_op == 6'd41 || pd_op == 6'd43 ||
+           (pd_op == 6'd31 && (pd_x == 10'd55 || pd_x == 10'd119 || pd_x == 10'd311 || pd_x == 10'd375))) ? 2'd1 : 2'd0;
+  assign pd_w = {pd_crack, pd_u.a_used, pd_u.b_used, pd_u.s_used};
+
+  ppc_fetchq u_q (
+    .clk (clk), .clear (rst || redir_hard_q), .we (rsp_use && !redir_hard_q),
+    .w_insn (i_data), .w_pc (f_rsp_pc), .w_pred (pw_pred), .w_pd (pd_w),
+    .pop (id_take && !redir_hard_q), .count (q_cnt),
+    .r_insn (q_hi), .r_pc (q_hp), .r_pred (q_hd), .r_pd (q_pd)
+  );
 
   // ==================================================================== decode
   logic [4:0]  id_step;
   uop_t        id_u;
-  wire         id_valid = (q_cnt != 2'd0);
+  wire         id_valid = (q_cnt != 3'd0) && !redir_hard_q;
+  wire         id_pred  = q_hd;
+  logic        ex_pred;
 
   ppc_decode u_dec (
-    .insn (q_insn[q_head]),
-    .pc   (q_pc[q_head]),
+    .insn (q_hi),
+    .pc   (q_hp),
     .step (id_step),
     .u    (id_u)
   );
 
-  // load-use: the load in EX writes a register this uop reads
-  wire ex_is_load = ex_valid && ex_u.op == OP_LOAD;
+  // load-use: the load in EX writes a register this uop reads. From the
+  // predecode and the raw fields, not the decoder; a cracked instruction
+  // (update forms, lmw, stmw) waits out any load ahead of it.
+  logic ex_ld, ex_md;                                  // EX is a load / multiply-divide (registered in ID)
+  wire ex_is_load = ex_valid && ex_ld;
   wire load_use   = ex_is_load && ex_u.rd_we && (
-                      (id_u.a_used && id_u.ra == ex_u.rd) ||
-                      (id_u.b_used && id_u.rb == ex_u.rd) ||
-                      (id_u.s_used && id_u.rs == ex_u.rd));
+                      (q_pd[4:3] != 2'd0) ||
+                      (q_pd[2] && q_hi[20:16] == ex_u.rd) ||
+                      (q_pd[1] && q_hi[15:11] == ex_u.rd) ||
+                      (q_pd[0] && q_hi[25:21] == ex_u.rd));
+
+  // the uop that finishes the instruction, from the predecode and the step
+  wire id_last = (q_pd[4:3] == 2'd0) ||
+                 (q_pd[4:3] == 2'd1 && id_step == 5'd1) ||
+                 (q_pd[4:3] == 2'd2 && (q_hi[25:21] + id_step) == 5'd31);
 
   logic ex_hold, mem_hold, mem_adv;
   wire  id_adv = id_valid && !ex_hold && !load_use && !redirect;
-  assign id_take = id_adv && id_u.last;
+  // the pop does not wait on a redirect: a redirect clears the queue next cycle
+  assign id_take = id_valid && !ex_hold && !load_use && id_last;
 
   always_ff @(posedge clk) begin
-    if (rst || redirect) id_step <= 5'd0;
+    if (rst || redirect || redir_hard_q) id_step <= 5'd0;
     else if (id_adv)     id_step <= id_u.last ? 5'd0 : id_step + 5'd1;
   end
+
+  // result group, logical truth table, shift and misc kinds, from decode
+  logic [6:0] id_rsel;
+  logic [3:0] id_ltt;
+  logic [1:0] id_shk, id_mk;
+  always_comb begin
+    id_rsel = 7'd0;
+    id_ltt  = 4'b0000;
+    id_shk  = 2'd0;
+    id_mk   = 2'd0;
+    case (id_u.op)
+      OP_AND:  begin id_rsel[1] = 1'b1; id_ltt = 4'b1000; end
+      OP_OR:   begin id_rsel[1] = 1'b1; id_ltt = 4'b1110; end
+      OP_XOR:  begin id_rsel[1] = 1'b1; id_ltt = 4'b0110; end
+      OP_NAND: begin id_rsel[1] = 1'b1; id_ltt = 4'b0111; end
+      OP_NOR:  begin id_rsel[1] = 1'b1; id_ltt = 4'b0001; end
+      OP_EQV:  begin id_rsel[1] = 1'b1; id_ltt = 4'b1001; end
+      OP_ANDC: begin id_rsel[1] = 1'b1; id_ltt = 4'b0100; end
+      OP_ORC:  begin id_rsel[1] = 1'b1; id_ltt = 4'b1101; end
+      OP_SLW:  begin id_rsel[2] = 1'b1; id_shk = 2'd0; end
+      OP_SRW:  begin id_rsel[2] = 1'b1; id_shk = 2'd1; end
+      OP_SRAW: begin id_rsel[2] = 1'b1; id_shk = 2'd2; end
+      OP_RLW:  id_rsel[3] = 1'b1;
+      OP_CNTLZW: begin id_rsel[4] = 1'b1; id_mk = 2'd0; end
+      OP_EXTSB:  begin id_rsel[4] = 1'b1; id_mk = 2'd1; end
+      OP_EXTSH:  begin id_rsel[4] = 1'b1; id_mk = 2'd2; end
+      OP_MUL, OP_MULH, OP_MULHU, OP_DIV, OP_DIVU: id_rsel[5] = 1'b1;
+      OP_MFSPR, OP_MFCR, OP_MFMSR:               id_rsel[6] = 1'b1;
+      default: id_rsel[0] = 1'b1;                      // sum: add, subtract, EA
+    endcase
+  end
+  logic [6:0] ex_rsel;
+  logic [3:0] ex_ltt;
+  logic [1:0] ex_shk, ex_mk;
 
   // the special registers this uop writes, from its decode alone
   wire id_w_cr  = id_u.rc || id_u.op == OP_CMP || id_u.op == OP_CMPL || id_u.op == OP_CRLOG ||
@@ -232,52 +332,83 @@ module ppc_core
                   (id_u.op == OP_MTSPR && id_u.spr == 10'd9);
 
   // ================================================================ registers
-  logic [31:0] rf_a, rf_b, rf_s;
+  logic [31:0] ld_val;                                 // load data, formed in MEM
+
+  logic [31:0] rf_ra, rf_rb, rf_rs;                   // read in ID
 
   ppc_regfile u_rf (
     .clk (clk),
-    .ren (!ex_hold),
     .ra  (id_u.ra), .rb (id_u.rb), .rs (id_u.rs),
-    .qa  (rf_a),    .qb (rf_b),    .qs (rf_s),
+    .qa  (rf_ra),   .qb (rf_rb),   .qs (rf_rs),
     .we  (wb_valid && wb_rd_we),
     .wa  (wb_rd),
     .wd  (wb_result)
   );
 
-  // Forwarding. Which older instruction holds each operand is decided in ID,
-  // where the producers' register numbers are already in their stage registers,
-  // and carried into EX as a one-hot select: {MEM, WB, wb2}, else the register
-  // file. EX then has a 4:1 mux and no comparators on its critical path (study
-  // R23's worst path ran through them). While EX is held the selects follow the
-  // producer down the pipe: MEM -> WB when MEM advances, WB -> wb2, wb2 -> file.
+  // Forwarding into the operand registers. As a uop moves from ID to EX each
+  // operand register captures its final value: the MEM producer's result (or
+  // its load data), the WB producer's result, else the register file, which ID
+  // has already read; immediates, zero and -1 are captured the same way, and
+  // the ALU's first operand (rA or rS) is chosen here too. Only a producer one
+  // step ahead -- in EX now, in MEM next cycle -- is left for EX, which takes
+  // MEM's result through a single 2:1 mux (R23 timing: EX had three mux levels
+  // before its adder). While EX is held the registers re-latch their forwarded
+  // values and the selects clear.
   //
-  // (Written out, not as a function: Quartus 17 dropped the module-level
-  // signals a forwarding function read without taking them as arguments.)
-  logic [2:0] fa_sel, fb_sel, fs_sel;                  // {wb2, WB, MEM}
+  // x: the ALU's first operand (rA, (rA|0) or rS); y: rB, the immediate, 0 or -1;
+  // a: rA for rlwimi's insert; s: rS, the store and move-to source.
+  logic [31:0] op_x, op_y, op_a, op_s;
+  logic        mx_x, mx_y, mx_a, mx_s;                 // take MEM's result in EX
 
-  function automatic logic [2:0] fwd_pick(input logic [4:0] r,
-                                          input logic ex_w, input logic [4:0] ex_rd,
-                                          input logic m_w,  input logic [4:0] m_rd,
-                                          input logic w_w,  input logic [4:0] w_rd);
-    if (ex_w && ex_rd == r)     fwd_pick = 3'b001;     // EX now: in MEM next cycle
-    else if (m_w && m_rd == r)  fwd_pick = 3'b010;     // MEM now: in WB next cycle
-    else if (w_w && w_rd == r)  fwd_pick = 3'b100;     // WB now: wb2 next cycle
-    else                        fwd_pick = 3'b000;
-  endfunction
+  wire        ex_w   = ex_valid && ex_u.rd_we;
+  wire        mem_w  = m.valid && m.rd_we;
+  wire        wb_w   = wb_valid && wb_rd_we;
+  wire [31:0] m_val  = m.is_load ? ld_val : m.result;
 
-  function automatic logic [2:0] fwd_follow(input logic [2:0] sel, input logic m_adv);
-    fwd_follow = {sel[1], sel[0] && m_adv, sel[0] && !m_adv};
-  endfunction
+  wire [4:0]  id_xr    = id_u.x_from_s ? id_u.rs : id_u.ra;
+  wire [31:0] id_xrf   = id_u.x_from_s ? rf_rs : rf_ra;
+  wire        id_xzero = !id_u.x_from_s && id_u.a_zero && id_u.ra == 5'd0;
+  wire        id_yreg  = id_u.bsel == BSEL_RB;
 
-  // ======================================================================= EX
-  wire [31:0] a_fwd = fa_sel[0] ? m.result : fa_sel[1] ? wb_result : fa_sel[2] ? wb2_val : rf_a;
-  wire [31:0] b_val = fb_sel[0] ? m.result : fb_sel[1] ? wb_result : fb_sel[2] ? wb2_val : rf_b;
-  wire [31:0] s_val = fs_sel[0] ? m.result : fs_sel[1] ? wb_result : fs_sel[2] ? wb2_val : rf_s;
-  wire [31:0] a_val = (ex_u.a_zero && ex_u.ra == 5'd0) ? 32'd0 : a_fwd;
+  wire        x_ex  = !id_xzero && ex_w && ex_u.rd == id_xr;
+  wire        y_ex  = id_yreg && ex_w && ex_u.rd == id_u.rb;
+  wire        a_ex  = ex_w && ex_u.rd == id_u.ra;
+  wire        s_ex  = ex_w && ex_u.rd == id_u.rs;
+
+  wire [31:0] x_cap = id_xzero                          ? 32'd0     :
+                      (mem_w && m.rd == id_xr)          ? m_val     :
+                      (wb_w && wb_rd == id_xr)          ? wb_result : id_xrf;
+  wire [31:0] y_cap = (id_u.bsel == BSEL_IMM)           ? id_u.imm  :
+                      (id_u.bsel == BSEL_ZERO)          ? 32'd0     :
+                      (id_u.bsel == BSEL_MINUS1)        ? 32'hFFFF_FFFF :
+                      (mem_w && m.rd == id_u.rb)        ? m_val     :
+                      (wb_w && wb_rd == id_u.rb)        ? wb_result : rf_rb;
+  wire [31:0] a_cap = (mem_w && m.rd == id_u.ra)        ? m_val     :
+                      (wb_w && wb_rd == id_u.ra)        ? wb_result : rf_ra;
+  wire [31:0] s_cap = (mem_w && m.rd == id_u.rs)        ? m_val     :
+                      (wb_w && wb_rd == id_u.rs)        ? wb_result : rf_rs;
+
+  wire [31:0] x_val = mx_x ? m.result : op_x;
+  wire [31:0] y_val = mx_y ? m.result : op_y;
+  wire [31:0] a_val = mx_a ? m.result : op_a;
+  wire [31:0] s_val = mx_s ? m.result : op_s;
 
   // special registers as EX sees them: the MEM stage's pending write, else committed
   // CR0 from Rc is formed here, from MEM's registered result, not after EX's adder
-  wire [31:0] m_cr   = m.rc0 ? {m.result[31], !m.result[31] && (m.result != 32'd0), m.result == 32'd0, m.xer[31], m.cr[27:0]} : m.cr;
+  // CR0 from Rc and a compare's field are both put into CR here, in MEM, from
+  // registered values, not after EX's adder and comparator (R23 timing)
+  // A CR writer carries only the bits it writes (crm) and their values; they
+  // are merged into the committed CR here, so no uop copies the whole
+  // forwarded CR into MEM (R23 timing). m_cr is CR as it will be once this
+  // uop commits: what EX's readers see while it is in MEM.
+  logic [31:0] m_cr;
+  always_comb begin
+    m_cr = (cr_q & ~m.crm) | (m.cr & m.crm);
+    if (m.rc0)
+      m_cr[31:28] = {m.result[31], !m.result[31] && (m.result != 32'd0), m.result == 32'd0, m.xer[31]};
+    if (m.cmp_we)
+      m_cr[5'd31 - {m.crf, 2'b00} -: 4] = m.cmpv;
+  end
   // Special registers forward from MEM only (they commit as MEM is left). As
   // for the GPRs, ID decides from the producer's decoded write flags and hands
   // EX a registered select, so MEM's own flags are off EX's paths (R23 timing).
@@ -341,23 +472,18 @@ module ppc_core
 
   wire [31:0] srr0_in  = fs_srr0 ? m.sprv : srr0_q;
   wire [31:0] srr1_in  = fs_srr1 ? m.sprv : srr1_q;
+  // The SPR array is read in ID and the value captured into EX, with MEM's
+  // committing write folded in, as for the GPRs; only a mtspr one step ahead
+  // is taken from MEM in EX (R23 timing: the MLAB read was on EX's result path).
+  logic [31:0] ex_spr_v;
+  wire  [31:0] id_spr_v = (m.valid && m.spr_we && m.spr == id_spr_idx) ? m.sprv : spr_mem[id_spr_idx];
   wire [31:0] spr_rd   = (ex_spr_idx == 6'd0) ? srr0_in :
                          (ex_spr_idx == 6'd1) ? srr1_in :
-                         fs_spr ? m.sprv : spr_mem[ex_spr_idx];
+                         fs_spr ? m.sprv : ex_spr_v;
 
   // ALU
-  logic [31:0] y_val;
-  always_comb begin
-    case (ex_u.bsel)
-      BSEL_RB:     y_val = b_val;
-      BSEL_IMM:    y_val = ex_u.imm;
-      BSEL_ZERO:   y_val = 32'd0;
-      default:     y_val = 32'hFFFF_FFFF;
-    endcase
-  end
-  wire [31:0] x_val = ex_u.x_from_s ? s_val : a_val;
 
-  logic [31:0] alu_res;
+  logic [31:0] alu_res, r_sum, r_logic, r_shift, r_rot, r_misc;
   logic        alu_ca, alu_ov;
   logic [3:0]  alu_cmp;
 
@@ -366,12 +492,13 @@ module ppc_core
     .cin (ex_u.cin), .ca_in (xer_in[29]), .so_in (xer_in[31]),
     .sh_imm (ex_u.sh), .sh_from_rb (ex_u.sh_from_rb), .mb (ex_u.mb), .me (ex_u.me),
     .rlw_insert (ex_u.rlw_insert),
-    .result (alu_res), .ca_out (alu_ca), .ov_out (alu_ov), .cmp_out (alu_cmp)
+    .ltt (ex_ltt), .shk (ex_shk), .mk (ex_mk),
+    .r_sum (r_sum), .r_logic (r_logic), .r_shift (r_shift), .r_rot (r_rot), .r_misc (r_misc),
+    .ca_out (alu_ca), .ov_out (alu_ov), .cmp_out (alu_cmp)
   );
 
   // multiply / divide
-  wire ex_is_md = ex_valid && (ex_u.op == OP_MUL || ex_u.op == OP_MULH || ex_u.op == OP_MULHU ||
-                               ex_u.op == OP_DIV || ex_u.op == OP_DIVU);
+  wire ex_is_md = ex_valid && ex_md;
   logic        md_done, md_ov;
   logic [31:0] md_res;
   logic        md_have;                                // result captured, waiting on MEM
@@ -379,9 +506,9 @@ module ppc_core
   logic        md_ov_q;
 
   ppc_muldiv u_md (
-    .clk (clk), .rst (rst || redirect),
+    .clk (clk), .rst (rst),        // a redirect never meets a divide in EX
     .start (ex_is_md && !ex_md_busy && !md_have),
-    .op (ex_u.op), .x (a_val), .y (y_val),
+    .op (ex_u.op), .x (x_val), .y (y_val),
     .done (md_done), .result (md_res), .ov (md_ov)
   );
 
@@ -410,7 +537,8 @@ module ppc_core
   end
 
   // memory access
-  wire [31:0] ea      = alu_res;
+  assign alu_res = r_sum;
+  wire [31:0] ea      = r_sum;
   wire        is_ld   = ex_u.op == OP_LOAD;
   wire        is_st   = ex_u.op == OP_STORE;
   wire        st_ok   = !ex_u.cond || res_in;           // stwcx. stores only when reserved
@@ -447,6 +575,23 @@ module ppc_core
   assign d_wdata = st_data;
 
   // results and special-register updates
+  // the move-from value: mfcr, mfmsr, mfspr
+  logic [31:0] mf_val;
+  always_comb begin
+    case (ex_mf_sel)
+      3'd1:    mf_val = xer_in;
+      3'd2:    mf_val = lr_in;
+      3'd3:    mf_val = ctr_in;
+      3'd4:    mf_val = dec_q;
+      3'd5:    mf_val = tb_q[31:0];
+      3'd6:    mf_val = tb_q[63:32];
+      3'd7:    mf_val = PVR;
+      default: mf_val = ex_spr_hit ? spr_rd : 32'd0;
+    endcase
+    if (ex_u.op == OP_MFCR)  mf_val = cr_in;
+    if (ex_u.op == OP_MFMSR) mf_val = msr_q;
+  end
+
   mem_t mx;
   logic [3:0]  c0;
   logic [31:0] res, xer_n, cr_n, msk;
@@ -468,29 +613,16 @@ module ppc_core
     mx.brev    = ex_u.brev;
     mx.spr     = ex_spr_idx;
 
-    res   = alu_res;
     xer_n = xer_in;
-    cr_n  = cr_in;
+    cr_n  = 32'd0;                                       // values of the bits written (mx.crm)
+    mx.crm = 32'd0;
 
-    case (ex_u.op)
-      OP_MUL, OP_MULH, OP_MULHU, OP_DIV, OP_DIVU: res = md_val;
-      OP_STORE:  res = ea;                                   // update form writes EA to rA
-      OP_MFCR:   res = cr_in;
-      OP_MFMSR:  res = msr_q;
-      OP_MFSPR: begin
-        case (ex_mf_sel)
-          3'd1:    res = xer_in;
-          3'd2:    res = lr_in;
-          3'd3:    res = ctr_in;
-          3'd4:    res = dec_q;
-          3'd5:    res = tb_q[31:0];
-          3'd6:    res = tb_q[63:32];
-          3'd7:    res = PVR;
-          default: res = ex_spr_hit ? spr_rd : 32'd0;
-        endcase
-      end
-      default: ;
-    endcase
+    // one-hot result select, registered in decode (R23 timing); the update
+    // form of a store writes its EA (the sum) to rA
+    res = ({32{ex_rsel[0]}} & r_sum)   | ({32{ex_rsel[1]}} & r_logic) |
+          ({32{ex_rsel[2]}} & r_shift) | ({32{ex_rsel[3]}} & r_rot)   |
+          ({32{ex_rsel[4]}} & r_misc)  | ({32{ex_rsel[5]}} & md_val)  |
+          ({32{ex_rsel[6]}} & mf_val);
 
     // XER: carry, overflow, summary overflow
     if (ex_u.set_ca) xer_n[29] = alu_ca;
@@ -505,33 +637,46 @@ module ppc_core
     c0 = 4'd0;
     if (ex_u.rc) begin
       mx.rc0   = 1'b1;                                   // CR0 formed in MEM (m_cr)
+      mx.crm[31:28] = 4'hF;
       mx.cr_we = 1'b1;
     end
     case (ex_u.op)
       OP_CMP, OP_CMPL: begin
-        cr_n[5'd31 - {ex_u.crf, 2'b00} -: 4] = alu_cmp;
-        mx.cr_we = 1'b1;
+        mx.cmp_we = 1'b1;                                // field inserted in MEM (m_cr)
+        mx.crm[5'd31 - {ex_u.crf, 2'b00} -: 4] = 4'hF;
+        mx.cmpv   = alu_cmp;
+        mx.crf    = ex_u.crf;
+        mx.cr_we  = 1'b1;
       end
       OP_CRLOG: begin
         if (ex_u.insn[10:1] == 10'd0)                        // mcrf
-          cr_n[5'd31 - {ex_u.crf, 2'b00} -: 4] = cr_in[5'd31 - {ex_u.crf_src, 2'b00} -: 4];
+          begin
+            cr_n[5'd31 - {ex_u.crf, 2'b00} -: 4]   = cr_in[5'd31 - {ex_u.crf_src, 2'b00} -: 4];
+            mx.crm[5'd31 - {ex_u.crf, 2'b00} -: 4] = 4'hF;
+          end
         else
-          cr_n[5'd31 - ex_u.crbd] = ex_u.crop[{cr_in[5'd31 - ex_u.crba], cr_in[5'd31 - ex_u.crbb]}];
+          begin
+            cr_n[5'd31 - ex_u.crbd]   = ex_u.crop[{cr_in[5'd31 - ex_u.crba], cr_in[5'd31 - ex_u.crbb]}];
+            mx.crm[5'd31 - ex_u.crbd] = 1'b1;
+          end
         mx.cr_we = 1'b1;
       end
       OP_MTCRF: begin
         for (int f = 0; f < 8; f++) msk[31 - 4*f -: 4] = {4{ex_u.crm[7 - f]}};
-        cr_n = (cr_in & ~msk) | (s_val & msk);
+        cr_n   = s_val;
+        mx.crm = msk;
         mx.cr_we = 1'b1;
       end
       OP_MCRXR: begin
-        cr_n[5'd31 - {ex_u.crf, 2'b00} -: 4] = xer_in[31:28];
+        cr_n[5'd31 - {ex_u.crf, 2'b00} -: 4]   = xer_in[31:28];
+        mx.crm[5'd31 - {ex_u.crf, 2'b00} -: 4] = 4'hF;
         xer_n[31:28] = 4'd0;
         mx.cr_we = 1'b1;
         mx.xer_we = 1'b1;
       end
       OP_STORE: if (ex_u.cond) begin                       // stwcx.
-        cr_n[31:28] = {2'b00, res_in, xer_in[31]};
+        cr_n[31:28]   = {2'b00, res_in, xer_in[31]};
+        mx.crm[31:28] = 4'hF;
         mx.cr_we = 1'b1;
       end
       default: ;
@@ -585,7 +730,7 @@ module ppc_core
     // tw / twi: the operands go to MEM, which compares them (R23 timing)
     mx.is_trap = (ex_u.op == OP_TRAP);
     mx.to      = ex_u.bo;
-    mx.ta      = a_val;
+    mx.ta      = x_val;
     mx.tb      = y_val;
     if (ex_u.op == OP_SC || ex_u.op == OP_ILLEGAL) begin
       mx.exc    = 1'b1;
@@ -599,11 +744,17 @@ module ppc_core
   logic [31:0] exc_vec;
   always_comb begin
     exc_vec = msr_q[MSR_IP] ? 32'hFFF0_0000 : 32'd0;
-    redirect    = 1'b0;
-    redirect_pc = 32'd0;
+    redirect      = 1'b0;
+    redirect_pc   = 32'd0;
+    redirect_pc_b = ex_u.pc + 32'd4;                   // a branch that falls through
+    redirect_sel  = 1'b1;
     if (ex_adv) begin
       case (ex_u.op)
-        OP_BRANCH:  if (br_taken) begin redirect = 1'b1; redirect_pc = br_target; end
+        OP_BRANCH:  begin
+                      redirect_pc  = br_target;          // not behind the taken decision
+                      redirect_sel = br_taken;
+                      if (br_taken != ex_pred) redirect = 1'b1;
+                    end
         OP_SC:      begin redirect = 1'b1; redirect_pc = exc_vec | 32'h0C00; end
         OP_ILLEGAL: begin redirect = 1'b1; redirect_pc = exc_vec | 32'h0700; end
         // A trap redirects to the next instruction from EX, decided by the
@@ -617,11 +768,13 @@ module ppc_core
         default: ;
       endcase
     end
-    if (m.valid && m_trap) begin
-      redirect    = 1'b1;
-      redirect_pc = exc_vec | 32'h0700;
+    if (wb_trap) begin
+      redirect     = 1'b1;
+      redirect_pc  = exc_vec | 32'h0700;
+      redirect_sel = 1'b1;
     end
   end
+
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -642,6 +795,22 @@ module ppc_core
         // the uop's data loads whenever EX is free; only ex_valid waits on the
         // redirect decision (R23 timing)
         ex_u       <= id_u;
+        ex_pred    <= id_pred;
+        ex_rsel    <= id_rsel;
+        ex_ld      <= id_u.op == OP_LOAD;
+        ex_md      <= id_rsel[5];
+        ex_spr_v   <= id_spr_v;
+        ex_ltt     <= id_ltt;
+        ex_shk     <= id_shk;
+        ex_mk      <= id_mk;
+        op_x       <= x_cap;
+        op_y       <= y_cap;
+        op_a       <= a_cap;
+        op_s       <= s_cap;
+        mx_x       <= x_ex;
+        mx_y       <= y_ex;
+        mx_a       <= a_ex;
+        mx_s       <= s_ex;
         ex_spr_idx <= id_spr_idx;
         ex_spr_hit <= id_spr_hit;
         ex_mf_sel  <= id_mf_sel;
@@ -657,10 +826,18 @@ module ppc_core
         fs_spr     <= ex_valid && ex_w_spr && ex_spr_idx == id_spr_idx;
         fs_srr0    <= ex_valid && ex_w_spr && ex_spr_idx == 6'd0;
         fs_srr1    <= ex_valid && ex_w_spr && ex_spr_idx == 6'd1;
-        fa_sel <= fwd_pick(id_u.ra, ex_valid && ex_u.rd_we, ex_u.rd, m.valid && m.rd_we, m.rd, wb_valid && wb_rd_we, wb_rd);
-        fb_sel <= fwd_pick(id_u.rb, ex_valid && ex_u.rd_we, ex_u.rd, m.valid && m.rd_we, m.rd, wb_valid && wb_rd_we, wb_rd);
-        fs_sel <= fwd_pick(id_u.rs, ex_valid && ex_u.rd_we, ex_u.rd, m.valid && m.rd_we, m.rd, wb_valid && wb_rd_we, wb_rd);
       end else begin
+        // Held: keep the operands as forwarded now and drop the selects; every
+        // producer they could need is in MEM or WB this cycle.
+        ex_spr_v <= fs_spr ? m.sprv : ex_spr_v;
+        op_x <= x_val;
+        op_y <= y_val;
+        op_a <= a_val;
+        op_s <= s_val;
+        mx_x <= 1'b0;
+        mx_y <= 1'b0;
+        mx_a <= 1'b0;
+        mx_s <= 1'b0;
         // the producer in MEM commits when MEM advances; then read the register
         fs_cr   <= fs_cr   && !mem_adv;
         fs_xer  <= fs_xer  && !mem_adv;
@@ -669,9 +846,6 @@ module ppc_core
         fs_spr  <= fs_spr  && !mem_adv;
         fs_srr0 <= fs_srr0 && !mem_adv;
         fs_srr1 <= fs_srr1 && !mem_adv;
-        fa_sel <= fwd_follow(fa_sel, mem_adv);
-        fb_sel <= fwd_follow(fb_sel, mem_adv);
-        fs_sel <= fwd_follow(fs_sel, mem_adv);
       end
     end
   end
@@ -684,10 +858,23 @@ module ppc_core
   wire m_trap = m.is_trap && (
                   (m.to[4] && $signed(m.ta) <  $signed(m.tb)) || (m.to[3] && $signed(m.ta) > $signed(m.tb)) ||
                   (m.to[2] && m.ta == m.tb) || (m.to[1] && m.ta < m.tb) || (m.to[0] && m.ta > m.tb));
-  wire m_exc  = m.exc || m_trap;
+  wire m_exc  = m.exc;                                  // sc / illegal commit at MEM exit
+
+  // A fired trap commits and redirects from WB, one cycle on, from registered
+  // state (R23 timing): nothing younger can have issued, since EX already
+  // redirected the trap to its next instruction.
+  logic        wb_trap;
+  logic [31:0] wb_tsrr0, wb_tsrr1, wb_tmsr;
+  always_ff @(posedge clk) begin
+    if (rst) wb_trap <= 1'b0;
+    else     wb_trap <= mem_adv && m_trap;
+    wb_tsrr0 <= m.srr0;
+    wb_tsrr1 <= m.srr1;
+    wb_tmsr  <= m.msr;
+  end
   assign mem_adv  = m.valid && !mem_hold;
 
-  logic [31:0] ld_val, ld_w;
+  logic [31:0] ld_w;
   logic [15:0] ld_h;
   logic [7:0]  ld_b;
   always_comb begin
@@ -727,12 +914,13 @@ module ppc_core
         tb_q  <= tb_q + 64'd1;
         dec_q <= dec_q - 32'd1;
       end
+      if (wb_trap) msr_q <= wb_tmsr;
       if (mem_adv) begin
         if (m.cr_we)  cr_q  <= m_cr;
         if (m.xer_we) xer_q <= m.xer;
         if (m.lr_we)  lr_q  <= m.lr;
         if (m.ctr_we) ctr_q <= m.ctr;
-        if (m.msr_we || m_trap) msr_q <= m.msr;
+        if (m.msr_we) msr_q <= m.msr;
         if (m.res_set) res_q <= 1'b1;
         if (m.res_clr) res_q <= 1'b0;
         if (m.dec_we) dec_q <= m.sprv;
@@ -749,6 +937,9 @@ module ppc_core
     if (rst) begin
       srr0_q <= 32'd0;
       srr1_q <= 32'd0;
+    end else if (wb_trap) begin                        // a fired trap, one cycle on
+      srr0_q <= wb_tsrr0;
+      srr1_q <= wb_tsrr1;
     end else if (mem_adv) begin
       if (m_exc) begin
         srr0_q <= m.srr0;
@@ -762,7 +953,6 @@ module ppc_core
   always_ff @(posedge clk) begin
     if (rst) begin
       wb_valid <= 1'b0;
-      wb2_we   <= 1'b0;
     end else begin
       wb_valid  <= mem_adv;
       wb_last   <= m.last;
@@ -771,9 +961,6 @@ module ppc_core
       wb_result <= m.is_load ? ld_val : m.result;
       wb_pc     <= m.pc;
       wb_insn   <= m.insn;
-      wb2_we    <= wb_valid && wb_rd_we;
-      wb2_rd    <= wb_rd;
-      wb2_val   <= wb_result;
     end
   end
 
@@ -796,8 +983,8 @@ module ppc_core
       tr_lr   <= m.lr_we  ? m.lr  : lr_q;
       tr_ctr  <= m.ctr_we ? m.ctr : ctr_q;
       tr_msr  <= (m.msr_we || m_trap) ? m.msr : msr_q;
-      tr_srr0 <= m_exc ? m.srr0 : (m.spr_we && m.spr == 6'd0) ? m.sprv : srr0_q;
-      tr_srr1 <= m_exc ? m.srr1 : (m.spr_we && m.spr == 6'd1) ? m.sprv : srr1_q;
+      tr_srr0 <= (m_exc || m_trap) ? m.srr0 : (m.spr_we && m.spr == 6'd0) ? m.sprv : srr0_q;
+      tr_srr1 <= (m_exc || m_trap) ? m.srr1 : (m.spr_we && m.spr == 6'd1) ? m.sprv : srr1_q;
     end
   end
 

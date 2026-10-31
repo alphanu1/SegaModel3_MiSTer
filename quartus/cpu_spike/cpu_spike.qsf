@@ -10,6 +10,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_decode.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_alu.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_muldiv.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_regfile.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fetchq.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_core.sv
 set_global_assignment -name SYSTEMVERILOG_FILE cpu_spike_top.sv
 set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"

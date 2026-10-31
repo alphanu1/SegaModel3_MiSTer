@@ -3,6 +3,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_decode.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_alu.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_muldiv.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_regfile.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_fetchq.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_core.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/dbg/m3_uart_tx.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/dbg/m3_cpu_mon.sv
