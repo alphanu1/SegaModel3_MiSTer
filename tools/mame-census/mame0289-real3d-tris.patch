@@ -1,0 +1,221 @@
+--- a/src/mame/sega/model3_v.cpp
++++ b/src/mame/sega/model3_v.cpp
+@@ -225,6 +225,49 @@
+ } // anonymous namespace
+ 
+ void m3b_frame_tick() { g_m3b.tick(); }
++
++/* Real3D triangle lists (M2 golden data): enabled by M3TRIS=<dir> during an
++   M3REPLAY run. One file per replayed dump, <dir>/<dump>.tri, a sequence of
++   records { tag, nwords, words[nwords] } in little-endian 32-bit words.
++   Floats are written as their IEEE bit patterns. Record layouts:
++     'F' seq, step                                   frame start
++     'V' pass, addr, node0, vx, vy, vw, vh, near, far, proj[16], coord[16],
++         light[3], light_int, ambient, matrix_base, node[12..19]
++     'M' pass, addr, stack_ptr, list_depth, top[16], vp[16]
++     'P' pass, model, word_off, hdr[7], nv_in, nv_new, nv_clip, status,
++         clip_in[4][7] (x, y, z, w, p0, p1, p2 before clip)
++     'T' pass, alpha, buf_index, poly_seq, v[3][7] (x, y, z, w, p0, p1, p2
++         after clip, divide and viewport; p0/p1 are u/w, v/w), tex_en, page,
++         tex_x, tex_y, tex_w, tex_h, tex_fmt, param, transparency, color
++     'X' pass, model, word_off, reason              model ended early
++     'E' polys, verts_new, verts_reused, tris_opaque, tris_alpha, bad_addr */
++struct m3t_writer
++{
++	bool on = false;
++	std::string dir, name;
++	std::vector<uint32_t> buf;
++	size_t rec = 0;
++	uint32_t seq = 0, pass = 0, poly_seq = 0;
++	uint64_t polys = 0, vnew = 0, vreused = 0, bad0 = 0;
++	m3t_writer() { if (char const *const d = std::getenv("M3TRIS")) { on = true; dir = d; } }
++	void begin(char t) { rec = buf.size(); buf.push_back(uint32_t(t)); buf.push_back(0); }
++	void w(uint32_t x) { buf.push_back(x); }
++	void f(float x) { uint32_t u; std::memcpy(&u, &x, 4); buf.push_back(u); }
++	void end() { buf[rec + 1] = uint32_t(buf.size() - rec - 2); }
++	void frame_start(uint32_t step, uint64_t bad)
++	{
++		buf.clear(); poly_seq = 0; polys = vnew = vreused = 0; bad0 = bad;
++		begin('F'); w(seq); w(step); end();
++	}
++	void frame_end(uint64_t tris_o, uint64_t tris_a, uint64_t bad)
++	{
++		begin('E'); w(uint32_t(polys)); w(uint32_t(vnew)); w(uint32_t(vreused)); w(uint32_t(tris_o)); w(uint32_t(tris_a)); w(uint32_t(bad - bad0)); end();
++		std::string const fn = dir + "/" + (name.empty() ? std::to_string(seq) : name) + ".tri";
++		if (std::FILE *o = std::fopen(fn.c_str(), "wb")) { std::fwrite(buf.data(), 4, buf.size(), o); std::fclose(o); }
++		seq++;
++	}
++};
++m3t_writer g_m3t;
+ constexpr bool m3b_defer = false;  // overridden in the opaque textured scanline functions
+ 
+ /*
+@@ -1452,6 +1495,7 @@
+ 		return;
+ 	}
+ 	// gzip file, inflated with the raw zlib API (MAME's zlib has no gz* functions)
++	g_m3t.name = std::filesystem::path(files[next]).stem().stem().string();
+ 	std::FILE *fp = std::fopen(files[next++].c_str(), "rb");
+ 	if (!fp)
+ 		return;
+@@ -1479,8 +1523,20 @@
+ 	invalidate_texture(0, 0, 0, 6, 5);
+ 	invalidate_texture(1, 0, 0, 6, 5);
+ 	m_texture_fifo_pos = 0;
++	if (g_m3t.on)
++	{
++		static bool vrom_saved = false;
++		if (!vrom_saved && std::getenv("M3TRIS_VROM"))
++		{
++			if (std::FILE *o = std::fopen(std::getenv("M3TRIS_VROM"), "wb")) { std::fwrite(m_vrom.get(), 4, 0x4000000 / 4, o); std::fclose(o); }
++			vrom_saved = true;
++		}
++		g_m3t.frame_start(m_step, g_m3b.bad_addresses);
++	}
+ 	m3b_replaying = true;
+ 	real3d_display_list_end();
++	if (g_m3t.on)
++		g_m3t.frame_end(m_tri_buffer_ptr, m_tri_alpha_buffer_ptr, g_m3b.bad_addresses);
+ 	m3b_replaying = false;
+ }
+ 
+@@ -1828,6 +1884,18 @@
+ 	// make view-projection matrix
+ 	matrix_multiply(transform_matrix, coord_matrix, &transform_matrix);
+ 	matrix_multiply(transform_matrix, m_projection_matrix, &vp_matrix);
++	if (g_m3t.on)
++	{
++		MATRIX top;
++		get_top_matrix(&top);
++		g_m3t.begin('M'); g_m3t.w(g_m3t.pass); g_m3t.w(addr); g_m3t.w(m_matrix_stack_ptr); g_m3t.w(m_list_depth);
++		for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) g_m3t.f(top[r][c]);
++		for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) g_m3t.f(vp_matrix[r][c]);
++		g_m3t.end();
++	}
++	auto m3t_exit = [&](uint32_t off, uint32_t why) { if (g_m3t.on) { g_m3t.begin('X'); g_m3t.w(g_m3t.pass); g_m3t.w(addr); g_m3t.w(off); g_m3t.w(why); g_m3t.end(); } };
++	uint32_t m3t_off = 0;
++	m3_clip_vertex m3t_in[4];
+ 
+ 	memset(prev_vertex, 0, sizeof(prev_vertex));
+ 
+@@ -1840,21 +1908,22 @@
+ 		VECTOR p[4];
+ 		int polygon_transparency;
+ 
++		m3t_off = index;
+ 		for (i = 0; i < 7; i++)
+ 			header[i] = model[index++];
+ 
+ 		if (first_polygon && (header[0] & 0x0f) != 0)
+-			return;
++			{ m3t_exit(m3t_off, 1); return; }
+ 		first_polygon = false;
+ 
+ 		if (header[6] == 0)
+-			return;
++			{ m3t_exit(m3t_off, 2); return; }
+ 
+ 		if (header[1] & 0x4)
+ 			last_polygon = true;
+ 
+ 		if ((header[0] & 0x300) == 0x300)       // TODO: broken polygons in srally2 have these bits set
+-			return;
++			{ m3t_exit(m3t_off, 3); return; }
+ 
+ 		num_vertices = (header[0] & 0x40) ? 4 : 3;
+ 		{
+@@ -1984,7 +2053,22 @@
+ 		}
+ 
+ 		/* clip against all edges of the view frustum */
++		int const m3t_nv_in = num_vertices;
++		std::memcpy(m3t_in, clip_vert, sizeof(m3t_in));
+ 		num_vertices = frustum_clip_all<float, 4>(clip_vert, num_vertices, clip_vert);
++		uint32_t m3t_poly = g_m3t.poly_seq;
++		auto m3t_poly_rec = [&](uint32_t status) {
++			if (!g_m3t.on) return;
++			int reused = 0;
++			for (int rv = 0; rv < 4; rv++) reused += (header[0] >> rv) & 1;
++			g_m3t.polys++; g_m3t.vreused += reused; g_m3t.vnew += m3t_nv_in - reused;
++			g_m3t.begin('P'); g_m3t.w(g_m3t.pass); g_m3t.w(addr); g_m3t.w(m3t_off);
++			for (int k = 0; k < 7; k++) g_m3t.w(header[k]);
++			g_m3t.w(m3t_nv_in); g_m3t.w(m3t_nv_in - reused); g_m3t.w(num_vertices); g_m3t.w(status);
++			for (int k = 0; k < 4; k++) { g_m3t.f(m3t_in[k].x); g_m3t.f(m3t_in[k].y); g_m3t.f(m3t_in[k].z); g_m3t.f(m3t_in[k].w); g_m3t.f(m3t_in[k].p[0]); g_m3t.f(m3t_in[k].p[1]); g_m3t.f(m3t_in[k].p[2]); }
++			g_m3t.end();
++			g_m3t.poly_seq++;
++		};
+ 
+ 		/* divide by W, transform to screen coords */
+ 		for(i=0; i < num_vertices; i++)
+@@ -2038,7 +2122,7 @@
+ 					colormod = !!BIT(header[3], 7);
+ 
+ 				if (tex_width >= 6 || tex_height >= 6)      // srally2 poly ram has degenerate polys with 2k tex size (cpu bug or intended?)
+-					return;
++					{ m3t_poly_rec(1); m3t_exit(m3t_off, 4); return; }
+ 
+ 				texture = get_texture((header[4] & 0x40) ? 1 : 0, tex_x, tex_y, tex_width, tex_height, tex_format);
+ 			}
+@@ -2047,6 +2131,7 @@
+ 				texture = nullptr;
+ 			}
+ 
++			m3t_poly_rec(0);
+ 			for (i=2; i < num_vertices; i++)
+ 			{
+ 				bool alpha = (header[6] & 0x1) || ((header[6] & 0x800000) == 0);        // put to alpha buffer if there's any transparency involved
+@@ -2054,7 +2139,7 @@
+ 
+ 				// bail out if tri buffer is maxed out (happens during harley boot)
+ 				if (!tri)
+-					return;
++					{ m3t_exit(m3t_off, 5); return; }
+ 
+ 				memcpy(&tri->v[0], &clip_vert[0], sizeof(m3_clip_vertex));
+ 				memcpy(&tri->v[1], &clip_vert[i-1], sizeof(m3_clip_vertex));
+@@ -2071,6 +2156,18 @@
+ 				tri->param |= (header[2] & 0x1) ? TRI_PARAM_TEXTURE_MIRROR_V : 0;
+ 				tri->param |= (header[6] & 0x80000000) ? TRI_PARAM_ALPHA_TEST : 0;
+ 				tri->param |= (colormod) ? TRI_PARAM_COLOR_MOD : 0;
++				if (g_m3t.on)
++				{
++					g_m3t.begin('T'); g_m3t.w(g_m3t.pass); g_m3t.w(alpha);
++					g_m3t.w(alpha ? m_tri_alpha_buffer_ptr - 1 : m_tri_buffer_ptr - 1); g_m3t.w(m3t_poly);
++					for (int k = 0; k < 3; k++) { auto const &cv = tri->v[k]; g_m3t.f(cv.x); g_m3t.f(cv.y); g_m3t.f(cv.z); g_m3t.f(cv.w); g_m3t.f(cv.p[0]); g_m3t.f(cv.p[1]); g_m3t.f(cv.p[2]); }
++					bool const te = header[6] & 0x400;
++					g_m3t.w(te); g_m3t.w((header[4] & 0x40) ? 1 : 0);
++					g_m3t.w(((header[4] & 0x1f) << 1) | ((header[5] >> 7) & 0x1)); g_m3t.w(header[5] & 0x1f);
++					g_m3t.w((header[3] >> 3) & 0x7); g_m3t.w(header[3] & 0x7); g_m3t.w((header[6] >> 7) & 0x7);
++					g_m3t.w(tri->param); g_m3t.w(tri->transparency); g_m3t.w(tri->color);
++					g_m3t.end();
++				}
+ 			}
+ 		}
+ 	}
+@@ -2287,6 +2384,18 @@
+ 
+ 	/* set coordinate system matrix */
+ 	load_matrix(0, &m_coordinate_system);
++	if (g_m3t.on)
++	{
++		g_m3t.begin('V'); g_m3t.w(pri); g_m3t.w(address); g_m3t.w(node[0]);
++		g_m3t.f(m_viewport_x); g_m3t.f(m_viewport_y); g_m3t.f(m_viewport_width); g_m3t.f(m_viewport_height);
++		g_m3t.f(m_viewport_near); g_m3t.f(m_viewport_far);
++		for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) g_m3t.f(m_projection_matrix[r][c]);
++		for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) g_m3t.f(m_coordinate_system[r][c]);
++		g_m3t.f(m_parallel_light[0]); g_m3t.f(m_parallel_light[1]); g_m3t.f(m_parallel_light[2]);
++		g_m3t.f(m_parallel_light_intensity); g_m3t.f(m_ambient_light_intensity); g_m3t.w(m_matrix_base_address);
++		for (int k = 12; k < 20; k++) g_m3t.w(node[k]);
++		g_m3t.end();
++	}
+ 
+ 	/* process a link */
+ 	process_link(link_address, node[2]);
+@@ -2303,6 +2412,7 @@
+ 	{
+ 		m_viewport_tri_index[pri] = m_tri_buffer_ptr;
+ 		m_viewport_tri_alpha_index[pri] = m_tri_alpha_buffer_ptr;
++		g_m3t.pass = pri;
+ 		draw_viewport(pri, 0x800000);
+ 	}
+ }

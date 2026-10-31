@@ -6,7 +6,11 @@
   //
   //   sm3-builds/mame289-m3   MAME 0.289 clone carrying the census patch
   //                           (tools/mame-census). Measurement only.
+  //   sm3-builds/mame289-r3d  MAME 0.289 clone with the census and triangle-list
+  //                           patches (tools/mame-census). Measurement only.
   //   sm3-builds/supermodel   Supermodel clone, the Real3D reference.
+  //   sm3-builds/supermodel-r3d  Supermodel clone with a finished-frame grab
+  //                           (M3SHOT3D_LIST). Measurement only.
   //   tools/sloppc603-ref     SloPPC603, a GPL-2.0+ 603e core under review.
   //   tools/*-ref             read-only reference clones of other cores.
   //   third_party/*           upstream clones, never vendored.
@@ -15,7 +19,9 @@
   // one of them does not bring its repository back into Source Control.
   "git.ignoredRepositories": [
     "sm3-builds/mame289-m3",
+    "sm3-builds/mame289-r3d",
     "sm3-builds/supermodel",
+    "sm3-builds/supermodel-r3d",
     "tools/sloppc603-ref"
   ],
   "git.repositoryScanIgnoredFolders": [

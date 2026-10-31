@@ -1,0 +1,41 @@
+--- a/Src/OSD/SDL/Main.cpp
++++ b/Src/OSD/SDL/Main.cpp
+@@ -874,12 +874,23 @@
+   return true;
+ }
+ 
++int g_m3shot3d_frame = -1;  // set by CReal3D::RenderFrame when M3SHOT3D_LIST names the frame
++
+ void EndFrameVideo()
+ {
+   // Show crosshairs for light gun games
+   if (videoInputs)
+     s_crosshair->Update(currentInputs, videoInputs, xOffset, yOffset, xRes, yRes);
+ 
++  // finished frame, 3D included, for the frame number the Real3D dump used
++  if (g_m3shot3d_frame >= 0 && std::getenv("M3SHOT3D_DIR"))
++  {
++    char name[512];
++    std::snprintf(name, sizeof(name), "%s/full_%06d.bmp", std::getenv("M3SHOT3D_DIR"), g_m3shot3d_frame);
++    SaveFrameBuffer(name);
++    g_m3shot3d_frame = -1;
++  }
++
+   // Swap the buffers
+   SDL_GL_SwapWindow(s_window);
+ }
+--- a/Src/Model3/Real3D.cpp
++++ b/Src/Model3/Real3D.cpp
+@@ -643,6 +643,12 @@
+     extern void M3Shot(const char *, int);
+     M3Shot(shotDir, frame);
+   }
++  if (const char *l3 = std::getenv("M3SHOT3D_LIST"))
++  {
++    char key[16];
++    std::snprintf(key, sizeof(key), ",%d,", frame);
++    if (std::strstr((std::string(",") + l3 + ",").c_str(), key)) { extern int g_m3shot3d_frame; g_m3shot3d_frame = frame; }
++  }
+   extern void m3cpu_frame();
+   m3cpu_frame();
+   frame++;

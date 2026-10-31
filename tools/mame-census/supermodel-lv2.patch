@@ -1,0 +1,486 @@
+--- a/Src/CPU/PowerPC/ppc603.c
++++ b/Src/CPU/PowerPC/ppc603.c
+@@ -360,10 +360,22 @@
+ 	int redirect = 2;		// built I-side (icbuilt): cycles lost on a correctly predicted taken branch
+ 	int btb = 0;			// 64 or 256: a direct-mapped BTB hit makes that redirect free
+ 	int nl_cost = 1, wm_cost = 2;	// sequential new line; load hit outside the predicted way (ld1b)
+-	int dual_mode = 0;
+-	bool fast_wb = false;		// single ops and frsqrte on a fast path: may issue only when no FP pipeline
+-					// result is due at t + fast latency or later (in-order write-back)
+-	int fast_lat = 0;		// with dual: 0 any two different units, 2 an FP op with a non-FP op
++	int dual_mode = 0;		// with dual: 0 any two different units, 2 an FP op with a non-FP op,
++					// 3 a single-cycle integer op with an op of another unit (a second
++					// integer pipe), 4 the same with the integer op writing no CR or XER,
++					// 5 a single-cycle integer op with a load or store, 6 the second op
++					// a load, store or branch; with the core's three GPR read ports
++					// and none added (the pair reads at most three GPRs): 7 the second
++					// op a branch, 8 a store or branch writing no GPR (one write port),
++					// 9 a load, store or branch; 10 one op a branch, either order (the
++					// branch unit beside the others, no GPR port); 11 a single-cycle
++					// integer op with an op of another unit that writes no GPR, the pair
++					// reading at most three GPRs (one write port, no new read port)
++	int btbd = 0;			// built BTB designs (lv2_): 1-3 C, looked up a request ahead, the
++					// cache answers the target at once (a hit is free); 4-6 D, looked up
++					// at the branch's own request (a hit costs 1); 256, 128, 64 entries
++	int fetch_w = 0, fetch_q = 4;	// lv2_ fetch model: words a cycle (0: bubbles charged at issue,
++					// as lv_), queue entries
+ 	bool fold = false;		// 603e branch folding (User's Manual 6.4.1.1): a branch takes no
+ 					// dispatch slot and a taken branch hitting in the cache costs nothing;
+ 					// a misprediction refetches 2 cycles after the CR is ready, and
+@@ -380,8 +392,14 @@
+ 	int pending_bubbles = 0;
+ 	int slot = 0, last_xu = -1;	// dual dispatch: instructions issued at cycle 'last', unit of the first
+ 	uint64_t min_next = 0;		// folded branches: earliest issue of the next instruction
+-	uint64_t pipe_due = 0;		// latest result due from the FP pipeline (fast_wb)
+ 	bool last_pairable = false, last_fpop = false;
++	bool last_simple = false, last_crx = false;	// lv2_ pairing: the slot's first op
++	int last_gsrc = 0, last_gdst = 0;
++	uint64_t fa1 = 0, fa2 = 0;	// lv2_ fetch model: arrival of the last two instructions
++	uint64_t tq[16] = {};		// ... and issue times, for the queue's capacity
++	unsigned tqi = 0;
++	bool f_hard = false, f_soft = false;	// the previous instruction redirects: from issue / from arrival
++	int f_nb = 0;
+ };
+ 
+ enum { R_CR = 64, R_LR, R_CTR, R_NONE = 127 };
+@@ -557,6 +575,7 @@
+ 		cfg.emplace_back("32k_p40_er20_sb", 32, 40, 20, true);
+ 		if (std::getenv("M3CPI_FPU"))
+ 			init_fpu();
++		open_trace();
+ 	}
+ 
+ 	/*
+@@ -696,38 +715,76 @@
+ 								opts.emplace_back(std::string("lv_") + (ld ? "ld1" : "ld1b") + (rd == 0 ? "_r2" : rd == 1 ? "_r1" : rd == 2 ? "_b64" : "_b256")
+ 									+ (nl ? "_n0" : "_n1") + (wm ? "_w1" : "_w2") + (du == 0 ? "_d0" : du == 1 ? "_da" : "_db"), f);
+ 							}
+-			// the built fast single path at latency 6 (l6_): singles and the frsqrte estimate at 6,
+-			// issuing only when no pipeline result is due at t + 6 or later; doubles 12; lever rows
+-			// from the lv_ grid, each also without the write-back rule (_nowb)
+-			for (const char *lev : { "ld1b_r2_n1_w2_d0", "ld1b_b256_n1_w2_d0", "ld1b_r2_n1_w2_da", "ld1b_b256_n1_w2_da",
+-				"ld1b_b256_n0_w1_d0", "ld1b_b256_n0_w1_da", "ld1_b256_n0_w1_da", "ld1_b256_n1_w2_da" })
+-				for (int wb = 1; wb >= 0; wb--)
++			// lv2_: the BTB as it can be built and dual-issue variants, on the lv_ base (load use 3,
++			// redirect 2, new line 1, way miss 2). BTB: r2 none, b256 as lv_, bC / bD the built
++			// designs (btbd); dual: d0, da, di, dn, dl, dc (dual_mode 0, 3, 4, 5, 6); fetch: fi
++			// bubbles charged at issue as lv_, or a fetch stream of 1 or 2 words a cycle into a
++			// queue of 4 or 6 (f1q4, f2q4, f2q6)
++			for (int bt = 0; bt < 4; bt++)
++				for (int du = 0; du < 11; du++)
++					for (int fm = 0; fm < 3; fm++)
++					{
++						// kept: every BTB single issue; every dual variant with b256 and bC; the
++						// fetch models for d0, da, di, dm, dw with bC; da, di, dm, dw with bD
++						bool const fsel = du == 0 || du == 1 || du == 2 || du == 6 || du == 10;
++						bool const keep = fm == 0 ? (du == 0 || bt == 1 || bt == 2 || (bt == 3 && fsel && du)) : (bt == 2 && fsel);
++						if (!keep) continue;
++						m3cpi_fpu f = unified(12, built, false, false, false);
++						for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, 4, 0);
++						set(f, FC_FRSQRTE, 12, 0);
++						f.icbuilt = true; f.ld1b = true; f.redirect = 2;
++						f.btb = bt == 1 ? 256 : 0; f.btbd = bt == 2 ? 1 : bt == 3 ? 4 : 0;
++						static const int dm[11] = { 0, 0, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
++						f.dual = du != 0; f.dual_mode = dm[du];
++						f.fetch_w = fm == 0 ? 0 : fm == 1 ? 1 : 2; f.fetch_q = fm == 3 ? 6 : 4;
++						static const char *const bn[4] = { "_r2", "_b256", "_bC", "_bD" }, *const dn[11] = { "_d0", "_da", "_di", "_dn", "_dl", "_dc", "_dm", "_ds", "_dq", "_db", "_dw" },
++							*const fn[4] = { "_fi", "_f1q4", "_f2q4", "_f2q6" };
++						opts.emplace_back(std::string("lv2") + bn[bt] + dn[du] + fn[fm], f);
++					}
++			// lv3_ (100 MHz) and lv3x_ (110 MHz): the BTB designs with the entry's direction
++			for (int bt = 0; bt < 2; bt++)
++				for (int du = 0; du < 6; du++)
+ 				{
+-					std::string const s(lev);
+-					m3cpi_fpu f = unified(12, built, false, false, false);
+-					for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, 6, 0);
+-					set(f, FC_FRSQRTE, 6, 0);
+-					f.icbuilt = true; f.ld1b = true; f.ld_use2 = s.compare(0, 4, "ld1_") == 0;
+-					f.redirect = 2; f.btb = s.find("_b256_") != std::string::npos ? 256 : 0;
+-					f.nl_cost = s.find("_n0") != std::string::npos ? 0 : 1; f.wm_cost = s.find("_w1") != std::string::npos ? 1 : 2;
+-					f.dual = s.find("_da") != std::string::npos; f.dual_mode = 0;
+-					f.fast_wb = wb; f.fast_lat = 6;
+-					opts.emplace_back("l6_" + s + (wb ? "" : "_nowb"), f);
++					static const int dmode[6] = { 0, 0, 3, 7, 11, 10 };
++					static const char *const dn3[6] = { "_d0", "_da", "_di", "_dm", "_dw", "_db" };
++					for (int fm = 0; fm < 3; fm++)
++					{
++						if (fm && du != 0 && du != 3) continue;
++						m3cpi_fpu f = unified(12, built, false, false, false);
++						for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, 4, 0);
++						set(f, FC_FRSQRTE, 12, 0);
++						f.icbuilt = true; f.ld1b = true; f.redirect = 2; f.btbd = bt ? 8 : 7;
++						f.dual = du != 0; f.dual_mode = dmode[du];
++						f.fetch_w = fm == 0 ? 0 : fm; f.fetch_q = 4;
++						opts.emplace_back(std::string("lv3") + (bt ? "_bDy" : "_bCy") + dn3[du] + (fm == 0 ? "_fi" : fm == 1 ? "_f1q4" : "_f2q4"), f);
++					}
++					if (du == 0)
++						for (int lv = 0; lv < 2; lv++)
++						{
++							m3cpi_fpu f = unified(12, built, false, false, false);
++							for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, 4, 0);
++							set(f, FC_FRSQRTE, 12, 0);
++							f.icbuilt = true; f.ld1b = true; f.redirect = 2; f.btbd = bt ? 8 : 7;
++							if (lv) { f.nl_cost = 0; f.wm_cost = 1; }
++							opts.emplace_back(std::string("lv3x") + (bt ? "_bDy" : "_bCy") + (lv ? "_n0w1" : "_n1w2"), f);
++						}
+ 				}
+-			// no pipelined double FMA (dn<L>_): doubles, frsp and fctiw iterate through the single
+-			// unit's multiplier, blocking the FP pipeline for L cycles; singles and the frsqrte estimate
+-			// on the latency-6 fast path as l6_
+-			for (int L : { 16, 24, 32 })
+-				for (const char *lev : { "ld1b_r2_n1_w2_d0", "ld1b_b256_n1_w2_d0", "ld1b_r2_n1_w2_da", "ld1b_b256_n1_w2_da" })
++			// lv2s_ (100 MHz) BTB sizes; lv2x_ (110 MHz) single issue with new line 0 and way
++			// miss 1 beside the BTB options: <bt>_<n1w2|n0w1>
++			for (int bx = 0; bx < 8; bx++)
++				for (int lv = 0; lv < 2; lv++)
+ 				{
+-					std::string const s(lev);
+ 					m3cpi_fpu f = unified(12, built, false, false, false);
+-					for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, 6, 0);
+-					set(f, FC_FRSQRTE, 6, 0);
+-					for (int cl : { FC_D_ADD, FC_D_MUL, FC_D_FMA, FC_RND }) set(f, cl, L, L);
+-					f.icbuilt = true; f.ld1b = true; f.redirect = 2; f.btb = s.find("_b256_") != std::string::npos ? 256 : 0;
+-					f.dual = s.find("_da") != std::string::npos; f.fast_wb = true; f.fast_lat = 6;
+-					opts.emplace_back("dn" + std::to_string(L) + "_" + s, f);
++					for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, 4, 0);
++					set(f, FC_FRSQRTE, 12, 0);
++					f.icbuilt = true; f.ld1b = true; f.redirect = 2;
++					static const char *const xn[8] = { "_r2", "_b256", "_bC", "_bC128", "_bC64", "_bD", "_bD128", "_bD64" };
++					static const int xd[8] = { 0, 0, 1, 2, 3, 4, 5, 6 };
++					f.btb = bx == 1 ? 256 : 0; f.btbd = xd[bx];
++					if (lv) { f.nl_cost = 0; f.wm_cost = 1; }
++					else if (bx > 1) { if (bx == 3 || bx == 4 || bx == 6 || bx == 7) opts.emplace_back(std::string("lv2s") + xn[bx] + "_n1w2", f); continue; }
++					std::string const tail = std::string(xn[bx]) + (lv ? "_n0w1" : "_n1w2");
++					opts.emplace_back("lv2x" + tail, f);
+ 				}
+ 			// load-hit and I-cache costs of the built caches, frsqrte 24 and 60
+ 			for (int Q : { 24, 60 })
+@@ -754,10 +811,18 @@
+ 				bool const ref = o.first.compare(0, 5, "ref66") == 0, sp = o.first.compare(0, 3, "sp_") == 0 || o.first.compare(0, 4, "rsq_") == 0 || o.first.compare(0, 3, "lh_") == 0;
+ 				bool const dt = o.first.compare(0, 3, "dt_") == 0;	// decision grid: 100, 105, 110 and 120 MHz
+ 				if (ref != (mhz == 66) || (sp && mhz != 120)) continue;
+-				bool const l6 = o.first.compare(0, 3, "l6_") == 0 || (o.first.compare(0, 2, "dn") == 0 && isdigit((unsigned char)o.first[2]));
+-				if (l6 && mhz != 100 && mhz != 110) continue;
+ 				bool const lv = o.first.compare(0, 3, "lv_") == 0;	// levers: all at 100 MHz; at 110 MHz one lever or the full sets
+-				if (lv)
++				if (o.first.compare(0, 4, "lv2_") == 0 || o.first.compare(0, 5, "lv2s_") == 0)
++				{
++					if (mhz != 100) continue;
++				}
++				else if (o.first.compare(0, 4, "lv3_") == 0) { if (mhz != 100) continue; }
++				else if (o.first.compare(0, 5, "lv3x_") == 0) { if (mhz != 110) continue; }
++				else if (o.first.compare(0, 5, "lv2x_") == 0)
++				{
++					if (mhz != 110) continue;
++				}
++				else if (lv)
+ 				{
+ 					if (mhz != 100 && mhz != 110) continue;
+ 					if (mhz == 110)
+@@ -768,7 +833,6 @@
+ 						if (changed > 1 && !full) continue;
+ 					}
+ 				}
+-				else if (l6) {}
+ 				else if (dt ? (mhz == 115) : (mhz == 105 || mhz == 110)) continue;
+ 				m3cpi_fcfg c;
+ 				c.name = "f" + std::to_string(mhz) + "_" + o.first;
+@@ -794,6 +858,11 @@
+ 	{
+ 		int8_t src[4], dst[3];
+ 		uint8_t lat, busy, unit, extra, fclass, ic_miss, ld_miss, io_ld, io_st, bub, redirect, idle, xu, ld, nl, misp, regtgt, wmiss, fpld, btb64, btb256;
++		uint8_t simple, crx;		// a single-cycle integer op; one that writes CR or XER
++		uint8_t nbX[8], hX[8];		// BTB designs (C 256 / 128 / 64, D 256 / 128 / 64): bubbles after
++						// this instruction, and whether they count from its issue (EX
++						// redirect) or its arrival
++		int8_t gsrc, gdst;		// GPRs read and written
+ 	};
+ 	std::vector<fp_rec> recs;
+ 	uint64_t ld_hit_pred = 0, ld_way_miss = 0;	// shared D-cache load hits in the predicted / another way
+@@ -801,6 +870,59 @@
+ 	std::vector<btb_entry> btb64 = std::vector<btb_entry>(64), btb256 = std::vector<btb_entry>(256);
+ 	uint64_t taken_br = 0, btb64_hit = 0, btb256_hit = 0;
+ 
++	/*
++	 * The BTB designs that can be built (rtl/cpu/ppc_btb.sv), each with its own table: 256
++	 * entries, direct mapped, tagged with the full PC and MSR[IR, PR]. An entry is written
++	 * for a taken branch the static rule predicts taken (b, bc taken by the rule) and for a
++	 * taken bclr or bcctr; a hit predicts taken to the entry's target. The static rule
++	 * still decides a bc it predicts not taken. A hit on a bclr / bcctr that is not taken
++	 * invalidates the entry; a wrong target is replaced. A lookup needs the branch's own
++	 * request to follow the previous one (D), or the previous request too (C: looked up a
++	 * request ahead); a redirect, refetch or exception breaks the sequence. Design C stores
++	 * the target's physical line and way, so it is emptied by every translation change.
++	 */
++	struct dbtb { UINT32 pc = ~0u, target = 0, ctx = 0; bool v = false; };
++	struct btb_design
++	{
++		std::vector<dbtb> t = std::vector<dbtb>(256);
++		unsigned mask = 255;
++		bool prev_redir = true, prev_seq = false;	// the previous instruction redirected fetch; it was fetched in sequence
++		uint64_t look = 0, hit = 0, good = 0, wrong = 0, nottaken_hit = 0, taken = 0, flushes = 0;
++	} bd[8];					// C 256 / 128 / 64, D 256 / 128 / 64; [6] C, [7] D with the
++						// direction from the entry (lv3_): every taken branch written, a
++						// hit predicts taken, a hit not taken invalidates
++	uint64_t frame_no = 0;
++	std::FILE *brt = nullptr;			// M3BRTRACE: branch and context records for the BTB bench
++	uint64_t brt_from = 0, brt_to = 0, brt_since = 0;
++	uint64_t r52_look = 0, r52_hit = 0;
++	std::vector<btb_entry> cold256 = std::vector<btb_entry>(256);	// the lv_ 256-entry BTB over the trace window
++	bool idle_gap = true, prev_seq1 = false;
++
++	void open_trace()
++	{
++		const char *p = std::getenv("M3BRTRACE");
++		if (!p) return;
++		brt = std::fopen(p, "wb");
++		brt_from = std::getenv("M3BRT_FROM") ? std::strtoull(std::getenv("M3BRT_FROM"), nullptr, 10) : 6000;
++		brt_to = brt_from + (std::getenv("M3BRT_N") ? std::strtoull(std::getenv("M3BRT_N"), nullptr, 10) : 300);
++	}
++	// trace record, 16 bytes: pc, npc, op, instructions since the last record (saturating),
++	// flags (0 taken, 1 fetched in sequence from pc - 4 with no redirect between, 2 so was
++	// pc - 4, 3 MSR[IR], 4 MSR[PR], 5 the static rule predicts taken), kind (0 b, 1 bc,
++	// 2 bclr, 3 bcctr, 8 a translation change, 9 a refetching op or exception entry)
++	void trace(UINT32 pc, UINT32 npc, UINT32 op, int flags, int kind)
++	{
++		if (!brt || frame_no < brt_from || frame_no >= brt_to) { brt_since = 0; return; }
++		uint8_t rec[16];
++		UINT32 const w[3] = { pc, npc, op };
++		std::memcpy(rec, w, 12);
++		uint16_t const n = uint16_t(std::min<uint64_t>(brt_since, 65535));
++		std::memcpy(rec + 12, &n, 2);
++		rec[14] = uint8_t(flags); rec[15] = uint8_t(kind);
++		std::fwrite(rec, 16, 1, brt);
++		brt_since = 0;
++	}
++
+ 	void step_fpu(UINT32 pc, UINT32 op, UINT32 npc, int redirect, int bub, m3cpi_decoded d)
+ 	{
+ 		m3cpi_decode_fp(op, d);
+@@ -849,11 +971,99 @@
+ 			}
+ 			if (p == 16 && cond) r.misp = taken != (((op & 0x8000) != 0) ^ ((bo & 1) != 0));
+ 			if (p == 19 && (x == 16 || x == 528)) { r.regtgt = 1; if (cond) r.misp = taken != ((bo & 1) != 0); }
++
++			// lv2_ pairing classes: a single-cycle integer op, and one writing CR or XER
++			// (Rc, compares, carry and overflow forms)
++			r.simple = r.xu == 0 && d.lat == 1 && d.unit == 0 && d.extra == 0;
++			r.gsrc = r.gdst = 0;
++			for (int k = 0; k < 4; k++) if (d.src[k] >= 0 && d.src[k] < 32) r.gsrc++;
++			for (int k = 0; k < 3; k++) if (d.dst[k] >= 0 && d.dst[k] < 32) r.gdst++;
++			{
++				bool crx = false;
++				for (int k = 0; k < 3; k++) if (d.dst[k] == R_CR) crx = true;
++				if (p == 8 || p == 12 || p == 13) crx = true;					// subfic, addic(.)
++				if (p == 31 && ((x & 0x1ff) == 8 || (x & 0x1ff) == 10 || (x & 0x1ff) == 136 || (x & 0x1ff) == 138 || (x & 0x1ff) == 200
++					|| (x & 0x1ff) == 202 || (x & 0x1ff) == 232 || (x & 0x1ff) == 234 || x == 792 || x == 824)) crx = true;	// carry forms, sraw(i)
++				if (p == 31 && (op & 0x400) && (x & 0x1ff) != 0 && ((x & 0x1ff) == 266 || (x & 0x1ff) == 40 || (x & 0x1ff) == 104 || (x & 0x1ff) == 235
++					|| (x & 0x1ff) == 8 || (x & 0x1ff) == 10 || (x & 0x1ff) == 136 || (x & 0x1ff) == 138)) crx = true;	// OE = 1
++				r.crx = crx;
++			}
++
++			// the built BTB designs
++			bool const isbr = p == 16 || p == 18 || (p == 19 && (x == 16 || x == 528));
++			bool const stat = p == 18 || (p == 16 && (((bo & 0x14) == 0x14) || (((op & 0x8000) != 0) ^ ((bo & 1) != 0))));
++			bool const reg = p == 19 && (x == 16 || x == 528);
++			// a refetching op: isync, rfi, sc, mtmsr, and MMU writes (603e: these redirect)
++			bool const refetch = p == 17 || (p == 19 && (x == 150 || x == 50)) || (p == 31 && (x == 146 || x == 210 || x == 242 || x == 306 || x == 978 || x == 1010));
++			int const spr = ((op >> 16) & 31) | ((op >> 6) & 0x3e0);
++			bool const xlate = (p == 31 && (x == 210 || x == 242 || x == 306 || x == 978 || x == 1010)) || (p == 31 && x == 467 && spr >= 528 && spr <= 535);
++			UINT32 const ctx = MSR & (MSR_IR | MSR_PR);
++			bool const brk = redirect || idle_gap || prev_pc != pc - 4;	// not reached by falling through
++			for (int k = 0; k < 8; k++)
++			{
++				btb_design &b = bd[k];
++				bool const dyn = k >= 6;
++				b.mask = dyn ? 255 : k % 3 == 0 ? 255 : k % 3 == 1 ? 127 : 63;
++				bool const seq = !brk && !b.prev_redir;
++				bool const capable = (k < 3 || k == 6) ? (seq && b.prev_seq) : seq;
++				int nb = 0; bool hard = false, redir = false;
++				if (isbr)
++				{
++					dbtb &e = b.t[(pc >> 2) & b.mask];
++					bool const hit = capable && e.v && e.pc == pc && e.ctx == ctx;
++					if (capable) b.look++;
++					if (taken) b.taken++;
++					if (hit)
++					{
++						b.hit++;
++						if (taken && e.target == npc) { b.good++; nb = (k < 3 || k == 6) ? 0 : 1; }
++						else
++						{
++							b.wrong++; nb = 2; hard = true;
++							if (!taken) b.nottaken_hit++;
++							if (!taken && (reg || dyn)) e.v = false;
++						}
++					}
++					else if (reg) { if (taken) { nb = 2; hard = true; } }
++					else if (stat) { if (taken) nb = 2; else { nb = 2; hard = true; } }
++					else if (taken) { nb = 2; hard = true; }
++					if (taken && (stat || reg || dyn)) { e.v = true; e.pc = pc; e.target = npc; e.ctx = ctx; }
++					redir = taken || hard;
++				}
++				if (refetch) redir = true;
++				if ((k < 3 || k == 6) && xlate) { for (auto &e : b.t) e.v = false; b.flushes++; }
++				b.prev_redir = redir;
++				b.prev_seq = seq;
++				r.nbX[k] = uint8_t(nb); r.hX[k] = hard;
++			}
++			// trace window
++			brt_since++;
++			if (brt && frame_no >= brt_from && frame_no < brt_to)
++			{
++				if (isbr)
++				{
++					int const kind = p == 18 ? 0 : p == 16 ? 1 : x == 16 ? 2 : 3;
++					bool const seq1 = !brk;
++					int const fl = (taken ? 1 : 0) | (seq1 ? 2 : 0) | (seq1 && prev_seq1 ? 4 : 0) | ((ctx & MSR_IR) ? 8 : 0) | ((ctx & MSR_PR) ? 16 : 0) | (stat ? 32 : 0);
++					trace(pc, npc, op, fl, kind);
++					if (taken)
++					{	// the lv_ 256-entry BTB, started empty at the window, as the bench's model does
++						btb_entry &e = cold256[(pc >> 2) & 255];
++						r52_look++; r52_hit += e.pc == pc && e.target == npc;
++						e.pc = pc; e.target = npc;
++					}
++				}
++				else if (xlate) trace(pc, npc, op, 0, 8);
++				else if (refetch || redirect) trace(pc, npc, op, 0, 9);
++			}
++			prev_seq1 = !brk;
++			idle_gap = false;
+ 		}
+ 		recs.push_back(r);
+ 	}
+ 	void idle_fpu()
+ 	{
++		idle_gap = true;
+ 		if (!recs.empty() && recs.back().idle) return;
+ 		fp_rec r{}; r.idle = 1; recs.push_back(r);
+ 	}
+@@ -862,7 +1072,7 @@
+ 	{
+ 		for (fp_rec const &r : recs)
+ 		{
+-			if (r.idle) { c.pending_bubbles = 0; c.last_pairable = false; continue; }
++			if (r.idle) { c.pending_bubbles = 0; c.last_pairable = false; c.f_hard = true; c.f_nb = 0; continue; }
+ 			if (c.fpu.fold && r.xu == 4)
+ 			{
+ 				uint64_t const gate = c.last + (r.ic_miss ? c.stall : 0);
+@@ -880,11 +1090,45 @@
+ 			// dual dispatch: a second instruction may issue in the same cycle as the previous
+ 			// one if nothing intervenes and the two go to different units
+ 			bool const fpop = r.xu == 2 && r.fclass != FC_FPSCR;
+-			bool const pair = c.fpu.dual && c.slot == 1 && c.last_pairable && !c.pending_bubbles && !r.redirect && !r.ic_miss && !r.extra && r.xu != c.last_xu
+-				&& (c.fpu.dual_mode != 2 || fpop != c.last_fpop);
++			bool const fw = c.fpu.fetch_w != 0;
++			bool pairok = c.fpu.dual_mode != 2 || fpop != c.last_fpop;
++			switch (c.fpu.dual_mode)
++			{
++			case 3: pairok = (r.simple && c.last_xu != 0) || (c.last_simple && r.xu != 0); break;
++			case 4: pairok = (r.simple && !r.crx && c.last_xu != 0) || (c.last_simple && !c.last_crx && r.xu != 0); break;
++			case 5: pairok = (r.simple && c.last_xu == 1) || (c.last_simple && r.xu == 1); break;
++			case 6: pairok = r.xu == 1 || r.xu == 4; break;
++			case 7: pairok = r.xu == 4 && c.last_gsrc + r.gsrc <= 3; break;
++			case 8: pairok = (r.xu == 4 || (r.xu == 1 && !r.ld)) && r.gdst == 0 && c.last_gsrc + r.gsrc <= 3; break;
++			case 9: pairok = (r.xu == 1 || r.xu == 4) && c.last_gsrc + r.gsrc <= 3; break;
++			case 10: pairok = r.xu == 4 || c.last_xu == 4; break;
++			case 11: pairok = c.last_gsrc + r.gsrc <= 3 && ((r.simple && c.last_xu != 0 && c.last_gdst == 0) || (c.last_simple && r.xu != 0 && r.gdst == 0)); break;
++			default: break;
++			}
++			bool const pair = c.fpu.dual && c.slot == 1 && c.last_pairable && (fw || (!c.pending_bubbles && !r.redirect && !r.ic_miss)) && !r.extra && r.xu != c.last_xu
++				&& pairok;
+ 			int const bubbles = c.pending_bubbles;
+-			uint64_t t = c.last + (pair ? 0 : 1) + bubbles + r.redirect + (c.fpu.icbuilt && r.nl ? c.fpu.nl_cost : 0);
+-			t += uint64_t(r.ic_miss) * (c.fpu.icbuilt ? c.ist : c.stall);
++			uint64_t t, arrive = 0;
++			if (!fw)
++			{
++				t = c.last + (pair ? 0 : 1) + bubbles + r.redirect + (c.fpu.icbuilt && r.nl ? c.fpu.nl_cost : 0);
++				t += uint64_t(r.ic_miss) * (c.fpu.icbuilt ? c.ist : c.stall);
++			}
++			else
++			{	// fetch stream (lv2_ f*): words arrive fetch_w a cycle into a queue of fetch_q
++				// (plus ID's one or two); a redirect counts from the redirecting instruction's
++				// issue (EX: mispredicts, register targets, exceptions) or its arrival (fetch:
++				// predicted taken, BTB); new-line and miss costs delay the word itself
++				if (r.redirect) arrive = c.last + 1 + r.redirect;
++				else if (c.f_hard) arrive = c.last + 1 + c.f_nb;
++				else if (c.f_nb) arrive = c.fa1 + 1 + c.f_nb;
++				else arrive = c.fpu.fetch_w == 1 ? c.fa1 + 1 : std::max(c.fa1, c.fa2 + 1);
++				arrive += (r.nl ? c.fpu.nl_cost : 0) + uint64_t(r.ic_miss) * c.ist;
++				unsigned const cap = unsigned(c.fpu.fetch_q) + (c.fpu.dual ? 2u : 1u);
++				uint64_t const room = c.tq[(c.tqi - cap) & 15] + 1;
++				if (room > arrive) arrive = room;
++				t = std::max(c.last + (pair ? 0 : 1), arrive);
++			}
+ 			if (c.min_next > t) t = c.min_next;
+ 			for (int s : r.src) if (s >= 0 && c.ready[s] > t) t = c.ready[s];
+ 			int const fc = r.fclass;
+@@ -893,8 +1137,6 @@
+ 			if (unit == FU_PIPE && c.fpu_free > t) t = c.fpu_free;
+ 			if (unit == FU_DIV && c.fdiv_free > t) t = c.fdiv_free;
+ 			if (unit == 2 && c.div_free > t) t = c.div_free;
+-			bool const fast = c.fpu.fast_wb && (fc == FC_S_ADD || fc == FC_S_MUL || fc == FC_S_FMA || (fc == FC_FRSQRTE && unit == FU_PIPE));
+-			if (fast && c.pipe_due + 1 > t + c.fpu.fast_lat) t = c.pipe_due + 1 - c.fpu.fast_lat;
+ 			if (((c.fpu.serial && (fc == FC_CMP || fc == FC_FPSCR)) || (c.fpu.serial_fpscr && fc == FC_FPSCR)) && c.drain > t) t = c.drain;
+ 			if (unit == 2 && c.fpu.idiv) { lat = c.fpu.idiv; busy = c.fpu.idiv - 1; }
+ 			t += uint64_t(r.io_st) * c.io_store + uint64_t(r.io_ld) * c.io_load + uint64_t(r.ld_miss) * (c.fpu.icbuilt ? c.dst : c.stall);
+@@ -906,24 +1148,33 @@
+ 			if (unit == FU_DIV) c.fdiv_free = t + busy;
+ 			if (unit == 2) c.div_free = t + busy;
+ 			if (fc != FC_NONE && t + lat > c.drain) c.drain = t + lat;
+-			if (unit == FU_PIPE && fc != FC_NONE && t + lat > c.pipe_due) c.pipe_due = t + lat;
+ 			if (t == c.last && c.slot == 1) c.slot = 2;
+-			else { c.slot = 1; c.last_xu = r.xu; c.last_fpop = fpop; c.last_pairable = !r.extra && !r.ld_miss && !r.io_ld && !r.io_st; }
++			else { c.slot = 1; c.last_xu = r.xu; c.last_fpop = fpop; c.last_pairable = !r.extra && !r.ld_miss && !r.io_ld && !r.io_st;
++				c.last_simple = r.simple; c.last_crx = r.crx; c.last_gsrc = r.gsrc; c.last_gdst = r.gdst; }
+ 			c.last = t;
+ 			int nb = r.bub;
++			bool hard = false;
+ 			if (c.fpu.icbuilt && r.bub)
+ 			{	// built I-side: a misprediction costs 2; a correctly predicted taken branch costs the
+ 				// redirect, or nothing on a BTB hit
+-				if (r.misp) nb = 2;
++				if (r.misp) { nb = 2; hard = true; }
+ 				else if ((c.fpu.btb == 64 && r.btb64) || (c.fpu.btb == 256 && r.btb256)) nb = 0;
+-				else nb = c.fpu.redirect;
++				else { nb = c.fpu.redirect; hard = r.regtgt; }
+ 			}
++			if (c.fpu.btbd) { nb = r.nbX[c.fpu.btbd - 1]; hard = r.hX[c.fpu.btbd - 1]; }
+ 			c.pending_bubbles = nb;
++			if (fw)
++			{
++				c.fa2 = c.fa1; c.fa1 = arrive;
++				c.tq[c.tqi & 15] = t; c.tqi++;
++				c.f_hard = hard; c.f_nb = nb;
++			}
+ 		}
+ 	}
+ 
+ 	void flush_fpu()
+ 	{
++		frame_no++;
+ 		if (fcfg.empty()) return;
+ 		unsigned const nt = std::min<size_t>(8, fcfg.size());
+ 		std::vector<std::thread> th;
+@@ -1063,6 +1314,19 @@
+ 		if (!cpi.fcfg.empty())
+ 			std::fprintf(o, "shared D-cache load hits: predicted way %llu, other way %llu\ntaken branches %llu, BTB hits: 64-entry %llu, 256-entry %llu\n", (unsigned long long)cpi.ld_hit_pred, (unsigned long long)cpi.ld_way_miss,
+ 				(unsigned long long)cpi.taken_br, (unsigned long long)cpi.btb64_hit, (unsigned long long)cpi.btb256_hit);
++		for (int k = 0; k < 8; k++)
++		{
++			auto const &b = cpi.bd[k];
++			std::fprintf(o, "BTB design %c%d: lookups %llu, hits %llu (right %llu, wrong %llu, of them not taken %llu), taken branches %llu, flushes %llu\n", (k < 3 || k == 6) ? 'C' : 'D', k >= 6 ? 0 : 256 >> (k % 3),
++				(unsigned long long)b.look, (unsigned long long)b.hit, (unsigned long long)b.good, (unsigned long long)b.wrong, (unsigned long long)b.nottaken_hit,
++				(unsigned long long)b.taken, (unsigned long long)b.flushes);
++		}
++		if (cpi.brt)
++		{
++			std::fprintf(o, "trace frames %llu-%llu: lv_ 256-entry BTB, taken branches %llu, hits %llu\n", (unsigned long long)cpi.brt_from,
++				(unsigned long long)cpi.brt_to - 1, (unsigned long long)cpi.r52_look, (unsigned long long)cpi.r52_hit);
++			std::fclose(cpi.brt);
++		}
+ 		std::fprintf(o, "\nhottest RAM PCs\n");
+ 		std::vector<std::pair<uint64_t, UINT32>> hot;
+ 		for (size_t i = 0; i < pc_ram.size(); i++)

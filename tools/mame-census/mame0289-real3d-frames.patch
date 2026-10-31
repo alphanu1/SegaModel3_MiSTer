@@ -1,0 +1,116 @@
+--- a/src/mame/sega/model3.h
++++ b/src/mame/sega/model3.h
+@@ -106,6 +106,7 @@
+ 	void draw_scanline_tex_trans(int32_t scanline, const extent_t &extent, const model3_polydata &extradata, int threadid);
+ 	void draw_scanline_tex_alpha(int32_t scanline, const extent_t &extent, const model3_polydata &extradata, int threadid);
+ 	void wait_for_polys();
++	bitmap_rgb32 &fb() { return *m_fb; }  // census: the 3D layer of the last frame
+ 
+ private:
+ 	std::unique_ptr<bitmap_rgb32> m_fb;
+@@ -427,6 +428,7 @@
+ 	void real3d_traverse_display_list();
+ 	void real3d_display_list_end();
+ 	void m3b_replay_frame();  // census: render Real3D memory dumped from Supermodel
++	void m3f_save(char const *dir, std::string const &name);  // census: 3D layer and composite of a replayed dump
+ 	bool m3b_replaying = false;
+ 	void real3d_display_list1_dma(uint32_t src, uint32_t dst, int length, int byteswap);
+ 	void real3d_display_list2_dma(uint32_t src, uint32_t dst, int length, int byteswap);
+--- a/src/mame/sega/model3_v.cpp
++++ b/src/mame/sega/model3_v.cpp
+@@ -1538,6 +1538,95 @@
+ 	if (g_m3t.on)
+ 		g_m3t.frame_end(m_tri_buffer_ptr, m_tri_alpha_buffer_ptr, g_m3b.bad_addresses);
+ 	m3b_replaying = false;
++	if (char const *const fd = std::getenv("M3FRAMES"))
++		m3f_save(fd, g_m3t.name);
++}
++
++/* Real3D frame images (M3 golden data): M3FRAMES=<dir> writes, for each replayed dump,
++   <dir>/<dump>.3d, the 3D layer as 496 x 384 little-endian ARGB words (alpha 0 where
++   nothing was drawn). With M3TILES=<dir> holding <dump>.tile.gz from Supermodel
++   (supermodel-rast-frames.patch: tile generator VRAM in bus byte order, then its 64
++   registers), the tile layers of that frame are loaded for one call of
++   screen_update_model3 and <dir>/<dump>.full is the composite; MAME's own tile state
++   is restored afterwards. */
++void model3_state::m3f_save(char const *dir, std::string const &name)
++{
++	auto save = [&](std::string const &fn, bitmap_rgb32 const &b)
++	{
++		std::vector<uint32_t> px(496 * 384);
++		for (int y = 0; y < 384; y++)
++			for (int x = 0; x < 496; x++)
++				px[y * 496 + x] = b.pix(y, x);
++		if (std::FILE *o = std::fopen(fn.c_str(), "wb")) { std::fwrite(px.data(), 4, px.size(), o); std::fclose(o); }
++	};
++	save(std::string(dir) + "/" + name + ".3d", m_renderer->fb());
++
++	char const *const td = std::getenv("M3TILES");
++	if (!td)
++		return;
++	std::FILE *fp = std::fopen((std::string(td) + "/" + name + ".tile.gz").c_str(), "rb");
++	if (!fp)
++		return;
++	std::vector<uint8_t> in;
++	uint8_t buf[65536];
++	size_t n;
++	while ((n = std::fread(buf, 1, sizeof(buf), fp)) > 0)
++		in.insert(in.end(), buf, buf + n);
++	std::fclose(fp);
++	std::vector<uint8_t> v(0x120000 + 256);
++	z_stream z = {};
++	inflateInit2(&z, 16 + MAX_WBITS);
++	z.next_in = in.data();
++	z.avail_in = uInt(in.size());
++	z.next_out = v.data();
++	z.avail_out = uInt(v.size());
++	inflate(&z, Z_FINISH);
++	inflateEnd(&z);
++	if (z.total_out != v.size())
++		return;
++
++	auto be64 = [&](size_t a) { uint64_t r = 0; for (int i = 0; i < 8; i++) r = (r << 8) | v[a + i]; return r; };
++	auto reg = [&](int i) { uint32_t r; std::memcpy(&r, &v[0x120000 + 4 * i], 4); return BYTE_REVERSE32(r); };  // the word the CPU wrote
++	auto pens = [&]()
++	{
++		for (int o = 0; o < 0x20000 / 8; o++)
++		{
++			uint32_t const d1 = BYTE_REVERSE32((uint32_t)(m_paletteram64[o] >> 32));
++			uint32_t const d2 = BYTE_REVERSE32((uint32_t)(m_paletteram64[o] >> 0));
++			m_palette->set_pen_color((o * 2) + 0, pal5bit(d1 >> 0), pal5bit(d1 >> 5), pal5bit(d1 >> 10));
++			m_palette->set_pen_color((o * 2) + 1, pal5bit(d2 >> 0), pal5bit(d2 >> 5), pal5bit(d2 >> 10));
++		}
++		m_gfxdecode->gfx(0)->mark_all_dirty();
++		m_gfxdecode->gfx(1)->mark_all_dirty();
++		for (int l = 0; l < 4; l++) { m_layer4[l]->mark_all_dirty(); m_layer8[l]->mark_all_dirty(); }
++	};
++
++	std::vector<uint64_t> c0(m_m3_char_ram.get(), m_m3_char_ram.get() + 0x100000 / 8);
++	std::vector<uint64_t> t0(m_m3_tile_ram.get(), m_m3_tile_ram.get() + 0x8000 / 8);
++	std::vector<uint64_t> p0(&m_paletteram64[0], &m_paletteram64[0] + 0x20000 / 8);
++	uint16_t const pr0 = m_layer_priority;
++	uint64_t const s0 = m_layer_scroll[0], s1 = m_layer_scroll[1];
++
++	for (int i = 0; i < 0xf8000 / 8; i++) m_m3_char_ram[i] = be64(i * 8);
++	for (int i = 0; i < 0x8000 / 8; i++) m_m3_tile_ram[i] = be64(0xf8000 + i * 8);
++	for (int i = 0; i < 0x20000 / 8; i++) m_paletteram64[i] = be64(0x100000 + i * 8);
++	m_layer_priority = uint16_t(reg(0x20 / 4) >> 16);
++	m_layer_scroll[0] = (uint64_t(reg(0x60 / 4)) << 32) | reg(0x64 / 4);
++	m_layer_scroll[1] = (uint64_t(reg(0x68 / 4)) << 32) | reg(0x6c / 4);
++	pens();
++
++	bitmap_rgb32 bmp(496, 384);
++	rectangle const r(0, 495, 0, 383);
++	screen_update_model3(*m_screen, bmp, r);
++	save(std::string(dir) + "/" + name + ".full", bmp);
++
++	std::copy(c0.begin(), c0.end(), m_m3_char_ram.get());
++	std::copy(t0.begin(), t0.end(), m_m3_tile_ram.get());
++	std::copy(p0.begin(), p0.end(), &m_paletteram64[0]);
++	m_layer_priority = pr0;
++	m_layer_scroll[0] = s0;
++	m_layer_scroll[1] = s1;
++	pens();
+ }
+ 
+ void model3_state::real3d_display_list_end()

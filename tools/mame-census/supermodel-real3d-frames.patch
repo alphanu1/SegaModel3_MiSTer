@@ -1,0 +1,102 @@
+--- a/Src/Model3/TileGen.h
++++ b/Src/Model3/TileGen.h
+@@ -303,6 +303,10 @@
+ 	CTileGen(const Util::Config::Node& config);
+ 	~CTileGen(void);
+ 
++public:
++	// Model 3 census: VRAM (1.125 MiB, bus byte order) and the 64 registers, gzip
++	void	M3Dump				(const char *name) const;
++
+ private:
+ 
+ 	struct ColourOffsetRegister
+--- a/Src/Model3/TileGen.cpp
++++ b/Src/Model3/TileGen.cpp
+@@ -56,6 +56,7 @@
+ #include <cstring>
+ #include <algorithm>
+ #include "Supermodel.h"
++#include <zlib.h>
+ 
+ // Offsets of memory regions within TileGen memory pool
+ #define OFFSET_VRAM         0x000000	// VRAM and palette data
+@@ -409,8 +410,28 @@
+ 	DebugLog("Tile Generator attached a Render2D object\n");
+ }
+ 
++static const CTileGen *g_m3tilegen = nullptr;
++
++void CTileGen::M3Dump(const char *name) const
++{
++	if (gzFile f = gzopen(name, "wb1"))
++	{
++		gzwrite(f, m_vram, 0x120000);
++		gzwrite(f, m_regs, sizeof(m_regs));
++		gzclose(f);
++	}
++}
++
++// Model 3 census: called from CReal3D::RenderFrame for each Real3D dump (M3TILE_DIR)
++void M3DumpTileGen(const char *name)
++{
++	if (g_m3tilegen)
++		g_m3tilegen->M3Dump(name);
++}
++
+ Result CTileGen::Init(IIRQController *IRQObjectPtr)
+ {
++	g_m3tilegen = this;
+ 	unsigned memSize   = (m_gpuMultiThreaded ? MEMORY_POOL_SIZE : MEM_POOL_SIZE_RW);
+ 	float	 memSizeMB = (float)memSize/(float)0x100000;
+ 	
+--- a/Src/Model3/Real3D.cpp
++++ b/Src/Model3/Real3D.cpp
+@@ -628,6 +628,15 @@
+       gzclose(f);
+     }
+   }
++  // M3TILE_DIR saves the tile generator's VRAM and registers on the same frames
++  static const char *tileDir = std::getenv("M3TILE_DIR");
++  if (tileDir && frame >= start && (frame - start) % every == 0)
++  {
++    char name[512];
++    std::snprintf(name, sizeof(name), "%s/f%06d.tile.gz", tileDir, frame);
++    extern void M3DumpTileGen(const char *);
++    M3DumpTileGen(name);
++  }
+   static const char *shotDir = std::getenv("M3SHOT_DIR");
+   static const int shotEvery = std::getenv("M3SHOT_EVERY") ? std::atoi(std::getenv("M3SHOT_EVERY")) : 600;
+   static const char *shotList = std::getenv("M3SHOT_LIST");	// comma-separated frame numbers, instead of every M3SHOT_EVERY
+--- a/Src/Graphics/Render2D.cpp
++++ b/Src/Graphics/Render2D.cpp
+@@ -286,6 +286,7 @@
+   */
+ 
+ #include "Render2D.h"
++#include <cstdlib>
+ 
+ #include "Supermodel.h"
+ #include "Shader.h"
+@@ -369,14 +370,20 @@
+ 	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+ }
+ 
++// Model 3 census: M3NO2D clears the frame but draws no tile layer, so a frame grab shows the 3D alone
++static const bool s_m3no2d = std::getenv("M3NO2D") != nullptr;
++
+ void CRender2D::RenderFrameBottom(void)
+ {
+ 	Setup2D(true);
+-	DrawSurface(m_textureIDs[0]);
++	if (!s_m3no2d)
++		DrawSurface(m_textureIDs[0]);
+ }
+ 
+ void CRender2D::RenderFrameTop(void)
+ {
++	if (s_m3no2d)
++		return;
+ 	Setup2D(false);
+ 	DrawSurface(m_textureIDs[1]);
+ }

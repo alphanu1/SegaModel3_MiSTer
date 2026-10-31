@@ -1,6 +1,41 @@
 # Handoff
 
-## Current state (2026-10-30)
+## Current state (2026-10-31, evening)
+
+Committed this evening in four commits, from verified snapshots (see the log). The
+study's §15 R26–R63 and D-17–D-31 carry every finding and decision; this is the summary.
+
+- **CPU** (`rtl/cpu`):
+  - 603e integer core, MMU and interrupts (R31).
+  - FPU: double FMA plus a fast single path at latency 6 and a pipelined frsqrte
+    estimate (R53, R63).
+  - 16 KiB I and D caches, connected, with pipelined loads (R36, R44).
+  - On the board at 100 MHz with and without caches, every report identical to the
+    simulation (R63, 19:07). Full-build closure holds on one fitter seed in three, so a
+    timing pass is under way.
+  - Next: BTB (64, look-ahead), dynamic branch direction and 2-word fetch (D-30), then
+    about 110 MHz (R58).
+- **Framework:** release form. Dual SDRAM (no analog board), plus the NN, ADAPTIVE, YC
+  and ALSA switches. The audio filter and `vga_osd` stay, for direct video (D-26, R57).
+- **Real3D geometry** (`rtl/real3d`): about 7,170 ALM, 100 MHz, bit-exact on 800 frames,
+  Supermodel rows per D-19/D-25 (R60).
+- **Rasteriser:** 100 MHz half width (D-28). Front, intake and Z span are built:
+  2,439 of 8,000 ALM (R62). Translucency is the plain blend (D-29).
+- **Sound:** both SCSPs on one engine, bit-identical to two, 2,148 ALM. It runs at
+  80 MHz with FM kept (R59, D-29). Not yet in a top level.
+- **Budget** (D-27, R54): framework + CPU about 11.4K + 6.2K, geometry about 7.5K,
+  rasteriser about 7K, sound about 4.4K, everything else 3.5K. About 40.7K against
+  41K usable, with no slack: every new block needs §8.4 sharing from the start.
+
+### In progress (uncommitted, in the working tree)
+- CPU timing pass to robust 100 MHz (`rtl/cpu`).
+- Rasteriser: the Z band block and onwards.
+- Geometry: a normal-based facing test, Daytona 2, and the record fields the
+  rasteriser asked for.
+- M2.5 (D-31): one VF3 frame drawn on the MiSTer from a dump, in its own project
+  (`quartus/m3_viewer`).
+
+## State on 2026-10-30
 
 No RTL yet. The work so far is the design study
 (`docs/model3-step10-design-study.md`) and the measurements behind it.
@@ -62,8 +97,8 @@ second SDRAM).
   at 75 MHz and report cycles, stall counters and a retire signature on the debug UART.
   Build: `make cputest_hex test_cputest`, then `quartus_sh --flow compile Model3`
   (write `build_id.v` first if only running analysis). Board: `tools/cputest-capture.sh`,
-  then `tools/cputest-compare.py capture.txt`. Built and timing-clean; **not yet run on
-  the board.**
+  then `tools/cputest-compare.py capture.txt`. Run on the board since (R25, R26, R28,
+  R32).
 
 ## What remains
 
@@ -91,3 +126,13 @@ second SDRAM).
   x64 recompiler can only address memory near its cache (`offset_from_rbp`).
 - The texel-cache simulation needs `-numprocessors 1`, so the renderer runs in one
   thread and the cache sees texels in order.
+- 2026-10-31: the standalone spike hides memory paths. Both the instruction side (R28)
+  and the data side (R32) missed in the full build through the harness's M10K. The
+  caches confirm it from the inside (tag M10K output about 2.3 ns late, R36).
+- 2026-10-31: the FPU agent's −200 ALM estimate for one subtract order measured −22 ALM
+  and cost 1 ns (R33).
+- 2026-10-31: I briefly believed MAME draws VF3 2× magnified. Supermodel frame grabs
+  refuted it (R35).
+- 2026-10-31: MAME's fnmsubs gives the wrong zero sign, and both emulators' double FMA
+  family is unfused. The manual wins; expect 2–13% of double FMA results to differ from
+  Supermodel (R30).

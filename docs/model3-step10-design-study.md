@@ -1071,8 +1071,23 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-12 | Build now, before the second SDRAM arrives: a single-SDRAM proof of concept running VF3 with sound left out (D-8). VF3 then needs 117.25 MiB of SDRAM (126.75 less 9.5 MiB of sound), 10.75 MiB spare. Heavy frames may slip on texture bandwidth (R17) until the dual-SDRAM build. |
 | D-13 | The 603e is written from scratch, designed around the 8.4 area techniques. SloPPC603 is a reference only: read to understand the 603e's corner cases and to cross-check, never copied. Confirmed against the CPI model before RTL starts. |
 | D-14 | One core for every step, driven by the game ID, as the Model 2 core is. Run-time selection: vertex format (17.7 / 13.11), culling-node layout, Real3D PCI ID, MPC105 or MPC106 register map, the SDRAM layout from the MRA. Compile-time parameters, with the game ID choosing inside what is built: 53C810 SCRIPTS and the Real3D DMA engine, the 315-5881 decrypter, the second SDRAM, sound. The CPU runs at 100 MHz for every step: the timebase and decrementer count from the 66 MHz bus on all steps, so only performance changes with the CPU clock. |
-| D-15 | CPU target from the CPI model (R22): scalar in-order pipeline at 100 MHz with forwarding and static branch prediction; 16 KiB 4-way instruction and data caches, 32-byte lines, data write-back; a store buffer; critical-word-first fills with early restart; single-precision FP pipelined, double multiply iterated through the same multiplier. 32 KiB caches buy 1–4% and are not worth the M10K. |
+| D-15 | CPU target from the CPI model (R22): scalar in-order pipeline at 100 MHz with forwarding and static branch prediction; 16 KiB 4-way instruction and data caches, 32-byte lines, data write-back; a store buffer; critical-word-first fills with early restart; single-precision FP pipelined, double multiply iterated through the same multiplier. 32 KiB caches buy 1–4% and are not worth the M10K. The FP clause is under review: the FPU was built as one pipelined double FMA (R29). |
 | D-16 | The SDRAM controller starts from the Model 2 core's `m2_sdram` at CAS latency 2, as the Model 1 and Model 2 cores run. |
+| D-17 | For the CPU, the 603e and PowerPC manuals are the authority. MAME and Supermodel are cross-checks for finding misreadings; where one disagrees with the manual, the manual wins and the difference is recorded here. Emulator behaviour is followed only where the manual leaves a result undefined (divide by zero, 0x80000000 / -1). |
+| D-18 | The FPU is built complete, everything the games execute, and the CPU clock is allowed to fall below 120 MHz to carry it. The core is at 106.7 MHz in the full build (R41); the frame-budget grid (R42) is re-run at the clock reached, not at 120. |
+| D-19 | For the Real3D, where MAME and Supermodel differ, Supermodel is followed: node culling, LOD choice, colour table, transparency width, light vector (`sim/real3d/m2-notes.md` difference list, rows 5, 6, 12, 17, 22), fog, lighting, translucency and the frustum set-up. MAME stays the bit-level reference wherever the two agree, because its triangle lists and software renderer can be matched exactly. M3's exit test is coverage against Supermodel's images plus a bit-exact test against my model. |
+| D-20 | The rasteriser's off-chip polygon store for banded Z (R46) goes in DDR3 for now, so it can be tested on the board before the second SDRAM arrives. Its memory client sits behind a compile-time parameter, as D-9 does for the Real3D memories, so moving it to the second SDRAM is a parameter change plus that controller's port, with no change to the rasteriser. M0-C measures whether DDR3 carries the 180–216 MB/s total. |
+| D-21 | A fast single-precision path at latency 4–6 sits beside R29's double FMA, which stays at L = 12 for doubles. It must give exactly the same results as the FMA alone: a single op whose operands are all exactly representable in single goes to the fast path, and any other goes to the double FMA, both computing exactly and rounding once (R29, choice 1). This is D-15's original plan, supported by R42. |
+| D-22 | frsqrte is a fast pipelined estimate, as on the 603e (1-1-1, 603e Table 6-5), within the manual's 1/32 bound (PEM 8-82). The 603e's exact table is not documented. The estimate's significand fits in a single, so its consumers stay on D-21's fast path. This replaces R29's exact Supermodel form, which needs 97 cycles where R39 allows ≤ 36. fres stays as R29 built it. |
+| D-23 | FPSCR bit 20 follows Supermodel: mtfsf, mtfsfi and mtfsb write it and mffs reads it back. The PEM lists it only as "Reserved" (PEM Rev 2, Table 2-4) and documents nothing more, so D-17's rule applies. R29 already builds it this way. |
+| D-24 | Following R52, a 256-entry branch target buffer and 603e-style dual issue (two instructions dispatched a cycle to different units, 603e manual §6) are estimated and measured before either goes into the core. The BTB is built and verified standalone first. Dual issue is costed in area and Fmax from standalone prototypes of its register-file ports, forwarding and pairing logic, in variants, and then decided. |
+| D-25 | D-19 refined: Real3D documentation and real-hardware footage outrank Supermodel. Supermodel is followed where it corrects real behaviour that MAME gets wrong (lighting values, culling, colour table, transparency). Its additions for a PC renderer are left out unless the hardware shows them, for example per-fragment lighting (R51: Gouraud) or anything that costs area for no measurable image change. So row 18's per-polygon normal memory (+252 ALM, no measurable change, R55) comes out, and row 6's LOD (400–600 ALM, about 0.1% of pixels) is not built. Both stay as model switches, to come back if the hardware footage shows them. Area keeps the first call on every block (R54). |
+| D-26 | The core is built with `MISTER_DUAL_SDRAM`. The second SDRAM takes the analog I/O board's header, so there is no analog video and no analog audio jack; HDMI carries both. That drops the framework's VGA path (OSD for VGA, the VGA scaler output, csync and subcarrier, the analog audio DACs), which Model 2 measured at about 600 ALM and 5 M10K in vga_osd and vga_scaler_out alone (Model 2A study, framework list). Measured on this core in R57. Model 2's other framework switches (`MISTER_DOWNSCALE_NN`, `_DISABLE_ADAPTIVE`, `_DISABLE_YC`, `_DISABLE_ALSA`) are taken too, but **not** Model 2's audio-filter patch: this core keeps the framework's audio filter. |
+| D-27 | Hard per-block ALM budgets, totalling about 40,830 against a 41,000 working ceiling. Framework plus CPU 17,780 (R57's measured 17,266, plus the D-21/D-22 FPU at +910 and a BTB at about +200, less about 600 of test harness). Real3D geometry 8,550. Rasteriser 8,000. Sound 3,000 (68000 plus both SCSPs on one engine plus glue). Everything else 3,500 (tile generator, SDRAM and DDR3 controllers, PCI bridge, I/O and SCRIPTS, Real3D command and texture upload). Dual issue does not fit and is not built; the CPU stays single-issue and gains CPI through cheap levers. Every block works to its number with §8.4 sharing first, and a block over its number is paid back from another block, recorded in an R-entry. |
+| D-28 | The rasteriser runs at 100 MHz, every cycle, at half R46's width: 2 Z tests and 1 shaded, bilinear-textured pixel a clock (4 texels a clock), the same throughput as 4 + 2 at 50 MHz (VF3 p99 about 66% of a frame). Halving the lanes, texel ports and DSPs is how it meets D-27's 8,000 ALM. The whole Real3D, CPU and SDRAM then share one 100 MHz clock, with no crossings inside the core. D-3's 50 MHz Real3D clock is withdrawn (R50 already moved the geometry). Every rasteriser block closes at 100 MHz. |
+| D-29 | Sound keeps FM: it is used, so `FM` stays on in the shared SCSP engine. The sound engine runs at 80 MHz, as Model 2's does (R59), from the main PLL with an 800 MHz VCO (100 / 80 / 50 MHz), with one crossing to the SDRAM. Translucency is the plain blend (R62 mode 0, MAME's), with no extra M10K; modes 1 and 2 stay as parameters. |
+| D-30 | The CPU gains R61's set, budgeted at about 750 ALM and 2 M10K. The set is: a 64-entry BTB looked up one fetch ahead (design C, a 0-cycle hit), with the I-cache pre-read port; dynamic branch direction; and 2-word fetch. Together they lose 3 frames against the branch-folding 603e at 100 MHz (R61). It is built after the timing pass that makes 100 MHz close on every seed (R63), so that timing margin and the new fetch paths are measured together. Dual issue stays out (D-27). |
+| D-31 | A milestone M2.5 goes in before M1: one real VF3 frame drawn on the MiSTer by the Real3D RTL, from a Supermodel dump of the Real3D memories loaded through the framework, with no CPU. It is untextured first, and textured once the rasteriser has textures. It is a separate MiSTer project (`quartus/m3_viewer/`), so the main core's build is untouched. Its exit is the board's image matching the bench's, which matches the RTL-form model. The dump is ROM-derived and never enters the repository. |
 
 ### Open
 
@@ -1312,3 +1327,1836 @@ string` for `$readmemh` file names; untyped parameters work.
 behaviour on silicon, its MLAB register file included, matches the model-checked
 simulation exactly for this program. CPI 2.18 on this random program is not a
 real-code figure: 39% of its cycles wait on divides.
+
+**R26 — Timing pass: 77 to 104–114 MHz standalone, and the 100 MHz board run.** Two
+passes (`a6ccb96`, `62e0f14`) moved the integer core from 77.2 MHz to 101.65 MHz at a
+100 MHz target, then to 109.8 / 114.2 / 104.3 MHz over three seeds at a 120 MHz target
+(8.333 ns), at about 2,580 ALM. What moved it: forwarding into the operand registers so
+EX keeps one 2:1 mux; register and SPR files read in ID; static prediction at fetch with
+the prediction carried to EX; every redirect registered, its target chosen a cycle
+late; the fetch queue as a shift register in its own module with RAM recognition off
+(Quartus turned every other form of it into a RAM); predecode for the queue pop; a
+one-hot result select; a truth-table logic unit; a tree count-leading-zeros; CR
+written as mask and values; trap commit in WB. Cost: the board program went from 3,355
+to 3,383 cycles (+0.8%), instructions and signature unchanged. I had expected the full
+MiSTer build to close where the standalone fit does; at a 100 MHz target it reports
+108.5 MHz for the CPU clock (+0.786 ns), because the fitter stops working on a path
+once it meets the target. The first 100 MHz board build, before the second pass,
+missed by 0.423 ns and was not loaded. The second (`62e0f14`, RBF md5 d7392dc3…) ran on
+the DE10-Nano at 100 MHz: 1,395 reports in 20 s, all identical to the simulation,
+3,383 cycles, 1,539 instructions, signature E1058DC4.
+
+**R27 — The integer core closes 120 MHz on every seed, for 400 ALM.** Seven sweeps at
+8.333 ns took the three seeds from 109.8 / 114.2 / 104.3 MHz to **126.0 / 125.3 /
+121.6 MHz** (slow 100 °C), at 2,978–2,988 ALM (+15.5%), 2,010 registers, 0 M10K, 3 DSP.
+The board program's cycles, instructions and signature did not move (3,383 / 1,539 /
+E1058DC4), so the gain cost no CPI. What moved it:
+- the EX producer forwarded into the operand registers at the end of its own EX cycle,
+  so EX starts from registers;
+- CR bits for BI, crbA and crbB captured in ID, with a registered select for a writer
+  one step ahead; CTR==1 carried as a flag beside CTR;
+- slw, srw, sraw and rlw* on one left and one right rotator with masks after; the
+  rlw* mask formed in ID;
+- everything step-independent predecoded at fetch (operand selects, immediate form,
+  result kind, special-register writes, SPR index), 36 bits a queue entry;
+- cmp/cmpl on the main adder's carry (Quartus had built `x < y` as a 5-level tree);
+- the multiplier's partial products summed a cycle after the DSPs, which take the
+  operand registers directly (latency still 3);
+- GPRs written as a uop leaves MEM, not WB, which removes the WB forward.
+Where the 400 ALM went: fetch queue +123, the second decoder +80, core logic +226, ALU
+−92. Wrong turns: two sweeps fixed the paths they aimed at and still lost Fmax, because
+the result OR tree and the decoder depth in ID were next and placement moved; the gain
+came only when both were fixed together. A first move-from capture in ID put an opcode
+compare in front of a 32-bit mux (−1.3 ns). Checked with 16,000 seeds per change and
+about 35 planted faults, all caught. One gap found in the generator, not the core: rfi
+straight after mtsrr1 was never generated, so a broken SRR1 forward went unseen at HEAD
+too; the generator now emits it and the planted fault is caught. The spike times no
+memory-input paths (virtual pins); with the inputs registered at the top it gives
+127.3 / 125.6 MHz.
+
+**R28 — Predecode at fetch is the CPU's critical path in the full build.** The first
+full MiSTer build of the R27 core with the CPU at 120 MHz missed by 2.852 ns (89.4 MHz):
+every one of the worst 3,000 paths ran from the test ROM's M10K, through the new fetch
+predecode, into the fetch queue. The spike could not show it because its memory inputs
+are virtual pins. With the board test's ROM and RAM outputs registered once more (two
+cycles a request) the same build missed by 0.365 ns (114.97 MHz), every failing path now
+from a plain `i_data` register through predecode into `qx[0]`. So predecode depth sets
+the full-design Fmax, and the instruction cache must feed it from a register, not from
+M10K directly; with one fetch outstanding that costs fetch rate, so the cache fetch
+path has to be pipelined. At 100 MHz the build closes with +1.121 ns (112.6 MHz; 10,497
+ALM, 123 M10K, 36 DSP; RBF md5 b3698cc8…) and ran on the board: 1,395 reports in 20 s,
+all identical to the simulation (new program after the rfi generator change, 4,726
+cycles, 1,539 instructions, signature 54DD0CB7). The test system's two-cycle memories
+put 38% of cycles into fetch wait; that CPI is the test system's, not the core's.
+
+**R29 — The FPU, built standalone: 120 MHz needs a 12-stage multiply-add and 3,520 ALM.**
+This contradicts D-15's "single precision pipelined, double multiply iterated through the
+same multiplier" and §8.4's last paragraph. I built one fully pipelined double-precision
+fused multiply-add (FMA) instead. It runs every add, subtract, multiply, multiply-add and
+frsp, single and double. Beside it sit an iterative divide/sqrt unit, a small unit
+(compares, fsel, moves, mffs), the lfs/stfs conversions and the FPSCR update. The reason
+was correctness first: single ops given double operands must be computed exactly from
+the full doubles and rounded once (decision below). Until the CPI sweep with these
+numbers is in, this is provisional, and so is D-15's FP clause.
+- **Latency.** The 4–7 cycles the CPI sweep assumed do not close. Standalone fits at
+  8.333 ns (slow 100 °C, Model3.qsf's retiming settings), three seeds each:
+  - L = 8: 71 MHz;
+  - L = 10: 106–115 MHz;
+  - L = 11: 112.7 / 117.1 / 114.6 MHz;
+  - **L = 12: 116.4 / 117.1 / 121.1 MHz.**
+
+  One LUT level costs about 1.4 ns with routing on this part, so a stage holds about five.
+  The remaining L = 12 misses are the stopper-bit decode in the add stage and the fanout of
+  the coarse alignment. A one-stage move not yet tried should take the first.
+- **Area (fit, L = 12):**
+
+  | Unit | ALM | Registers | DSP |
+  |---|---|---|---|
+  | FMA | 2,895 | 3,462 | 4 |
+  | Divide/sqrt | 626 | 336 | 0 |
+  | Small unit, 2 cycles | 107 | 193 | 0 |
+  | lfs/stfs | 104 | 0 | 0 |
+  | FPSCR | 75 | 0 | 0 |
+  | **Total** | **≈3,520** | 3,798 | 4 |
+
+  No M10K. The target was under 2,500 ALM. Options not yet tried, with rough savings:
+  - one subtract order and a one's-complement fix-up: −200 ALM;
+  - radix-2 division: −150 ALM, at +28 cycles per fdiv;
+  - each stage removed: about −100 ALM, at the cost of Fmax;
+  - D-15's single-fast, double-iterated design.
+
+  Against §8.1's CPU room (3,500 to 12,000 ALM) and the 2,980 ALM integer core (R27), this
+  puts the CPU core at about 6,500 ALM before the MMU and caches.
+- **Divide unit cycles** (normal operands, idle pipe, start to result):
+  - fdiv: 38 (the 603e takes 33 at 66 MHz);
+  - fdivs: 24 (603e 18);
+  - fres: 24 (603e 18);
+  - frsqrte: **97, blocking** (603e 3, pipelined);
+  - specials: 8.
+
+  frsqrte goes through a full square root and then a reciprocal. At VF3's 885 a frame
+  that is about 86k cycles, ≈4.9% of a 100 MHz frame, so a table estimate would pay its
+  way if the bits can be matched.
+- **Verification.** An MPFR reference model was checked against host IEEE arithmetic in
+  every rounding mode: 11.2M checks, 0 failures. The RTL was then checked against the
+  model:
+  - about 66M checks, 0 failures, over L = 12, 11, 10, 8 and 3 and both small-unit
+    settings;
+  - each check covers write enable, all 64 result bits, the new FPSCR and the CR field;
+  - every run includes 133,632 directed cases at zeros, denormals, extremes, ties,
+    overflow and underflow boundaries, NaN position and fctiw near ±2³¹.
+
+  Six planted faults were all caught. The FX-on-any-cause fault passed every directed
+  case, because those start from a clean FPSCR; only random FPSCRs found it.
+- **Where the manual leaves a result undefined, D-17 was followed (Supermodel).** Each of
+  these needs a board capture to confirm:
+  - **Single ops on double operands:** exact, rounded once. A NaN result has its low 29
+    bits cleared. The 603e may use a narrow single multiplier here, so silicon could
+    differ.
+  - **fres:** 1/x rounded once to single.
+  - **frsqrte:** the square root rounded to double, then 1/s rounded to double.
+  - **fres and frsqrte flags:** FR and FI come from the last rounding; XX is unchanged.
+  - **High words:** for fctiw and fctiwz, 0 when the result is in range, otherwise the sign
+    extension of the clamped word. FPRF is unchanged. mffs reads a high word of 0.
+  - **Reserved FPSCR bit 20:** writable and read back, as Supermodel's masks do. **This
+    is open:** my reading of the manual was to hold it at 0.
+  - **NI = 1:** a denormal result becomes zero of the same sign, judged after rounding.
+    Inputs are not flushed.
+  - **mtfsb1:** sets FX only on a 0→1 change.
+  - **stfs below 2⁻¹⁴⁹:** host round-to-nearest.
+- **Integration constraints:**
+  - Divide results can complete after later FMA results. FR, FI and FPRF go to whichever
+    op writes last, so the core must apply FPSCR updates in program order.
+  - The divider's result enters the FMA's back end, which needs a one-cycle bubble in FMA
+    issue.
+  - Compare plus FPSCR update in one cycle measured 8.66 ns, so the small unit's flags are
+    registered before the FPSCR.
+- **Quartus 17 findings.** Verilator accepted all of the following, so they were checked
+  only by `--analyze_file` and fits:
+  - `wire <typedef> x = …` is rejected;
+  - non-constant `'{field: value}` struct patterns are rejected;
+  - side-band delay pipes were inferred as `altshift_taps` (3 M10K) until marked
+    `AUTO_SHIFT_REGISTER_RECOGNITION OFF`;
+  - retiming moved stage registers into critical paths until marked `preserve`.
+
+  A 17-case constant fold of the signed-cast idioms matched Quartus exactly.
+- **Reuse:** Model 2's fp_add split into align, add, normalise and round, with the
+  alignment shift taken from the exponents alone (R739). The sticky bit comes from a
+  trailing-zero count, not a second shifter (R512). fp_div's restoring division is
+  reused. Divider results go through the FMA's rounder, which takes m2_fp_pool's shared
+  reciprocal one step further.
+
+**R30 — FP census and FPU latency sweep: round-to-nearest only, FPRF is read, and frsqrte
+latency decides the worst frame.** Measured on VF3 (MAME, 360 s with play; Supermodel
+attract as a cross-check), Daytona 2 and Bass Fishing (Supermodel attract, 18,900
+frames each by the R22 method). New Bass Fishing wait loops are in the census README.
+The R22 configurations were re-run inside the new runs and reproduce R22 exactly.
+- **FPSCR is never left at its defaults.** The control byte is 0 (RN = 0, every enable
+  off, NI off) at every FP op and after every write, in every title. MSR FE0 = FE1 = 0
+  throughout, and no FP op ran with MSR[FP] = 0. mtfsfi, mtfsb0 and mtfsb1 never run.
+  - Daytona 2's 583k `mtfsf FF` come from a double maths library that saves FPSCR with
+    mffs, writes 0 and then restores it; it never tests a bit of the saved value.
+  - So the exception-enabled paths in R29 are correct but unexercised. Bit 20 and the
+    NI choice cannot change these games.
+- **FPRF must be exact.** `mcrfs` reads only fields 3 and 4, in sequences such as
+  `frsp; mcrfs cr7,cr4; mcrfs cr6,cr3; bt` or `fadds; mcrfs cr0,cr4; beq`. That is a
+  zero, sign, NaN or class test through FPCC and the C bit:
+  - Daytona 2: up to 5,128 a frame;
+  - VF3: 8.4M in 360 s;
+  - Bass Fishing: 18.0M in its run.
+
+  Each `mcrfs` depends on the FP op just before it, so the core must interlock it on
+  that op's FPSCR update.
+- **Special values.**
+  - SNaN: none in any title.
+  - QNaN inputs: Daytona 2 has many (median 88, p99 101 a frame); VF3 has few (p99 6).
+  - Infinity results: from x/0 and frsqrte(0).
+  - Inputs below single normal range: tens of thousands (VF3 fmuls 20,741, fmadds
+    6,616, fadds 2,355). Double denormals: none in VF3.
+  - fctiw: always RN; VF3 has 746k exact .5 ties, so round-half-even matters, and
+    5,374 out of range.
+- **Single ops with double operands: 98–100% are an emulator artefact.** Their non-single
+  operands come almost entirely from frsqrte and fres, which both emulators compute
+  exactly in double. On the 603e both are estimates.
+  - True double-to-single cases are about 5 a frame in VF3 and 24 in Daytona 2.
+  - Rounding the double result to single, against R29's rounding once from the exact
+    operands: at most 9 differences in about 2G ops (VF3 fmadds and fmsubs), and 0 in
+    the other titles.
+  - So R12's point (single-only arithmetic would change results) still holds for the
+    double Newton step. Most of VF3's frsqrte results, though, feed single fmuls (91%).
+- **The emulators' double fmadd family is unfused.** It differs from the manual's fused
+  result on 2–13% of results:
+  - Daytona 2 fnmsub: 9.1% of 26.1M;
+  - Daytona 2 fmsub: 12.9%;
+  - Bass Fishing fnmsub: 6.0%.
+
+  Under D-17 the manual wins and R29's FMA is fused, so these results will differ from
+  Supermodel. That is a known difference, not a fault. MAME's fnmsubs gives the wrong
+  zero sign (it computes b − a·c) 1.66M times in VF3.
+- **CPI sweep.** The baseline is the D-15 configuration (16 KiB 4-way caches, store
+  buffer, early restart). A fully pipelined FMA costs about 0.07 CPI per cycle of
+  latency, and serialising on FPSCR costs at most 0.02. **frsqrte is what costs.**
+
+  | Configuration | VF3 at 100 MHz: CPI / heaviest frame | VF3 at 120 MHz | Daytona 2 at 100 MHz |
+  |---|---|---|---|
+  | No FP latency (base) | 1.51 / 96% | 1.56 / 82% | 1.78 / 85% |
+  | FMA L = 4, radix-2 divide, frsqrte 115 cycles | 1.91 / 139% | 1.95 / 118% | 2.06 / 98% |
+  | FMA L = 7, radix-4 divide, frsqrte iterative | 1.94 / 140% | 1.98 / 118% | 2.10 / 100% |
+  | FMA L = 4, frsqrte and fres a pipelined table | 1.57 / 101% | 1.61 / 86% | 1.82 / 87% |
+  | FMA L = 6, frsqrte and fres a pipelined table | 1.71 / 115% | 1.76 / 98% | 1.95 / 94% |
+  | Fully blocking, L = 6, radix 2 | 2.50 / 193%, 19.6% of frames over | 2.54 / 163% | 2.46 / 118% |
+
+  - VF3's heaviest frames run about 5,900 frsqrte, so each frsqrte cycle is worth about
+    0.34% of a 100 MHz frame.
+  - Bass Fishing's p99 frame is 30–43% of budget. Its 4–9 frames over budget execute
+    Supermodel's whole frame without reaching a wait loop, so the FPU does not decide
+    them.
+
+- **The FPU as built (R29) costs more than the sweep's range suggested.** A second pass
+  ran the measured unit: L = 12 FMA, and on one divider fdiv 38, fdivs 24, fres 24 and
+  frsqrte 97 cycles. Each cell is CPI / median / p99 / heaviest frame / % of frames over
+  budget:
+
+  | | VF3 at 100 MHz | VF3 at 120 MHz | Daytona 2 at 120 MHz | Bass Fishing at 120 MHz |
+  |---|---|---|---|---|
+  | Built: L = 12, frsqrte 97 | 2.43 / 84 / 113 / 190 / 14.8% | 2.47 / 71 / 96 / 160 / 0.19% | 2.61 / 74 / 90 / 103 / 0.05% | 2.40 / 9 / 35 / 91 / 0 |
+  | L = 8, frsqrte 97 | 2.13 / 72 / 97 / 160 / 0.28% | 2.18 / 62 / 82 / 136 / 0.06% | 2.34 / 66 / 81 / 93 / 0 | 2.20 / 8 / 32 / 88 / 0 |
+  | L = 12, frsqrte 24 | 2.21 / 76 / 100 / 165 / 0.98% | 2.25 / 65 / 85 / 139 / 0.07% | 2.45 / 70 / 85 / 98 / 0 | 2.19 / 8 / 32 / 89 / 0 |
+
+  - Each FMA cycle is worth about 0.08 CPI here, against 0.07 below L = 7.
+  - A 24-cycle frsqrte is worth about as much as cutting L from 12 to 8.
+  - At 120 MHz the built FPU leaves VF3 at p99 96%. About 36 frames go over, peaking at
+    160%: those are the frames with up to 5,900 frsqrte.
+  - Daytona 2 only just fits at 120 MHz.
+  - The census does not see operand values, so the 8-cycle special-operand early-outs
+    are not modelled; that makes these figures slightly pessimistic.
+  - Still to measure: whether the real 603e at 66 MHz also runs over on those VF3 frames,
+    and single and double ops at different latencies.
+- **Open, for my decision:** frsqrte (and fres) as 603e-style pipelined estimates, or
+  exact as Supermodel does.
+  - The 603e's estimate tables are not public; the manual gives only the precision. A
+    table estimate therefore matches neither silicon nor Supermodel bit for bit.
+  - The exact form matches Supermodel, but blocks for about 100 cycles and puts VF3's
+    heaviest frames 18–40% over budget.
+- Two fixes in the census tools:
+  - the CPI model's line loop wrapped at the top of the address space and hung, now
+    fixed; earlier results are unaffected;
+  - Daytona 2 is not fully deterministic between runs (0.0005% of busy instructions).
+
+  Established with `M3FP` and `M3CPI_FPU` in `tools/mame-census/`, outputs in
+  `sm3-builds/census/`.
+
+**R31 — 603e MMU and interrupts: translated hits cost no cycles, for 1,660 ALM.** Built
+from the 603e manual (Rev 3) and the PEM:
+- the BATs and segment registers;
+- 64-entry two-way ITLB and DTLB, reloaded by software;
+- the three TLB-miss exceptions, with their SRR1 and miss-SPR contents;
+- the TGPR shadow;
+- DSI and ISI;
+- the decrementer;
+- the external interrupt as a level input.
+
+The reference model was built first, then the RTL.
+- **Data side.** The DBATs and a 4-entry micro-TLB of allowed translations translate in
+  EX, so a hit costs 0 cycles. The micro-TLB tag is compared against x + y without the
+  adder, by a carry-free A + B = K test. A micro-TLB miss replays from MEM: a two-cycle
+  lookup, then a refetch from the uop that replayed, about 6 cycles.
+- **Fetch side.** Real mode, the IBATs and a 2-entry micro-TLB translate beside the
+  request. A miss is retried after a two-cycle ITLB lookup, about 4 cycles.
+- **Other costs.** MMU writes with translation on take about 4 cycles to refetch, and
+  isync about 3 (it was a no-op). Real mode costs nothing: the pre-MMU RTL gives
+  identical cycle counts on the board program.
+- **Fit.** The standalone spike runs 121.7 / 122.3 / 120.7 MHz over three seeds at
+  8.333 ns. It uses 4,640–4,651 ALM (+1,660, +56%), 3,270 registers, 17,136 MLAB bits,
+  0 M10K and 3 DSP.
+  - It took eleven fit revisions. With the TLB compared in EX the core ran at 79 MHz.
+  - From revision 5 the limit was the integer core's own forwarding paths, pushed out
+    by placement in a bigger design. Each was fixed and checked on the bench:
+    - the stmw register index taken from a counter;
+    - a CR compare merge without the field decode;
+    - registered step-zero and last-uop flags;
+    - the multiply and divide result as a flat AND-OR;
+    - mcrf of a forwarded CR0 resolved in MEM.
+  - The registered-input variant runs 117–119 MHz, limited by those integer paths and
+    not by predecode. So R28's predecode path is placement-sensitive, not structural.
+- **Verification.** 34,000 seeds pass, 123.5M instructions at wait states 1–9, over four
+  kinds of program:
+  - integer;
+  - translated, with random layouts and the manual's own TLB-miss handlers;
+  - translated with interrupts;
+  - real mode with interrupts.
+
+  All 36 GPRs are compared at every retirement and memory at the end. The ordered stream
+  of data accesses on both sides is compared too, which catches an access that should
+  never have reached memory.
+  - 46 planted faults caught. One more is caught only at 12,000 seeds.
+  - One planted fault (a divide started during a replay hold) is missed in 2,000 seeds.
+    The bench had found that same bug itself in an earlier revision.
+  - Five real RTL bugs were found and fixed during the work.
+- **Manual ambiguities and the choices made:**
+  - **SRR1[15] = 1 means a store.** Tables 4-5 and 4-17 and the example handler say so;
+    tables 5-4 and 5-10 say the opposite. MAME follows 5-4.
+  - **DMISS, IMISS, DCMP and ICMP are read/write.** Section 2.1.2 says so; chapters 1
+    and 5 say read-only.
+  - **SRR1[WAY] uses replacement order** (the way not loaded most recently), not use
+    order. Use order would depend on speculative fetches.
+  - **A store hitting a C = 0 entry** reports the way that hit, so the manual's handler
+    does not load a second copy of the page.
+  - **A double TLB hit takes way 0.**
+  - **Interrupts are taken before the instruction in EX.** This is legal under PEM
+    6.1.2.4.2; the 603e lets that instruction complete first.
+  - **The manual's example miss handlers need four corrections:**
+    - SPRs 976–982, not 1010–1015;
+    - srwi, not srw;
+    - the ISI path's TGPR mask 0x0002, not 0x8000;
+    - bdnzf tested on CR0[EQ].
+- **The emulators.**
+  - Supermodel has no MMU: tlbld halts it, and VF3 runs anyway. That suggests VF3's
+    translations are identity wherever they matter. This is inferred, not checked on
+    the cabinet.
+  - MAME differs from the manual in eight ways: SRR1[15], WAY and KEY never set, a random
+    tlbld way, miss SPRs read-only, no PP check on a TLB hit, no DAR on a BAT DSI,
+    BRPN masked instead of ORed, and an N = 1 fetch reported as SRR1[4]. The ~7 tlbld
+    a frame in MAME's census come from MAME's own TLB model.
+- **Board test program changed.** With translation built, random mtmsr and rfi could
+  turn on IR, DR or TGPR and run the program through random BATs. The generator now
+  clears IR, DR, TGPR, POW, RI and LE in what it writes to MSR. The new expected values
+  are 4,728 cycles, 1,539 instructions and signature 1284CEB8.
+- **Still to do:** privilege checks, MSR[LE], misaligned accesses and the alignment
+  exception, translation for the cache-block instructions, trace, IABR, SMI, machine
+  check, and a measure of how many of VF3's data accesses fall outside its DBATs.
+
+**R32 — The MMU core on the board: 1,395 of 1,395 reports identical; the data request is a
+late signal.** The first full MiSTer build of the R31 core at 100 MHz missed by 0.322 ns
+(96.9 MHz, 11,992 ALM). All 89 failing paths ran from the EX operand registers through
+the address add and translation into the test RAM's M10K write enables. That is the
+data-side counterpart of R28, and the standalone spike cannot see it for the same
+reason: its memory ports are virtual pins.
+
+With the test system's writes posted, the same RTL closes at 100 MHz with +0.990 ns
+(111.0 MHz, 12,011 ALM, 123 M10K, 36 DSP; RBF md5 2222bab2…). Posted means each write
+is registered and lands a cycle later, and a read of that word in the same cycle takes
+the posted bytes. On the board it gave 1,395 reports in 20 s, all identical to the
+simulation: 4,728 cycles, 1,539 instructions, signature 1284CEB8.
+
+For the cache: d_req, d_we and d_addr leave the core straight from EX translation. The
+data cache must therefore write its data and tag RAMs from a registered request, after
+the tag check, never from EX. Its index can still come from EX, because a 4 KiB way
+needs only untranslated address bits.
+
+**R33 — FPU timing follow-up: L = 12 is at the edge of 120 MHz, now 3,332 ALM.** Six more
+fits (fit18–fit23) went after the R29 misses. The best, fit19, is kept as the RTL:
+**+0.141 / −0.406 / +0.058 ns** (seeds 1 / 2 / 3, 8.333 ns) at **3,332 ALM** (−149).
+- **Changes kept:**
+  - The S | stopper OR is gone: the cap now comes from s_den with a stopper bit at S4, so
+    the count gives min(lz, s_den) directly.
+  - The coarse alignment's guard, round and sticky are split out at S2.
+  - The S6 normalise-to-lsb path is cut, the lfs/stfs unit is pipelined, and the small
+    unit compares in halves.
+- **What still fails** is S1 on seed 2: the denormal pre-normalise shift into the DSP
+  input register, which Quartus retimed. The same path passes on seeds 1 and 3, so
+  what is left is placement noise of about ±0.5 ns, not a long stage.
+- **Wrong turns, each measured and reverted:**
+  - **One subtract order with a one's-complement fix-up.** Estimated at −200 ALM,
+    measured −22 ALM, and S5 got 1.06 ns worse. The estimate left out the 162-bit XOR,
+    the increment chain and the count correction.
+  - **The divider's classification moved into CHK:** −1.25 ns.
+  - **Exponent-zero gating of the operand counts:** −1.18 ns. The A, B and C operand
+    registers fan out to all three units at once.
+- **Checks on the final RTL:**
+  - 16.8M random checks over four seeds plus 133,632 directed cases per seed, all with
+    0 failures;
+  - all six planted faults caught;
+  - the map counts match fit19 exactly.
+
+  The divider cycle counts are unchanged from R29.
+- **Untried, for the core:** give the FMA, the divider and the small unit their own
+  copies of the operand registers at the core boundary, and pin the S1 register with
+  `preserve`.
+
+**R34 — Against a modelled 66 MHz 603e, only frsqrte's latency makes the core drop frames
+the cabinet would not.** Run on the same 18,900-frame runs as R30.
+- **The reference model.** A real 603e at 66 MHz:
+  - FPU: singles and double adds 1-1-1, double multiplies 2-1-1;
+  - divides: fdivs and fres 18 cycles, fdiv 33, all blocking;
+  - frsqrte: 3 cycles, pipelined;
+  - caches and store buffer as D-15;
+  - memory either the same in nanoseconds or 1.5× slower;
+  - issue: scalar, or dual-dispatch to different units, which is the closer of the two
+    to the chip.
+
+  It is a model, not a measurement: rename and completion limits are ignored, and the
+  cabinet's memory timing is unknown.
+- **The cabinet misses vblank too.** VF3 runs at CPI 1.30 on the dual model, with
+  6.3% of frames over budget. 664 of its 1,187 over-budget frames never reach the wait
+  loop even in Supermodel, which runs one instruction per cycle. They come in pairs, so
+  the game itself runs below 60 Hz there.
+- **The core's heaviest frames are the cabinet's too.** VF3's 35 heaviest frames at
+  120 MHz with the built FPU (R29: L = 12, frsqrte 97) are each isolated, and sit at
+  scene cuts: 15 open a scene, 14 close one and 6 are mid-scene peaks. The attract loop
+  repeats every 14,840 frames, and seven of them recur exactly. 25 of the 35 are also
+  over budget on the dual model, peaking at 123% against the core's 160%.
+- **The measure that matters** for lag-free running: frames the core misses while the
+  modelled cabinet makes them (dual model, normal memory / slow memory):
+
+  | Core at 120 MHz | VF3 | Daytona 2 | Bass Fishing |
+  |---|---|---|---|
+  | Built: unified L = 12, frsqrte 97 | 10 / 2 | 9 / 9 | 0 |
+  | Unified L = 12, frsqrte 24 | 0 / 0 | 0 / 0 | 0 |
+  | Unified L = 8, frsqrte 97 | 0 / 0 | 0 / 0 | 0 |
+  | Single and double at separate latencies (18 options: single 4–8, double 12 pipelined or 16 blocking, frsqrte 97 / 24 / pipelined estimate) | 0 in 17, 2 / 0 in one (single 8, double blocking, frsqrte 97) | 0 | 0 |
+
+  Daytona 2's real CPU is a 166 MHz Step 2.1 part, so its true bar is stricter: no frame
+  over budget at all. The core with frsqrte 24 has none: heaviest frame 98%.
+- **Conclusion:** the unified L = 12 FMA (R29) is good enough once frsqrte comes down
+  to about 24 cycles. Going back to D-15's single-fast design would save CPI (VF3 1.66
+  at single latency 4 with a pipelined frsqrte, against 2.25), but drops no fewer
+  frames. **frsqrte is the decision:**
+  - **Supermodel's exact form** cannot reach 24 cycles: a square root and a reciprocal,
+    each rounded to double.
+  - **A shorter estimate meets the manual's precision.** The 603e's own estimate is a
+    3-cycle table result that the manual specifies only to within 1/32.
+- **The model is generous to scene changes.** The hottest code outside the wait loops
+  is a byte-swapped store copy (`stwbrx` at 0x209C4 and 0x32720), probably an upload to
+  the Real3D, which the model counts as 2-cycle posted stores. The real cost depends on
+  the bridge and the Real3D's write acceptance.
+
+**R35 — M2 groundwork: an FP32 geometry model matches MAME's triangles bit for bit; R13's
+two multipliers do not cover it.** The golden triangle lists come from Supermodel dumps of
+the Real3D memories, taken every 30th attract frame and replayed through an instrumented
+MAME renderer (`tools/mame-census/mame0289-real3d-tris.patch`): 400 VF3 frames and 400
+Bass Fishing frames. Each records every triangle as the rasteriser receives it, plus the
+viewport, model and pre-clip polygon records.
+
+A C++ model in `sim/real3d/` walks, decodes, transforms, lights, clips and projects in
+FP32, in MAME's operation order and with no fused multiply-add.
+- **It matches every field on every triangle:** about 21M triangle vertices and 27M
+  pre-clip vertices, with or without subnormal flushing. MAME builds as plain
+  single-precision steps, so an FP32 datapath in its order reproduces it exactly. That
+  makes M2's exit test a bit-exact diff, not a tolerance.
+- **One set-up stage is not exact by construction.** MAME's frustum set-up, once per
+  viewport, takes tanf of atan2/2. Exactness needs a correctly rounded set-up unit,
+  about 800 ALM against about 250 for y / (√(x² + y²) + x). The cheaper form keeps
+  screen x and y within 0.053 px on every VF3 vertex, but no frame is then bit-exact.
+  **Open:** bit-exact or 1/16 px. MAME's formula is MAME's construction, not documented
+  silicon.
+- **MAME reads an uninitialised vertex slot** in 308 VF3 polygons (0.006%), which
+  changes the triangle count in 16 of 400 frames. The model keeps vertex slots across
+  models, as Supermodel does, and the diff excludes those polygons. So "frame for frame
+  against MAME" needs that exclusion in M2's exit test.
+- **Measured load per frame, p99 (VF3 / Bass Fishing):**
+
+  | | VF3 | Bass Fishing |
+  |---|---|---|
+  | Polygons | 16,612 | 23,916 |
+  | New vertices | 46,278 | 46,404 |
+  | Triangles | 15,494 | 16,589 |
+  | Matrix stack depth (maximum) | 8 | 11 |
+
+  Viewport chains reach 28 in VF3, and pointer lists nest at most 1 deep. No subnormals
+  reach the geometry, so flush-to-zero FP units serve.
+- **Correction to R13.** Its "two multipliers at 50 MHz" was already at 100% use, and
+  the adders bind as hard as the multipliers. Share of a 50 MHz frame at p99, counting
+  operations only:
+
+  | Multipliers + adders | VF3 | Bass Fishing |
+  |---|---|---|
+  | 2 + 2 | 81% | 88% |
+  | 3 + 3 | 59% | 63% |
+  | 4 + 4 | 47% | 54%, limited by memory fetch |
+
+  The plan is 4 + 4, because Model 2's pool runs at 65–70% occupancy and Daytona 2 is
+  heavier.
+
+  Per new vertex the cost is 12 + 9 + 5 multiplies. Each projected vertex adds 1
+  reciprocal and 8 multiplies, and a node with a matrix costs 36. The reciprocal is
+  correctly rounded: it matches `1.0f/x` on every mantissa.
+- **Correction to §8.3 risk 2 and open question 4.** Polygons average 72 B in VF3 and
+  60 B in Bass Fishing. At p99 VF3 reads 29 MB/s of polygon RAM and 43 MB/s of VROM,
+  but Bass Fishing reads **80 MB/s of VROM**, twice the 40 MB/s carried for VF3.
+  - MAME's walk culls no nodes: 59–68% of polygons reach the clipper, and most are
+    rejected whole.
+  - Supermodel-style node culling would roughly halve the fetch and the arithmetic, but
+    it changes what is drawn relative to MAME. It is one of five rows in the
+    MAME/Supermodel difference list (`sim/real3d/m2-notes.md`) that change the image:
+    node culling, LOD, colour table, transparency width and light vector.
+- **Area estimate for the geometry:** 6,200–7,650 ALM, 6–9 M10K and 9–10 DSP (4
+  multipliers, 5–6 for the reciprocal). That is inside §8.1's 6,000–8,000 row.
+- **First RTL: the display-list walker,** `rtl/real3d/r3d_walker.sv`.
+  - It matches the model's event trace on all 800 frames (2.56M events) at memory
+    latency 1, 8 and 20 cycles, with 0–50% consumer stalls.
+  - It takes 7.1% (VF3) and 10.1% (Bass Fishing) of a 50 MHz frame at p99.
+  - Standalone fit at 50 MHz, three seeds: 741–744 ALM, 0 M10K, 0 DSP, 98.7–106.7 MHz.
+  - Quartus 17 left its two tables in registers (2,000–3,080 ALM) while a word was read
+    in the cycle it was written. Allowing that put them in MLAB.
+- **Wrong turn.** From the viewport words I believed MAME drew VF3 2.08× magnified,
+  since MAME halves the plane angle while Supermodel's words 8–11 give tan 22.5°.
+  Deterministic Supermodel frame grabs refuted it: they show MAME's scale. The factor in
+  Supermodel that compensates is not yet found.
+
+**R36 — The 603e caches: 120 MHz on every seed, 36 M10K, but a load hit takes 2 cycles.**
+Standalone instruction and data caches to D-15, in `rtl/cpu/ppc_icache.sv` and
+`rtl/cpu/ppc_dcache.sv`: 16 KiB, 4-way, 32-byte lines, tree PLRU, data write-back with
+a store buffer, critical word first with early restart, and the 603e cache operations
+and HID0 bits.
+- **Fit:** 121.7 / 126.0 / 126.7 MHz over three seeds.
+  - D-cache: 712–717 ALM, 18 M10K.
+  - I-cache: 440–444 ALM, 18 M10K.
+  - Each cache's M10K are 16 blocks of data (4 ways × 4 byte lanes) and 2 of tags.
+  - There are no valid bits: an invalid line carries a reserved tag in Model 3's I/O
+    page, which is always uncached. That keeps four 20-bit tags in two blocks.
+- **R28 and R32 hold inside the caches too.** The tag M10K's output arrives about 2.3 ns
+  into the cycle, so:
+  - **a load hit takes 2 cycles**, request to data, and the core's MEM stage holds one
+    cycle per load as it does on the test RAM;
+  - misses and cache operations are decided a cycle after the compare, from registers.
+
+  Four fits took the caches from 92.7 MHz to 121.7 MHz.
+- **Measured cycles:**
+  - I-cache, sequential hits with the core's `i_seq` hint: 1.00 a fetch. A redirect
+    costs 2 cycles; a new line 2, or 4 when way prediction misses.
+  - D-cache: stores are posted, 1 a cycle; a store then a load of the same word takes 3.
+  - Misses get their first word at L + 3 (I) and L + 4 (D), where L is the controller's
+    latency after acknowledge (12–15 cycles).
+  - The D-cache does not block during a fill: only the set being filled waits. That
+    follows R22's model, not the 603e (3.2.2).
+
+  **R22 assumed a 1-cycle load hit, so the CPI effect is being measured before the core
+  is wired to the caches.**
+- **Verification:** 116 runs with no failures, 12.0M data operations and 12.4M fetches,
+  checked against a reference of the exact cache state at memory latencies 1–80. 36 of
+  38 planted faults were caught:
+  - one missed fault is masked by design: a set stays blocked until its write-back
+    issues;
+  - the other affects performance only.
+- **Choices where the manual is open:**
+  - **Replacement is tree PLRU,** following table 2-2. Chapter 3 says "strictly LRU".
+  - **dcbt fills the cache.** The 603e uses a one-block touch buffer instead (3.2.4).
+  - **A write-through store to a modified line** keeps the line modified.
+  - **An inhibited access to a resident line** bypasses the cache and leaves the line
+    untouched (3.6.4.1, "boundedly undefined").
+  - **The fill order is in 32-bit words.** Figure 3-3 orders double words.
+- **The core changes needed for integration:**
+  - WIMG per access: the data and fetch micro-TLBs keep none today.
+  - Load lanes in `d_be`.
+  - Cache operations issued as data requests.
+  - HID0's cache bits as flip-flops.
+  - sync waiting on `d_idle`.
+  - The `i_seq` hint.
+
+**R37 — The FPU inside the core: correct, but the spike falls to 105–115 MHz.** R29's FPU
+is wired into `ppc_core`, and the reference model now executes every 603e FP instruction
+through R29's MPFR-checked model. What was added:
+- FPRs in MLAB, three copies of 32 × 64 bits;
+- a pending-write scoreboard;
+- FPSCR updates in program order;
+- lfd and stfd as two word uops, high word first;
+- the FP-unavailable exception (0x800);
+- precise FP program exceptions;
+- CR1 for Rc = 1.
+
+**Checks:**
+- 9,000 seeds, 30.1M instructions compared, 0 failures, at L = 12 over wait states 1–9
+  and at L = 3, 8 and 11. That covers 1.22M FP ops, 583k FP loads, 338k FP stores and
+  46,587 FP-unavailable exceptions.
+- 35 of 35 planted faults caught, across the scoreboard, FPSCR order, load/store beats,
+  FP unavailable, CR1, serialisation, the write port and exceptions.
+- The bench found five bugs in the new RTL, all fixed.
+
+**Findings:**
+- **The divider can overtake *older* multiply-add ops,** not only later ones as R29's
+  interface says. The hand-over takes the first free S4b slot, so a short special-operand
+  divide jumped ahead of an older fctiw and FI came out wrong.
+  - Fix: a divide starts only once every older FMA op is past S4b, and no FMA op issues
+    between a divide's start and its hand-over. This is the 603e's own rule for fdiv,
+    fdivs and fres (6.4.3).
+  - The divider also starts a cycle after its uop leaves EX, costing one cycle per divide:
+    EX's late leave decision was driving the operand enables.
+- **FE ≠ 00 is precise mode,** which the 603e manual allows (4.1, 4.5.7.1, table 4-7).
+  - mtfsf, mtfsfi and mtfsb1 setting FEX also trap. This follows PEM 6.4.7 and the class
+    C ordering of table 6-4; PEM 3.3.6's "only computational instructions" conflicts.
+  - fsqrt, fsqrts and unassigned 59/63 encodings are illegal whatever MSR[FP] is.
+  - lfd/stfd crossing a page while word-aligned is not alignment-faulted (603e 4.5.6.1
+    would); the alignment exception is not built yet.
+- **CPI costs of the implementation:**
+
+  | What | Cost |
+  |---|---|
+  | Compare | 2 EX cycles |
+  | stfs | 2 EX cycles |
+  | FPSCR instructions | +1 cycle |
+  | Divide | +1 cycle |
+  | lfs/lfd load-use | +1 cycle (no forwarding) |
+
+  FPU results forward only while VE = ZE = 0, which is how every game runs (R30).
+- **Fmax.** The standalone spike runs **104.6 / 111.9 / 106.7 MHz** over three seeds,
+  at 9,504 ALM (+4,854), 8,286 registers, 7 DSP and 0 M10K. Without R33's suggested
+  operand copies it runs 106.4 / 115.2 / 108.1 MHz with 357 fewer registers, so the
+  copies are being removed.
+  - The worst paths are the integer core's: x/y forwarding into the operand registers,
+    m.result to m.cr, and the MMU replay. The FPU's area pushed them out by placement,
+    as the MMU's did in R31. The only FP path near the top is the step-1 immediate of a
+    double (`ex_fd0` → `op_y`).
+- **Board program.** The new board program has 160 FP arithmetic ops and 118 FP loads
+  and stores. Its expected values are 4,813 cycles, 1,611 instructions and signature
+  093AF884.
+- **A Quartus 17 trap:** two `import` lines in a module header are rejected; a single
+  `import a::*, b::*;` works.
+
+**R38 — The FPU core on the board: 1,394 of 1,394 reports identical.** This is the R37
+core with the per-unit operand copies removed, built as a full MiSTer build at 100 MHz:
+16,468 ALM, 123 M10K, 40 DSP, RBF md5 179562d0…. The board program has 160 FP
+arithmetic ops and 118 FP loads and stores. The board gave 1,394 reports in 20 s, all
+identical to the simulation: 4,813 cycles, 1,611 instructions, signature 093AF884.
+
+So the FPU's arithmetic, FPSCR and FP load/store paths behave on silicon exactly as in
+simulation, for the RTL's own choices. It does not show that those choices match a
+603e.
+
+The build is **not timing-clean**: it misses by 0.046 ns on one endpoint at the slow
+100 °C corner. The path is R28's again, from the harness `i_data` register through
+predecode into the fetch queue entries. The FP fields the predecoder now adds put it at
+about 10 ns, so it has to come out of the fetch path before 120 MHz. A build that fails
+timing does not count as verified; this run checks function only.
+
+**R39 — frsqrte must be ≤ 36 cycles, and the 2-cycle load hit costs frames.** Both on
+the same 18,900-frame runs as R34, at 120 MHz, with the unified L = 12 FMA.
+- **frsqrte latency.** Frames the core drops while the modelled 603e (ref66_dual)
+  keeps them:
+
+  | frsqrte (cycles) | 24 | 36 | 48 | 60 | 72 | 84 | 97 |
+  |---|---|---|---|---|---|---|---|
+  | VF3 | 0 | 0 | 1 | 7 | 8 | 9 | 10 |
+  | Daytona 2, frames over at all | 0 | 0 | 0 | 3 | 4 | 8 | 9 |
+
+  Bass Fishing drops none at any latency. **36 cycles is the target and 48 the limit.**
+  The frames added at 60 and above are VF3 scene cuts at 100–109% that the 603e makes
+  at 95–100%.
+- **The built caches' costs.** R36's 2-cycle load hit holds MEM a cycle per load
+  (ld2). The I-cache charges 2 cycles per taken branch and 1 per new line (ic). With
+  frsqrte at 24:
+
+  | Option | VF3: CPI / heaviest / dropped where the 603e keeps (normal / slow memory) | Daytona 2: CPI / frames over / dropped where the 603e keeps | Bass Fishing: frames over / dropped |
+  |---|---|---|---|
+  | Model before (ld1) | 2.25 / 139% / 0 / 0 | 2.45 / 0 / 0 | 0 / 0 |
+  | ld2 | 2.44 / 150% / 8 / 1 | 2.66 / 17 / 0 | 0 / 0 |
+  | ld1 + ic | 2.40 / 146% / 9 / 1 | 2.60 / 12 / 0 | 2 / 0 |
+  | ld2 + ic (as built) | 2.59 / 157% / 16 / 7 | 2.81 / 71 / 51 | 19 / 0 |
+
+  With frsqrte at 60 as well, VF3 falls off a cliff: 434 frames over, 398 of them kept
+  by the 603e. Steady attract frames move from 98–99% to 100–104%.
+- **Conclusion.** With unified L = 12, the core as built has no throughput margin.
+  - The load hit must not hold MEM: loads need to pipeline at one per cycle with
+    2-cycle latency, which the core does not do today.
+  - Even then (ld1 + ic) VF3 drops 9 frames the modelled 603e keeps.
+  - The difference must come from FP latency (a single-precision fast path) or from
+    fetch (redirect cost).
+  - A combined table is being measured: {unified L = 12, singles 4 or 6 / doubles 12}
+    × {frsqrte 36, pipelined estimate} × {ld1, ld2}, with the 603e reference also
+    charged its own fetch costs.
+- **Caveat.** The reference is a model, and so is the core's. A margin of a frame or two
+  in either direction is inside their error; tens of frames are not.
+
+**R40 — Timing pass on the FPU core: FP arithmetic out of predecode, spike still
+104–111 MHz.** Four batches (T1–T4). T3 is kept: **104.6 / 111.3 / 111.4 MHz**, at
+9,420–9,444 ALM, 7,945 registers, 7 DSP and 0 M10K. It leaves CPI and the board values
+unchanged.
+- **Out of the fetch predecoder**, for R38's full-build path:
+  - FP arithmetic: opcodes 59 and 63 decode as illegal there, via a parameter. FP
+    loads and stores decode like integer ones.
+  - FP register-use bits come from a shallow decoder fed straight from `i_data`.
+  - FP CR-writer flags are their own predecode bits.
+  - FP-unavailable comes from the ID decoder.
+
+  The predecoder is 140 ALM (156 with the FPU's fields, 129 before the FPU). Only the
+  full build can time this path.
+- **Other changes:**
+  - the HASH1/HASH2 wait taken from one predecode bit;
+  - CR1 updated in place from a registered select;
+  - the FPSCR logic split into two instances, so EX's op is not in front of `fpscr_q`;
+  - `fp_wait` formed from registered next-state bits.
+
+  Setting the pending bit a cycle late (T4) was worse on every seed and was reverted.
+- **Still limiting.** The integer x/y forward into the operand registers leads two of
+  three seeds: from the queue head through the compare and a 49-way select, with
+  1.0–1.5 ns routing hops. A select precomputed a cycle early needs the ID uop's
+  destination a cycle early, which would grow either the decoder ahead of the compare
+  or the fetch predecode. Also near the top:
+  - the MMU's EX translation into `m.rp`;
+  - the FMA's own S1 stage (−0.68 ns).
+- **FP forwarding, measured on random programs:**
+  - **lfd forwarding** is cheap for timing and saves 30 cycles in 4.57M. Real code
+    pays a cycle per directly dependent use, so the random programs understate it.
+  - **lfs forwarding** saves 38 but adds about 6 levels to the forward path.
+
+  Neither is built. The 2-cycle compare costs at most one cycle per fcmpu or fcmpo
+  (≤ 0.06%). It cannot drop to one cycle: compare plus FPSCR update measured 8.66 ns.
+- **Checks:** the bench passes after every batch. 38 of 39 planted faults are caught;
+  the miss is now an equivalent mutant, because the replay address is taken before the
+  write it tested.
+- **Status against D-15.** With MMU and FPU the core no longer reaches 120 MHz: about
+  105–111 MHz standalone, lower in the full build. R39's frame margins were measured
+  at 120 MHz, so at 110 MHz they are worse still. Unified L = 12 at about 110 MHz
+  needs a review of D-15. The next measures:
+  - a combined CPI table, being run;
+  - the full-build Fmax of T3, being built.
+
+**R41 — The fitter folded R28's fetch register back into the M10K.** R40's core
+(T3), built in full at 100 MHz (16,501 ALM, 40 DSP), missed by 0.003 ns: 99.97 MHz.
+The worst path began at `i_data`, the register R28 added between the test ROM and the
+core. But the fitter had packed that register into the M10K's output register, so the
+block's clock-to-out (the RAM's clock arrives about 2.3 ns late) was again in front of
+predecode. The map report shows `i_q` packed into `rom_rtl_0`, with the ROM's output
+unregistered. The core's own path from that register, through predecode and into the
+fetch queue, is about 9.3 ns.
+
+The harness now keeps `i_data` in the fabric: it is marked preserve, and is fed
+through a mux that changes the word only while `i_valid` is low, where the core
+ignores it. So R28's earlier 114.97 MHz was not a clean measure of the core either. A
+register that Quartus can fold into a RAM block does not isolate the RAM's
+clock-to-out. With the harness fixed, the same core closes 100 MHz with +0.628 ns (16,486 ALM,
+123 M10K, 40 DSP, RBF md5 76c9986d…). On the board it gave 1,394 of 1,394 reports
+identical to the simulation (4,813 cycles, 1,611 instructions, 093AF884), so this is
+the first timing-clean board run of the core with MMU and FPU. Its full-design Fmax is 106.7 MHz.
+
+**R42 — Decision grid: at 120 MHz all three titles need singles at 4, a frsqrte of 36
+cycles or a pipelined estimate, and a load hit that does not hold MEM.** Same runs and
+frames as R34, with the built I-cache costs on every option.
+
+The 603e reference was corrected first. R34's dual model charged branches a dispatch
+slot plus 1–2 cycles. The 603e manual (6.4.1.1, branch folding) says branches take no
+dispatch slot and a taken branch's target arrives "in most cases" before any bubble;
+the fetcher reads two words a cycle into a six-entry queue, with no line-crossing cost
+on a hit. `ref66_dual_ic` models that and is the optimistic end; the old model is the
+pessimistic end.
+
+| 603e reference | VF3 CPI / heaviest / frames over | Daytona 2 | Bass Fishing |
+|---|---|---|---|
+| Old dual model | 1.30 / 123% / 1,187 | 1.47 / 108% / 20 | 1.38 / 146% / 26 |
+| Branch folding (`ref66_dual_ic`) | 1.09 / 107% / 335 | 1.27 / 93% / 0 | 1.20 / 122% / 14 |
+
+Core at 120 MHz, frames dropped that the branch-folding 603e keeps (Daytona 2: frames
+over at all):
+
+| Core option | Changes from as built | VF3 CPI / dropped | Daytona 2 CPI / over | Bass Fishing over (603e keeps) |
+|---|---|---|---|---|
+| As built: unified L = 12, frsqrte 97, load holds MEM | 0 | 2.82 / 1,352 | 2.97 / 334 | 18–19 (4–5) |
+| Unified, frsqrte estimate, load pipelined | 2 | 2.37 / 30 | 2.58 / 8 | 0–2 (0) |
+| Singles 4 / doubles 12, frsqrte 97, load pipelined | 2 | 2.10 / 6 | 2.35 / 0 | 0–2 (0) |
+| Singles 4 / doubles 12, frsqrte estimate, load holds | 2 | 2.04 / 3 | 2.38 / 0 | 18–19 (4–5) |
+| **Singles 4 / doubles 12, frsqrte 36, load pipelined** | 3 | **1.91 / 0** | **2.22 / 0** | 0–2 (0) |
+| **Singles 4 / doubles 12, frsqrte estimate, load pipelined** | 3 | **1.84 / 0** (heaviest 99%) | **2.17 / 0** | 0–2 (0) |
+| Singles 6 / doubles 12, frsqrte estimate, load pipelined | 3 | 1.96 / 0 | 2.27 / 0 | 0–2 (0) |
+
+- **The fewest changes that pass all three titles is three:** a single-precision path
+  at latency 4, frsqrte at 36 cycles or as a pipelined estimate, and loads that
+  pipeline. Against the pessimistic reference it is one change fewer.
+- **The core as built fails badly:** 1,356 VF3 frames and 334 Daytona 2 frames over
+  budget.
+- **This is D-15's original FP plan,** fast single-precision pipelined, which R29
+  replaced with one unified double FMA. It is the plan the measurements now support.
+- **Two limits on the table:**
+  - it is measured at 120 MHz, and R40 puts the core at 105–111 MHz;
+  - doubles at 12 pipelined still means a double unit, so the area question is two FMA
+    datapaths or one FMA with a short single path. That is not measured.
+
+**These are study-level decisions, left for review.**
+
+**R43 — The geometry datapath is bit-exact but 2.5× over its area row and 1.8–2× too
+slow at 50 MHz.** Built behind R35's walker, in `rtl/real3d/`:
+- the four lanes, each one multiplier into one adder computing (a·b) + c, where a plain
+  multiply adds −0 and so stays bit-exact;
+- static microcode generated by `sim/real3d/gen_ucode.py`;
+- the Model 2 divider, copied at `47edd9dc00` (THIRD_PARTY.md);
+- the correctly rounded reciprocal;
+- a 64-bit CORDIC unit for the correctly rounded frustum set-up, or a square-root unit
+  for the cheap one.
+
+**Checks:**
+- **Against the C++ model:** every triangle field matches on all 400 VF3 frames (3.61M
+  triangles) and all 400 Bass Fishing frames (1.83M), in all three builds (exact
+  set-up, cheap set-up, culling). Memory latency was random at 12–20 cycles and the
+  output not ready 20% of the time.
+- **Units:** the reciprocal matches `1.0f/x` on 76.8M inputs, and the CORDIC its model
+  and libm on 958,556.
+- **Planted faults:** 13 of 13 caught.
+
+**Measured against the budget:**
+
+| | Measured | Budget |
+|---|---|---|
+| Area | about 19.9K ALM, 0–1 M10K, 9 DSP | §8.1: 6,000–8,000 ALM |
+| Cycles at p99, VF3 | 1.54M (177% of a 50 MHz frame) | 100% |
+| Cycles at p99, Bass Fishing | 1.76M (202%) | 100% |
+| Cycles with culling, VF3 / Bass Fishing | 1.38M (159%) / 1.23M (141%) | 100% |
+
+- **Where the area goes:**
+  - controller: 9.1K ALM, about 11K registers in buffers;
+  - lanes: 5.9K, including 393 ALM per multiplier that keeps subnormals, against 144
+    for my Model 1 flush-to-zero unit;
+  - CORDIC: 2.2K;
+  - the standalone top's virtual pins: about 1.2K.
+- **Fmax:** 63.6–73.3 MHz with the 50 MHz constraint, which closes. With the 100 MHz
+  constraint it reaches 74.4–80.3 MHz and fails.
+- **Speed.** The engine waits on its own kernels' latency 42–47% of the time. It is
+  latency-bound, not operation-bound.
+- **Culling** cuts VROM reads by 41% (VF3) and 48% (Bass Fishing), and loses 0.06%
+  and 0.01% of MAME's triangles.
+- **Memory per frame at p99:**
+  - VF3: 31.7 MB/s of polygon RAM and 49.9 MB/s of VROM;
+  - Bass Fishing: 93.6 MB/s of VROM.
+
+  These include 10–15% of prefetch past each model's end.
+- **R35's wrong turn explained.** MAME stores the projection's −1 and −2fn/(f−n)
+  transposed, for its row-vector maths. That makes clip w about 2× depth, and halving
+  the frustum half-angle cancels it.
+- **No subnormal reaches the geometry in 800 frames,** so flush-to-zero units would
+  give the same results on this data.
+
+**The fixes are §8.4's techniques:**
+- buffers into MLAB or M10K, read a word at a time;
+- flush-to-zero FP units;
+- one shared adder in the CORDIC;
+- interleaving two chunks' transform and lighting to hide the 10-cycle chain latency;
+- overlapping clip, assembly and projection with the kernels.
+
+With the CPU at about 10K ALM (R40) and the rest of the design at 29K–37K (§8.1),
+this geometry does not fit as built. Cutting it back to its row is now on the critical
+path for fitting the core.
+
+**R44 — Pipelined loads and the caches connected: the core runs a load a cycle, at a cost
+of 3–6 MHz.**
+- **Loads pipeline.** A load hit occupies MEM for one cycle, its data arrives two
+  cycles after the request, and loads and stores can issue back to back. The data port
+  allows up to three requests in flight: the uops in MEM and in WB, plus the one in
+  the current cycle. `d_rdy` comes from a register, and answers come in order.
+  - **Load-use distance is 3, not R42's 2.** A directly dependent instruction waits two
+    bubbles, because EX starts only from registers.
+  - GPR writes moved back from MEM exit to WB exit, undoing R27's change, behind a 4:1
+    forward with a select formed from registers.
+  - sc, rfi, mtmsr, isync, traps and EX-taken exceptions now wait for MEM and WB to
+    empty. Otherwise a handler read a stale SRR0, SRR1 or MSR (PEM 6.1.2.4.2 allows the
+    delay).
+  - On the board program: 4,813 → 4,715 cycles (−2.0%). On the bench at data latency 2:
+    −6.5%; at latency 1: +0.7%, because the consumer now waits for WB.
+- **The D-cache accepts a request every cycle on hits:** 64 loads at 1.00 cycle each,
+  and store-then-load pairs at 2.00. Its spike runs 124.2 / 128.1 / 130.9 MHz at
+  776–782 ALM and 18 M10K.
+- **R36's core changes are all in:**
+  - WIMG per access from the BATs and micro-TLBs, with real mode as 0011;
+  - load lanes in `d_be`;
+  - dcbz, dcbst, dcbf, dcbi, dcbt and dcbtst as data requests;
+  - icbi from MEM with EA[20–26];
+  - HID0's cache bits as flip-flops;
+  - sync waiting for every answer and `d_idle`;
+  - `i_seq`;
+  - the dcbz alignment exception on W or I pages;
+  - dcbi privilege.
+
+  `rtl/cpu/ppc_cpu.sv` puts the core and both caches behind the caches' memory port.
+  The board harness gains `CACHED = 1`, with its ROM and RAM behind that port at a
+  4-cycle latency.
+- **Fit.** The CPU spike runs **101.6 / 105.0 / 105.4 MHz**, against R40's
+  104.6 / 111.3 / 111.4, at 9,662–9,686 ALM and 7 DSP. The new leading paths are:
+  - WB's wait and forward select into EX's operand capture (−1.0 to −1.5 ns);
+  - EX translation's WIMG into the dcbz alignment term (−1.37 ns).
+
+  R40's queue-head → `op_y` path remains.
+- **Verification:**
+  - **Core bench:** 3,000 seeds at wait states 1–9, 1,000 with 25% back-pressure and
+    1,000 at data latency 2; 16.6M instructions in all.
+  - **CPU subsystem bench:** 940 seeds at memory latency 1–80 (3.1M instructions). Every
+    retirement is checked against the ISS; final memory is not compared, because dirty
+    lines stay in the D-cache.
+  - **Planted faults: 16 of 19 caught.** The misses:
+    - icbi of the wrong set: there is no self-modifying code in the programs;
+    - sync drain removed: equivalent in an in-order, single-master system;
+    - replay kill not gated by WB's wait: probably equivalent.
+- **Bugs found:**
+  - **An early WB forward.** A consumer could enter EX before WB's load word had
+    arrived. The old bench hid it by showing the next answer's word before `d_valid`;
+    the bench now shows junk outside `d_valid`.
+  - The stale SRR1 after sc.
+  - A D-cache write-port conflict between a store hit and dcbz.
+- **Choices where the manual is open:**
+  - dcbt is a no-op in real mode, because the page is guarded (3.5, 3.7.2);
+  - DSISR[22–26] for a dcbz alignment fault comes from instruction bits 6–10;
+  - dcbi is translated and protected as a store; dcbst and dcbf as loads;
+  - ICFI and DCFI always read 0.
+- **New board values:**
+
+  | Harness | Cycles | Instructions | Signature |
+  |---|---|---|---|
+  | No cache | 4,697 | 1,632 | EA97AAFC |
+  | Cached, 4-cycle memory | 11,313 | 1,632 | EA97AAFC |
+
+  The board program now enables both caches first and contains cache operations.
+
+**R45 — The CPU with its caches on the board: identical to the simulation, at 90 MHz.**
+Both of R44's forms missed 100 MHz in the full build:
+- **no cache:** 95.5 MHz (−0.467 ns). The worst path ran into the debug monitor's
+  signature register, from WB's load alignment, so it is the harness's trace port.
+- **CACHED = 1:** 94.1 MHz (−0.629 ns). The worst path runs from EX's operands,
+  through the address add and translation, into the D-cache's request registers. That
+  one is real.
+
+Rebuilt with the CPU clock at 90 MHz, both close timing. Each was run on the board,
+20 s per form:
+
+| Form | Slack at 90 MHz | Fmax | ALM | M10K | DSP | RBF md5 | Board | Cycles / instructions / signature |
+|---|---|---|---|---|---|---|---|---|
+| No cache | +0.855 ns | 97.5 MHz | 16,822 | 123 | 40 | e9861960… | 1,393 of 1,393 identical | 4,697 / 1,632 / EA97AAFC |
+| Caches, 4-cycle memory | +0.565 ns | 94.8 MHz | 18,299 | 159 | 40 | d1f874fc… | 1,386 of 1,386 identical | 11,313 / 1,632 / EA97AAFC |
+
+The cached program runs on silicon exactly as simulated, every cycle included:
+- both caches enabled through HID0;
+- cache operations;
+- cold misses with critical word first and early restart;
+- write-backs;
+- uncached I/O pages.
+
+In this short program the cycles are mostly cold misses (69% fetch wait). A timing pass
+to bring the full build back above 100 MHz is under way.
+
+**R46 — M3 groundwork: a rasteriser model bit-exact against MAME, and why two pixels a
+clock is not enough.** The references are MAME's rasterised 3D layer and composite, plus
+Supermodel grabs (finished frames, and 3D alone through a new `M3NO2D` mode), for the
+400 VF3 and 400 Bass Fishing frames. They need fresh triangle lists from the same MAME
+run, because MAME's undefined vertex slot (R35) gives different values from run to run.
+For the composite, Supermodel's tile state is saved on the same frames.
+- **MAME against Supermodel.**
+  - The 3D layer reaches PSNR 13.5 dB (VF3) and 10.7 dB (Bass Fishing) at p50; colour
+    where both draw, 8.3–8.6 dB.
+  - Coverage disagrees on 4.47% of pixels. The causes are lighting, fog (Supermodel
+    only), translucency, and MAME z-fighting on coplanar layers.
+  - Tile layers sit 2 px apart in x and y.
+  - Poses match frame for frame, which refutes the earlier note that they differ.
+  - **So M3's "within tolerance of Supermodel" cannot be a PSNR.** It becomes a
+    coverage test against Supermodel plus a bit-exact model test.
+- **The C++ model, MAME form,** is bit-exact on all 800 frames in all eight texel
+  formats. It excludes 347k pixels in 39 VF3 frames whose value depends on texel reads
+  past a sheet's end (undefined in MAME), each tracked by a taint bit.
+- **The RTL form cannot be bit-exact against MAME.** MAME steps each interpolant once
+  per pixel in FP32, and that drift cannot be reproduced at several pixels a clock. The
+  RTL form uses:
+  - 16.16 edges;
+  - FP32 set-up in MAME's order;
+  - planes evaluated exactly in 40-bit block fixed point;
+  - 24-bit Z and a 24-bit reciprocal.
+
+  Against MAME it scores 47.1 dB (VF3) and 37.1 dB (Bass Fishing). Spans differ on
+  0.004–0.007%, Z outcomes on 0.003% (VF3) and 0.15% (Bass Fishing). Its texture
+  coordinates stay within 1/256 texel of the set-up plane on 99.8% of fetches, while
+  MAME's own drift more than 4/256 off it on 36–54%. A fully fixed-point set-up was
+  measured and rejected: shade differs on 27% against 3%.
+- **Correction to §8.3 risk 3 and R13.** At VF3's attract p99 (2.18M Z-tested pixels,
+  11.4× overdraw), share of a 50 MHz frame:
+
+  | Scheme | VF3 p99 | Bass Fishing |
+  |---|---|---|
+  | 2 px/clk | 127% | — |
+  | Z pre-pass | 96% | — |
+  | 4 Z tests and 2 shaded px/clk | 66% | 32% |
+
+  The plan is the last one.
+- **Estimates:**
+  - **M10K:** about 148 with 16-row bands (Z 20, colour double-buffered 40, a 64 KiB
+    texture cache with tags 74, FIFOs 14); 118 with 8-row bands, 208 with 32-row.
+  - **ALM:** 8,000–11,200, against the §8.1 row's 7,500–10,000.
+  - **DSP:** 26–34.
+- **Correction to open question 1, D-6 and §7.3.** Banded Z needs the polygon store off
+  chip, which puts DDR3 at 180–216 MB/s in all against the 100 MB/s assumed. M0-C must
+  measure DDR3 burst bandwidth; otherwise the polygon store moves to the second SDRAM.
+- **First RTL: the rasteriser front,** a slope divider plus the edge walker.
+  - **Exact:** on every span of the 800 frames (40.2M) and on 38.5M synthetic tie spans,
+    with input gaps and output stalls.
+  - **Planted faults:** 8 of 8 caught.
+  - **Fit at 50 MHz:** 60.7–64.8 MHz, 2,512–2,515 ALM, 0 M10K, 0 DSP. The divider is
+    two-thirds of it; sharing its normalisers should save about 1,000 ALUTs.
+- **Undocumented:** MAME reads texels past the end of a sheet, and what the hardware
+  does there is unknown.
+
+**R47 — The Supermodel-form rasteriser model (D-19): fog is Bass Fishing's gap, lighting is
+VF3's, and translucency may cost 140 M10K.** `sim/real3d/r3d_rast_sm.cpp` models New3D's
+behaviour behind 11 switches (colour, decode, sample, alpha, translucency, depth, layer,
+cull, fog, mip, priority). Each was measured against Supermodel's 3D-only grabs over the
+800 frames:
+
+| Form | VF3: PSNR all / p50 frame / coverage disagreeing | Bass Fishing |
+|---|---|---|
+| MAME | 8.58 / 13.50 dB / 4.47% | 10.91 / 10.67 dB / 4.47% |
+| Supermodel, all switches | 8.72 / 14.16 dB / 5.13% | 17.29 / 21.82 dB / 3.13% |
+
+- **Fog decides Bass Fishing.** Fog alone takes its p50 from 10.7 to 21.3 dB.
+- **Translucency and culling** are worth about 1 dB each on Bass Fishing.
+- **Sampling and mipmaps** are worth up to 0.4 dB at p50.
+- **Each other switch** moves p50 by less than 0.4 dB.
+- **VF3's remaining gap is lighting, which belongs to the geometry's vertex output.**
+  Supermodel lights the sand floor white where MAME's light vector leaves it at ambient
+  grey. So D-19's lighting rows (m2-notes rows 18–22) go to the geometry.
+- **Not modelled:** Supermodel's white block-culling flashes, quad interpolation,
+  micro-textures and specular.
+- **Estimated cost of each feature in the RTL:**
+  - fog: about 5 DSP and 160 ALM;
+  - depth on 1/w: about −100 ALM;
+  - culling: one flag bit from the geometry;
+  - mipmaps: small logic, but trilinear doubles texel reads;
+  - **translucency as Supermodel does it,** two layers with their own Z: band memory
+    about 60 → 200 M10K at 16-row bands, or about 100 at 8 rows.
+- **Open, for the board or the cabinet: does translucency dither?** Supermodel's own
+  source names header[6] bit 17 "translucency pattern select". Its composite rule,
+  where both layers present give opaque, is what two screen-door stipple patterns would
+  produce. If the Pro-1000 dithers, translucency needs no extra M10K and matches
+  Supermodel only on average. A close photo of VF3's translucent shadows would decide
+  it.
+- **Set-up sharing.** The rasteriser's triangle set-up is 25 dot operations per
+  textured triangle. On its own unit it costs 1,300–1,600 ALM and 4 DSP. On the
+  geometry's FP pool it costs about 150 ALM and adds 287K cycles at VF3 p99, 33% of a
+  50 MHz frame. Sharing only works if the restructured geometry lands near 40–55% of a
+  frame, so it is decided together with R43's area pass.
+  - Flushing set-up results to zero changes no pixel: 6 subnormals in 546M operations.
+  - 1/w can come from the geometry, which already computes it for projection.
+- **Shared divider.** The per-triangle divisions can share one divider and normaliser.
+  The per-pixel perspective reciprocal cannot, at two pixels a clock, without cutting
+  slopes to 24 bits, which changes coverage.
+
+**R48 — At the clocks the core reaches, a scalar in-order core falls about 10% short of
+the 603e's throughput.** This re-runs R42's grid at 100, 105, 110 and 120 MHz, with the
+built caches' miss latency scaled per clock (L = 10 / 11 / 11 / 12). It adds `ld1b`,
+the load path as built (R44):
+- load-use distance 3;
+- 2 more cycles for a hit outside the predicted way (4.25% of VF3's load hits, 6.29%
+  of Daytona 2's, 3.65% of Bass Fishing's);
+- FP loads holding WB for a cycle.
+- **Against the branch-folding 603e (`ref66_dual_ic`), nothing passes all three titles
+  at 100, 105 or 110 MHz.** At 120 MHz three configurations pass with a 2-cycle load
+  use (`ld1`), and none with the built `ld1b`.
+- **The best configuration, at 100 MHz:** singles at 4, doubles at 12, a pipelined
+  frsqrte estimate and `ld1`.
+  - It delivers about 55 / 47 / 49 M instructions/s on VF3 / Daytona 2 / Bass Fishing,
+    against the 603e model's 61 / 52 / 55 at 66 MHz.
+  - VF3 still loses 602 frames the 603e keeps.
+- **Against the pessimistic 603e model** (branches take a dispatch slot and a cycle),
+  that same configuration passes all three titles at 100 MHz. The real chip lies
+  between the two models.
+- **The built third load-use cycle costs nearly as much as the MEM hold it replaced.**
+  `ld1b` is 0.16–0.22 CPI above `ld1`, and within 0.03 of `ld2`. On VF3 at 110 MHz it
+  turns 5 lost frames into 190.
+
+  | Title | singles 4 + estimate: ld1 → ld1b (ld2) | unified 12 + frsqrte 97: ld1 → ld1b (ld2) |
+  |---|---|---|
+  | VF3, 100 MHz | 1.81 → 1.98 (2.01) | 2.60 → 2.76 (2.79) |
+  | Daytona 2, 100 MHz | 2.11 → 2.31 (2.33) | 2.70 → 2.90 (2.91) |
+  | Bass Fishing, 100 MHz | 2.06 → 2.24 (2.27) | 2.49 → 2.67 (2.70) |
+
+- **The core as built** (unified 12, frsqrte 97, `ld2`) at 100 MHz: VF3 CPI 2.79, with
+  8,331 frames over budget; Daytona 2 CPI 2.91, with 8,887.
+
+**Conclusion.** D-21 and D-22 are necessary but not enough at 100 MHz. The core also
+needs:
+- a load-use distance of 2;
+- either cheaper taken branches, since the 603e folds them and this core pays 2 cycles,
+  or limited dual issue.
+
+Which levers are worth what is being measured.
+
+**R49 — A real-hardware video capture of VF3 as an image reference.** "Virtua Fighter 3
+(Arcade, 1996) Real Arcade Hardware Capture – Full Playthrough",
+https://www.youtube.com/watch?v=WFfIEQcY6aQ. It outranks both emulators for anything it
+shows clearly (oracle order: hardware first).
+
+From a frame of stage 1 (Jacky against Taka-Arashi, 28"93 on the clock):
+- **The fighters' shadows look like a smooth darkening** of the sand: the floor's grain
+  shows through at roughly 35–40% of the floor's brightness, with no checker or dot
+  pattern visible. This leans towards blended translucency over R47's stipple reading.
+  It does not settle it: the video is scaled about 3.7× from 496 × 384 and
+  H.264-compressed, which can average a one-pixel stipple into a flat tone.
+- **The sand floor is a lit mid tan.** R47 has Supermodel lighting a VF3 sand floor
+  white and MAME leaving it ambient grey. Which is nearer the hardware needs this stage
+  rendered by each emulator. Lighting gets checked against this video, not against
+  either emulator alone.
+
+A frame-accurate comparison needs frames taken from the video itself, matched to the same
+stage and moment in a Supermodel run.
+
+**R50 — The geometry rebuilt on one shared pool: 19.9K → 8.2K ALM, real time at 100 MHz,
+still bit-exact.** This applies §8.4 to R43's datapath.
+
+| Technique | Applied | ALM before → after | Source |
+|---|---|---|---|
+| Register files out of flops | into M10K (one write port) | 800 → 0, +8 M10K | Model 1 `7d95cdd` |
+| Storage out of flops | every controller buffer into MLAB | controller 9,097 → about 2,800 logic + 1,404 MLAB; registers 14,952 → 8,712 | Model 1 `a5c905c`, `e643842`, `29a5fa0` |
+| Duplicated arithmetic built once | one divide for projection, clip and set-up; one outcode set; one u/v converter | reciprocal 265 + fp_div 130 → 363 | Model 1 `86927fb` |
+| Idle registers shared | assembly, clip and new-vertex registers; viewport slots | in the controller figure | Model 1 `86927fb` |
+| Operators time-shared | the CORDIC on one adder and shifter | 2,212 → 966, and 0 by default (below) | Model 2 R952 |
+| One pool, divide on the pool | every FP op | fp_div 130 → 0, fsqrt 117 → 0 | Model 1 `640eb4e`, `m2_fp_pool` |
+| MLAB/M10K trade | microcode ROM to M10K; matrix stack in the register file's spare half | ROM 687 → 4 M10K | Model 1 `29a5fa0` |
+| Flush-to-zero units | default; subnormal units kept as a parameter | fp_mul 393 → 88, fp_add 430 → 323 | Model 1 fp_mul |
+| Per-build parameters | FRUSTUM_SM, SETUP_CR, CULL, SUBNORM | about −90 | Model 2 R948 |
+
+- **Latency hidden.** Four decoupled machines (main, decoder, polygon machine and
+  emitter) are coupled through memories. Main runs up to two chunks ahead, and clip and
+  projection interleave with transform and lighting at kernel boundaries.
+- **Fit at 10 ns:**
+  - Fmax 110.1 / 110.6 / 112.3 MHz;
+  - **8,170–8,193 ALM** (plus 622 holding the standalone top's pins), 13 M10K, 10 DSP;
+  - that is 170–190 ALM over the 8,000 target.
+- **Cycles at p99, default build** (Supermodel frustum, culling):
+  - VF3: 1.05M cycles, **60.7% of a 100 MHz frame**;
+  - Bass Fishing: 1.04M cycles, **59.7%**.
+
+  The engine is dependency-bound: issue occupancy at p99 is 34–37% (20–22% of a frame),
+  so a fifth lane would buy little.
+- **Correction to D-3 and §8.3.** The geometry runs at **100 MHz full rate**. Its best
+  structure needs 1.04–1.06M cycles at p99, which is 120% of a 50 MHz frame. §8.3
+  already allowed 100 MHz with a clock enable; this goes further, to every cycle.
+- **Correction: the clip divide cannot be reciprocal × multiply.** That differs from
+  MAME on 27% of divides. The reciprocal is extended into a correctly rounded divide, at
+  one extra DSP stage.
+- **D-19 as built so far:**
+  - **Culling.** Bass Fishing's p99 drops from 84.8% to 60.8% of a frame. VROM reads
+    fall from 49.8 to 29.6 MB/s on VF3, and from 91.7 to 48.4 MB/s on Bass Fishing.
+  - **Supermodel's frustum.** It removes the CORDIC (966 ALM) and is bit-exact to
+    Supermodel's CPU float maths by construction.
+  - **Not built yet:** LOD, colour-table base, transparency width, and lighting (rows 6,
+    12, 17 and 18–22). Supermodel lights per fragment, with face normals for flat
+    polygons, the fixed shade from the vertex byte, double-sided polygons drawn twice,
+    and its own sun clamp. That touches the decoder, the transform-and-lighting kernel
+    and the emitter.
+- **Correction to R35: MAME's image scale is off by about 4%.** MAME's frame is 4.1%
+  wider and 2.5% taller than Supermodel's on VF3's main viewport. On three Supermodel
+  frames, Supermodel's frustum correlates better with Supermodel's image, and scaling
+  MAME's triangles peaks near the predicted 0.96. This supports Supermodel's
+  construction without proving it; R49's hardware video can decide.
+- **Checks:**
+  - every triangle field matches on all 800 frames in all five builds;
+  - flush-to-zero confirmed by a monitor on every FP unit's inputs and outputs: 0
+    subnormals in 800 frames;
+  - 20 of 22 planted faults caught. The two misses are cases the frames never reach: a
+    zero product's sign at an output, and reuse two chunks back.
+- **Memory at p99, default build:**
+
+  | Region | VF3 | Bass Fishing |
+  |---|---|---|
+  | Culling RAM | 4.6 MB/s | 3.6 MB/s |
+  | Polygon RAM | 31.4 MB/s | 1.7 MB/s |
+  | VROM | 29.6 MB/s | 48.4 MB/s |
+
+  The VROM figures replace R43's.
+
+**R51 — Culling and Supermodel's frustum measured separately. The Real3D's own documents
+say Gouraud.**
+- **Area and timing of each D-19 item** (seed 1, 10 ns, totals including 622 pin ALMs):
+
+  | Build | ALM | Fmax |
+  |---|---|---|
+  | MAME frustum, no culling | 9,496 (CORDIC 950) | 100.9 MHz |
+  | MAME frustum, culling | 9,670 | 92.6 MHz, fails |
+  | Supermodel frustum, no culling | 8,694 | 112.7 MHz |
+  | Supermodel frustum, culling (default) | 8,796 | 110.1 MHz |
+
+  Culling costs +102 ALM on the default build, for R50's cycle and VROM savings.
+  Supermodel's frustum saves 802–874 ALM. The MAME-and-culling build does not close
+  10 ns, and is not the default.
+- **Lighting is Gouraud.** Real3D's architecture overview of the R3D-100 (Nov 1996), a
+  sibling of the Pro-1000, says the raster processor does Gouraud shading and that
+  lighting makes faceted models look smooth (`sm3-builds/refs/`, lines 183, 249–255 and
+  388–390). That is documented silicon behaviour: lighting per vertex, interpolated
+  across the triangle. Supermodel lights per fragment, which is a GL convenience. So
+  D-19's lighting rows are built as Supermodel's lighting formula evaluated per vertex,
+  and the geometry hands the rasteriser a per-vertex shade, not normals. Per-fragment
+  is measured in the model only, for comparison.
+
+**R52 — The throughput levers, priced: at 100 MHz only a branch target buffer plus 603e-style
+dual issue passes all three titles against the branch-folding 603e.** The base is
+singles at 4, doubles at 12, a pipelined frsqrte estimate (D-21, D-22) and the core's
+costs as built: load use 3, taken-branch redirect 2, sequential new line 1,
+way-prediction miss 2, single issue. All 96 combinations of five levers were run at
+100 MHz on 18,900 frames per title, with a subset at 110 MHz.
+
+What each lever is worth on VF3 at 100 MHz (from CPI 1.98, and 848 frames lost against
+`ref66_dual_ic`):
+
+| Lever | CPI saved | Frames lost |
+|---|---|---|
+| Dual issue to two different 603e units (IU, LSU, FPU, SRU, BPU) | 0.17 | 32 |
+| 256-entry BTB (taken-branch hit rate VF3 89.1%, Daytona 2 73.6%, Bass Fishing 85.1%) | 0.14 | 11 |
+| 64-entry BTB (82.5% / 61.9% / 76.3%) | 0.13 | 14 |
+| Redirect 1 cycle instead of 2 | 0.08 | 412 |
+| No new-line cycle | 0.08 | 478 |
+| Load use 2 | 0.07 | 641 |
+| Dual issue of FP with non-FP only | 0.03 | 844 |
+| Way miss 1 cycle instead of 2 | 0.01 | 848 |
+
+- **The BTB and dual issue are the only levers that remove over-budget frames,** not
+  just CPI.
+- **The smallest passing sets:**
+  - **Against `ref66_dual_ic` at 100 MHz:** two levers, a 256-entry BTB plus dual issue
+    to different units. CPI is 1.64 / 2.01 / 1.92 on VF3 / Daytona 2 / Bass Fishing,
+    with no frame lost. No single-issue set passes; even all four single-issue levers
+    together lose 2 VF3 frames.
+  - **Against the midpoint of the two 603e models:** dual issue plus a 1-cycle redirect
+    or either BTB.
+  - **At 110 MHz:** three single-issue levers pass against `ref66_dual_ic` (256 BTB, no
+    new-line cycle, way miss 1).
+- **Dual issue to different units is the 603e's own dispatch rule** (603e manual §6).
+  Branch folding is how the 603e makes taken branches free (6.4.1.1); a BTB is this
+  core's way to the same effect.
+- **Area is not yet estimated for either lever.** A 256-entry direct-mapped BTB is
+  small, about 2 M10K. Dual issue means a second integer issue path, two more
+  register-file read ports and wider forwarding, which is a large change to `ppc_core`.
+  **This is a study-level decision.**
+- **Modelling note.** The load-use-2 lever here keeps the way-miss and FP-load WB costs,
+  so it is 0.1 CPI smaller than R48's `ld1`.
+
+**R53 — D-21 and D-22 built standalone: the fast single path closes at latency 6, not 4.**
+Both are in `ppc_fpu_fast` (new top), not yet wired into the core.
+
+**The fast single unit (`ppc_fpu_sfma`):**
+- **Design.** R29's FMA construction at single width: a 75-bit window, both subtract
+  orders, leading- and trailing-zero counts, and a tiny result rounded at a moved place.
+- **Routing.** Opcode-59 add, sub, mul and the four multiply-adds go fast when every
+  operand they read is a zero, or has its low 29 fraction bits clear and a biased
+  exponent of 874–1150 or 7FF. Anything else goes to the double FMA.
+- **Same results by construction.** On every seed, about 496k fast/double twins match
+  bit for bit, with 0 route mismatches.
+- **Ordering.** Fast results enter the double unit's output register, so there is one
+  result port. A fast op issues only when no result is due at t + 6 or later. Results
+  therefore leave in issue order, and FPSCR updates stay in program order.
+
+**The frsqrte estimate (`ppc_fpu_rsqe`):**
+- **Table.** 128 entries indexed by exponent parity and the top 6 fraction bits; a
+  linear segment per entry (22-bit base, 13-bit slope) on the next 12 bits; 1 DSP; a
+  logic ROM, so 0 M10K.
+- **Precision.** Worst relative error over every input is 1.27e-5 (2^-16.3), against
+  PEM's 1/32. The significand fits a single, so consumers stay fast.
+- **Timing.** One op a cycle, latency 6.
+- **Shared table.** `sim/fpu/gen_rsqe_tab.py` writes the same integers into the RTL
+  and the reference model.
+- **FR and FI unchanged by frsqrte.** Supermodel's source writes FR or FI for no FP
+  op. That corrects R29's choice 3, which wrote them from a rounding Supermodel never
+  does (D-17).
+- **The divider loses its square root** (−190 ALM).
+
+**Latency.** At 8.9 ns (112 MHz), latency 6 closes on all three seeds:
+
+| Fit | Worst slack s1 / s2 / s3 (ns) | Note |
+|---|---|---|
+| L = 6 | +0.060 / +0.028 / −0.090 | seed 3's only failure is the standalone harness's own FPSCR instance; every FPU path is ≥ +0.39 |
+| L = 5 | −1.044 | one seed |
+| L = 4 | −3.826 | one seed |
+
+Each adjacent pair of stages carries about 14 ns of logic. L = 5 would need a
+leading-zero anticipator beside the add, and L = 4 a near/far split as well. **So R42's
+"singles at 4" is not met; the build gives 6.**
+
+**Area:**
+- **Total:** `ppc_fpu_fast` is **4,240–4,243 ALM, 6 DSP, 0 M10K**: +910 ALM and +2 DSP
+  over R33's unified FPU.
+- **Parts:**
+
+  | Unit | ALM |
+  |---|---|
+  | Double FMA | 2,665–2,673 |
+  | Single unit | 852–862 |
+  | Estimate pipe | 267–279 |
+  | Divider | 436–441 |
+
+**The double FMA improved along the way,** with results unchanged:
+- operand normalisation counts leading zeros on the 53-bit significand, which fixes S1A
+  (−0.26 → about +0.55 ns, −31 ALM) and should ease R40's FMA S1 path in the core;
+- single-precision tiny tests use a clamped 9-bit subtract.
+
+**A bug in the reference model, fixed.** The disabled-underflow path for single ops on
+double operands narrowed MPFR's exponent range, which the operands also have to sit
+inside. It returned garbage, for example fdivs of −2^191 by −2^341. The RTL was right.
+The path now rounds to the 2^-149 or 2^-1074 grid by hand from a 600-bit value. Before
+the fix it showed as 1 failure in about 4.7M checks.
+
+**Checks:**
+- fast bench: about 4.72M checks per seed over 7 seeds, 0 failures;
+- unified FPU bench: counts unchanged;
+- core bench: 300 seeds pass;
+- planted faults: 25 of 26 caught. The one miss is an equivalent mutant: a clamp bound
+  no single-range operand can reach.
+
+**Core changes listed for integration:**
+- instantiate `ppc_fpu_fast`;
+- decode frsqrte as an FMA-port op;
+- register the route decision;
+- add fast-issue slots in the write-port vectors and a fast-issue wait;
+- build the ISS with `-DPPC_FPU_RSQRTE_EST`.
+
+**R54 — Whole-design area review: about 4,000–5,000 ALM over, so sharing and space saving
+come first.** Each block's current figure, against its §8.1 row:
+
+| Block | §8.1 row (opt / pess) | Now | Basis |
+|---|---|---|---|
+| CPU: core, MMU, pipelined loads | 3,500–12,000 for the whole CPU | about 6,310 (9,670 less the FPU) | R44 fit |
+| CPU: FPU (D-21, D-22) | in the CPU row | 4,240 | R53 fit |
+| CPU: I + D caches | in the CPU row | 1,440, 36 M10K | R44 fit |
+| CPU: BTB, dual issue | in the CPU row | about 150–250 (BTB) + 1,000–2,000 (dual issue) | estimate, being measured |
+| Real3D geometry and walker | 6,000 / 8,000 | 8,170 | R50 fit |
+| Rasteriser | 7,500 / 10,000 | 8,000–11,200 | R46 estimate |
+| Framework: `sys/` + `hps_io` | 6,025 / 6,025 | 6,025 | measured on Model 2, MiSTer options already off |
+| **Sound: 68000 (fx68k)** | 1,859 / 1,859 | not built | measured on Model 2 |
+| **Sound: 2 × SCSP** | 3,857 / 3,857 | not built | measured on Model 2 (1,928 each) |
+| **Sound: board glue** (bank latch, i8251 link, mixing) | 357 / 600 | not built | Model 2 |
+| Tile generator, 4 layers | 1,100 / 2,000 | not built | `[EST]` from Model 2 |
+| SDRAM controller and arbiter | 750 / 1,500 | not built | `[EST]` from m2_sdram |
+| DDR3 path outside the rasteriser | 200 / 300 | not built | Model 2 |
+| CPU bus bridge (MPC105, PCI windows) | 600 / 1,000 | not built | `[EST]` from m2_cpu_bridge |
+| I/O, i8251, NVRAM, RTC, 53C810 SCRIPTS | 500 / 1,500 | not built | `[EST]` |
+| Real3D command, status, texture upload | 300 / 800 | not built | `[EST]` |
+
+The optimistic sum is about 45,000–46,500 ALM against 41,910 (about 41,000 usable).
+
+**Candidates for sharing, each to be measured before it is decided:**
+1. **Doubles through the single unit.** D-15's original "double multiply iterated
+   through the same multiplier" would drop most of R53's 2,670-ALM pipelined double FMA.
+   Doubles run 1.5K–9K a frame (R30). R42's d16n rows put a non-pipelined double path at
+   about +0.1 CPI, so its frame cost has to be weighed against about 2,000 ALM.
+2. **The divider into an iterative double unit.** Today it is 436–441 ALM on its own.
+3. **The rasteriser's triangle set-up on the geometry's FP pool.** The pool issues 20–22%
+   of a frame at p99 (R50), and R47 priced its own unit at 1,300–1,600 ALM and 4 DSP.
+4. **One divider and normaliser for every per-triangle division in the rasteriser**
+   (about −1,000 ALUTs, R46).
+5. **Dual issue only in its smallest form,** or not at all. At 110 MHz three cheap
+   single-issue levers pass (R52), so the clock is weighed against about 1,000–2,000 ALM.
+6. **Sound is about 6,100–6,300 ALM, the biggest block not yet started.**
+   - **The two SCSPs time-multiplexed through one datapath** (§8.2 lever 2): about −1,900
+     if the 512 clocks per sample allow it. That needs a measure of how many of those
+     clocks Model 2's `m2_scsp` actually uses per sample.
+   - **The SCSP's own datapath** (slot engine, DSP, envelope and LFO) read for
+     time-sharing and storage out of flops, as R952 did for Model 2's converters.
+   - **The 68000:** a smaller 68000 core instead of fx68k (1,859), if one is cycle-good
+     enough for the sound program. Measure, don't assume.
+   - D-8 lets early builds leave sound out. That is a schedule measure, not a saving.
+7. **The rasteriser built to §8.4 from the start,** at or below its row.
+8. **Narrower control state everywhere:** flops into MLAB, idle registers shared, one
+   adder and one shifter shared across groups that are never live together (§8.4).
+
+**The rule from here:** no block grows without an R-entry that names what it shares and
+what it saved. The full-design ledger in §8.1 is re-measured after each block lands.
+
+**R55 — D-19's geometry rows built: lighting gains up to 1.9 dB, Gouraud costs nothing
+against per-fragment, and the rows cost 446 ALM.**
+
+| Row | Change | ALM | p99 cycles | Against Supermodel |
+|---|---|---|---|---|
+| 22 (+19), lighting | normal × model matrix; sunFactor clamped to [0, 1]; I = min(sf·d + a, 1) | about 0 | 0 | +1.9 dB VF3, +1.2 dB Bass Fishing at p50. VF3 pixels more than 8 out: 45% → 28% |
+| 18, normals | face normals for flat polygons; (2b + 1)/255 normals; a per-slot normal memory | **+252** | about 0 | no measurable change |
+| 20, fixed shading | fixed shade as a T&L input | +14 | 0 | no measurable change |
+| 21, double-sided | second shade carried; the inverted copy emitted | about 0 | +0.5 VF3 / +2.3 Bass Fishing | +0.2 dB |
+| 17, transparency | transparency-0 polygons dropped (bit 23 is the opaque flag) | +8 | 0 | no measurable change |
+| 12, colour table | walker carries the colour base; 12-bit index | +13 | 0 | VF3 all-pixel PSNR 9.55 → 9.71 dB |
+| 6, LOD | model only: about 0.1% of pixels; an estimated 400–600 ALM and +9% of a VF3 frame | — | — | not built |
+
+- **Light vector.** It is (n5, n6, −n4) in MAME's view space, which is GL eye space
+  with y negated. Negating y as well would double-flip it. Supermodel's sun clamp is on
+  in both games.
+- **Gouraud against per-fragment** (R51): VF3 19.62 against 19.63 dB at p50, Bass
+  Fishing 23.32 against 23.33. Per-vertex lighting costs nothing measurable, so the
+  rasteriser takes one shade per vertex.
+- **Output is now a word stream.** A record is 3 + 7n words (vertex x, y, z, w, u/w,
+  v/w, shade), with the format in `sim/real3d/m2-notes.md` §13. It removed 672
+  vertex flops and about 1,000 virtual pins.
+- **Fit at 10 ns:**
+  - 106.1 / 109.9 / 105.9 MHz;
+  - 8,908–8,949 ALM including 232 pin ALMs, so **about 8,790–8,830 without them**,
+    about 600 over R50 and the 8,000 target;
+  - 12 M10K, 10 DSP.
+
+  p99 cycles are 62.9% (VF3) and 63.3% (Bass Fishing) of a 100 MHz frame.
+- **Checks:**
+  - bit-exact against the model on all 800 frames in seven builds, plus the six one-row-off
+    builds;
+  - 33 of 36 planted faults caught;
+  - two latent R50 bugs found and fixed: the polygon list rewritten under the emitter,
+    and the translation read after the event.
+- **The rasteriser's set-up on the geometry pool,** measured in RTL:
+
+  | Case | VF3 p99 | Bass Fishing p99 |
+  |---|---|---|
+  | Set-up for every emitted triangle | 100.7% | 99.0% |
+  | One set-up per double-sided polygon | 94.6% | 87.0% |
+
+  That is over 85%. A facing test in the geometry plus a third lane-register read would
+  bring it to about 80% / 75% (estimated). Shared, it costs about 150–300 ALM and 3 M10K,
+  against 1,300–1,600 ALM and 4 DSP for its own unit.
+- **Area candidates (R54):**
+  - **Row 18's per-slot normal memory:** +252 ALM for no measurable image change.
+  - **Row 6, LOD:** 400–600 ALM for about 0.1% of pixels.
+
+**R56 — The CPU with caches closes 100 MHz in the full build, and runs on the board.** A
+timing pass on R44's core, in seven batches:
+- **The core:**
+  - register compares a cycle early;
+  - multiplier inputs gated, so Quartus cannot pack operand copies into the DSP;
+  - MEM fields taken from registers;
+  - write bits folded into early selects;
+  - the MEM kill target through the second redirect;
+  - a predecoded op for EX;
+  - the CR kinds split into bit, field and mtcrf;
+  - dcbz's W/I alignment check moved to MEM.
+- **The D-cache:** request fields load whenever `d_rdy` is high, and bypass and
+  reservation are formed in the lookup cycle.
+- **The harness:** the monitor registers all its inputs.
+
+**Cost.** Moving the dcbz check costs about 1.1 cycles per alignment fault: +295 cycles
+in 20.87M on the bench. Nothing else moved; every UART value is unchanged.
+
+| Full build at 100 MHz | Fmax | Slack | ALM / M10K / DSP | RBF md5 | Board, 20 s |
+|---|---|---|---|---|---|
+| No cache | 102.47 MHz | +0.241 ns | 16,835 / 123 / 40 | 28ca0e6c… | 1,394 of 1,394 identical (4,697 / 1,632 / EA97AAFC) |
+| CACHED = 1 | 101.72 MHz | +0.169 ns | 18,319 / 159 / 40 | b6c1ae7a… | 1,387 of 1,387 identical (11,313 / 1,632 / EA97AAFC) |
+
+- **The margin is 2%, not the planned 12%.** The standalone spike runs 103.3 / 105.2 /
+  101.6 MHz, or 112.8 / 108.7 / 108.5 with its inputs registered, and swings about
+  ±5 MHz per seed between batches.
+- **Paths that remain:** inside the FPU (the FMA and divider, −0.44 to −0.94 ns on
+  some seeds), MEM's replay hold into the fetch queue's pop, and the second redirect's
+  mux.
+- **Wrong turns, both reverted:** a CR reader bit through a 32:1 select (−2.08 ns), and
+  an FPR one-hot from the decoder (−1.04 ns).
+- **Two-cycle load use, built as a patch** (`sm3-builds/tp_lu2_patch.py`), not in the
+  tree. It passes the bench, but costs **6.9 MHz** on average (110.0 → 103.2 MHz with
+  registered inputs), because EX's operands then come through a mux. R52 puts its worth
+  at 0.07 CPI on VF3, about 3.5%, which the 6.9 MHz (about 6.5%) outweighs. Not taken.
+- **Checks:**
+  - core, subsystem and cache benches pass;
+  - each restructure has a Verilator equivalence check against the logic it replaced;
+  - 42 of 46 planted faults caught. One miss (`fp_ok_fres`) is a generator gap: it never
+    emits opcode 63 with bits [5:1] = 24.
+
+**R57 — Framework switches and dual SDRAM measured: −1,053 ALM and −12 DSP.** These are
+cached full builds of R56's RTL at 100 MHz. Framework = everything in `sys_top` outside
+`emu`, plus `hps_io`.
+
+| Build | Total ALM | M10K | DSP | Framework ALM | CPU Fmax |
+|---|---|---|---|---|---|
+| R56 as built, no framework switches | 18,319 | 159 | 40 | about 7,177 | 101.7 MHz |
+| + `MISTER_DUAL_SDRAM` (D-26) | 17,994 | 159 | 40 | about 6,830 | 98.3 MHz |
+| + `DOWNSCALE_NN`, `DISABLE_ADAPTIVE`, `DISABLE_YC`, `DISABLE_ALSA` | **17,266** | **157** | **28** | **about 6,141** | 92.8 MHz |
+
+- **What each switch removes:**
+  - **Dual SDRAM** removes only `vga_out` and `vga_scaler_out` (277 ALM).
+  - **This framework version still builds `vga_osd` (about 520 ALM, about 4 M10K) and
+    `csync_vga` (23) under `MISTER_DUAL_SDRAM`.** They are not only analog: MiSTer's
+    direct video (native video over HDMI, used for CRTs through an HDMI-to-VGA adapter)
+    takes its picture and csync from them (`sys_top.v` 1255–1259). Removing them would
+    leave direct video without the OSD and without csync, so **they stay** for now.
+  - **`DOWNSCALE_NN`** takes 12 DSP out of the scaler (`ascal` 1,974 → 1,846 ALM).
+  - **ALSA and YC** go entirely.
+  - **The audio filter is kept** (D-26): `audio_out` 871 ALM, against Model 2's 443
+    with its patch.
+- **Against Model 2.** Model 2's framework in its latest fit on disk (s1633, 30 Oct) is
+  6,025 ALM with its audio filter removed; this core's 6,141 keeps the filter.
+- **The CPU's Fmax swings with placement:** 101.7 → 98.3 → 92.8 MHz across these three
+  builds, with the CPU unchanged. Every failing path in the last build is fetch
+  translation into the I-cache's uncached decision: the fetch PC or redirect, then the
+  IBAT compare, then WIMG, then `ppc_icache` `p_unc`. That is R56's cached-build worst path
+  (+0.17 ns there), so it is real. It must come off the fetch cycle before R56's
+  closure can be trusted.
+- **From here,** full builds use `MISTER_DUAL_SDRAM` and the four switches, as the
+  release will.
+
+**R58 — The built FPU latency (6) and iterated doubles, priced: without dual issue the CPU
+needs about 110 MHz.** Same runs as R52 (18,900 frames per title, all four 603e
+references).
+- **Latency 6 against 4 costs about 0.1 CPI in every row:** +0.10–0.11 on VF3, +0.08–0.09
+  on Daytona 2, +0.04–0.05 on Bass Fishing. The rule that a fast op waits behind a double
+  costs nothing on VF3 and about 0.01 elsewhere.
+- **Single issue with the cheap levers** (BTB 256, no new-line cycle, way miss 1), the
+  option D-27 leaves:
+
+  | Clock | VF3: CPI / heaviest / lost against `ic` (midpoint) | Daytona 2: CPI / heaviest / over | Bass Fishing: lost against `ic` |
+  |---|---|---|---|
+  | 100 MHz | 1.85 / 126% / 7 (4) | 2.21 / 107% / 18 | 5 |
+  | 110 MHz | 1.87 / 116% / 3 (0) | 2.24 / 98% / 0 | 0 |
+
+  At 100 MHz it passes against neither the branch-folding reference nor the midpoint. At
+  110 MHz it passes all three titles against the midpoint and loses 3 VF3 frames against
+  `ic`. Those are the scene-cut frames of R34, where the real chip is near its own limit
+  too.
+- **With dual issue** (not built, D-27): BTB 256 plus dual issue passes all three at
+  110 MHz against `ic`. At 100 MHz it still loses 3 VF3 and 5 Daytona 2 frames.
+- **Dropping the pipelined double FMA** (about 2,000 ALM) for doubles iterated through the
+  single unit costs about +0.11 CPI at 16 cycles, +0.25 at 24 and +0.40 at 32. Daytona
+  2's double maths library pays most. Frames lost against `ic`, with BTB 256 plus dual
+  issue:
+
+  | Doubles | 100 MHz: VF3 / Daytona 2 / Bass Fishing | 110 MHz: VF3 / Daytona 2 / Bass Fishing |
+  |---|---|---|
+  | Pipelined, 12 cycles | 3 / 5 / 0 | 0 / 0 / 0 |
+  | Iterated, 16 cycles | 7 / 18 / 4 | 3 / 0 / 0 |
+  | Iterated, 24 cycles | 16 / 109 / 6 | 7 / 17 / 3 |
+  | Iterated, 32 cycles | 22 / 429 / 8 | 13 / 54 / 5 |
+
+  Only 16 cycles is near pipelined, and only alongside dual issue, which is not
+  built. **So the pipelined double FMA stays.**
+- **Conclusion for D-27.** A single-issue CPU with the cheap levers needs about
+  **110 MHz in the full build** to keep the frames the 603e keeps. R56 closes 100 MHz
+  by 2%, so roughly 10% of Fmax is still to find.
+
+**R59 — Both SCSPs on one engine: bit-identical to two, −1,833 ALM, but sound is still
+about 1,270 over D-27.** Model 2A's `m2_scsp` was copied at `47edd9dc` into
+`rtl/sound/scsp/` (THIRD_PARTY.md). `scsp_dual` runs both chips through one engine and
+one DSP, behind `SCSP_SHARED`. The two-engine build is kept for comparison.
+- **The clock budget premise was wrong.** `m2_scsp` is a microcoded engine behind an
+  output FIFO, not a 16-clocks-per-slot pipeline:
+  - an active slot takes about 24 clocks plus fetch waits, an idle slot 1;
+  - effect returns and output take about 101 clocks a sample;
+  - the DSP takes 33 + 5 × LastStep clocks.
+
+  One chip needs up to about 1,540 clocks a sample. So the shared engine runs on
+  enables of a fast clock, as Model 2 does at 80 MHz. On VF3 it takes 1,462 clocks a
+  sample pair on average, and it is DSP-bound (the two DSP runs take 1,433). At
+  100 MHz that is 64% of the 2,268 available.
+- **The interleave is a chip's whole sample at a time,** not one slot of each chip. Each
+  chip's DSP runs while the other chip takes its turn.
+- **Identity, proved on real streams.** MAME 0.289 played VF3 for 180 s through a Lua
+  write-tap, no MAME patch: 6.1M and 5.8M register writes on the two chips (both are
+  used), and 39.5M sound-RAM writes. Every output sample, slot sample, read, interrupt
+  level and MIDI byte matched two separate engines:
+  - **0 differences over 1,764,000 samples a chip,** at memory latencies of 6–40 and
+    0–600 clocks;
+  - also 0 on random streams with random DSP programs and 68000 RAM rewrites;
+  - 14 of 19 planted faults caught; the 5 misses are unreachable by construction.
+
+  The header lists six places where free-running behaviour can differ, all
+  write-timing. The largest: a write can land between a chip's slots and its effect
+  returns, for one sample.
+
+| Build (both SCSPs, standalone) | ALM | M10K | DSP | Fmax |
+|---|---|---|---|---|
+| Two `m2_scsp` + port arbiters | 3,981–3,990 | 60 | 6 | 87.1–90.3 MHz |
+| Shared engine, as first built | 2,424 | 37 | 3 | 85.4 |
+| + COEF/MADRS in one M10K, FM ring in M10K | **2,144–2,154** | 39 | 3 | 86.9–89.5 |
+| + shared 256-line caches | 2,144 | 35 | 3 | 89.5 |
+| + FM off (VF3 never writes FM) | 2,116 | 38 | 3 | 87.2 |
+| + chip 1's unused timers cut (its interrupt is not wired on Model 3) | 2,053 | 39 | 3 | 90.1 |
+
+- **The engine misses 100 MHz** at 87–90 MHz. The paths are `m2_scsp`'s own (M10K
+  output → ALU → side compare → flags → state RAM), not the sharing's. 80 MHz works:
+  about 0.16% of sample pairs overrun the cycle budget and the FIFO absorbs them. An
+  800 MHz VCO gives 100, 50 and 80 MHz, at the cost of a crossing to the SDRAM.
+- **Where the 2,150 goes:**
+  - engine core about 1,030;
+  - DSP 580;
+  - chip 0's common registers, timers and MIDI 235;
+  - chip 1's common registers 121;
+  - level 101;
+  - LFO 60;
+  - caches 52 each.
+
+  The engine already shares one 27×18 multiplier and one adder across envelope, LFO,
+  interpolation and mix. Getting to about 1,140 would need a narrower ALU taking two
+  passes, a microcode rewrite that eats the cycle margin.
+- **The 68000.** TG68K.C (LGPL-3.0, 68000 mode) is 1,808 ALM against fx68k's 2,142
+  standalone, and reaches 58.9 MHz against 109. It does not aim for cycle accuracy, and
+  VF3's driver polls the 0x408 monitor about 32,000 times a second per chip, the
+  timing-sensitive pattern of Model 2's R885. fx68k stays.
+- **Sound total:**
+
+  | Part | ALM |
+  |---|---|
+  | fx68k | 1,859 |
+  | SCSPs on one engine | 2,053–2,148 |
+  | Glue | 357+ |
+  | **Total** | **about 4,270–4,360** |
+
+  That is against D-27's 3,000 (§8.1's old row was 6,073–6,316), so sound is about
+  1,270–1,360 over and must be paid back elsewhere or the budget moved.
+
+**R60 — Geometry area pass: 8,800 → about 7,170 ALM, and the rasteriser's set-up fits on
+its pool.**
+
+The default build:
+
+| | R55 | Now |
+|---|---|---|
+| ALM, without pins | about 8,800 | **7,160–7,177** |
+| ALM, with the 232 pin ALMs | — | 7,276–7,293 |
+| M10K / DSP | — | 12 / 10 |
+| Fmax at 10 ns | — | 111.5 / 104.1 / 104.7 MHz |
+| p99 cycles, VF3 / Bass Fishing | 62.9% / 63.3% | **63.5% / 63.8%** |
+
+The default build is still bit-exact on all 800 frames, and every build of
+`test_real3d_geo3_all` passes. 44 of 50 planted faults are caught; the misses are
+cases these frames never reach.
+
+**Savings by §8.4 technique** (seed 1, before → after):
+
+| Technique | Change | ALM |
+|---|---|---|
+| Storage out of flops | row 18's normal memory and face-normal path removed (D-25) | 250 → 0 |
+| | vertex slots by reference: 4 memories → 1 | 80 → 20 |
+| | clip lists by entry index | about −80 |
+| | polygon rings, stream FIFO and walker return stack 64 → 32 deep | about −200 in all, for +0.4% of a frame |
+| Duplicated arithmetic built once | one int16 converter for viewport words and u/v | about −120 |
+| | one /255 product | about −60 |
+| | outcodes as 3 magnitude compares (miter: 200M cases, 0 different) | about −30 |
+| | cull verdict as sign + magnitude | about −30 |
+| | one adder for all culling-RAM addresses | about −60 |
+| Narrower arithmetic | the divide's remainder test 51 → 30 bits (\|d\| < 2^26; 20.7M divides and 72.3M reciprocals, 0 wrong) | 365 → about 300 |
+| One shared pool | Supermodel's frustum as one kernel; R50's broadcast side channel removed | about −200 |
+
+**Further trades, built as parameters and off by default.** Each one spends M10K to save
+ALM:
+
+| Parameter | ALM | M10K |
+|---|---|---|
+| `SIDE_M10K` | −336 | +16 |
+| `OUT_M10K` | −228 | +4 |
+| `BC_M10K` | −140 | +8 |
+| All three | −685 | +28 |
+
+Dropping one of the four pool lanes would save about 880 ALM and 2 M10K, for an
+estimated +7–10% of a frame and a rewrite of the generator and controller.
+
+**The rasteriser's triangle set-up on the geometry's pool** (p99, share of a 100 MHz
+frame):
+
+| Configuration | VF3 | Bass Fishing |
+|---|---|---|
+| No set-up | 63.5% | 63.8% |
+| Set-up, two reads | 100.7% | 99.0% |
+| Set-up, third read port | 93.7% | 90.3% |
+| Third read port, facing test on the pool | 96.0% | 88.8% |
+| **Third read port, facing test beside the pool** | **83.6%** | **79.6%** |
+
+All rows except the first two include loading each kernel's inputs.
+- **Facing test beside the pool:** this one fits under 85% on both games. Back faces
+  are 37% of VF3's polygons and 25% of Bass Fishing's, and they are dropped before
+  set-up.
+- **Cost:** about 250–450 ALM, 1–2 DSP and 7 M10K on the geometry side, against
+  1,300–1,600 ALM and 4 DSP for the rasteriser's own set-up unit. The output format is
+  in `m2-notes` §14.
+- **VF3's margin is only 1.4 points.** Daytona 2 has about 46% more new vertices at
+  p99, so it must be measured before the rasteriser drops its own unit.
+
+**A Quartus 17 trap.** A 2-D unpacked array (`logic [4:0] clst [2][16]`) segfaults
+`quartus_map` in elaboration. `--analyze_file` passes it; the flat form works.
+
+**R61 — BTB built and verified. Two-word fetch is the strongest single-issue lever, and
+R52 overstated the new-line cost.**
+
+**The BTB.** `rtl/cpu/ppc_btb.sv` is built and verified but not yet in the core.
+- **Configurable:** 64, 128 or 256 entries, in M10K or MLAB. The tag includes MSR[IR,PR].
+- **Hit rate** against the CPI model's own 256-entry BTB, branch by branch:
+  - VF3 89.07%, Daytona 2 72.96%, Bass Fishing 75.14%;
+  - 0 mismatches on every built policy;
+  - 11 of 11 planted faults caught.
+- **Two ways into fetch:**
+  - **Design D** looks up at the branch's own request. A hit costs 1 cycle, and it needs
+    no cache change.
+  - **Design C** looks up one request ahead. A hit costs 0, but it needs a pre-read port
+    in the I-cache.
+- **Dynamic direction.** 72% of the bc branches that the static rule predicts not-taken
+  are taken. Correct predictions as a share of taken branches:
+
+  | | VF3 | Daytona 2 | Bass Fishing |
+  |---|---|---|---|
+  | D, static | 64.8% | 44.6% | 35.4% |
+  | D, dynamic direction | 76.1% | 62.6% | 70.6% |
+- **Size:** 64 entries keeps the hit rate, at 48 ALM and 2 M10K (or 107 ALM in MLAB).
+  Fmax is far above need, 177–228 MHz.
+- **Design C's pre-read port** adds 173 ALM to the I-cache (457 → 630). It takes the
+  cache's standalone Fmax from 117–129 MHz down to 106–117 MHz.
+- **Core side:** about 150 ALM, plus 100–150 for bclr/bcctr targets.
+
+**R52's base charged too much for crossing a cache line.** The built I-cache's lookahead
+crosses a sequential line at 0 cost. It pays +1 only when a jump lands at words 5–7.
+
+| Line crossings per instruction | VF3 | Daytona 2 | Bass Fishing |
+|---|---|---|---|
+| Charged by R52's model | 0.090 | 0.108 | 0.096 |
+| Paid by the built cache | 0.022 | 0.026 | 0.027 |
+
+The real core is about 0.07 CPI better than R52's base.
+
+**Two-word fetch is the strongest single-issue lever measured.** It costs about 350 ALM:
+queue push of 2 (+152 measured), a second predecoder, and a 64-bit I-cache output path.
+
+| At 100 MHz, single issue | Frames lost against `ref66_dual_ic` (all three titles) | CPI VF3 / Daytona 2 / Bass Fishing |
+|---|---|---|
+| BTB C, R52's model | 63 | — |
+| BTB C, with the real 1-word fetch queue modelled | 32 | — |
+| BTB C + 2-word fetch | 12 | — |
+| BTB C + 2-word fetch + dynamic direction | **3** (3 / 0 / 0) | **1.726 / 2.055 / 1.986** |
+
+At 110 MHz, single issue with BTB C 256 or 64 (no new-line cycle, way miss 1) loses 0.
+
+**Not worth building:**
+- **Way miss cut to 1 cycle:** an estimated 100–150 ALM on a known full-build path, for
+  0.01 CPI and 0 frames.
+- **The residual new-line fix:** a second tag copy (an estimated +2 M10K and 40 ALM),
+  for 0.02–0.027 CPI.
+
+**Dual issue, for the record (D-27, not built).** Prototype-measured, it adds 1,513 to
+at least 2,287 ALM in its datapath variants. Branch as the second op is 344 ALM plus
+core steering. The best variant loses 0–3 frames, where single issue with 2-word fetch
+loses 3. With 2-word fetch, single issue is within a few frames of dual issue for about
+a sixth of the area.
+
+**R62 — Rasteriser at 100 MHz, first three blocks: 2,589 of 8,000 ALM, and culling must
+come from the normal, not the screen winding.** Built and benched bit for bit against
+the RTL-form model (now moved to D-28 half width), all closing 10 ns on three seeds:
+
+| Block | ALM | M10K | DSP | Fmax | §8.4 |
+|---|---|---|---|---|---|
+| Front: slope divider and band walker | 1,595–1,600 | 0 | 0 | 105.2–114.3 MHz | The divider's three normalisers became a fixed 16-bit skip on a 2:1 select: divider 2,510 → 900 ALUTs, front 2,513 → 1,598 ALM |
+| Set-up intake (D-25/R60 option (a): coefficients from the geometry) | 310–313 | 0 | 0 | 146.8–156.2 MHz | One FP→fixed converter for 21 conversions a textured triangle |
+| Z span, 2 a clock | 676 | 0 | 2 | 127.8–141.3 MHz | One multiplier for both span products; DDA lanes per pixel |
+
+**Checks:**
+- **Divider:** 5.45M list triangles and 2M random, 0 wrong.
+- **Walker:** 40.2M spans, plus 38.5M synthetic at 7-row bands, 0 wrong.
+- **Intake:** 184M fields, 0 wrong.
+- **Z span:** 675M pixels, 0 wrong.
+- **Planted faults:** 16 of 16 caught. Five of them only by the random sets.
+
+**Findings:**
+- **Culling must come from the normal.**
+  - The screen-space winding agrees with Supermodel's view-space normal test on only
+    58–69% of single-sided triangles. Culling by winding makes VF3 worse: 13.50 → 12.19
+    dB p50, and coverage disagreement 4.46% → 8.82%.
+  - Culling by the normal, sent as a flag in the record, leaves the image unchanged and
+    takes VF3 p99 from 66.9% to 53.6% of a frame.
+  - **This bears on R60.** Its 83.6% / 79.6% used the model's normal verdict, but the
+    hardware form of "facing beside the pool" was a 2-D cross product. The facing test
+    has to use the normal, and R60's figure must be re-measured with it. The normal test
+    on the pool measured 92.1% for VF3.
+- **Depth on 1/w,** not MAME's w, is the default. It is image-neutral (VF3 13.63 against
+  13.61 dB). It saves 12 of 66 set-up products and about 16 B per stored triangle, and
+  gives fog a single path.
+- **Translucency, three modes in the model** (p99 share of a 100 MHz frame with FIFOs;
+  p50 PSNR against Supermodel):
+
+  | Mode | VF3 frame | Bass Fishing frame | VF3 PSNR | Bass Fishing PSNR | Extra M10K |
+  |---|---|---|---|---|---|
+  | 0, MAME blend | 57.1% | 26.3% | 13.63 dB | 19.05 dB | 0 |
+  | 1, 4×4 ordered-dither stipple | 38.5% | 26.2% | 13.45 dB | 19.05 dB | 0 |
+  | 2, Supermodel's two layers | 45.8% | 26.3% | 14.12 dB | 19.13 dB | about +36 (8-row bands) |
+
+  R49's hardware video leans to a blend.
+- **8-row bands** cost nothing at the frame level, because shading binds.
+- **Integer fog matches the float form** (Bass Fishing 19.13 against 19.12 dB p50).
+  R47's fog-alone figure of 21.3 dB is not reproduced here: this harness gives 19.12.
+- **Estimate for the whole rasteriser:** 7,000–7,150 ALM, 70–80 M10K and 28–32 DSP.
+  The front's two savings, estimated at −350 ALM, measured −148 (front 1,598 → 1,450,
+  registers −720), because registers share ALMs with logic as in Model 2's R952. The
+  ledger now stands at 2,439 of 8,000 ALM for three blocks.
+- **The geometry record must add:**
+  - 1/w for untextured triangles;
+  - the cull flag from the normal;
+  - header[6] bits 11–15 (fog) and bit 17 (translucency layer);
+  - a viewport record with fog colour, ambient, density, start and kz.
+
+  It must also drop the w plane.
+
+**R63 — The fast FPU in the core, on the board at 100 MHz; closure holds on one seed in
+three.** D-21 and D-22 are wired into `ppc_core` as R53 listed:
+- `ppc_fpu_fast`, with LS = 6;
+- frsqrte on the FMA port as the estimate;
+- the route decision registered beside the operands;
+- fast write slots, and a fast-issue wait;
+- the ISS built with `-DPPC_FPU_RSQRTE_EST`.
+
+The wait register is held inverted (`ffbl_q`, reset 0), because `ffok_q = 0` at power-up
+broke the schedule check in the board harness's first cycle.
+
+**The I-cache uncached path (R57).** `i_wimg[2]` is registered raw and the reserved-page
+compare uses the physical address. Both take effect from the first pending cycle, which
+is the tag-check cycle anyway. It costs zero cycles: the cache and subsystem benches are
+cycle-identical, and `p_unc` has left every failing path list.
+
+**Generator gaps closed:**
+- every unassigned 59/63 encoding is now emitted, including fres on 63, so `fp_ok_fres`
+  is caught;
+- FP dependency patterns added: a multiply-add result reused, and a burst of
+  multiply-add, access and move.
+
+Without the dependency patterns a route-forwarding fault went uncaught. A
+multi-cycle-FSM fault also became uncaught, because the fast path leaves fewer results
+in flight.
+
+**Checks:**
+- core bench: 5,000 seeds, 16.6M instructions, including back-pressure and data latency
+  2;
+- subsystem, cache, `test_fpu_fast` and `test_fpu_reg`: all pass;
+- planted faults: 43 of 49 caught. The misses are R44's three, one generator gap
+  (`pd_ctr_bclr`) and two equivalent mutants.
+
+**The board program changed.** D-21 saves 94 cycles (2.0%) without cache and 62 (0.8%)
+with it.
+
+| Harness | Cycles | Instructions | Signature |
+|---|---|---|---|
+| No cache | 4,586 | 1,633 | 0CA977DF |
+| Cached | 7,774 | 1,633 | 0CA977DF |
+
+**Fit.** The CPU spike runs 100.6 / 101.1 / 106.3 MHz at 10,840–10,867 ALM and 9 DSP.
+Like for like against R57's release form (17,266 / 157 / 28), the full build is +893 to
++964 ALM, +0 M10K and +2 DSP. Full builds in release form, at 100 MHz:
+
+| Form | Seed 1 | Seed 2 | Seed 3 |
+|---|---|---|---|
+| No cache (16.7K ALM, 121 M10K, 30 DSP) | −0.355 ns | −0.116 ns | **+0.294 ns (103.0 MHz)** |
+| Cached (18.2K ALM, 157 M10K, 30 DSP) | −0.402 ns | **+0.317 ns (103.3 MHz)** | −0.034 ns |
+
+The failing paths are earlier core paths pushed out by the FPU's area:
+- the fetch-queue pop;
+- the EX address into the D-cache request;
+- the harness redirect into its ROM;
+- the route register;
+- the single unit's first stage.
+
+**On the board,** run on 2026-10-31 at 19:07 with the closing seeds:
+- **no cache, seed 3** (RBF md5 dfe28134…): 1,395 of 1,395 reports identical to the
+  simulation;
+- **cached, seed 2** (RBF md5 0c960225…): 1,391 of 1,391 identical.
+
+**100 MHz closure is not yet robust.** The CPU needs a timing pass for margin, and
+R58's 110 MHz target still stands.

@@ -1,3 +1,692 @@
+diff --git a/Src/CPU/PowerPC/m3fp_census.h b/Src/CPU/PowerPC/m3fp_census.h
+new file mode 100644
+index 0000000..d4386cf
+--- /dev/null
++++ b/Src/CPU/PowerPC/m3fp_census.h
+@@ -0,0 +1,683 @@
++/*
++ * Model 3 census: FP operand census (M3FP=<prefix>). Shared between the MAME and
++ * Supermodel patches. Called before (pre) and after (post) every instruction with
++ * the FPRs, FPSCR and MSR. Counts, per FP opcode: operand and result classes,
++ * single ops with operands not representable in single format, emulator result
++ * against a once-rounded reference (exact, from error-free
++ * transformations; checked against MPFR with M3FP_MPFR), FPSCR writes, MSR FE0/FE1, mffs and
++ * mcrfs use, fctiw(z) inputs, and what consumes frsqrte and fres results.
++ * Writes <prefix>_fp.txt and <prefix>_fp_frames.csv.
++ */
++#ifndef M3FP_CENSUS_H
++#define M3FP_CENSUS_H
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <cmath>
++#include <cfloat>
++#include <string>
++#include <vector>
++#include <map>
++#include <functional>
++#include <algorithm>
++#include <xmmintrin.h>
++#ifdef M3FP_MPFR
++#include <mpfr.h>
++#endif
++
++namespace m3fp {
++
++static inline uint64_t bits(double d) { uint64_t u; std::memcpy(&u, &d, 8); return u; }
++static inline double dbl(uint64_t u) { double d; std::memcpy(&d, &u, 8); return d; }
++
++enum { C_ZERO, C_DENORM, C_TINY, C_INF, C_QNAN, C_SNAN, C_NORMAL, C_N };
++static const char *const cname[C_N] = { "zero", "denorm", "tiny", "inf", "qnan", "snan", "normal" };
++
++// double class; "tiny" = nonzero, below single normal range, not a double denormal
++static inline int dclass(double v)
++{
++	uint64_t const u = bits(v);
++	uint64_t const e = (u >> 52) & 0x7ff, m = u & 0xfffffffffffffull;
++	if (e == 0x7ff) return m == 0 ? C_INF : ((m >> 51) & 1) ? C_QNAN : C_SNAN;
++	if (e == 0) return m == 0 ? C_ZERO : C_DENORM;
++	if (std::fabs(v) < FLT_MIN) return C_TINY;
++	return C_NORMAL;
++}
++
++enum { R_EXACT, R_SDENORM, R_MANT, R_EXPHI, R_EXPLO, R_SPECIAL, R_N };
++static const char *const rname[R_N] = { "exact", "single-denorm", "mantissa>24b", "exp-too-big", "exp-too-small", "zero/inf/nan" };
++
++// representability in single format
++static inline int repclass(double v)
++{
++	if (v == 0 || std::isinf(v) || std::isnan(v)) return R_SPECIAL;
++	double const a = std::fabs(v);
++	if (a > FLT_MAX) return R_EXPHI;
++	float const f = (float)v;
++	if (a < FLT_MIN) return (double)f == v ? R_SDENORM : R_EXPLO;
++	return (double)f == v ? R_EXACT : R_MANT;
++}
++static inline bool nonrep(int r) { return r == R_MANT || r == R_EXPHI || r == R_EXPLO; }
++
++// operation kinds for the single-precision reference
++enum { K_NONE, K_ADD, K_SUB, K_MUL, K_DIV, K_MADD, K_MSUB, K_NMADD, K_NMSUB };
++
++#ifdef M3FP_MPFR
++// Once-rounded single result from exact double operands, MPFR, IEEE single range with
++// subnormals, mode rn (PowerPC RN field)
++static double mp_single(int kind, double a, double b, double c, int rn)
++{
++	static const mpfr_rnd_t mode[4] = { MPFR_RNDN, MPFR_RNDZ, MPFR_RNDU, MPFR_RNDD };
++	bool neg = kind == K_NMADD || kind == K_NMSUB;
++	int k = kind == K_NMADD ? K_MADD : kind == K_NMSUB ? K_MSUB : kind;
++	mpfr_rnd_t rnd = mode[rn & 3];
++	mpfr_t A, B, C, R;
++	mpfr_inits2(53, A, B, C, (mpfr_ptr)0);
++	mpfr_init2(R, 64);
++	mpfr_set_d(A, a, MPFR_RNDN); mpfr_set_d(B, b, MPFR_RNDN); mpfr_set_d(C, c, MPFR_RNDN);
++	auto run = [&](mpfr_prec_t p) {
++		mpfr_set_prec(R, p);
++		switch (k)
++		{
++		case K_ADD: mpfr_add(R, A, B, rnd); break;
++		case K_SUB: mpfr_sub(R, A, B, rnd); break;
++		case K_MUL: mpfr_mul(R, A, C, rnd); break;
++		case K_DIV: mpfr_div(R, A, B, rnd); break;
++		case K_MADD: mpfr_fma(R, A, C, B, rnd); break;
++		case K_MSUB: mpfr_fms(R, A, C, B, rnd); break;
++		}
++	};
++	run(200);
++	double out;
++	if (mpfr_zero_p(R) || mpfr_nan_p(R) || mpfr_inf_p(R))
++		out = mpfr_get_d(R, MPFR_RNDN);
++	else
++	{
++		bool const positive = mpfr_sgn(R) > 0;
++		mpfr_exp_t e = mpfr_get_exp(R);	// value = m * 2^e, 0.5 <= m < 1
++		auto overflow = [&]() {
++			bool big = rnd == MPFR_RNDN || (rnd == MPFR_RNDU && positive) || (rnd == MPFR_RNDD && !positive);
++			double v = big ? INFINITY : FLT_MAX;
++			return positive ? v : -v;
++		};
++		if (e > 128) out = overflow();
++		else if (e >= -125)
++		{
++			run(24);
++			out = mpfr_get_exp(R) > 128 ? overflow() : mpfr_get_d(R, MPFR_RNDN);
++		}
++		else
++		{
++			long p = e + 149;
++			if (p >= 1) { run(p); out = mpfr_get_d(R, MPFR_RNDN); }
++			else
++			{
++				double const tiny = std::ldexp(1.0, -149);
++				bool up;
++				if (rnd == MPFR_RNDN) { mpfr_set_d(C, std::ldexp(1.0, -150), MPFR_RNDN); up = p == 0 && mpfr_cmpabs(R, C) > 0; }
++				else up = (rnd == MPFR_RNDU && positive) || (rnd == MPFR_RNDD && !positive);
++				out = up ? tiny : 0.0;
++				if (!positive) out = -out;
++			}
++		}
++	}
++	mpfr_clears(A, B, C, R, (mpfr_ptr)0);
++	return neg && !std::isnan(out) ? -out : out;
++}
++
++#endif
++
++// Exact sign of a sum of doubles (Shewchuk grow-expansion); no overflow or underflow assumed
++static inline void two_sum(double a, double b, double &s, double &e)
++{
++	s = a + b;
++	double const bv = s - a, av = s - bv;
++	e = (a - av) + (b - bv);
++}
++static inline int sum_sign(const double *t, int n)
++{
++	double E[8]; int m = 1;
++	E[0] = t[0];
++	for (int i = 1; i < n; i++)
++	{
++		double q = t[i];
++		for (int j = 0; j < m; j++) { double s, h; two_sum(q, E[j], s, h); E[j] = h; q = s; }
++		E[m++] = q;
++	}
++	for (int j = m - 1; j >= 0; j--) if (E[j] != 0) return E[j] > 0 ? 1 : -1;
++	return 0;
++}
++
++/*
++ * Once-rounded single result from exact double operands without MPFR: the correctly rounded
++ * double r1, the exact sign of (exact - r1) from error-free transformations, then rounding
++ * to the single grid by mode rn. Returns false where an intermediate could under- or
++ * overflow in double (the transformations are then not exact). Round to nearest must be
++ * the host mode.
++ */
++static bool exact_single(int kind, double a, double b, double c, int rn, double &out)
++{
++	bool const neg = kind == K_NMADD || kind == K_NMSUB;
++	if (kind == K_MSUB || kind == K_NMSUB) b = -b;
++	double r1, t[4]; int n = 0, sgn;
++	auto bad = [](double v) { double const x = std::fabs(v); return x != 0 && (x < 0x1p-900 || x > 0x1p1000); };
++	if (bad(a) || bad(b) || bad(c)) return false;
++	switch (kind)
++	{
++	case K_ADD: r1 = a + b; t[0] = a; t[1] = b; t[2] = -r1; n = 3; sgn = sum_sign(t, n); break;
++	case K_SUB: r1 = a - b; t[0] = a; t[1] = -b; t[2] = -r1; n = 3; sgn = sum_sign(t, n); break;
++	case K_MUL: r1 = a * c; if (bad(r1)) return false; { double const e = std::fma(a, c, -r1); sgn = e > 0 ? 1 : e < 0 ? -1 : 0; } break;
++	case K_DIV:
++	{
++		if (b == 0) return false;
++		r1 = a / b; if (bad(r1)) return false;
++		double const rem = std::fma(-r1, b, a);	// exact: a - r1*b
++		sgn = rem == 0 ? 0 : ((rem > 0) == (b > 0) ? 1 : -1);
++		break;
++	}
++	default:	// a*c + b (b already negated for msub)
++	{
++		double const p = a * c;
++		if (bad(p)) return false;
++		double const e = std::fma(a, c, -p);
++		r1 = std::fma(a, c, b);
++		if (bad(r1)) return false;
++		t[0] = e; t[1] = b; t[2] = p; t[3] = -r1; n = 4; sgn = sum_sign(t, n);
++		break;
++	}
++	}
++	float const f = (float)r1;
++	float res;
++	if ((double)f == r1)
++	{
++		res = f;
++		if (sgn != 0 && rn != 0)
++		{
++			if (rn == 1 && ((sgn < 0) == (f > 0))) res = std::nextafter(f, 0.0f);
++			if (rn == 2 && sgn > 0) res = std::nextafter(f, INFINITY);
++			if (rn == 3 && sgn < 0) res = std::nextafter(f, -INFINITY);
++		}
++	}
++	else
++	{
++		float lo, hi;
++		if ((double)f < r1) { lo = f; hi = std::nextafter(f, INFINITY); }
++		else { hi = f; lo = std::nextafter(f, -INFINITY); }
++		if (rn == 0)
++		{
++			double const mid = std::isinf(hi) ? 0x1.ffffffp127 : std::isinf(lo) ? -0x1.ffffffp127 : ((double)lo + (double)hi) * 0.5;
++			if (r1 != mid) res = r1 < mid ? lo : hi;
++			else if (sgn > 0) res = hi;
++			else if (sgn < 0) res = lo;
++			else { uint32_t u; std::memcpy(&u, &lo, 4); res = (u & 1) ? hi : lo; }
++		}
++		else if (rn == 1) res = r1 > 0 ? lo : hi;
++		else if (rn == 2) res = hi;
++		else res = lo;
++	}
++	if (rn == 3 && r1 == 0 && sgn == 0 && kind != K_MUL && kind != K_DIV)
++	{	// exact zero sum under round toward -inf is -0 unless both terms are +0
++		double const t1 = (kind == K_ADD || kind == K_SUB) ? a : (std::signbit(a) != std::signbit(c) ? -0.0 : 0.0) + (a * c);
++		double const t2 = kind == K_SUB ? -b : b;
++		bool const pos = t1 == 0 && !std::signbit(t1) && t2 == 0 && !std::signbit(t2);
++		res = pos ? 0.0f : -0.0f;
++	}
++	out = neg ? -(double)res : (double)res;
++	return true;
++}
++
++// float neighbour test: is r exactly halfway between two adjacent singles?
++static inline bool single_midpoint(double r)
++{
++	float const f = (float)r;
++	if ((double)f == r) return false;
++	float const g = std::nextafter(f, (float)(r > (double)f ? INFINITY : -INFINITY));
++	if (std::isinf(g) || std::isinf(f)) return true;
++	return ((double)f + (double)g) * 0.5 == r;
++}
++
++struct opstat
++{
++	uint64_t n = 0, fp_off = 0;
++	uint64_t in_cls[C_N] = {}, out_cls[C_N] = {};
++	uint64_t neg_in = 0;
++	uint64_t rep[R_N] = {};		// per operand, single ops and frsqrte/fres/fctiw inputs
++	uint64_t any_nonrep = 0;
++	uint64_t rn[4] = {};
++	// single arithmetic: emulator result E, double-then-float model D, once-rounded R
++	uint64_t cmp = 0, cmp_nr = 0, e_ne_r = 0, e_ne_r_nr = 0, d_ne_r = 0, d_ne_r_nr = 0, e_ne_d = 0, e_ne_d_nr = 0;
++	uint64_t e_ne_r_big = 0, zero_sign = 0, e_not_single = 0, skipped = 0;
++	// double fma family: emulator against fused once-rounded double
++	uint64_t fused_cmp = 0, fused_ne = 0;
++	// fctiw(z)
++	uint64_t fx_frac = 0, fx_tie = 0, fx_range = 0, fx_nan = 0, fx_negzero = 0;
++};
++
++struct census
++{
++	bool on = false;
++	std::string prefix;
++	std::vector<uint16_t> idx = std::vector<uint16_t>(65536, 0);
++	std::vector<opstat> st = std::vector<opstat>(1);
++	std::vector<uint32_t> keyof = std::vector<uint32_t>(1, 0);
++	uint32_t prod[32] = {};		// key of the last writer of each FPR
++	uint8_t chain[32] = {};		// frsqrte/fres derivation depth (1 = direct result)
++	uint32_t chain_root[32] = {};
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> consumers;	// (root key * 8 + depth, consumer key)
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> nonrep_prod;	// (single op key, producer of the non-single operand)
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> fpscr_ctl;	// (op key, FPSCR & 0xff after the write)
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> fpscr_full;	// (op key, FPSCR after the write)
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> fpscr_arg;	// (op key, FM / field+imm / bit)
++	std::map<uint32_t, uint64_t> ctl_at_arith;			// FPSCR & 0xff seen at FP arithmetic
++	std::map<uint32_t, uint64_t> mffs_val;				// FPSCR value read by mffs
++	std::map<uint32_t, uint64_t> mcrfs_field;			// crfS * 8 + crfD
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> site;	// (key, pc)
++	uint64_t msr_fe[4] = {}, msr_fp_off = 0, insn = 0;
++	uint32_t msr_or = 0, msr_and = ~0u;
++
++	// pending instruction (between pre and post)
++	bool pend = false;
++	uint32_t p_key = 0, p_op = 0, p_pc = 0;
++	int p_kind = K_NONE, p_d = -1, p_rn = 0;
++	bool p_single = false, p_nonrep = false, p_fused = false, p_fpscr = false, p_res = false;
++	double p_a = 0, p_b = 0, p_c = 0;
++
++	// per frame
++	enum { F_SINGLE, F_DOUBLE, F_NONREP, F_E_NE_R, F_D_NE_R, F_NAN_IN, F_INF_IN, F_DEN_IN, F_ZERO_IN,
++		F_NAN_OUT, F_INF_OUT, F_DEN_OUT, F_FPSCR_W, F_MFFS, F_MCRFS, F_FCTIW, F_FRSQRTE, F_FRES, F_DIV, F_FUSED_NE, F_N };
++	uint64_t fr[F_N] = {};
++	std::FILE *ff = nullptr;
++	uint64_t frame_no = 0;
++
++	void init(const char *p)
++	{
++		on = true;
++		prefix = p;
++		ff = std::fopen((prefix + "_fp_frames.csv").c_str(), "w");
++		std::fprintf(ff, "frame,single,double,single_nonrep,single_e_ne_r,single_d_ne_r,nan_in,inf_in,denorm_in,zero_in,nan_out,inf_out,denorm_out,fpscr_writes,mffs,mcrfs,fctiw,frsqrte,fres,div,double_fma_unfused_ne\n");
++	}
++
++	static uint32_t key(uint32_t op)
++	{
++		uint32_t const p = op >> 26;
++		uint32_t x = 0;
++		if (p == 19 || p == 31) x = (op >> 1) & 0x3ff;
++		else if (p == 59) x = (op >> 1) & 0x1f;
++		else if (p == 63)
++		{
++			uint32_t const x5 = (op >> 1) & 0x1f;
++			x = (x5 >= 18 && x5 != 19 && x5 != 24 && x5 != 27) ? (992 + x5) : ((op >> 1) & 0x3ff);
++		}
++		return p * 1024 + x;
++	}
++	static std::string kname(uint32_t k)
++	{
++		uint32_t const p = k >> 10, x = k & 1023;
++		static const std::map<uint32_t, const char *> n = {
++			{ 59*1024+18, "fdivs" }, { 59*1024+20, "fsubs" }, { 59*1024+21, "fadds" }, { 59*1024+22, "fsqrts" }, { 59*1024+24, "fres" },
++			{ 59*1024+25, "fmuls" }, { 59*1024+28, "fmsubs" }, { 59*1024+29, "fmadds" }, { 59*1024+30, "fnmsubs" }, { 59*1024+31, "fnmadds" },
++			{ 63*1024+992+18, "fdiv" }, { 63*1024+992+20, "fsub" }, { 63*1024+992+21, "fadd" }, { 63*1024+992+22, "fsqrt" }, { 63*1024+992+23, "fsel" },
++			{ 63*1024+992+25, "fmul" }, { 63*1024+992+26, "frsqrte" }, { 63*1024+992+28, "fmsub" }, { 63*1024+992+29, "fmadd" }, { 63*1024+992+30, "fnmsub" }, { 63*1024+992+31, "fnmadd" },
++			{ 63*1024+0, "fcmpu" }, { 63*1024+32, "fcmpo" }, { 63*1024+12, "frsp" }, { 63*1024+14, "fctiw" }, { 63*1024+15, "fctiwz" },
++			{ 63*1024+40, "fneg" }, { 63*1024+72, "fmr" }, { 63*1024+136, "fnabs" }, { 63*1024+264, "fabs" }, { 63*1024+583, "mffs" },
++			{ 63*1024+711, "mtfsf" }, { 63*1024+134, "mtfsfi" }, { 63*1024+70, "mtfsb0" }, { 63*1024+38, "mtfsb1" }, { 63*1024+64, "mcrfs" },
++			{ 48*1024, "lfs" }, { 49*1024, "lfsu" }, { 50*1024, "lfd" }, { 51*1024, "lfdu" }, { 52*1024, "stfs" }, { 53*1024, "stfsu" }, { 54*1024, "stfd" }, { 55*1024, "stfdu" },
++			{ 31*1024+535, "lfsx" }, { 31*1024+567, "lfsux" }, { 31*1024+599, "lfdx" }, { 31*1024+631, "lfdux" },
++			{ 31*1024+663, "stfsx" }, { 31*1024+695, "stfsux" }, { 31*1024+727, "stfdx" }, { 31*1024+759, "stfdux" }, { 31*1024+983, "stfiwx" },
++			{ 0, "(reset)" } };
++		auto it = n.find(k);
++		if (it != n.end()) return it->second;
++		char b[32]; std::snprintf(b, sizeof(b), "%u/%u", p, x); return b;
++	}
++	opstat &S(uint32_t k)
++	{
++		uint16_t &i = idx[k];
++		if (!i) { i = (uint16_t)st.size(); st.emplace_back(); keyof.push_back(k); }
++		return st[i];
++	}
++
++	void read(uint32_t k, int r, const double *f)
++	{
++		if (chain[r] && chain[r] < 4)
++			consumers[{ chain_root[r] * 8 + chain[r], k }]++;
++		(void)f;
++	}
++
++	void count_in(opstat &s, double v)
++	{
++		int const c = dclass(v);
++		s.in_cls[c]++;
++		if (std::signbit(v) && v != 0) s.neg_in++;
++		if (c == C_QNAN || c == C_SNAN) fr[F_NAN_IN]++;
++		else if (c == C_INF) fr[F_INF_IN]++;
++		else if (c == C_DENORM || c == C_TINY) fr[F_DEN_IN]++;
++		else if (c == C_ZERO) fr[F_ZERO_IN]++;
++	}
++
++	inline void tick(uint32_t msr)
++	{
++		insn++;
++		msr_fe[((msr >> 10) & 2) | ((msr >> 8) & 1)]++;
++		msr_or |= msr; msr_and &= msr;
++	}
++
++	// before the instruction executes
++	void pre(uint32_t pc, uint32_t op, const double *f, uint32_t fpscr, uint32_t msr)
++	{
++		tick(msr);
++		uint32_t const p = op >> 26;
++		if (p < 48 && p != 31) return;
++		uint32_t const x10 = (op >> 1) & 0x3ff;
++		int const rd = (op >> 21) & 31, ra = (op >> 16) & 31, rb = (op >> 11) & 31, rc = (op >> 6) & 31;
++		uint32_t const k = key(op);
++		// FP loads and stores: producer tags and consumers only
++		if (p == 31)
++		{
++			bool const ld = x10 == 535 || x10 == 567 || x10 == 599 || x10 == 631;
++			bool const stx = x10 == 663 || x10 == 695 || x10 == 727 || x10 == 759 || x10 == 983;
++			if (!ld && !stx) return;
++			S(k).n++;
++			if (stx) read(k, rd, f);
++			else { prod[rd] = k; chain[rd] = 0; }
++			return;
++		}
++		if (p >= 48 && p <= 51) { S(k).n++; prod[rd] = k; chain[rd] = 0; return; }
++		if (p >= 52 && p <= 55) { S(k).n++; read(k, rd, f); return; }
++		if (p != 59 && p != 63) return;
++
++		opstat &s = S(k);
++		s.n++;
++		if (!(msr & 0x2000)) { s.fp_off++; msr_fp_off++; return; }
++		uint32_t const x5 = (op >> 1) & 0x1f;
++		int srcs[3]; int ns = 0;
++		int d = -1;
++		bool arith = false;
++		int kind = K_NONE;
++		bool fused = false;
++		if (p == 59 || (x5 >= 18 && x5 != 19 && x5 != 24 && x5 != 27))
++		{
++			arith = true;
++			d = rd;
++			switch (x5)
++			{
++			case 18: srcs[ns++] = ra; srcs[ns++] = rb; kind = K_DIV; break;
++			case 20: srcs[ns++] = ra; srcs[ns++] = rb; kind = K_SUB; break;
++			case 21: srcs[ns++] = ra; srcs[ns++] = rb; kind = K_ADD; break;
++			case 22: case 24: case 26: srcs[ns++] = rb; break;
++			case 23: srcs[ns++] = ra; srcs[ns++] = rc; srcs[ns++] = rb; arith = false; break;	// fsel
++			case 25: srcs[ns++] = ra; srcs[ns++] = rc; kind = K_MUL; break;
++			case 28: case 29: case 30: case 31:
++				srcs[ns++] = ra; srcs[ns++] = rc; srcs[ns++] = rb;
++				kind = x5 == 28 ? K_MSUB : x5 == 29 ? K_MADD : x5 == 30 ? K_NMSUB : K_NMADD;
++				fused = p == 63;
++				break;
++			default: break;
++			}
++			if (p == 63 && !fused) kind = K_NONE;
++		}
++		else
++		{
++			switch (x10)
++			{
++			case 0: case 32: srcs[ns++] = ra; srcs[ns++] = rb; break;		// fcmpu, fcmpo
++			case 12: case 14: case 15: case 40: case 72: case 136: case 264: srcs[ns++] = rb; d = rd; break;
++			case 583: d = rd; fr[F_MFFS]++; mffs_val[fpscr]++; site[{ k, pc }]++; break;
++			case 711: srcs[ns++] = rb; fpscr_arg[{ k, (op >> 17) & 0xff }]++; site[{ k, pc }]++; break;
++			case 134: fpscr_arg[{ k, ((op >> 23) & 7) * 16 + ((op >> 12) & 15) }]++; site[{ k, pc }]++; break;
++			case 70: case 38: fpscr_arg[{ k, (uint32_t)rd }]++; site[{ k, pc }]++; break;
++			case 64: fr[F_MCRFS]++; mcrfs_field[((op >> 18) & 7) * 8 + ((op >> 23) & 7)]++; site[{ k, pc }]++; break;
++			default: break;
++			}
++		}
++		for (int i = 0; i < ns; i++)
++		{
++			read(k, srcs[i], f);
++			count_in(s, f[srcs[i]]);
++		}
++		s.rn[fpscr & 3]++;
++		if (arith) { ctl_at_arith[fpscr & 0xff]++; fr[p == 59 ? F_SINGLE : F_DOUBLE]++; }
++		if (x5 == 18 && (p == 59 || arith)) fr[F_DIV]++;
++		bool single_rep_check = p == 59 || (p == 63 && arith && x5 == 26) || (p == 63 && (x10 == 14 || x10 == 15 || x10 == 12));
++		bool any_nr = false;
++		if (single_rep_check)
++			for (int i = 0; i < ns; i++)
++			{
++				int const r = repclass(f[srcs[i]]);
++				s.rep[r]++;
++				if (nonrep(r))
++				{
++					any_nr = true;
++					if (p == 59) nonrep_prod[{ k, prod[srcs[i]] }]++;
++				}
++			}
++		if (any_nr) { s.any_nonrep++; if (p == 59) fr[F_NONREP]++; }
++		if (p == 63 && (x10 == 14 || x10 == 15))
++		{
++			fr[F_FCTIW]++;
++			double const v = f[rb];
++			if (std::isnan(v)) s.fx_nan++;
++			else if (v >= 2147483648.0 || v < -2147483648.0) s.fx_range++;
++			else
++			{
++				if (v != std::trunc(v)) s.fx_frac++;
++				if (std::fabs(v - std::trunc(v)) == 0.5) s.fx_tie++;
++				if (v == 0 && std::signbit(v)) s.fx_negzero++;
++			}
++		}
++		if (p == 63 && x5 == 26) fr[F_FRSQRTE]++;
++		if (p == 59 && x5 == 24) fr[F_FRES]++;
++
++		// derivation chain for frsqrte / fres results
++		uint8_t depth = 0; uint32_t root = 0;
++		if ((p == 63 && x5 == 26 && arith) || (p == 59 && x5 == 24)) { depth = 1; root = k; }
++		else
++			for (int i = 0; i < ns; i++)
++				if (chain[srcs[i]] && chain[srcs[i]] + 1 > depth) { depth = chain[srcs[i]] + 1; root = chain_root[srcs[i]]; }
++		if (d >= 0)
++		{
++			prod[d] = k;
++			chain[d] = depth > 4 ? 0 : depth;
++			chain_root[d] = root;
++		}
++
++		pend = true;
++		p_key = k; p_op = op; p_pc = pc; p_d = d; p_kind = kind; p_rn = fpscr & 3;
++		p_single = p == 59; p_nonrep = any_nr; p_fused = fused;
++		p_fpscr = p == 63 && (x10 == 711 || x10 == 134 || x10 == 70 || x10 == 38);
++		p_res = d >= 0 && !(p == 63 && x10 == 583);
++		p_a = f[ra]; p_b = f[rb]; p_c = f[rc];
++	}
++
++	// after it executed
++	void post(const double *f, uint32_t fpscr)
++	{
++		if (!pend) return;
++		pend = false;
++		opstat &s = st[idx[p_key]];
++		if (p_fpscr)
++		{
++			fr[F_FPSCR_W]++;
++			fpscr_ctl[{ p_key, fpscr & 0xff }]++;
++			if (fpscr_full.size() < 4096) fpscr_full[{ p_key, fpscr }]++;
++		}
++		if (!p_res) return;
++		double const e = f[p_d];
++		int c = dclass(e);
++		if (p_single && (c == C_TINY)) c = C_DENORM;	// single result below single normal range
++		s.out_cls[c]++;
++		if (c == C_QNAN || c == C_SNAN) fr[F_NAN_OUT]++;
++		else if (c == C_INF) fr[F_INF_OUT]++;
++		else if (c == C_DENORM || c == C_TINY) fr[F_DEN_OUT]++;
++		if (p_single && !std::isnan(e) && (double)(float)e != e) s.e_not_single++;
++
++		if (p_kind == K_NONE) return;
++		double const a = p_a, b = p_b, cc = p_c;
++		if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(cc) || std::isnan(e)
++			|| (p_kind == K_DIV && b == 0)) { s.skipped++; return; }
++		unsigned const csr = _mm_getcsr();
++		_mm_setcsr(0x1f80);
++		if (p_fused)
++		{
++			if (p_rn == 0)
++			{
++				double r = std::fma(a, cc, (p_kind == K_MSUB || p_kind == K_NMSUB) ? -b : b);
++				if (p_kind == K_NMADD || p_kind == K_NMSUB) r = -r;
++				s.fused_cmp++;
++				if (bits(r) != bits(e)) { s.fused_ne++; fr[F_FUSED_NE]++; }
++			}
++			_mm_setcsr(csr);
++			return;
++		}
++		// double-then-float model (separate multiply and add, each rounded to double)
++		double dm = 0;
++		{
++			volatile double pr = a * cc;
++			switch (p_kind)
++			{
++			case K_ADD: dm = (float)(a + b); break;
++			case K_SUB: dm = (float)(a - b); break;
++			case K_MUL: dm = (float)(a * cc); break;
++			case K_DIV: dm = (float)(a / b); break;
++			case K_MADD: dm = (float)(pr + b); break;
++			case K_MSUB: dm = (float)(pr - b); break;
++			case K_NMADD: dm = -(float)(pr + b); break;
++			case K_NMSUB: dm = -(float)(pr - b); break;
++			}
++		}
++		// once-rounded reference from the exact operands (exact_single)
++		double r;
++		if (!exact_single(p_kind, a, b, cc, p_rn, r)) { _mm_setcsr(csr); s.skipped++; return; }
++		_mm_setcsr(csr);
++		s.cmp++;
++		if (p_nonrep) s.cmp_nr++;
++		if (p_rn != 0) dm = r;	// the double model is only defined here for round-to-nearest
++		bool const er = bits(e) != bits(r), dr = bits(dm) != bits(r), ed = bits(e) != bits(dm);
++		if (er)
++		{
++			s.e_ne_r++; fr[F_E_NE_R]++;
++			if (p_nonrep) s.e_ne_r_nr++;
++			if (e == r) s.zero_sign++;
++			else
++			{
++				float const fe = (float)e, frr = (float)r;
++				if (std::nextafter(fe, frr) != frr) s.e_ne_r_big++;
++			}
++		}
++		if (dr) { s.d_ne_r++; fr[F_D_NE_R]++; if (p_nonrep) s.d_ne_r_nr++; }
++		if (ed) { s.e_ne_d++; if (p_nonrep) s.e_ne_d_nr++; }
++	}
++
++	void frame()
++	{
++		if (!on) return;
++		std::fprintf(ff, "%llu", (unsigned long long)frame_no++);
++		for (int i = 0; i < F_N; i++) { std::fprintf(ff, ",%llu", (unsigned long long)fr[i]); fr[i] = 0; }
++		std::fprintf(ff, "\n");
++	}
++
++	// ctx(pc) returns a disassembly listing of the code around pc
++	void dump(std::function<std::string(uint32_t)> ctx)
++	{
++		if (!on) return;
++		std::fclose(ff);
++		std::FILE *o = std::fopen((prefix + "_fp.txt").c_str(), "w");
++		std::fprintf(o, "frames %llu  instructions %llu\n", (unsigned long long)frame_no, (unsigned long long)insn);
++		std::fprintf(o, "MSR or %08X and %08X; FE0,FE1 = 00 %llu, 01 %llu, 10 %llu, 11 %llu; FP ops with MSR[FP]=0 %llu\n",
++			msr_or, msr_and, (unsigned long long)msr_fe[0], (unsigned long long)msr_fe[1], (unsigned long long)msr_fe[2], (unsigned long long)msr_fe[3], (unsigned long long)msr_fp_off);
++		std::vector<size_t> order;
++		for (size_t i = 1; i < st.size(); i++) order.push_back(i);
++		std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return st[a].n > st[b].n; });
++		std::fprintf(o, "\n== per opcode: count, input classes (%s...), result classes, RN histogram\n", cname[0]);
++		for (size_t i : order)
++		{
++			opstat const &s = st[i];
++			std::fprintf(o, "%-8s n %llu", kname(keyof[i]).c_str(), (unsigned long long)s.n);
++			std::fprintf(o, " | in");
++			for (int c = 0; c < C_N; c++) if (s.in_cls[c]) std::fprintf(o, " %s %llu", cname[c], (unsigned long long)s.in_cls[c]);
++			if (s.neg_in) std::fprintf(o, " negative %llu", (unsigned long long)s.neg_in);
++			std::fprintf(o, " | out");
++			for (int c = 0; c < C_N; c++) if (s.out_cls[c]) std::fprintf(o, " %s %llu", cname[c], (unsigned long long)s.out_cls[c]);
++			std::fprintf(o, " | RN %llu %llu %llu %llu", (unsigned long long)s.rn[0], (unsigned long long)s.rn[1], (unsigned long long)s.rn[2], (unsigned long long)s.rn[3]);
++			if (s.fp_off) std::fprintf(o, " | FP off %llu", (unsigned long long)s.fp_off);
++			std::fprintf(o, "\n");
++		}
++		std::fprintf(o, "\n== single-format representability of operands (per operand read)\n");
++		for (size_t i : order)
++		{
++			opstat const &s = st[i];
++			uint64_t t = 0; for (int r = 0; r < R_N; r++) t += s.rep[r];
++			if (!t) continue;
++			std::fprintf(o, "%-8s", kname(keyof[i]).c_str());
++			for (int r = 0; r < R_N; r++) std::fprintf(o, " %s %llu", rname[r], (unsigned long long)s.rep[r]);
++			std::fprintf(o, " | ops with a non-single operand %llu of %llu\n", (unsigned long long)s.any_nonrep, (unsigned long long)s.n);
++		}
++		std::fprintf(o, "\n== single arithmetic: emulator E, double-then-float model D, once-rounded R (all / with a non-single operand)\n");
++		for (size_t i : order)
++		{
++			opstat const &s = st[i];
++			if (!s.cmp && !s.skipped) continue;
++			std::fprintf(o, "%-8s compared %llu / %llu  E!=R %llu / %llu  D!=R %llu / %llu  E!=D %llu / %llu  | E!=R by >1 ulp %llu, zero sign only %llu, E not single %llu, skipped %llu\n",
++				kname(keyof[i]).c_str(), (unsigned long long)s.cmp, (unsigned long long)s.cmp_nr, (unsigned long long)s.e_ne_r, (unsigned long long)s.e_ne_r_nr,
++				(unsigned long long)s.d_ne_r, (unsigned long long)s.d_ne_r_nr, (unsigned long long)s.e_ne_d, (unsigned long long)s.e_ne_d_nr,
++				(unsigned long long)s.e_ne_r_big, (unsigned long long)s.zero_sign, (unsigned long long)s.e_not_single, (unsigned long long)s.skipped);
++		}
++		std::fprintf(o, "\n== double fma family: emulator against fused once-rounded double (RN only)\n");
++		for (size_t i : order)
++			if (st[i].fused_cmp)
++				std::fprintf(o, "%-8s compared %llu differ %llu\n", kname(keyof[i]).c_str(), (unsigned long long)st[i].fused_cmp, (unsigned long long)st[i].fused_ne);
++		std::fprintf(o, "\n== producer of the non-single operand of single ops (op, producer, count)\n");
++		{
++			std::vector<std::pair<uint64_t, std::pair<uint32_t, uint32_t>>> v;
++			for (auto &e : nonrep_prod) v.emplace_back(e.second, e.first);
++			std::sort(v.rbegin(), v.rend());
++			for (size_t i = 0; i < v.size() && i < 60; i++)
++				std::fprintf(o, "%-8s <- %-8s %llu\n", kname(v[i].second.first).c_str(), kname(v[i].second.second).c_str(), (unsigned long long)v[i].first);
++		}
++		std::fprintf(o, "\n== fctiw / fctiwz inputs\n");
++		for (size_t i : order)
++		{
++			opstat const &s = st[i];
++			uint32_t const k = keyof[i];
++			if (k != 63*1024+14 && k != 63*1024+15) continue;
++			std::fprintf(o, "%-8s n %llu RN %llu %llu %llu %llu fractional %llu exact .5 %llu out of range %llu NaN %llu -0 %llu\n", kname(k).c_str(), (unsigned long long)s.n,
++				(unsigned long long)s.rn[0], (unsigned long long)s.rn[1], (unsigned long long)s.rn[2], (unsigned long long)s.rn[3],
++				(unsigned long long)s.fx_frac, (unsigned long long)s.fx_tie, (unsigned long long)s.fx_range, (unsigned long long)s.fx_nan, (unsigned long long)s.fx_negzero);
++		}
++		std::fprintf(o, "\n== consumers of frsqrte / fres results (root, depth, consumer, count; depth 1 = reads the estimate itself)\n");
++		for (auto &e : consumers)
++			std::fprintf(o, "%-8s d%u %-8s %llu\n", kname(e.first.first / 8).c_str(), e.first.first % 8, kname(e.first.second).c_str(), (unsigned long long)e.second);
++		std::fprintf(o, "\n== FPSCR writes: control byte after the write (VE OE UE ZE XE NI RN: bits 7..0 = VE OE UE ZE XE NI RN1 RN0)\n");
++		for (auto &e : fpscr_ctl)
++			std::fprintf(o, "%-8s ctl %02X  VE%u OE%u UE%u ZE%u XE%u NI%u RN%u  %llu\n", kname(e.first.first).c_str(), e.first.second,
++				(e.first.second >> 7) & 1, (e.first.second >> 6) & 1, (e.first.second >> 5) & 1, (e.first.second >> 4) & 1, (e.first.second >> 3) & 1, (e.first.second >> 2) & 1, e.first.second & 3,
++				(unsigned long long)e.second);
++		std::fprintf(o, "\n== FPSCR write arguments (mtfsf FM, mtfsfi field*16+imm, mtfsb bit)\n");
++		for (auto &e : fpscr_arg)
++			std::fprintf(o, "%-8s %02X  %llu\n", kname(e.first.first).c_str(), e.first.second, (unsigned long long)e.second);
++		std::fprintf(o, "\n== full FPSCR after writes (first 4096 distinct)\n");
++		for (auto &e : fpscr_full)
++			std::fprintf(o, "%-8s %08X  %llu\n", kname(e.first.first).c_str(), e.first.second, (unsigned long long)e.second);
++		std::fprintf(o, "\n== FPSCR control byte at FP arithmetic\n");
++		for (auto &e : ctl_at_arith)
++			std::fprintf(o, "ctl %02X  %llu\n", e.first, (unsigned long long)e.second);
++		std::fprintf(o, "\n== FPSCR value read by mffs\n");
++		for (auto &e : mffs_val)
++			std::fprintf(o, "%08X  %llu\n", e.first, (unsigned long long)e.second);
++		std::fprintf(o, "\n== mcrfs (crfS, crfD, count)\n");
++		for (auto &e : mcrfs_field)
++			std::fprintf(o, "crfS %u crfD %u  %llu\n", e.first / 8, e.first % 8, (unsigned long long)e.second);
++		std::fprintf(o, "\n== FPSCR instruction sites, with the code around each\n");
++		for (auto &e : site)
++		{
++			std::fprintf(o, "\n-- %s at %08X, %llu times\n", kname(e.first.first).c_str(), e.first.second, (unsigned long long)e.second);
++			if (ctx) std::fprintf(o, "%s", ctx(e.first.second).c_str());
++		}
++		std::fclose(o);
++		on = false;
++	}
++};
++
++}	// namespace m3fp
++
++#endif
 diff --git a/Src/CPU/PowerPC/ppc.cpp b/Src/CPU/PowerPC/ppc.cpp
 index 18ef2cd..fb69b93 100644
 --- a/Src/CPU/PowerPC/ppc.cpp
@@ -58,10 +747,10 @@ index 18ef2cd..fb69b93 100644
  }
  
 diff --git a/Src/CPU/PowerPC/ppc603.c b/Src/CPU/PowerPC/ppc603.c
-index a5290eb..c006edd 100644
+index a5290eb..9230c85 100644
 --- a/Src/CPU/PowerPC/ppc603.c
 +++ b/Src/CPU/PowerPC/ppc603.c
-@@ -260,6 +260,350 @@ void ppc_add_cycles(int cycles)
+@@ -260,6 +260,861 @@ void ppc_add_cycles(int cycles)
  	ppc.icount -= cycles;
  }
  
@@ -76,6 +765,9 @@ index a5290eb..c006edd 100644
 +#include <string>
 +#include <vector>
 +#include <algorithm>
++#include <thread>
++#include "m3fp_census.h"
++#include "PPCDisasm.h"
 +
 +namespace {
 +
@@ -94,7 +786,7 @@ index a5290eb..c006edd 100644
 +	std::vector<uint32_t> age;
 +	uint32_t clk = 0;
 +	m3cpi_cache(int kib, int w) : ways(w), sets(kib * 1024 / 32 / w), tag(sets * w, ~0u), dirty(sets * w, 0), age(sets * w, 0) {}
-+	int access(UINT32 addr, bool write)	// 0 hit, 1 miss, 2 miss with dirty victim
++	int access(UINT32 addr, bool write, int *way_miss = nullptr)	// 0 hit, 1 miss, 2 miss with dirty victim
 +	{
 +		UINT32 const line = addr >> 5;
 +		int const set = line % sets;
@@ -105,7 +797,16 @@ index a5290eb..c006edd 100644
 +		int victim = 0;
 +		for (int w = 0; w < ways; w++)
 +		{
-+			if (t[w] == line) { a[w] = clk; d[w] |= write; return 0; }
++			if (t[w] == line)
++			{
++				if (way_miss)	// way prediction: the most recently used way of the set
++				{
++					int mru = 0;
++					for (int v = 1; v < ways; v++) if (a[v] > a[mru]) mru = v;
++					*way_miss = w != mru;
++				}
++				a[w] = clk; d[w] |= write; return 0;
++			}
 +			if (a[w] < a[victim]) victim = w;
 +		}
 +		int const r = d[victim] ? 2 : 1;
@@ -126,6 +827,57 @@ index a5290eb..c006edd 100644
 +	m3cpi_config(const char *n, int kib, int pen, int st = -1, bool sb = false) : name(n), penalty(pen), stall(st < 0 ? pen : st), storebuf(sb), ic(kib, 4), dc(kib, 4) {}
 +};
 +
++/*
++ * FPU sweep (M3CPI_FPU=1): FPU latency options on one shared 16 KiB 4-way I and D cache
++ * pair with store buffer and early restart, at several CPU clocks. Cache contents do not
++ * depend on timing, so hit and miss are computed once per instruction; each option keeps
++ * only its own scoreboard. FP sources and destinations are decoded exactly here.
++ */
++enum { FC_NONE, FC_S_ADD, FC_S_MUL, FC_S_FMA, FC_D_ADD, FC_D_MUL, FC_D_FMA, FC_FDIVS, FC_FDIV, FC_FRES, FC_FRSQRTE,
++	FC_FSEL, FC_MOVE, FC_RND, FC_CMP, FC_FPSCR, FC_N };
++enum { FU_PIPE = 1, FU_DIV = 3 };
++
++struct m3cpi_fpu
++{
++	struct { int lat, busy, unit; } c[FC_N];
++	bool serial = false;		// fcmpu/fcmpo, mffs, mtfsf(i), mtfsb0/1, mcrfs wait for the FP pipeline to drain
++	bool div_blocks = false;	// the iterative unit also stalls the FMA pipeline
++	bool serial_fpscr = false;	// mffs, mtfsf(i), mtfsb0/1, mcrfs wait for the FP pipeline to drain
++	int idiv = 0;			// integer divide latency override (0: the decode's 20)
++	bool dual = false;		// 603e dispatch: two instructions a cycle to different units
++	bool ld1b = false;		// built loads: load-use 3, a hit in the non-predicted (not most recently
++					// used) way +2 cycles, FP loads hold WB one cycle
++	bool load2 = false;		// load hit holds MEM a second cycle: +1 cycle per word loaded, load-use +1
++	bool icbuilt = false;		// built I-cache: taken-branch redirect 2 cycles, sequential new line +1,
++					// first word of a miss L+4 (D) and L+3 (I) with L = 12 at 120 MHz
++	bool ld_use2 = false;		// with ld1b: keep the way-miss and FP-load costs but load use 2, not 3
++	int redirect = 2;		// built I-side (icbuilt): cycles lost on a correctly predicted taken branch
++	int btb = 0;			// 64 or 256: a direct-mapped BTB hit makes that redirect free
++	int nl_cost = 1, wm_cost = 2;	// sequential new line; load hit outside the predicted way (ld1b)
++	int dual_mode = 0;
++	bool fast_wb = false;		// single ops and frsqrte on a fast path: may issue only when no FP pipeline
++					// result is due at t + fast latency or later (in-order write-back)
++	int fast_lat = 0;		// with dual: 0 any two different units, 2 an FP op with a non-FP op
++	bool fold = false;		// 603e branch folding (User's Manual 6.4.1.1): a branch takes no
++					// dispatch slot and a taken branch hitting in the cache costs nothing;
++					// a misprediction refetches 2 cycles after the CR is ready, and
++					// bclr/bcctr wait for LR/CTR
++};
++
++struct m3cpi_fcfg
++{
++	std::string name;
++	m3cpi_fpu fpu;
++	int stall, io_load, io_store;
++	int ist = 15, dst = 16;		// built caches: first word of an I / D miss (L + 3, L + 4)
++	uint64_t last = 0, ready[72] = {}, fpu_free = 0, fdiv_free = 0, div_free = 0, drain = 0, frame_start = 0;
++	int pending_bubbles = 0;
++	int slot = 0, last_xu = -1;	// dual dispatch: instructions issued at cycle 'last', unit of the first
++	uint64_t min_next = 0;		// folded branches: earliest issue of the next instruction
++	uint64_t pipe_due = 0;		// latest result due from the FP pipeline (fast_wb)
++	bool last_pairable = false, last_fpop = false;
++};
++
 +enum { R_CR = 64, R_LR, R_CTR, R_NONE = 127 };
 +
 +struct m3cpi_decoded
@@ -137,7 +889,51 @@ index a5290eb..c006edd 100644
 +	int unit = 0;			// 1 FPU, 2 divider
 +	int extra = 0;			// extra issue cycles (lmw/stmw, sync, rfi)
 +	int is_load = 0;
++	int fclass = FC_NONE;		// FPU sweep only
 +};
++
++// exact FP operands and class for the FPU sweep (the R22 configurations keep m3cpi_decode)
++static inline void m3cpi_decode_fp(UINT32 op, m3cpi_decoded &d)
++{
++	int const p = op >> 26, rd = (op >> 21) & 31, ra = (op >> 16) & 31, rb = (op >> 11) & 31, rc = (op >> 6) & 31;
++	int const xo10 = (op >> 1) & 0x3ff, xo5 = (op >> 1) & 0x1f;
++	if (p != 59 && p != 63) return;
++	for (int &s : d.src) s = R_NONE;
++	for (int &x : d.dst) x = R_NONE;
++	d.unit = 1;
++	int const A = 32 + ra, B = 32 + rb, C = 32 + rc, D = 32 + rd;
++	auto src = [&](int a, int b = R_NONE, int c = R_NONE) { d.src[0] = a; d.src[1] = b; d.src[2] = c; };
++	int cls = FC_NONE;
++	if (p == 59 || (xo5 >= 18 && xo5 != 19 && xo5 != 24 && xo5 != 27))
++	{
++		bool const s = p == 59;
++		d.dst[0] = D;
++		switch (xo5)
++		{
++		case 18: src(A, B); cls = s ? FC_FDIVS : FC_FDIV; break;
++		case 20: case 21: src(A, B); cls = s ? FC_S_ADD : FC_D_ADD; break;
++		case 22: src(B); cls = s ? FC_FDIVS : FC_FDIV; break;		// fsqrt(s), not on the 603e
++		case 23: src(A, C, B); cls = FC_FSEL; break;
++		case 24: src(B); cls = FC_FRES; break;
++		case 25: src(A, C); cls = s ? FC_S_MUL : FC_D_MUL; break;
++		case 26: src(B); cls = FC_FRSQRTE; break;
++		default: src(A, C, B); cls = s ? FC_S_FMA : FC_D_FMA; break;
++		}
++	}
++	else
++		switch (xo10)
++		{
++		case 0: case 32: src(A, B); d.dst[0] = R_CR; cls = FC_CMP; break;
++		case 12: case 14: case 15: src(B); d.dst[0] = D; cls = FC_RND; break;
++		case 583: d.dst[0] = D; cls = FC_FPSCR; break;
++		case 711: src(B); cls = FC_FPSCR; break;
++		case 64: d.dst[0] = R_CR; cls = FC_FPSCR; break;
++		case 134: case 70: case 38: cls = FC_FPSCR; break;
++		default: src(B); d.dst[0] = D; cls = FC_MOVE; break;	// fmr, fneg, fabs, fnabs
++		}
++	if ((op & 1) && d.dst[0] != R_CR) d.dst[1] = R_CR;
++	d.fclass = cls;
++}
 +
 +static inline void m3cpi_decode(UINT32 op, m3cpi_decoded &d)
 +{
@@ -235,6 +1031,8 @@ index a5290eb..c006edd 100644
 +{
 +	bool on = false;
 +	std::vector<m3cpi_config> cfg;
++	std::vector<m3cpi_fcfg> fcfg;
++	m3cpi_cache sic = m3cpi_cache(16, 4), sdc = m3cpi_cache(16, 4);
 +	struct memop { UINT32 addr; unsigned size; bool write; };
 +	memop mem[128];
 +	int nmem = 0;
@@ -251,7 +1049,384 @@ index a5290eb..c006edd 100644
 +		cfg.emplace_back("32k_p24_er12_sb", 32, 24, 12, true);
 +		cfg.emplace_back("16k_p40_er20_sb", 16, 40, 20, true);
 +		cfg.emplace_back("32k_p40_er20_sb", 32, 40, 20, true);
++		if (std::getenv("M3CPI_FPU"))
++			init_fpu();
 +	}
++
++	/*
++	 * Latencies in CPU cycles. Clock options scale the memory-side costs (first word of a
++	 * 24-cycle fill, 12 at 100 MHz; uncached load 20) by the clock ratio, rounded up; posted
++	 * uncached stores stay 2. FP latencies stay in cycles.
++	 */
++	void init_fpu()
++	{
++		auto set = [](m3cpi_fpu &f, int cls, int lat, int busy, int unit = FU_PIPE) { f.c[cls].lat = lat; f.c[cls].busy = busy; f.c[cls].unit = unit; };
++		std::vector<std::pair<std::string, m3cpi_fpu>> opts;
++		{	// R22 latencies on exact FP operands
++			m3cpi_fpu f{};
++			for (int c : { FC_S_ADD, FC_S_MUL, FC_S_FMA, FC_FRES, FC_FRSQRTE }) set(f, c, 3, 0);
++			set(f, FC_D_ADD, 4, 0); set(f, FC_FSEL, 4, 0);
++			set(f, FC_D_MUL, 9, 8); set(f, FC_D_FMA, 9, 8);
++			set(f, FC_FDIVS, 18, 17); set(f, FC_FDIV, 33, 32);
++			for (int c : { FC_MOVE, FC_RND, FC_CMP, FC_FPSCR }) set(f, c, 2, 0);
++			opts.emplace_back("base", f);
++		}
++		struct divset { const char *n; int s, d, r, q; } const divs[2] = { { "r2", 28, 57, 28, 115 }, { "r4", 16, 30, 16, 60 } };
++		auto unified = [&](int L, divset const &dv, bool blocking, bool serial, bool div_blocks) {
++			m3cpi_fpu f{};
++			int const b = blocking ? L - 1 : 0;
++			for (int c : { FC_S_ADD, FC_S_MUL, FC_S_FMA, FC_D_ADD, FC_D_MUL, FC_D_FMA, FC_RND }) set(f, c, L, b);
++			for (int c : { FC_FSEL, FC_MOVE, FC_CMP, FC_FPSCR }) set(f, c, 2, blocking ? 1 : 0);
++			int const du = (blocking || div_blocks) ? FU_PIPE : FU_DIV;
++			set(f, FC_FDIVS, dv.s, dv.s - 1, du); set(f, FC_FDIV, dv.d, dv.d - 1, du);
++			set(f, FC_FRES, dv.r, dv.r - 1, du); set(f, FC_FRSQRTE, dv.q, dv.q - 1, du);
++			f.serial = serial; f.div_blocks = div_blocks;
++			return f;
++		};
++		for (auto const &dv : divs)
++			for (int L = 4; L <= 7; L++)
++				opts.emplace_back("u" + std::to_string(L) + "_" + dv.n, unified(L, dv, false, false, false));
++		for (auto const &dv : divs)
++			for (int L = 4; L <= 6; L++)
++				opts.emplace_back("blk" + std::to_string(L) + "_" + dv.n, unified(L, dv, true, false, false));
++		for (auto const &dv : divs)
++			for (int L = 5; L <= 6; L++)
++				opts.emplace_back("u" + std::to_string(L) + "_" + dv.n + "_ser", unified(L, dv, false, true, false));
++		opts.emplace_back("u5_r2_divblk", unified(5, divs[0], false, false, true));
++		for (int L = 4; L <= 6; L++)
++		{	// fres and frsqrte as pipelined table estimates (latency L), divides iterative radix 2
++			m3cpi_fpu f = unified(L, divs[0], false, false, false);
++			set(f, FC_FRES, L, 0); set(f, FC_FRSQRTE, L, 0);
++			opts.emplace_back("u" + std::to_string(L) + "_r2_est", f);
++		}
++		{	// the built FPU: pipelined FMA at L; divider from start to result fdiv 38, fdivs 24,
++			// fres 24, frsqrte 97, each blocking the divider (special-operand early outs not modelled)
++			divset const built = { "built", 24, 38, 24, 97 };
++			for (int L : { 12, 8 })
++				opts.emplace_back("meas_l" + std::to_string(L), unified(L, built, false, false, false));
++			m3cpi_fpu f = unified(12, built, false, false, false);
++			set(f, FC_FRSQRTE, 24, 23, FU_DIV);
++			opts.emplace_back("meas_l12_rsq24", f);
++		}
++		{	// the real 603e at 66 MHz: three-stage FPU, singles and double adds 1-1-1, double
++			// multiplies 2-1-1, fdivs and fres 18 and fdiv 33 blocking the FPU, frsqrte 3 pipelined,
++			// FPSCR instructions serialised, divw 37. ref66: memory costs scaled from 100 MHz
++			// (same time in ns); ref66_slow: the 100 MHz cycle counts kept (memory 1.5x slower)
++			m3cpi_fpu f{};
++			for (int c : { FC_S_ADD, FC_S_MUL, FC_S_FMA, FC_D_ADD, FC_FRSQRTE, FC_FSEL, FC_MOVE, FC_RND, FC_CMP, FC_FPSCR }) set(f, c, 3, 0);
++			set(f, FC_D_MUL, 4, 2); set(f, FC_D_FMA, 4, 2);
++			set(f, FC_FDIVS, 18, 17); set(f, FC_FRES, 18, 17); set(f, FC_FDIV, 33, 32);
++			f.serial_fpscr = true; f.idiv = 37;
++			opts.emplace_back("ref66", f);
++			opts.emplace_back("ref66_slow", f);
++			f.dual = true;
++			opts.emplace_back("ref66_dual", f);
++			opts.emplace_back("ref66_dual_slow", f);
++			f.fold = true;
++			opts.emplace_back("ref66_dual_ic", f);
++			opts.emplace_back("ref66_dual_ic_slow", f);
++		}
++		{	// split latencies at 120 MHz: single ops (primary opcode 59) Ls pipelined; double
++			// arithmetic, frsp and fctiw Ld, pipelined (12) or issuing every Ld cycles (16n);
++			// built divider (fdiv 38, fdivs 24, fres 24); frsqrte 97 or 24 on the divider, or an
++			// Ls pipelined estimate
++			for (int Ls : { 4, 6, 8 })
++				for (int dn = 0; dn < 2; dn++)
++					for (int q = 0; q < 3; q++)
++					{
++						int const Ld = dn ? 16 : 12;
++						m3cpi_fpu f{};
++						for (int c : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, c, Ls, 0);
++						for (int c : { FC_D_ADD, FC_D_MUL, FC_D_FMA, FC_RND }) set(f, c, Ld, dn ? Ld : 0);
++						for (int c : { FC_FSEL, FC_MOVE, FC_CMP, FC_FPSCR }) set(f, c, 2, 0);
++						set(f, FC_FDIVS, 24, 23, FU_DIV); set(f, FC_FDIV, 38, 37, FU_DIV); set(f, FC_FRES, 24, 23, FU_DIV);
++						if (q == 0) set(f, FC_FRSQRTE, 97, 96, FU_DIV);
++						else if (q == 1) set(f, FC_FRSQRTE, 24, 23, FU_DIV);
++						else set(f, FC_FRSQRTE, Ls, 0);
++						opts.emplace_back("sp_s" + std::to_string(Ls) + "_d" + std::to_string(Ld) + (dn ? "n" : "") + (q == 0 ? "_q97" : q == 1 ? "_q24" : "_qest"), f);
++					}
++		}
++		{	// frsqrte latency sweep at 120 MHz: unified FMA L = 12, built divider, frsqrte blocking
++			// the divider at Q cycles
++			divset const built = { "built", 24, 38, 24, 97 };
++			for (int Q : { 24, 36, 48, 60, 72, 84, 97 })
++			{
++				m3cpi_fpu f = unified(12, built, false, false, false);
++				set(f, FC_FRSQRTE, Q, Q - 1, FU_DIV);
++				opts.emplace_back("rsq_l12_q" + std::to_string(Q), f);
++			}
++			// decision grid: built I-side costs; FPU unified 12, or singles 4/6 with doubles 12
++			// pipelined; frsqrte 36 or 97 on the divider, or a pipelined estimate at the FPU
++			// latency of its class (double: 12); ld1 / ld2
++			for (int fpu = 0; fpu < 3; fpu++)
++				for (int q = 0; q < 3; q++)
++					for (int ld = 1; ld <= 3; ld++)	// 3: ld1b
++					{
++						m3cpi_fpu f = unified(12, built, false, false, false);
++						if (fpu) { int const Ls = fpu == 1 ? 4 : 6; for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, Ls, 0); }
++						if (q == 0) set(f, FC_FRSQRTE, 36, 35, FU_DIV);
++						else if (q == 1) set(f, FC_FRSQRTE, 97, 96, FU_DIV);
++						else set(f, FC_FRSQRTE, 12, 0);
++						f.load2 = ld == 2; f.ld1b = ld == 3; f.icbuilt = true;
++						opts.emplace_back(std::string("dt_") + (fpu == 0 ? "u12" : fpu == 1 ? "s4d12" : "s6d12") + (q == 0 ? "_q36" : q == 1 ? "_q97" : "_qest") + (ld == 3 ? "_ld1b" : "_ld" + std::to_string(ld)) + "_ic", f);
++					}
++			// throughput levers on s4d12_qest with the built caches (lv_): load use 3 (ld1b) / 2 (ld1; the
++			// way-miss and FP-load costs stay),
++			// taken-branch redirect 2 / 1 / BTB 64 / BTB 256, sequential new line 1 / 0, way-prediction
++			// miss 2 / 1, issue single / dual to different units (a) / FP op with non-FP op (b)
++			for (int ld = 0; ld < 2; ld++)
++				for (int rd = 0; rd < 4; rd++)
++					for (int nl = 0; nl < 2; nl++)
++						for (int wm = 0; wm < 2; wm++)
++							for (int du = 0; du < 3; du++)
++							{
++								m3cpi_fpu f = unified(12, built, false, false, false);
++								for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, 4, 0);
++								set(f, FC_FRSQRTE, 12, 0);
++								f.icbuilt = true; f.ld1b = true; f.ld_use2 = ld == 1;
++								f.redirect = rd == 1 ? 1 : 2; f.btb = rd == 2 ? 64 : rd == 3 ? 256 : 0;
++								f.nl_cost = nl ? 0 : 1; f.wm_cost = wm ? 1 : 2;
++								f.dual = du != 0; f.dual_mode = du == 2 ? 2 : 0;
++								opts.emplace_back(std::string("lv_") + (ld ? "ld1" : "ld1b") + (rd == 0 ? "_r2" : rd == 1 ? "_r1" : rd == 2 ? "_b64" : "_b256")
++									+ (nl ? "_n0" : "_n1") + (wm ? "_w1" : "_w2") + (du == 0 ? "_d0" : du == 1 ? "_da" : "_db"), f);
++							}
++			// the built fast single path at latency 6 (l6_): singles and the frsqrte estimate at 6,
++			// issuing only when no pipeline result is due at t + 6 or later; doubles 12; lever rows
++			// from the lv_ grid, each also without the write-back rule (_nowb)
++			for (const char *lev : { "ld1b_r2_n1_w2_d0", "ld1b_b256_n1_w2_d0", "ld1b_r2_n1_w2_da", "ld1b_b256_n1_w2_da",
++				"ld1b_b256_n0_w1_d0", "ld1b_b256_n0_w1_da", "ld1_b256_n0_w1_da", "ld1_b256_n1_w2_da" })
++				for (int wb = 1; wb >= 0; wb--)
++				{
++					std::string const s(lev);
++					m3cpi_fpu f = unified(12, built, false, false, false);
++					for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, 6, 0);
++					set(f, FC_FRSQRTE, 6, 0);
++					f.icbuilt = true; f.ld1b = true; f.ld_use2 = s.compare(0, 4, "ld1_") == 0;
++					f.redirect = 2; f.btb = s.find("_b256_") != std::string::npos ? 256 : 0;
++					f.nl_cost = s.find("_n0") != std::string::npos ? 0 : 1; f.wm_cost = s.find("_w1") != std::string::npos ? 1 : 2;
++					f.dual = s.find("_da") != std::string::npos; f.dual_mode = 0;
++					f.fast_wb = wb; f.fast_lat = 6;
++					opts.emplace_back("l6_" + s + (wb ? "" : "_nowb"), f);
++				}
++			// no pipelined double FMA (dn<L>_): doubles, frsp and fctiw iterate through the single
++			// unit's multiplier, blocking the FP pipeline for L cycles; singles and the frsqrte estimate
++			// on the latency-6 fast path as l6_
++			for (int L : { 16, 24, 32 })
++				for (const char *lev : { "ld1b_r2_n1_w2_d0", "ld1b_b256_n1_w2_d0", "ld1b_r2_n1_w2_da", "ld1b_b256_n1_w2_da" })
++				{
++					std::string const s(lev);
++					m3cpi_fpu f = unified(12, built, false, false, false);
++					for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, 6, 0);
++					set(f, FC_FRSQRTE, 6, 0);
++					for (int cl : { FC_D_ADD, FC_D_MUL, FC_D_FMA, FC_RND }) set(f, cl, L, L);
++					f.icbuilt = true; f.ld1b = true; f.redirect = 2; f.btb = s.find("_b256_") != std::string::npos ? 256 : 0;
++					f.dual = s.find("_da") != std::string::npos; f.fast_wb = true; f.fast_lat = 6;
++					opts.emplace_back("dn" + std::to_string(L) + "_" + s, f);
++				}
++			// load-hit and I-cache costs of the built caches, frsqrte 24 and 60
++			for (int Q : { 24, 60 })
++				for (int v = 0; v < 4; v++)
++				{
++					m3cpi_fpu f = unified(12, built, false, false, false);
++					set(f, FC_FRSQRTE, Q, Q - 1, FU_DIV);
++					f.load2 = v & 1; f.icbuilt = v & 2;
++					opts.emplace_back("lh_q" + std::to_string(Q) + (f.load2 ? "_ld2" : "_ld1") + (f.icbuilt ? "_ic" : ""), f);
++				}
++		}
++		// M3CPI_FPU_ONLY=a,b,...: keep options whose name contains one of the texts. ref66*
++		// options run at 66 MHz only, sp_* at 120 MHz only, the rest at 100, 115 and 120.
++		std::vector<std::string> only;
++		if (const char *s = std::getenv("M3CPI_FPU_ONLY"))
++		{
++			std::string l(s), item;
++			for (size_t pos = 0; pos <= l.size();) { size_t e = l.find(',', pos); if (e == std::string::npos) e = l.size(); only.push_back(l.substr(pos, e - pos)); pos = e + 1; }
++		}
++		for (int mhz : { 66, 100, 105, 110, 115, 120 })
++			for (auto const &o : opts)
++			{
++				if (!only.empty() && std::none_of(only.begin(), only.end(), [&](std::string const &x) { return o.first.find(x) != std::string::npos; })) continue;
++				bool const ref = o.first.compare(0, 5, "ref66") == 0, sp = o.first.compare(0, 3, "sp_") == 0 || o.first.compare(0, 4, "rsq_") == 0 || o.first.compare(0, 3, "lh_") == 0;
++				bool const dt = o.first.compare(0, 3, "dt_") == 0;	// decision grid: 100, 105, 110 and 120 MHz
++				if (ref != (mhz == 66) || (sp && mhz != 120)) continue;
++				bool const l6 = o.first.compare(0, 3, "l6_") == 0 || (o.first.compare(0, 2, "dn") == 0 && isdigit((unsigned char)o.first[2]));
++				if (l6 && mhz != 100 && mhz != 110) continue;
++				bool const lv = o.first.compare(0, 3, "lv_") == 0;	// levers: all at 100 MHz; at 110 MHz one lever or the full sets
++				if (lv)
++				{
++					if (mhz != 100 && mhz != 110) continue;
++					if (mhz == 110)
++					{
++						int const changed = (o.first.find("_ld1_") != std::string::npos) + (o.first.find("_r2_") == std::string::npos)
++							+ (o.first.find("_n0") != std::string::npos) + (o.first.find("_w1") != std::string::npos) + (o.first.find("_d0") == std::string::npos);
++						bool const full = o.first.find("_b256_n0_w1_") != std::string::npos;
++						if (changed > 1 && !full) continue;
++					}
++				}
++				else if (l6) {}
++				else if (dt ? (mhz == 115) : (mhz == 105 || mhz == 110)) continue;
++				m3cpi_fcfg c;
++				c.name = "f" + std::to_string(mhz) + "_" + o.first;
++				c.fpu = o.second;
++				c.stall = (12 * mhz + 99) / 100;
++				c.io_load = (20 * mhz + 99) / 100;
++				c.io_store = 2;
++				{	// built caches: memory latency L = 12 cycles at 120 MHz, scaled to the clock and rounded up
++					int const L = (12 * mhz + 119) / 120;
++					c.ist = L + 3; c.dst = L + 4;
++				}
++				if (o.first.find("slow") != std::string::npos) { c.stall = 12; c.io_load = 20; }
++				fcfg.push_back(c);
++			}
++	}
++
++	/*
++	 * The sweep records one entry per busy instruction (cache outcomes already resolved on
++	 * the shared caches) and replays the frame's entries through every option at the end
++	 * of the frame, the options split over worker threads.
++	 */
++	struct fp_rec
++	{
++		int8_t src[4], dst[3];
++		uint8_t lat, busy, unit, extra, fclass, ic_miss, ld_miss, io_ld, io_st, bub, redirect, idle, xu, ld, nl, misp, regtgt, wmiss, fpld, btb64, btb256;
++	};
++	std::vector<fp_rec> recs;
++	uint64_t ld_hit_pred = 0, ld_way_miss = 0;	// shared D-cache load hits in the predicted / another way
++	struct btb_entry { UINT32 pc = ~0u, target = 0; };
++	std::vector<btb_entry> btb64 = std::vector<btb_entry>(64), btb256 = std::vector<btb_entry>(256);
++	uint64_t taken_br = 0, btb64_hit = 0, btb256_hit = 0;
++
++	void step_fpu(UINT32 pc, UINT32 op, UINT32 npc, int redirect, int bub, m3cpi_decoded d)
++	{
++		m3cpi_decode_fp(op, d);
++		fp_rec r;
++		r.ic_miss = sic.access(pc, false) ? 1 : 0;
++		int ld_miss = 0, io_ld = 0, io_st = 0, way_miss = 0;
++		for (int i = 0; i < nmem; i++)
++		{
++			if (!cacheable(mem[i].addr)) { (mem[i].write ? io_st : io_ld)++; continue; }
++			for (uint64_t a = mem[i].addr & ~31ull; a <= ((uint64_t(mem[i].addr) + mem[i].size - 1) & ~31ull); a += 32)	// 64-bit: an access at the top of the address space must not wrap the loop
++			{
++				int wm = 0;
++				if (sdc.access(a, mem[i].write, &wm) && !mem[i].write) ld_miss++;
++				else if (!mem[i].write && wm) way_miss++;
++				else if (!mem[i].write) ld_hit_pred++;
++			}
++		}
++		ld_way_miss += way_miss;
++		for (int k = 0; k < 4; k++) r.src[k] = d.src[k] == R_NONE ? -1 : d.src[k];
++		for (int k = 0; k < 3; k++) r.dst[k] = d.dst[k] == R_NONE ? -1 : d.dst[k];
++		r.lat = d.lat; r.busy = d.busy; r.unit = d.unit; r.extra = d.extra; r.fclass = d.fclass;
++		r.ld_miss = ld_miss; r.io_ld = io_ld; r.io_st = io_st; r.bub = bub; r.redirect = redirect; r.idle = 0;
++		// 603e execution unit: 0 IU, 1 LSU, 2 FPU, 3 SRU, 4 BPU
++		{
++			int const p = op >> 26, x = (op >> 1) & 0x3ff;
++			if (nmem > 0 || d.is_load) r.xu = 1;
++			else if (p == 59 || p == 63) r.xu = 2;
++			else if (p == 16 || p == 18 || (p == 19 && (x == 16 || x == 528))) r.xu = 4;
++			else if (p == 19 || p == 17 || (p == 31 && (x == 339 || x == 467 || x == 19 || x == 144 || x == 83 || x == 146 || x == 371 || x == 598 || x == 854 || x == 210 || x == 242 || x == 595 || x == 659 || x == 306 || x == 566 || x == 978 || x == 1010)))
++				r.xu = 3;
++			else r.xu = 0;
++			r.ld = d.is_load ? (p == 46 ? 32 - ((op >> 21) & 31) : 1) : 0;
++			r.wmiss = std::min(way_miss, 255);
++			r.fpld = (p >= 48 && p <= 51) || (p == 31 && (x == 535 || x == 567 || x == 599 || x == 631));
++			r.nl = (pc & 31) == 0 && prev_pc == pc - 4;	// sequential fetch into a new line
++			// static prediction outcome and register-target branches, for branch folding
++			int const bo = (op >> 21) & 31;
++			bool const taken = npc != pc + 4, cond = (bo & 0x14) != 0x14;
++			r.misp = 0; r.regtgt = 0; r.btb64 = 0; r.btb256 = 0;
++			if (taken && (p == 16 || p == 18 || (p == 19 && (x == 16 || x == 528))))
++			{	// direct-mapped BTBs: hit when the entry holds this branch and its target
++				btb_entry &a = btb64[(pc >> 2) & 63], &b = btb256[(pc >> 2) & 255];
++				r.btb64 = a.pc == pc && a.target == npc; r.btb256 = b.pc == pc && b.target == npc;
++				a.pc = b.pc = pc; a.target = b.target = npc;
++				taken_br++; btb64_hit += r.btb64; btb256_hit += r.btb256;
++			}
++			if (p == 16 && cond) r.misp = taken != (((op & 0x8000) != 0) ^ ((bo & 1) != 0));
++			if (p == 19 && (x == 16 || x == 528)) { r.regtgt = 1; if (cond) r.misp = taken != ((bo & 1) != 0); }
++		}
++		recs.push_back(r);
++	}
++	void idle_fpu()
++	{
++		if (!recs.empty() && recs.back().idle) return;
++		fp_rec r{}; r.idle = 1; recs.push_back(r);
++	}
++
++	static void replay(m3cpi_fcfg &c, std::vector<fp_rec> const &recs)
++	{
++		for (fp_rec const &r : recs)
++		{
++			if (r.idle) { c.pending_bubbles = 0; c.last_pairable = false; continue; }
++			if (c.fpu.fold && r.xu == 4)
++			{
++				uint64_t const gate = c.last + (r.ic_miss ? c.stall : 0);
++				uint64_t dep = 0;
++				for (int s : r.src) if (s >= 0 && c.ready[s] > dep) dep = c.ready[s];
++				for (int x : r.dst) if (x >= 0) c.ready[x] = std::max(c.last, dep) + 1;
++				uint64_t nxt = 0;
++				if (r.misp) nxt = std::max(dep, gate) + 2;
++				else if (r.regtgt) nxt = std::max(dep, gate) + 1;
++				else if (r.ic_miss) nxt = gate + 1;
++				if (nxt > c.min_next) c.min_next = nxt;
++				c.pending_bubbles = 0;
++				continue;
++			}
++			// dual dispatch: a second instruction may issue in the same cycle as the previous
++			// one if nothing intervenes and the two go to different units
++			bool const fpop = r.xu == 2 && r.fclass != FC_FPSCR;
++			bool const pair = c.fpu.dual && c.slot == 1 && c.last_pairable && !c.pending_bubbles && !r.redirect && !r.ic_miss && !r.extra && r.xu != c.last_xu
++				&& (c.fpu.dual_mode != 2 || fpop != c.last_fpop);
++			int const bubbles = c.pending_bubbles;
++			uint64_t t = c.last + (pair ? 0 : 1) + bubbles + r.redirect + (c.fpu.icbuilt && r.nl ? c.fpu.nl_cost : 0);
++			t += uint64_t(r.ic_miss) * (c.fpu.icbuilt ? c.ist : c.stall);
++			if (c.min_next > t) t = c.min_next;
++			for (int s : r.src) if (s >= 0 && c.ready[s] > t) t = c.ready[s];
++			int const fc = r.fclass;
++			int lat = r.lat, busy = r.busy, unit = r.unit;
++			if (fc != FC_NONE) { lat = c.fpu.c[fc].lat; busy = c.fpu.c[fc].busy; unit = c.fpu.c[fc].unit; }
++			if (unit == FU_PIPE && c.fpu_free > t) t = c.fpu_free;
++			if (unit == FU_DIV && c.fdiv_free > t) t = c.fdiv_free;
++			if (unit == 2 && c.div_free > t) t = c.div_free;
++			bool const fast = c.fpu.fast_wb && (fc == FC_S_ADD || fc == FC_S_MUL || fc == FC_S_FMA || (fc == FC_FRSQRTE && unit == FU_PIPE));
++			if (fast && c.pipe_due + 1 > t + c.fpu.fast_lat) t = c.pipe_due + 1 - c.fpu.fast_lat;
++			if (((c.fpu.serial && (fc == FC_CMP || fc == FC_FPSCR)) || (c.fpu.serial_fpscr && fc == FC_FPSCR)) && c.drain > t) t = c.drain;
++			if (unit == 2 && c.fpu.idiv) { lat = c.fpu.idiv; busy = c.fpu.idiv - 1; }
++			t += uint64_t(r.io_st) * c.io_store + uint64_t(r.io_ld) * c.io_load + uint64_t(r.ld_miss) * (c.fpu.icbuilt ? c.dst : c.stall);
++			t += r.extra;
++			if (c.fpu.load2) t += r.ld;
++			if (c.fpu.ld1b && r.ld) { t += c.fpu.wm_cost * r.wmiss + r.fpld; if (!c.fpu.ld_use2) lat += 1; }
++			for (int x : r.dst) if (x >= 0) c.ready[x] = t + lat;
++			if (unit == FU_PIPE && busy) c.fpu_free = t + busy;
++			if (unit == FU_DIV) c.fdiv_free = t + busy;
++			if (unit == 2) c.div_free = t + busy;
++			if (fc != FC_NONE && t + lat > c.drain) c.drain = t + lat;
++			if (unit == FU_PIPE && fc != FC_NONE && t + lat > c.pipe_due) c.pipe_due = t + lat;
++			if (t == c.last && c.slot == 1) c.slot = 2;
++			else { c.slot = 1; c.last_xu = r.xu; c.last_fpop = fpop; c.last_pairable = !r.extra && !r.ld_miss && !r.io_ld && !r.io_st; }
++			c.last = t;
++			int nb = r.bub;
++			if (c.fpu.icbuilt && r.bub)
++			{	// built I-side: a misprediction costs 2; a correctly predicted taken branch costs the
++				// redirect, or nothing on a BTB hit
++				if (r.misp) nb = 2;
++				else if ((c.fpu.btb == 64 && r.btb64) || (c.fpu.btb == 256 && r.btb256)) nb = 0;
++				else nb = c.fpu.redirect;
++			}
++			c.pending_bubbles = nb;
++		}
++	}
++
++	void flush_fpu()
++	{
++		if (fcfg.empty()) return;
++		unsigned const nt = std::min<size_t>(8, fcfg.size());
++		std::vector<std::thread> th;
++		for (unsigned w = 0; w < nt; w++)
++			th.emplace_back([this, w, nt]() { for (size_t i = w; i < fcfg.size(); i += nt) replay(fcfg[i], recs); });
++		for (auto &x : th) x.join();
++		recs.clear();
++	}
++
 +	static bool cacheable(UINT32 a) { return a < 0x00800000 || a >= 0xff000000; }
 +
 +	int branch_bubbles(UINT32 pc, UINT32 op, UINT32 npc)
@@ -274,7 +1449,7 @@ index a5290eb..c006edd 100644
 +
 +	void step(UINT32 pc, UINT32 op, UINT32 npc, bool idle)
 +	{
-+		if (idle) { nmem = 0; have_prev = false; for (auto &c : cfg) c.pending_bubbles = 0; return; }
++		if (idle) { nmem = 0; have_prev = false; for (auto &c : cfg) c.pending_bubbles = 0; if (!fcfg.empty()) idle_fpu(); return; }
 +		int redirect = 0;
 +		if (have_prev && pc != prev_npc) redirect = 4;	// exception or interrupt entry
 +		m3cpi_decoded d;
@@ -291,7 +1466,7 @@ index a5290eb..c006edd 100644
 +			{
 +				if (!cacheable(mem[i].addr)) { t += mem[i].write ? 2 : 20; continue; }
 +				if (!c.penalty) continue;
-+				for (UINT32 a = mem[i].addr & ~31u; a <= ((mem[i].addr + mem[i].size - 1) & ~31u); a += 32)
++				for (uint64_t a = mem[i].addr & ~31ull; a <= ((uint64_t(mem[i].addr) + mem[i].size - 1) & ~31ull); a += 32)	// 64-bit: an access at the top of the address space must not wrap the loop
 +				{
 +					int r = c.dc.access(a, mem[i].write);
 +					if (!r) continue;
@@ -306,6 +1481,8 @@ index a5290eb..c006edd 100644
 +			c.last = t;
 +			c.pending_bubbles = bub;
 +		}
++		if (!fcfg.empty())
++			step_fpu(pc, op, npc, redirect, bub, d);
 +		prev_pc = pc; prev_op = op; prev_npc = npc; have_prev = true;
 +		nmem = 0;
 +	}
@@ -325,6 +1502,7 @@ index a5290eb..c006edd 100644
 +	std::vector<UINT32> op_ram = std::vector<UINT32>(0x800000 / 4);
 +	uint64_t f_insn = 0, f_idle = 0, f_rom = 0, total = 0, frame = 0;
 +	m3cpi_model cpi;
++	m3fp::census fpc;		// M3FP=<prefix>: FP operand census (m3fp_census.h)
 +	m3cpu_census()
 +	{
 +		const char *p = std::getenv("M3CPU");
@@ -337,7 +1515,10 @@ index a5290eb..c006edd 100644
 +			cpi.init();
 +		std::fprintf(f, "frame,insn,idle,rom");
 +		for (auto const &c : cpi.cfg) std::fprintf(f, ",cyc_%s", c.name);
++		for (auto const &c : cpi.fcfg) std::fprintf(f, ",cyc_%s", c.name.c_str());
 +		std::fprintf(f, "\n");
++		if (const char *fp = std::getenv("M3FP"))
++			fpc.init(fp);
 +		if (const char *s = std::getenv("M3IDLE"))
 +		{
 +			std::string list(s), item;
@@ -359,8 +1540,24 @@ index a5290eb..c006edd 100644
 +		if (!on)
 +			return;
 +		std::fclose(f);
++		fpc.dump([this](UINT32 pc) {
++			std::string s;
++			for (UINT32 a = pc - 16; a <= pc + 40; a += 4)
++			{
++				char line[160], mnem[32] = "", oprs[96] = "";
++				UINT32 const w = a < 0x800000 ? op_ram[a >> 2] : 0;
++				if (w) DisassemblePowerPC(w, a, mnem, oprs, sizeof(oprs), true);
++				std::snprintf(line, sizeof(line), "%s %08X  %08X  %-8s %s\n", a == pc ? ">" : " ", a, w, w ? mnem : "(not run)", oprs);
++				s += line;
++			}
++			return s;
++		});
 +		std::FILE *o = std::fopen((prefix + "_cpu.txt").c_str(), "w");
-+		std::fprintf(o, "frames %llu\ninstructions %llu\n\nhottest RAM PCs\n", (unsigned long long)frame, (unsigned long long)total);
++		std::fprintf(o, "frames %llu\ninstructions %llu\n", (unsigned long long)frame, (unsigned long long)total);
++		if (!cpi.fcfg.empty())
++			std::fprintf(o, "shared D-cache load hits: predicted way %llu, other way %llu\ntaken branches %llu, BTB hits: 64-entry %llu, 256-entry %llu\n", (unsigned long long)cpi.ld_hit_pred, (unsigned long long)cpi.ld_way_miss,
++				(unsigned long long)cpi.taken_br, (unsigned long long)cpi.btb64_hit, (unsigned long long)cpi.btb256_hit);
++		std::fprintf(o, "\nhottest RAM PCs\n");
 +		std::vector<std::pair<uint64_t, UINT32>> hot;
 +		for (size_t i = 0; i < pc_ram.size(); i++)
 +			if (pc_ram[i]) hot.emplace_back(pc_ram[i], UINT32(i * 4));
@@ -392,7 +1589,10 @@ index a5290eb..c006edd 100644
 +			return;
 +		std::fprintf(f, "%llu,%llu,%llu,%llu", (unsigned long long)frame, (unsigned long long)f_insn, (unsigned long long)f_idle, (unsigned long long)f_rom);
 +		for (auto &c : cpi.cfg) { std::fprintf(f, ",%llu", (unsigned long long)(c.last - c.frame_start)); c.frame_start = c.last; }
++		cpi.flush_fpu();
++		for (auto &c : cpi.fcfg) { std::fprintf(f, ",%llu", (unsigned long long)(c.last - c.frame_start)); c.frame_start = c.last; }
 +		std::fprintf(f, "\n");
++		fpc.frame();
 +		total += f_insn;
 +		f_insn = f_idle = f_rom = 0;
 +		frame++;
@@ -412,10 +1612,22 @@ index a5290eb..c006edd 100644
  int ppc_execute(int cycles)
  {
  	UINT32 opcode;
-@@ -334,6 +678,9 @@ int ppc_execute(int cycles)
+@@ -325,6 +1180,9 @@ int ppc_execute(int cycles)
+ 		}
+ #endif // SUPERMODEL_DEBUGGER
+ 
++		if (g_m3cpu.fpc.on)
++			g_m3cpu.fpc.pre(ppc.pc, opcode, (const double *)ppc.fpr, ppc.fpscr, ppc.msr);
++
+ 		switch(opcode >> 26)
+ 		{
+ 			case 19:	optable19[(opcode >> 1) & 0x3ff](opcode); break;
+@@ -334,6 +1192,11 @@ int ppc_execute(int cycles)
  			default:	optable[opcode >> 26](opcode); break;
  		}
  
++		if (g_m3cpu.fpc.on)
++			g_m3cpu.fpc.post((const double *)ppc.fpr, ppc.fpscr);
 +		if (g_m3cpu.on)
 +			g_m3cpu.step(ppc.pc, opcode, ppc.npc);
 +
@@ -423,7 +1635,7 @@ index a5290eb..c006edd 100644
  		
  		// <= rather than ==, as ppc_add_cycles() can step over the trigger cycle
 diff --git a/Src/Model3/Real3D.cpp b/Src/Model3/Real3D.cpp
-index cd4accd..af2e440 100644
+index cd4accd..7a8712b 100644
 --- a/Src/Model3/Real3D.cpp
 +++ b/Src/Model3/Real3D.cpp
 @@ -256,6 +256,9 @@
@@ -436,7 +1648,7 @@ index cd4accd..af2e440 100644
  
  // Macros that divide memory regions into pages and mark them as dirty when they are written to
  #define PAGE_WIDTH 12
-@@ -604,7 +607,40 @@ void CReal3D::BeginFrame(void)
+@@ -604,7 +607,48 @@ void CReal3D::BeginFrame(void)
  
  void CReal3D::RenderFrame(void)
  {
@@ -464,7 +1676,15 @@ index cd4accd..af2e440 100644
 +  }
 +  static const char *shotDir = std::getenv("M3SHOT_DIR");
 +  static const int shotEvery = std::getenv("M3SHOT_EVERY") ? std::atoi(std::getenv("M3SHOT_EVERY")) : 600;
-+  if (shotDir && frame % shotEvery == 0)
++  static const char *shotList = std::getenv("M3SHOT_LIST");	// comma-separated frame numbers, instead of every M3SHOT_EVERY
++  bool listed = false;
++  if (shotList)
++  {
++    char key[16];
++    std::snprintf(key, sizeof(key), ",%d,", frame);
++    listed = std::strstr((std::string(",") + shotList + ",").c_str(), key) != nullptr;
++  }
++  if (shotDir && (shotList ? listed : frame % shotEvery == 0))
 +  {
 +    extern void M3Shot(const char *, int);
 +    M3Shot(shotDir, frame);

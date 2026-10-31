@@ -1,3 +1,692 @@
+diff --git a/src/devices/cpu/powerpc/m3fp_census.h b/src/devices/cpu/powerpc/m3fp_census.h
+new file mode 100644
+index 00000000..d4386cf1
+--- /dev/null
++++ b/src/devices/cpu/powerpc/m3fp_census.h
+@@ -0,0 +1,683 @@
++/*
++ * Model 3 census: FP operand census (M3FP=<prefix>). Shared between the MAME and
++ * Supermodel patches. Called before (pre) and after (post) every instruction with
++ * the FPRs, FPSCR and MSR. Counts, per FP opcode: operand and result classes,
++ * single ops with operands not representable in single format, emulator result
++ * against a once-rounded reference (exact, from error-free
++ * transformations; checked against MPFR with M3FP_MPFR), FPSCR writes, MSR FE0/FE1, mffs and
++ * mcrfs use, fctiw(z) inputs, and what consumes frsqrte and fres results.
++ * Writes <prefix>_fp.txt and <prefix>_fp_frames.csv.
++ */
++#ifndef M3FP_CENSUS_H
++#define M3FP_CENSUS_H
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <cmath>
++#include <cfloat>
++#include <string>
++#include <vector>
++#include <map>
++#include <functional>
++#include <algorithm>
++#include <xmmintrin.h>
++#ifdef M3FP_MPFR
++#include <mpfr.h>
++#endif
++
++namespace m3fp {
++
++static inline uint64_t bits(double d) { uint64_t u; std::memcpy(&u, &d, 8); return u; }
++static inline double dbl(uint64_t u) { double d; std::memcpy(&d, &u, 8); return d; }
++
++enum { C_ZERO, C_DENORM, C_TINY, C_INF, C_QNAN, C_SNAN, C_NORMAL, C_N };
++static const char *const cname[C_N] = { "zero", "denorm", "tiny", "inf", "qnan", "snan", "normal" };
++
++// double class; "tiny" = nonzero, below single normal range, not a double denormal
++static inline int dclass(double v)
++{
++	uint64_t const u = bits(v);
++	uint64_t const e = (u >> 52) & 0x7ff, m = u & 0xfffffffffffffull;
++	if (e == 0x7ff) return m == 0 ? C_INF : ((m >> 51) & 1) ? C_QNAN : C_SNAN;
++	if (e == 0) return m == 0 ? C_ZERO : C_DENORM;
++	if (std::fabs(v) < FLT_MIN) return C_TINY;
++	return C_NORMAL;
++}
++
++enum { R_EXACT, R_SDENORM, R_MANT, R_EXPHI, R_EXPLO, R_SPECIAL, R_N };
++static const char *const rname[R_N] = { "exact", "single-denorm", "mantissa>24b", "exp-too-big", "exp-too-small", "zero/inf/nan" };
++
++// representability in single format
++static inline int repclass(double v)
++{
++	if (v == 0 || std::isinf(v) || std::isnan(v)) return R_SPECIAL;
++	double const a = std::fabs(v);
++	if (a > FLT_MAX) return R_EXPHI;
++	float const f = (float)v;
++	if (a < FLT_MIN) return (double)f == v ? R_SDENORM : R_EXPLO;
++	return (double)f == v ? R_EXACT : R_MANT;
++}
++static inline bool nonrep(int r) { return r == R_MANT || r == R_EXPHI || r == R_EXPLO; }
++
++// operation kinds for the single-precision reference
++enum { K_NONE, K_ADD, K_SUB, K_MUL, K_DIV, K_MADD, K_MSUB, K_NMADD, K_NMSUB };
++
++#ifdef M3FP_MPFR
++// Once-rounded single result from exact double operands, MPFR, IEEE single range with
++// subnormals, mode rn (PowerPC RN field)
++static double mp_single(int kind, double a, double b, double c, int rn)
++{
++	static const mpfr_rnd_t mode[4] = { MPFR_RNDN, MPFR_RNDZ, MPFR_RNDU, MPFR_RNDD };
++	bool neg = kind == K_NMADD || kind == K_NMSUB;
++	int k = kind == K_NMADD ? K_MADD : kind == K_NMSUB ? K_MSUB : kind;
++	mpfr_rnd_t rnd = mode[rn & 3];
++	mpfr_t A, B, C, R;
++	mpfr_inits2(53, A, B, C, (mpfr_ptr)0);
++	mpfr_init2(R, 64);
++	mpfr_set_d(A, a, MPFR_RNDN); mpfr_set_d(B, b, MPFR_RNDN); mpfr_set_d(C, c, MPFR_RNDN);
++	auto run = [&](mpfr_prec_t p) {
++		mpfr_set_prec(R, p);
++		switch (k)
++		{
++		case K_ADD: mpfr_add(R, A, B, rnd); break;
++		case K_SUB: mpfr_sub(R, A, B, rnd); break;
++		case K_MUL: mpfr_mul(R, A, C, rnd); break;
++		case K_DIV: mpfr_div(R, A, B, rnd); break;
++		case K_MADD: mpfr_fma(R, A, C, B, rnd); break;
++		case K_MSUB: mpfr_fms(R, A, C, B, rnd); break;
++		}
++	};
++	run(200);
++	double out;
++	if (mpfr_zero_p(R) || mpfr_nan_p(R) || mpfr_inf_p(R))
++		out = mpfr_get_d(R, MPFR_RNDN);
++	else
++	{
++		bool const positive = mpfr_sgn(R) > 0;
++		mpfr_exp_t e = mpfr_get_exp(R);	// value = m * 2^e, 0.5 <= m < 1
++		auto overflow = [&]() {
++			bool big = rnd == MPFR_RNDN || (rnd == MPFR_RNDU && positive) || (rnd == MPFR_RNDD && !positive);
++			double v = big ? INFINITY : FLT_MAX;
++			return positive ? v : -v;
++		};
++		if (e > 128) out = overflow();
++		else if (e >= -125)
++		{
++			run(24);
++			out = mpfr_get_exp(R) > 128 ? overflow() : mpfr_get_d(R, MPFR_RNDN);
++		}
++		else
++		{
++			long p = e + 149;
++			if (p >= 1) { run(p); out = mpfr_get_d(R, MPFR_RNDN); }
++			else
++			{
++				double const tiny = std::ldexp(1.0, -149);
++				bool up;
++				if (rnd == MPFR_RNDN) { mpfr_set_d(C, std::ldexp(1.0, -150), MPFR_RNDN); up = p == 0 && mpfr_cmpabs(R, C) > 0; }
++				else up = (rnd == MPFR_RNDU && positive) || (rnd == MPFR_RNDD && !positive);
++				out = up ? tiny : 0.0;
++				if (!positive) out = -out;
++			}
++		}
++	}
++	mpfr_clears(A, B, C, R, (mpfr_ptr)0);
++	return neg && !std::isnan(out) ? -out : out;
++}
++
++#endif
++
++// Exact sign of a sum of doubles (Shewchuk grow-expansion); no overflow or underflow assumed
++static inline void two_sum(double a, double b, double &s, double &e)
++{
++	s = a + b;
++	double const bv = s - a, av = s - bv;
++	e = (a - av) + (b - bv);
++}
++static inline int sum_sign(const double *t, int n)
++{
++	double E[8]; int m = 1;
++	E[0] = t[0];
++	for (int i = 1; i < n; i++)
++	{
++		double q = t[i];
++		for (int j = 0; j < m; j++) { double s, h; two_sum(q, E[j], s, h); E[j] = h; q = s; }
++		E[m++] = q;
++	}
++	for (int j = m - 1; j >= 0; j--) if (E[j] != 0) return E[j] > 0 ? 1 : -1;
++	return 0;
++}
++
++/*
++ * Once-rounded single result from exact double operands without MPFR: the correctly rounded
++ * double r1, the exact sign of (exact - r1) from error-free transformations, then rounding
++ * to the single grid by mode rn. Returns false where an intermediate could under- or
++ * overflow in double (the transformations are then not exact). Round to nearest must be
++ * the host mode.
++ */
++static bool exact_single(int kind, double a, double b, double c, int rn, double &out)
++{
++	bool const neg = kind == K_NMADD || kind == K_NMSUB;
++	if (kind == K_MSUB || kind == K_NMSUB) b = -b;
++	double r1, t[4]; int n = 0, sgn;
++	auto bad = [](double v) { double const x = std::fabs(v); return x != 0 && (x < 0x1p-900 || x > 0x1p1000); };
++	if (bad(a) || bad(b) || bad(c)) return false;
++	switch (kind)
++	{
++	case K_ADD: r1 = a + b; t[0] = a; t[1] = b; t[2] = -r1; n = 3; sgn = sum_sign(t, n); break;
++	case K_SUB: r1 = a - b; t[0] = a; t[1] = -b; t[2] = -r1; n = 3; sgn = sum_sign(t, n); break;
++	case K_MUL: r1 = a * c; if (bad(r1)) return false; { double const e = std::fma(a, c, -r1); sgn = e > 0 ? 1 : e < 0 ? -1 : 0; } break;
++	case K_DIV:
++	{
++		if (b == 0) return false;
++		r1 = a / b; if (bad(r1)) return false;
++		double const rem = std::fma(-r1, b, a);	// exact: a - r1*b
++		sgn = rem == 0 ? 0 : ((rem > 0) == (b > 0) ? 1 : -1);
++		break;
++	}
++	default:	// a*c + b (b already negated for msub)
++	{
++		double const p = a * c;
++		if (bad(p)) return false;
++		double const e = std::fma(a, c, -p);
++		r1 = std::fma(a, c, b);
++		if (bad(r1)) return false;
++		t[0] = e; t[1] = b; t[2] = p; t[3] = -r1; n = 4; sgn = sum_sign(t, n);
++		break;
++	}
++	}
++	float const f = (float)r1;
++	float res;
++	if ((double)f == r1)
++	{
++		res = f;
++		if (sgn != 0 && rn != 0)
++		{
++			if (rn == 1 && ((sgn < 0) == (f > 0))) res = std::nextafter(f, 0.0f);
++			if (rn == 2 && sgn > 0) res = std::nextafter(f, INFINITY);
++			if (rn == 3 && sgn < 0) res = std::nextafter(f, -INFINITY);
++		}
++	}
++	else
++	{
++		float lo, hi;
++		if ((double)f < r1) { lo = f; hi = std::nextafter(f, INFINITY); }
++		else { hi = f; lo = std::nextafter(f, -INFINITY); }
++		if (rn == 0)
++		{
++			double const mid = std::isinf(hi) ? 0x1.ffffffp127 : std::isinf(lo) ? -0x1.ffffffp127 : ((double)lo + (double)hi) * 0.5;
++			if (r1 != mid) res = r1 < mid ? lo : hi;
++			else if (sgn > 0) res = hi;
++			else if (sgn < 0) res = lo;
++			else { uint32_t u; std::memcpy(&u, &lo, 4); res = (u & 1) ? hi : lo; }
++		}
++		else if (rn == 1) res = r1 > 0 ? lo : hi;
++		else if (rn == 2) res = hi;
++		else res = lo;
++	}
++	if (rn == 3 && r1 == 0 && sgn == 0 && kind != K_MUL && kind != K_DIV)
++	{	// exact zero sum under round toward -inf is -0 unless both terms are +0
++		double const t1 = (kind == K_ADD || kind == K_SUB) ? a : (std::signbit(a) != std::signbit(c) ? -0.0 : 0.0) + (a * c);
++		double const t2 = kind == K_SUB ? -b : b;
++		bool const pos = t1 == 0 && !std::signbit(t1) && t2 == 0 && !std::signbit(t2);
++		res = pos ? 0.0f : -0.0f;
++	}
++	out = neg ? -(double)res : (double)res;
++	return true;
++}
++
++// float neighbour test: is r exactly halfway between two adjacent singles?
++static inline bool single_midpoint(double r)
++{
++	float const f = (float)r;
++	if ((double)f == r) return false;
++	float const g = std::nextafter(f, (float)(r > (double)f ? INFINITY : -INFINITY));
++	if (std::isinf(g) || std::isinf(f)) return true;
++	return ((double)f + (double)g) * 0.5 == r;
++}
++
++struct opstat
++{
++	uint64_t n = 0, fp_off = 0;
++	uint64_t in_cls[C_N] = {}, out_cls[C_N] = {};
++	uint64_t neg_in = 0;
++	uint64_t rep[R_N] = {};		// per operand, single ops and frsqrte/fres/fctiw inputs
++	uint64_t any_nonrep = 0;
++	uint64_t rn[4] = {};
++	// single arithmetic: emulator result E, double-then-float model D, once-rounded R
++	uint64_t cmp = 0, cmp_nr = 0, e_ne_r = 0, e_ne_r_nr = 0, d_ne_r = 0, d_ne_r_nr = 0, e_ne_d = 0, e_ne_d_nr = 0;
++	uint64_t e_ne_r_big = 0, zero_sign = 0, e_not_single = 0, skipped = 0;
++	// double fma family: emulator against fused once-rounded double
++	uint64_t fused_cmp = 0, fused_ne = 0;
++	// fctiw(z)
++	uint64_t fx_frac = 0, fx_tie = 0, fx_range = 0, fx_nan = 0, fx_negzero = 0;
++};
++
++struct census
++{
++	bool on = false;
++	std::string prefix;
++	std::vector<uint16_t> idx = std::vector<uint16_t>(65536, 0);
++	std::vector<opstat> st = std::vector<opstat>(1);
++	std::vector<uint32_t> keyof = std::vector<uint32_t>(1, 0);
++	uint32_t prod[32] = {};		// key of the last writer of each FPR
++	uint8_t chain[32] = {};		// frsqrte/fres derivation depth (1 = direct result)
++	uint32_t chain_root[32] = {};
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> consumers;	// (root key * 8 + depth, consumer key)
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> nonrep_prod;	// (single op key, producer of the non-single operand)
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> fpscr_ctl;	// (op key, FPSCR & 0xff after the write)
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> fpscr_full;	// (op key, FPSCR after the write)
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> fpscr_arg;	// (op key, FM / field+imm / bit)
++	std::map<uint32_t, uint64_t> ctl_at_arith;			// FPSCR & 0xff seen at FP arithmetic
++	std::map<uint32_t, uint64_t> mffs_val;				// FPSCR value read by mffs
++	std::map<uint32_t, uint64_t> mcrfs_field;			// crfS * 8 + crfD
++	std::map<std::pair<uint32_t, uint32_t>, uint64_t> site;	// (key, pc)
++	uint64_t msr_fe[4] = {}, msr_fp_off = 0, insn = 0;
++	uint32_t msr_or = 0, msr_and = ~0u;
++
++	// pending instruction (between pre and post)
++	bool pend = false;
++	uint32_t p_key = 0, p_op = 0, p_pc = 0;
++	int p_kind = K_NONE, p_d = -1, p_rn = 0;
++	bool p_single = false, p_nonrep = false, p_fused = false, p_fpscr = false, p_res = false;
++	double p_a = 0, p_b = 0, p_c = 0;
++
++	// per frame
++	enum { F_SINGLE, F_DOUBLE, F_NONREP, F_E_NE_R, F_D_NE_R, F_NAN_IN, F_INF_IN, F_DEN_IN, F_ZERO_IN,
++		F_NAN_OUT, F_INF_OUT, F_DEN_OUT, F_FPSCR_W, F_MFFS, F_MCRFS, F_FCTIW, F_FRSQRTE, F_FRES, F_DIV, F_FUSED_NE, F_N };
++	uint64_t fr[F_N] = {};
++	std::FILE *ff = nullptr;
++	uint64_t frame_no = 0;
++
++	void init(const char *p)
++	{
++		on = true;
++		prefix = p;
++		ff = std::fopen((prefix + "_fp_frames.csv").c_str(), "w");
++		std::fprintf(ff, "frame,single,double,single_nonrep,single_e_ne_r,single_d_ne_r,nan_in,inf_in,denorm_in,zero_in,nan_out,inf_out,denorm_out,fpscr_writes,mffs,mcrfs,fctiw,frsqrte,fres,div,double_fma_unfused_ne\n");
++	}
++
++	static uint32_t key(uint32_t op)
++	{
++		uint32_t const p = op >> 26;
++		uint32_t x = 0;
++		if (p == 19 || p == 31) x = (op >> 1) & 0x3ff;
++		else if (p == 59) x = (op >> 1) & 0x1f;
++		else if (p == 63)
++		{
++			uint32_t const x5 = (op >> 1) & 0x1f;
++			x = (x5 >= 18 && x5 != 19 && x5 != 24 && x5 != 27) ? (992 + x5) : ((op >> 1) & 0x3ff);
++		}
++		return p * 1024 + x;
++	}
++	static std::string kname(uint32_t k)
++	{
++		uint32_t const p = k >> 10, x = k & 1023;
++		static const std::map<uint32_t, const char *> n = {
++			{ 59*1024+18, "fdivs" }, { 59*1024+20, "fsubs" }, { 59*1024+21, "fadds" }, { 59*1024+22, "fsqrts" }, { 59*1024+24, "fres" },
++			{ 59*1024+25, "fmuls" }, { 59*1024+28, "fmsubs" }, { 59*1024+29, "fmadds" }, { 59*1024+30, "fnmsubs" }, { 59*1024+31, "fnmadds" },
++			{ 63*1024+992+18, "fdiv" }, { 63*1024+992+20, "fsub" }, { 63*1024+992+21, "fadd" }, { 63*1024+992+22, "fsqrt" }, { 63*1024+992+23, "fsel" },
++			{ 63*1024+992+25, "fmul" }, { 63*1024+992+26, "frsqrte" }, { 63*1024+992+28, "fmsub" }, { 63*1024+992+29, "fmadd" }, { 63*1024+992+30, "fnmsub" }, { 63*1024+992+31, "fnmadd" },
++			{ 63*1024+0, "fcmpu" }, { 63*1024+32, "fcmpo" }, { 63*1024+12, "frsp" }, { 63*1024+14, "fctiw" }, { 63*1024+15, "fctiwz" },
++			{ 63*1024+40, "fneg" }, { 63*1024+72, "fmr" }, { 63*1024+136, "fnabs" }, { 63*1024+264, "fabs" }, { 63*1024+583, "mffs" },
++			{ 63*1024+711, "mtfsf" }, { 63*1024+134, "mtfsfi" }, { 63*1024+70, "mtfsb0" }, { 63*1024+38, "mtfsb1" }, { 63*1024+64, "mcrfs" },
++			{ 48*1024, "lfs" }, { 49*1024, "lfsu" }, { 50*1024, "lfd" }, { 51*1024, "lfdu" }, { 52*1024, "stfs" }, { 53*1024, "stfsu" }, { 54*1024, "stfd" }, { 55*1024, "stfdu" },
++			{ 31*1024+535, "lfsx" }, { 31*1024+567, "lfsux" }, { 31*1024+599, "lfdx" }, { 31*1024+631, "lfdux" },
++			{ 31*1024+663, "stfsx" }, { 31*1024+695, "stfsux" }, { 31*1024+727, "stfdx" }, { 31*1024+759, "stfdux" }, { 31*1024+983, "stfiwx" },
++			{ 0, "(reset)" } };
++		auto it = n.find(k);
++		if (it != n.end()) return it->second;
++		char b[32]; std::snprintf(b, sizeof(b), "%u/%u", p, x); return b;
++	}
++	opstat &S(uint32_t k)
++	{
++		uint16_t &i = idx[k];
++		if (!i) { i = (uint16_t)st.size(); st.emplace_back(); keyof.push_back(k); }
++		return st[i];
++	}
++
++	void read(uint32_t k, int r, const double *f)
++	{
++		if (chain[r] && chain[r] < 4)
++			consumers[{ chain_root[r] * 8 + chain[r], k }]++;
++		(void)f;
++	}
++
++	void count_in(opstat &s, double v)
++	{
++		int const c = dclass(v);
++		s.in_cls[c]++;
++		if (std::signbit(v) && v != 0) s.neg_in++;
++		if (c == C_QNAN || c == C_SNAN) fr[F_NAN_IN]++;
++		else if (c == C_INF) fr[F_INF_IN]++;
++		else if (c == C_DENORM || c == C_TINY) fr[F_DEN_IN]++;
++		else if (c == C_ZERO) fr[F_ZERO_IN]++;
++	}
++
++	inline void tick(uint32_t msr)
++	{
++		insn++;
++		msr_fe[((msr >> 10) & 2) | ((msr >> 8) & 1)]++;
++		msr_or |= msr; msr_and &= msr;
++	}
++
++	// before the instruction executes
++	void pre(uint32_t pc, uint32_t op, const double *f, uint32_t fpscr, uint32_t msr)
++	{
++		tick(msr);
++		uint32_t const p = op >> 26;
++		if (p < 48 && p != 31) return;
++		uint32_t const x10 = (op >> 1) & 0x3ff;
++		int const rd = (op >> 21) & 31, ra = (op >> 16) & 31, rb = (op >> 11) & 31, rc = (op >> 6) & 31;
++		uint32_t const k = key(op);
++		// FP loads and stores: producer tags and consumers only
++		if (p == 31)
++		{
++			bool const ld = x10 == 535 || x10 == 567 || x10 == 599 || x10 == 631;
++			bool const stx = x10 == 663 || x10 == 695 || x10 == 727 || x10 == 759 || x10 == 983;
++			if (!ld && !stx) return;
++			S(k).n++;
++			if (stx) read(k, rd, f);
++			else { prod[rd] = k; chain[rd] = 0; }
++			return;
++		}
++		if (p >= 48 && p <= 51) { S(k).n++; prod[rd] = k; chain[rd] = 0; return; }
++		if (p >= 52 && p <= 55) { S(k).n++; read(k, rd, f); return; }
++		if (p != 59 && p != 63) return;
++
++		opstat &s = S(k);
++		s.n++;
++		if (!(msr & 0x2000)) { s.fp_off++; msr_fp_off++; return; }
++		uint32_t const x5 = (op >> 1) & 0x1f;
++		int srcs[3]; int ns = 0;
++		int d = -1;
++		bool arith = false;
++		int kind = K_NONE;
++		bool fused = false;
++		if (p == 59 || (x5 >= 18 && x5 != 19 && x5 != 24 && x5 != 27))
++		{
++			arith = true;
++			d = rd;
++			switch (x5)
++			{
++			case 18: srcs[ns++] = ra; srcs[ns++] = rb; kind = K_DIV; break;
++			case 20: srcs[ns++] = ra; srcs[ns++] = rb; kind = K_SUB; break;
++			case 21: srcs[ns++] = ra; srcs[ns++] = rb; kind = K_ADD; break;
++			case 22: case 24: case 26: srcs[ns++] = rb; break;
++			case 23: srcs[ns++] = ra; srcs[ns++] = rc; srcs[ns++] = rb; arith = false; break;	// fsel
++			case 25: srcs[ns++] = ra; srcs[ns++] = rc; kind = K_MUL; break;
++			case 28: case 29: case 30: case 31:
++				srcs[ns++] = ra; srcs[ns++] = rc; srcs[ns++] = rb;
++				kind = x5 == 28 ? K_MSUB : x5 == 29 ? K_MADD : x5 == 30 ? K_NMSUB : K_NMADD;
++				fused = p == 63;
++				break;
++			default: break;
++			}
++			if (p == 63 && !fused) kind = K_NONE;
++		}
++		else
++		{
++			switch (x10)
++			{
++			case 0: case 32: srcs[ns++] = ra; srcs[ns++] = rb; break;		// fcmpu, fcmpo
++			case 12: case 14: case 15: case 40: case 72: case 136: case 264: srcs[ns++] = rb; d = rd; break;
++			case 583: d = rd; fr[F_MFFS]++; mffs_val[fpscr]++; site[{ k, pc }]++; break;
++			case 711: srcs[ns++] = rb; fpscr_arg[{ k, (op >> 17) & 0xff }]++; site[{ k, pc }]++; break;
++			case 134: fpscr_arg[{ k, ((op >> 23) & 7) * 16 + ((op >> 12) & 15) }]++; site[{ k, pc }]++; break;
++			case 70: case 38: fpscr_arg[{ k, (uint32_t)rd }]++; site[{ k, pc }]++; break;
++			case 64: fr[F_MCRFS]++; mcrfs_field[((op >> 18) & 7) * 8 + ((op >> 23) & 7)]++; site[{ k, pc }]++; break;
++			default: break;
++			}
++		}
++		for (int i = 0; i < ns; i++)
++		{
++			read(k, srcs[i], f);
++			count_in(s, f[srcs[i]]);
++		}
++		s.rn[fpscr & 3]++;
++		if (arith) { ctl_at_arith[fpscr & 0xff]++; fr[p == 59 ? F_SINGLE : F_DOUBLE]++; }
++		if (x5 == 18 && (p == 59 || arith)) fr[F_DIV]++;
++		bool single_rep_check = p == 59 || (p == 63 && arith && x5 == 26) || (p == 63 && (x10 == 14 || x10 == 15 || x10 == 12));
++		bool any_nr = false;
++		if (single_rep_check)
++			for (int i = 0; i < ns; i++)
++			{
++				int const r = repclass(f[srcs[i]]);
++				s.rep[r]++;
++				if (nonrep(r))
++				{
++					any_nr = true;
++					if (p == 59) nonrep_prod[{ k, prod[srcs[i]] }]++;
++				}
++			}
++		if (any_nr) { s.any_nonrep++; if (p == 59) fr[F_NONREP]++; }
++		if (p == 63 && (x10 == 14 || x10 == 15))
++		{
++			fr[F_FCTIW]++;
++			double const v = f[rb];
++			if (std::isnan(v)) s.fx_nan++;
++			else if (v >= 2147483648.0 || v < -2147483648.0) s.fx_range++;
++			else
++			{
++				if (v != std::trunc(v)) s.fx_frac++;
++				if (std::fabs(v - std::trunc(v)) == 0.5) s.fx_tie++;
++				if (v == 0 && std::signbit(v)) s.fx_negzero++;
++			}
++		}
++		if (p == 63 && x5 == 26) fr[F_FRSQRTE]++;
++		if (p == 59 && x5 == 24) fr[F_FRES]++;
++
++		// derivation chain for frsqrte / fres results
++		uint8_t depth = 0; uint32_t root = 0;
++		if ((p == 63 && x5 == 26 && arith) || (p == 59 && x5 == 24)) { depth = 1; root = k; }
++		else
++			for (int i = 0; i < ns; i++)
++				if (chain[srcs[i]] && chain[srcs[i]] + 1 > depth) { depth = chain[srcs[i]] + 1; root = chain_root[srcs[i]]; }
++		if (d >= 0)
++		{
++			prod[d] = k;
++			chain[d] = depth > 4 ? 0 : depth;
++			chain_root[d] = root;
++		}
++
++		pend = true;
++		p_key = k; p_op = op; p_pc = pc; p_d = d; p_kind = kind; p_rn = fpscr & 3;
++		p_single = p == 59; p_nonrep = any_nr; p_fused = fused;
++		p_fpscr = p == 63 && (x10 == 711 || x10 == 134 || x10 == 70 || x10 == 38);
++		p_res = d >= 0 && !(p == 63 && x10 == 583);
++		p_a = f[ra]; p_b = f[rb]; p_c = f[rc];
++	}
++
++	// after it executed
++	void post(const double *f, uint32_t fpscr)
++	{
++		if (!pend) return;
++		pend = false;
++		opstat &s = st[idx[p_key]];
++		if (p_fpscr)
++		{
++			fr[F_FPSCR_W]++;
++			fpscr_ctl[{ p_key, fpscr & 0xff }]++;
++			if (fpscr_full.size() < 4096) fpscr_full[{ p_key, fpscr }]++;
++		}
++		if (!p_res) return;
++		double const e = f[p_d];
++		int c = dclass(e);
++		if (p_single && (c == C_TINY)) c = C_DENORM;	// single result below single normal range
++		s.out_cls[c]++;
++		if (c == C_QNAN || c == C_SNAN) fr[F_NAN_OUT]++;
++		else if (c == C_INF) fr[F_INF_OUT]++;
++		else if (c == C_DENORM || c == C_TINY) fr[F_DEN_OUT]++;
++		if (p_single && !std::isnan(e) && (double)(float)e != e) s.e_not_single++;
++
++		if (p_kind == K_NONE) return;
++		double const a = p_a, b = p_b, cc = p_c;
++		if (!std::isfinite(a) || !std::isfinite(b) || !std::isfinite(cc) || std::isnan(e)
++			|| (p_kind == K_DIV && b == 0)) { s.skipped++; return; }
++		unsigned const csr = _mm_getcsr();
++		_mm_setcsr(0x1f80);
++		if (p_fused)
++		{
++			if (p_rn == 0)
++			{
++				double r = std::fma(a, cc, (p_kind == K_MSUB || p_kind == K_NMSUB) ? -b : b);
++				if (p_kind == K_NMADD || p_kind == K_NMSUB) r = -r;
++				s.fused_cmp++;
++				if (bits(r) != bits(e)) { s.fused_ne++; fr[F_FUSED_NE]++; }
++			}
++			_mm_setcsr(csr);
++			return;
++		}
++		// double-then-float model (separate multiply and add, each rounded to double)
++		double dm = 0;
++		{
++			volatile double pr = a * cc;
++			switch (p_kind)
++			{
++			case K_ADD: dm = (float)(a + b); break;
++			case K_SUB: dm = (float)(a - b); break;
++			case K_MUL: dm = (float)(a * cc); break;
++			case K_DIV: dm = (float)(a / b); break;
++			case K_MADD: dm = (float)(pr + b); break;
++			case K_MSUB: dm = (float)(pr - b); break;
++			case K_NMADD: dm = -(float)(pr + b); break;
++			case K_NMSUB: dm = -(float)(pr - b); break;
++			}
++		}
++		// once-rounded reference from the exact operands (exact_single)
++		double r;
++		if (!exact_single(p_kind, a, b, cc, p_rn, r)) { _mm_setcsr(csr); s.skipped++; return; }
++		_mm_setcsr(csr);
++		s.cmp++;
++		if (p_nonrep) s.cmp_nr++;
++		if (p_rn != 0) dm = r;	// the double model is only defined here for round-to-nearest
++		bool const er = bits(e) != bits(r), dr = bits(dm) != bits(r), ed = bits(e) != bits(dm);
++		if (er)
++		{
++			s.e_ne_r++; fr[F_E_NE_R]++;
++			if (p_nonrep) s.e_ne_r_nr++;
++			if (e == r) s.zero_sign++;
++			else
++			{
++				float const fe = (float)e, frr = (float)r;
++				if (std::nextafter(fe, frr) != frr) s.e_ne_r_big++;
++			}
++		}
++		if (dr) { s.d_ne_r++; fr[F_D_NE_R]++; if (p_nonrep) s.d_ne_r_nr++; }
++		if (ed) { s.e_ne_d++; if (p_nonrep) s.e_ne_d_nr++; }
++	}
++
++	void frame()
++	{
++		if (!on) return;
++		std::fprintf(ff, "%llu", (unsigned long long)frame_no++);
++		for (int i = 0; i < F_N; i++) { std::fprintf(ff, ",%llu", (unsigned long long)fr[i]); fr[i] = 0; }
++		std::fprintf(ff, "\n");
++	}
++
++	// ctx(pc) returns a disassembly listing of the code around pc
++	void dump(std::function<std::string(uint32_t)> ctx)
++	{
++		if (!on) return;
++		std::fclose(ff);
++		std::FILE *o = std::fopen((prefix + "_fp.txt").c_str(), "w");
++		std::fprintf(o, "frames %llu  instructions %llu\n", (unsigned long long)frame_no, (unsigned long long)insn);
++		std::fprintf(o, "MSR or %08X and %08X; FE0,FE1 = 00 %llu, 01 %llu, 10 %llu, 11 %llu; FP ops with MSR[FP]=0 %llu\n",
++			msr_or, msr_and, (unsigned long long)msr_fe[0], (unsigned long long)msr_fe[1], (unsigned long long)msr_fe[2], (unsigned long long)msr_fe[3], (unsigned long long)msr_fp_off);
++		std::vector<size_t> order;
++		for (size_t i = 1; i < st.size(); i++) order.push_back(i);
++		std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return st[a].n > st[b].n; });
++		std::fprintf(o, "\n== per opcode: count, input classes (%s...), result classes, RN histogram\n", cname[0]);
++		for (size_t i : order)
++		{
++			opstat const &s = st[i];
++			std::fprintf(o, "%-8s n %llu", kname(keyof[i]).c_str(), (unsigned long long)s.n);
++			std::fprintf(o, " | in");
++			for (int c = 0; c < C_N; c++) if (s.in_cls[c]) std::fprintf(o, " %s %llu", cname[c], (unsigned long long)s.in_cls[c]);
++			if (s.neg_in) std::fprintf(o, " negative %llu", (unsigned long long)s.neg_in);
++			std::fprintf(o, " | out");
++			for (int c = 0; c < C_N; c++) if (s.out_cls[c]) std::fprintf(o, " %s %llu", cname[c], (unsigned long long)s.out_cls[c]);
++			std::fprintf(o, " | RN %llu %llu %llu %llu", (unsigned long long)s.rn[0], (unsigned long long)s.rn[1], (unsigned long long)s.rn[2], (unsigned long long)s.rn[3]);
++			if (s.fp_off) std::fprintf(o, " | FP off %llu", (unsigned long long)s.fp_off);
++			std::fprintf(o, "\n");
++		}
++		std::fprintf(o, "\n== single-format representability of operands (per operand read)\n");
++		for (size_t i : order)
++		{
++			opstat const &s = st[i];
++			uint64_t t = 0; for (int r = 0; r < R_N; r++) t += s.rep[r];
++			if (!t) continue;
++			std::fprintf(o, "%-8s", kname(keyof[i]).c_str());
++			for (int r = 0; r < R_N; r++) std::fprintf(o, " %s %llu", rname[r], (unsigned long long)s.rep[r]);
++			std::fprintf(o, " | ops with a non-single operand %llu of %llu\n", (unsigned long long)s.any_nonrep, (unsigned long long)s.n);
++		}
++		std::fprintf(o, "\n== single arithmetic: emulator E, double-then-float model D, once-rounded R (all / with a non-single operand)\n");
++		for (size_t i : order)
++		{
++			opstat const &s = st[i];
++			if (!s.cmp && !s.skipped) continue;
++			std::fprintf(o, "%-8s compared %llu / %llu  E!=R %llu / %llu  D!=R %llu / %llu  E!=D %llu / %llu  | E!=R by >1 ulp %llu, zero sign only %llu, E not single %llu, skipped %llu\n",
++				kname(keyof[i]).c_str(), (unsigned long long)s.cmp, (unsigned long long)s.cmp_nr, (unsigned long long)s.e_ne_r, (unsigned long long)s.e_ne_r_nr,
++				(unsigned long long)s.d_ne_r, (unsigned long long)s.d_ne_r_nr, (unsigned long long)s.e_ne_d, (unsigned long long)s.e_ne_d_nr,
++				(unsigned long long)s.e_ne_r_big, (unsigned long long)s.zero_sign, (unsigned long long)s.e_not_single, (unsigned long long)s.skipped);
++		}
++		std::fprintf(o, "\n== double fma family: emulator against fused once-rounded double (RN only)\n");
++		for (size_t i : order)
++			if (st[i].fused_cmp)
++				std::fprintf(o, "%-8s compared %llu differ %llu\n", kname(keyof[i]).c_str(), (unsigned long long)st[i].fused_cmp, (unsigned long long)st[i].fused_ne);
++		std::fprintf(o, "\n== producer of the non-single operand of single ops (op, producer, count)\n");
++		{
++			std::vector<std::pair<uint64_t, std::pair<uint32_t, uint32_t>>> v;
++			for (auto &e : nonrep_prod) v.emplace_back(e.second, e.first);
++			std::sort(v.rbegin(), v.rend());
++			for (size_t i = 0; i < v.size() && i < 60; i++)
++				std::fprintf(o, "%-8s <- %-8s %llu\n", kname(v[i].second.first).c_str(), kname(v[i].second.second).c_str(), (unsigned long long)v[i].first);
++		}
++		std::fprintf(o, "\n== fctiw / fctiwz inputs\n");
++		for (size_t i : order)
++		{
++			opstat const &s = st[i];
++			uint32_t const k = keyof[i];
++			if (k != 63*1024+14 && k != 63*1024+15) continue;
++			std::fprintf(o, "%-8s n %llu RN %llu %llu %llu %llu fractional %llu exact .5 %llu out of range %llu NaN %llu -0 %llu\n", kname(k).c_str(), (unsigned long long)s.n,
++				(unsigned long long)s.rn[0], (unsigned long long)s.rn[1], (unsigned long long)s.rn[2], (unsigned long long)s.rn[3],
++				(unsigned long long)s.fx_frac, (unsigned long long)s.fx_tie, (unsigned long long)s.fx_range, (unsigned long long)s.fx_nan, (unsigned long long)s.fx_negzero);
++		}
++		std::fprintf(o, "\n== consumers of frsqrte / fres results (root, depth, consumer, count; depth 1 = reads the estimate itself)\n");
++		for (auto &e : consumers)
++			std::fprintf(o, "%-8s d%u %-8s %llu\n", kname(e.first.first / 8).c_str(), e.first.first % 8, kname(e.first.second).c_str(), (unsigned long long)e.second);
++		std::fprintf(o, "\n== FPSCR writes: control byte after the write (VE OE UE ZE XE NI RN: bits 7..0 = VE OE UE ZE XE NI RN1 RN0)\n");
++		for (auto &e : fpscr_ctl)
++			std::fprintf(o, "%-8s ctl %02X  VE%u OE%u UE%u ZE%u XE%u NI%u RN%u  %llu\n", kname(e.first.first).c_str(), e.first.second,
++				(e.first.second >> 7) & 1, (e.first.second >> 6) & 1, (e.first.second >> 5) & 1, (e.first.second >> 4) & 1, (e.first.second >> 3) & 1, (e.first.second >> 2) & 1, e.first.second & 3,
++				(unsigned long long)e.second);
++		std::fprintf(o, "\n== FPSCR write arguments (mtfsf FM, mtfsfi field*16+imm, mtfsb bit)\n");
++		for (auto &e : fpscr_arg)
++			std::fprintf(o, "%-8s %02X  %llu\n", kname(e.first.first).c_str(), e.first.second, (unsigned long long)e.second);
++		std::fprintf(o, "\n== full FPSCR after writes (first 4096 distinct)\n");
++		for (auto &e : fpscr_full)
++			std::fprintf(o, "%-8s %08X  %llu\n", kname(e.first.first).c_str(), e.first.second, (unsigned long long)e.second);
++		std::fprintf(o, "\n== FPSCR control byte at FP arithmetic\n");
++		for (auto &e : ctl_at_arith)
++			std::fprintf(o, "ctl %02X  %llu\n", e.first, (unsigned long long)e.second);
++		std::fprintf(o, "\n== FPSCR value read by mffs\n");
++		for (auto &e : mffs_val)
++			std::fprintf(o, "%08X  %llu\n", e.first, (unsigned long long)e.second);
++		std::fprintf(o, "\n== mcrfs (crfS, crfD, count)\n");
++		for (auto &e : mcrfs_field)
++			std::fprintf(o, "crfS %u crfD %u  %llu\n", e.first / 8, e.first % 8, (unsigned long long)e.second);
++		std::fprintf(o, "\n== FPSCR instruction sites, with the code around each\n");
++		for (auto &e : site)
++		{
++			std::fprintf(o, "\n-- %s at %08X, %llu times\n", kname(e.first.first).c_str(), e.first.second, (unsigned long long)e.second);
++			if (ctx) std::fprintf(o, "%s", ctx(e.first.second).c_str());
++		}
++		std::fclose(o);
++		on = false;
++	}
++};
++
++}	// namespace m3fp
++
++#endif
 diff --git a/src/devices/cpu/powerpc/ppc.h b/src/devices/cpu/powerpc/ppc.h
 index dd0dd039..094942d0 100644
 --- a/src/devices/cpu/powerpc/ppc.h
@@ -26,7 +715,7 @@ index dd0dd039..094942d0 100644
  		double f[32];
  		uint32_t cr[8];
 diff --git a/src/devices/cpu/powerpc/ppccom.cpp b/src/devices/cpu/powerpc/ppccom.cpp
-index fe846ace..831d4706 100644
+index fe846ace..c7bdddf4 100644
 --- a/src/devices/cpu/powerpc/ppccom.cpp
 +++ b/src/devices/cpu/powerpc/ppccom.cpp
 @@ -556,6 +556,8 @@ static inline int is_snan_double(double x)
@@ -46,7 +735,7 @@ index fe846ace..831d4706 100644
  }
  
  
-@@ -3241,3 +3244,237 @@ void ppc4xx_device::ppc4xx_set_dcr_write_handler(write32sm_delegate dcr_write_fu
+@@ -3241,3 +3244,258 @@ void ppc4xx_device::ppc4xx_set_dcr_write_handler(write32sm_delegate dcr_write_fu
  {
  	m_dcr_write_func = dcr_write_func;
  }
@@ -63,6 +752,7 @@ index fe846ace..831d4706 100644
 +#include <cmath>
 +#include <fstream>
 +#include <map>
++#include "m3fp_census.h"
 +
 +struct ppc_device::census_state
 +{
@@ -85,6 +775,7 @@ index fe846ace..831d4706 100644
 +	std::vector<std::pair<uint32_t, uint32_t>> idle;  // M3IDLE=lo-hi,... busy-wait PC ranges
 +	uint64_t f_idle = 0;
 +	std::ofstream frames;
++	m3fp::census fp;	// M3FP=<prefix>: FP operand census (m3fp_census.h)
 +};
 +
 +static inline uint32_t census_key(uint32_t op)
@@ -108,6 +799,13 @@ index fe846ace..831d4706 100644
 +	census_state &c = *m_census;
 +	uint32_t const op = m_core->census_op;
 +	uint32_t const pc = m_core->pc;
++
++	// FP census: the previous instruction's results, then this one's operands
++	if (c.fp.on)
++	{
++		c.fp.post(m_core->f, m_core->fpscr);
++		c.fp.pre(pc, op, m_core->f, m_core->fpscr, m_core->msr);
++	}
 +
 +	// the previous instruction has now executed: check its double result
 +	if (c.pending_key)
@@ -194,6 +892,7 @@ index fe846ace..831d4706 100644
 +			<< c.f_lines[0] << ',' << c.f_lines[1] << ',' << c.f_lines[2] << ','
 +			<< c.f_fps << ',' << c.f_fpd << ',' << c.f_idle << '\n';
 +	c.last_cycles = cyc;
++	c.fp.frame();
 +	c.f_insn = c.f_fps = c.f_fpd = c.f_idle = 0;
 +	std::fill(std::begin(c.f_region), std::end(c.f_region), 0);
 +	std::fill(std::begin(c.f_lines), std::end(c.f_lines), 0);
@@ -208,6 +907,15 @@ index fe846ace..831d4706 100644
 +	c.frames.close();
 +	std::ofstream o(c.prefix + ".txt");
 +	auto dasm = [this](uint32_t pc, uint32_t op) { std::ostringstream s; m_dasm.dasm_one(s, pc, op); return s.str(); };
++	c.fp.dump([this, &dasm](uint32_t pc) {
++		std::string s;
++		for (uint32_t a = pc - 16; a <= pc + 40; a += 4)
++		{
++			uint32_t const w = m_program->read_dword(a);
++			s += util::string_format("%s %08X  %08X  %s\n", a == pc ? ">" : " ", a, w, dasm(a, w));
++		}
++		return s;
++	});
 +
 +	uint64_t total = 0;
 +	for (auto n : c.op_count) total += n;
@@ -272,6 +980,8 @@ index fe846ace..831d4706 100644
 +		m_census->prefix = prefix;
 +		m_census->frames.open(m_census->prefix + "_frames.csv");
 +		m_census->frames << "frame,cycles,insn,ram,fixed_crom,banked_crom,other,lines_ram,lines_fixed,lines_banked,fp_single,fp_double,idle\n";
++		if (char const *const fp = getenv("M3FP"))
++			m_census->fp.init(fp);
 +		if (char const *const idle = getenv("M3IDLE"))
 +		{
 +			std::istringstream in(idle);
@@ -369,10 +1079,10 @@ index 383b0fe6..302de201 100644
  	void real3d_display_list2_dma(uint32_t src, uint32_t dst, int length, int byteswap);
  	void real3d_vrom_texture_dma(uint32_t src, uint32_t dst, int length, int byteswap);
 diff --git a/src/mame/sega/model3_v.cpp b/src/mame/sega/model3_v.cpp
-index fac2dfb6..b10c4bc6 100644
+index fac2dfb6..4e8d65c4 100644
 --- a/src/mame/sega/model3_v.cpp
 +++ b/src/mame/sega/model3_v.cpp
-@@ -6,6 +6,225 @@
+@@ -6,6 +6,227 @@
  
  #include "endianness.h"
  
@@ -404,6 +1114,7 @@ index fac2dfb6..b10c4bc6 100644
 +
 +	// textures: sheet tiles written (8x8 texels), and a texel-cache model
 +	std::vector<uint8_t> tile_w = std::vector<uint8_t>(2 * 256 * 128);
++	std::vector<uint8_t> vrom_model = std::vector<uint8_t>(0x4000);   // 4 KiB pages of VROM read as model data
 +	std::vector<uint8_t> blk_r = std::vector<uint8_t>(2 * 512 * 256);   // 4x4 blocks ever read
 +	std::vector<uint32_t> blk_stamp = std::vector<uint32_t>(2 * 512 * 256);
 +	uint64_t texel_fetches = 0, blocks_touched = 0, max_texel_fetches = 0, max_blocks = 0;
@@ -479,6 +1190,7 @@ index fac2dfb6..b10c4bc6 100644
 +		for (auto b : blk_r) br += b;
 +		std::fprintf(o, "texture sheets: 8x8 tiles written page 0 %llu, page 1 %llu of 32768 each (%.2f MiB of 8 written); 4x4 blocks ever read %llu (%.2f MiB)\n",
 +				(unsigned long long)tw0, (unsigned long long)tw1, (tw0 + tw1) * 128 / 1048576.0, (unsigned long long)br, br * 32 / 1048576.0);
++		{ uint64_t vp = 0; for (auto b : vrom_model) vp += b; std::fprintf(o, "VROM read as model data: %llu 4 KiB pages (%.2f MiB, page-rounded)\n", (unsigned long long)vp, vp * 4 / 1024.0); }
 +		std::fprintf(o, "texel fetches per frame peak %llu; distinct 4x4 blocks per frame peak %llu\n", (unsigned long long)max_texel_fetches, (unsigned long long)max_blocks);
 +		for (auto const &c : caches)
 +			std::fprintf(o, "cache %3d KiB %d-way, 32 B lines: total misses %llu, per-frame peak %llu (%.1f MB/s at 57.52 Hz)\n",
@@ -598,7 +1310,7 @@ index fac2dfb6..b10c4bc6 100644
  /*
      TODO:
      - Tilemap flash effect
-@@ -543,6 +762,10 @@ cached_texture *model3_state::get_texture(int page, int texx, int texy, int texw
+@@ -543,6 +764,10 @@ cached_texture *model3_state::get_texture(int page, int texx, int texy, int texw
  	/* create a new texture */
  	tex = new cached_texture(texwidth, texheight, format);
  
@@ -609,7 +1321,7 @@ index fac2dfb6..b10c4bc6 100644
  	/* set the new texture */
  	tex->next = m_texcache[page][texy][texx];
  	m_texcache[page][texy][texx] = tex;
-@@ -954,10 +1177,12 @@ void model3_state::real3d_display_list_w(offs_t offset, uint64_t data, uint64_t
+@@ -954,10 +1179,12 @@ void model3_state::real3d_display_list_w(offs_t offset, uint64_t data, uint64_t
  	if (ACCESSING_BITS_32_63)
  	{
  		m_display_list_ram[offset*2] = BYTE_REVERSE32((uint32_t)(data >> 32));
@@ -622,7 +1334,7 @@ index fac2dfb6..b10c4bc6 100644
  	}
  }
  
-@@ -966,10 +1191,12 @@ void model3_state::real3d_polygon_ram_w(offs_t offset, uint64_t data, uint64_t m
+@@ -966,10 +1193,12 @@ void model3_state::real3d_polygon_ram_w(offs_t offset, uint64_t data, uint64_t m
  	if (ACCESSING_BITS_32_63)
  	{
  		m_polygon_ram[offset*2] = BYTE_REVERSE32((uint32_t)(data >> 32));
@@ -635,7 +1347,7 @@ index fac2dfb6..b10c4bc6 100644
  	}
  }
  
-@@ -1006,6 +1233,7 @@ inline void model3_state::write_texture16(int xpos, int ypos, int width, int hei
+@@ -1006,6 +1235,7 @@ inline void model3_state::write_texture16(int xpos, int ypos, int width, int hei
  		for(x=xpos; x < xpos+width; x+=8)
  		{
  			uint16_t *texture = &m_texture_ram[page][y*2048+x];
@@ -643,7 +1355,7 @@ index fac2dfb6..b10c4bc6 100644
  			int b = 0;
  			for(j=y; j < y+8; j++) {
  				for(i=x; i < x+8; i++) {
-@@ -1028,6 +1256,7 @@ inline void model3_state::write_texture8(int xpos, int ypos, int width, int heig
+@@ -1028,6 +1258,7 @@ inline void model3_state::write_texture8(int xpos, int ypos, int width, int heig
  		for(x=xpos; x < xpos+width; x+=8)
  		{
  			uint16_t *texture = &m_texture_ram[page][y*2048+x];
@@ -651,7 +1363,7 @@ index fac2dfb6..b10c4bc6 100644
  			int b = 0;
  			for(j=y; j < y+8; j++)
  			{
-@@ -1098,6 +1327,8 @@ void model3_state::real3d_upload_texture(uint32_t header, uint32_t *data)
+@@ -1098,6 +1329,8 @@ void model3_state::real3d_upload_texture(uint32_t header, uint32_t *data)
  	int ypos    = ((header >> 7) & 0x1f) * 32;
  	int page    = (header >> 20) & 0x1;
  	int bitdepth = (header >> 23) & 0x1;
@@ -660,7 +1372,7 @@ index fac2dfb6..b10c4bc6 100644
  	int upper_byte = (header >> 22) & 0x1;
  	int lower_byte = (header >> 21) & 0x1;
  
-@@ -1189,13 +1420,72 @@ void model3_state::real3d_upload_texture(uint32_t header, uint32_t *data)
+@@ -1189,13 +1422,72 @@ void model3_state::real3d_upload_texture(uint32_t header, uint32_t *data)
  		case 0x80:      /* Gamma-table ? */
  			break;
  		default:
@@ -734,7 +1446,7 @@ index fac2dfb6..b10c4bc6 100644
  	/* upload textures if there are any in the FIFO */
  	if (m_texture_fifo_pos > 0)
  	{
-@@ -1214,6 +1504,7 @@ void model3_state::real3d_display_list_end()
+@@ -1214,6 +1506,7 @@ void model3_state::real3d_display_list_end()
  
  	reset_triangle_buffers();
  	real3d_traverse_display_list();
@@ -742,7 +1454,7 @@ index fac2dfb6..b10c4bc6 100644
  
  	for (int i=0; i < 4; i++)
  	{
-@@ -1231,12 +1522,16 @@ void model3_state::real3d_display_list_end()
+@@ -1231,12 +1524,16 @@ void model3_state::real3d_display_list_end()
  			tiacount = m_tri_alpha_buffer_ptr - tia;
  		}
  
@@ -759,7 +1471,7 @@ index fac2dfb6..b10c4bc6 100644
  		}
  	}
  }
-@@ -1252,6 +1547,7 @@ void model3_state::real3d_display_list1_dma(uint32_t src, uint32_t dst, int leng
+@@ -1252,6 +1549,7 @@ void model3_state::real3d_display_list1_dma(uint32_t src, uint32_t dst, int leng
  		if (byteswap)
  			w = BYTE_REVERSE32(w);
  
@@ -767,7 +1479,7 @@ index fac2dfb6..b10c4bc6 100644
  		m_display_list_ram[d++] = w;
  		src += 4;
  	}
-@@ -1268,6 +1564,7 @@ void model3_state::real3d_display_list2_dma(uint32_t src, uint32_t dst, int leng
+@@ -1268,6 +1566,7 @@ void model3_state::real3d_display_list2_dma(uint32_t src, uint32_t dst, int leng
  		if (byteswap)
  			w = BYTE_REVERSE32(w);
  
@@ -775,7 +1487,7 @@ index fac2dfb6..b10c4bc6 100644
  		m_culling_ram[d++] = w;
  		src += 4;
  	}
-@@ -1321,6 +1618,7 @@ void model3_state::real3d_polygon_ram_dma(uint32_t src, uint32_t dst, int length
+@@ -1321,6 +1620,7 @@ void model3_state::real3d_polygon_ram_dma(uint32_t src, uint32_t dst, int length
  		if (byteswap)
  			w = BYTE_REVERSE32(w);
  
@@ -783,15 +1495,16 @@ index fac2dfb6..b10c4bc6 100644
  		m_polygon_ram[d++] = w;
  		src += 4;
  	}
-@@ -1495,6 +1793,7 @@ void model3_state::draw_model(uint32_t addr)
+@@ -1495,6 +1795,8 @@ void model3_state::draw_model(uint32_t addr)
  {
  	// Polygon RAM is mapped to the low 4MB of VROM
  	uint32_t *model = (addr >= 0x100000) ? &m_vrom[addr] :  &m_polygon_ram[addr];
 +	g_m3b.models++;
++	if (g_m3b.on && addr >= 0x100000 && (addr >> 10) + 1 < g_m3b.vrom_model.size()) { g_m3b.vrom_model[addr >> 10] = 1; g_m3b.vrom_model[(addr >> 10) + 1] = 1; }
  
  	uint32_t header[7];
  	int index = 0;
-@@ -1555,6 +1854,15 @@ void model3_state::draw_model(uint32_t addr)
+@@ -1555,6 +1857,15 @@ void model3_state::draw_model(uint32_t addr)
  			return;
  
  		num_vertices = (header[0] & 0x40) ? 4 : 3;
@@ -807,7 +1520,7 @@ index fac2dfb6..b10c4bc6 100644
  
  		/* texture coordinates are 16.0 or 13.3 fixed-point */
  		texture_coord_scale = (header[1] & 0x40) ? 1.0f : (1.0f / 8.0f);
-@@ -1774,14 +2082,22 @@ uint32_t *model3_state::get_memory_pointer(uint32_t address)
+@@ -1774,14 +2085,22 @@ uint32_t *model3_state::get_memory_pointer(uint32_t address)
  	if (address & 0x800000)
  	{
  		if (address >= 0x840000) {
@@ -832,7 +1545,7 @@ index fac2dfb6..b10c4bc6 100644
  		}
  		return &m_culling_ram[address];
  	}
-@@ -2067,6 +2383,7 @@ void model3_renderer::draw_opaque_triangles(const m3_triangle* tris, int num_tri
+@@ -2067,6 +2386,7 @@ void model3_renderer::draw_opaque_triangles(const m3_triangle* tris, int num_tri
  			extra.transparency = tri->transparency;
  			extra.texture_param = tri->param;
  			extra.color = tri->color;
@@ -840,7 +1553,7 @@ index fac2dfb6..b10c4bc6 100644
  
  			if (tri->param & TRI_PARAM_ALPHA_TEST)
  			{
-@@ -2176,6 +2493,7 @@ void model3_renderer::draw_scanline_solid(int32_t scanline, const extent_t &exte
+@@ -2176,6 +2496,7 @@ void model3_renderer::draw_scanline_solid(int32_t scanline, const extent_t &exte
  
  			fb[x] = 0xff000000 | c.to_rgba_clamp();
  			zb[x] = z;
@@ -848,7 +1561,7 @@ index fac2dfb6..b10c4bc6 100644
  		}
  
  		in += inz;
-@@ -2238,6 +2556,7 @@ do {
+@@ -2238,6 +2559,7 @@ do {
  	uint32_t v1 = (v >> 8) & vmask;                                               \
  	uint32_t u2 = (u1 + 1) & umask;                                               \
  	uint32_t v2 = (v1 + 1) & vmask;                                               \
@@ -856,7 +1569,7 @@ index fac2dfb6..b10c4bc6 100644
  	uint32_t pix00 = texture->data[(v1 << width) + u1];                           \
  	uint32_t pix01 = texture->data[(v1 << width) + u2];                           \
  	uint32_t pix10 = texture->data[(v2 << width) + u1];                           \
-@@ -2253,6 +2572,7 @@ do {
+@@ -2253,6 +2575,7 @@ do {
  
  void model3_renderer::draw_scanline_tex(int32_t scanline, const extent_t &extent, const model3_polydata &polydata, int threadid)
  {
@@ -864,7 +1577,7 @@ index fac2dfb6..b10c4bc6 100644
  	uint32_t *const fb = &m_fb->pix(scanline);
  	float *const zb = (float*)&m_zb->pix(scanline);
  	const cached_texture *texture = polydata.texture;
-@@ -2297,6 +2617,7 @@ void model3_renderer::draw_scanline_tex(int32_t scanline, const extent_t &extent
+@@ -2297,6 +2620,7 @@ void model3_renderer::draw_scanline_tex(int32_t scanline, const extent_t &extent
  
  void model3_renderer::draw_scanline_tex_colormod(int32_t scanline, const extent_t &extent, const model3_polydata &polydata, int threadid)
  {
@@ -872,7 +1585,7 @@ index fac2dfb6..b10c4bc6 100644
  	uint32_t *const fb = &m_fb->pix(scanline);
  	float *const zb = (float*)&m_zb->pix(scanline);
  	const cached_texture *texture = polydata.texture;
-@@ -2383,6 +2704,7 @@ void model3_renderer::draw_scanline_tex_contour(int32_t scanline, const extent_t
+@@ -2383,6 +2707,7 @@ void model3_renderer::draw_scanline_tex_contour(int32_t scanline, const extent_t
  
  				fb[x] = 0xff000000 | color.to_rgba_clamp();
  				zb[x] = z;
