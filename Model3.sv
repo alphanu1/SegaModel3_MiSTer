@@ -138,8 +138,8 @@ pll pll
 wire reset = RESET | status[0] | buttons[1];
 
 // ---------------------------------------------------------------- CPU test
-// 75 MHz until the core closes 100 (study R23); the UART divisor follows.
-localparam int CPU_HZ = 75_000_000;
+// 100 MHz (study D-3); the UART divisor follows the clock.
+localparam int CPU_HZ = 100_000_000;
 
 reg [2:0] cpu_rst_sync = 3'b111;
 always @(posedge clk_cpu) cpu_rst_sync <= {cpu_rst_sync[1:0], reset | ~pll_locked};

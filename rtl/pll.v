@@ -9,7 +9,7 @@ module pll (
 		input  wire  refclk,   //  refclk.clk
 		input  wire  rst,      //   reset.reset
 		output wire  outclk_0, // outclk0.clk  20 MHz, the template's video
-		output wire  outclk_1, // outclk1.clk  75 MHz, the CPU (100 once timing closes)
+		output wire  outclk_1, // outclk1.clk  100 MHz, the CPU
 		output wire  locked    //  locked.export
 	);
 

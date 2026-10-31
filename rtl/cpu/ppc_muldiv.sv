@@ -16,7 +16,7 @@
 // result three cycles after start (the CPI model's figure, study R22).
 // mullw, mulhw, mulhwu and mulli share the one product.
 //
-// Divide: radix-2 restoring on magnitudes, one quotient bit a cycle, 34 cycles.
+// Divide: radix-2 restoring on magnitudes, one quotient bit a cycle, 35 cycles to the result.
 // divw / divwu are 0.2% of VF3's divide-free instruction stream (R12); area
 // matters more than speed here.
 //
@@ -66,19 +66,23 @@ module ppc_muldiv
   wire        m_ov  = (prod[63:32] != {32{prod[31]}});
 
   // --------------------------------------------------------------- divide
-  logic        d_busy, d_fin, d_neg, d_special;
+  logic        d_busy, d_fin, d_neg, d_special, d_first, d_sgn;
+  logic [31:0] d_x, d_y;
   logic [5:0]  d_cnt;
   logic [31:0] d_q, d_div, d_spec;
   logic [32:0] d_r;
 
   wire        d_start  = start && (op == OP_DIV || op == OP_DIVU);
-  wire        d_signed = (op == OP_DIV);
-  wire        x_neg    = d_signed && x[31];
-  wire        y_neg    = d_signed && y[31];
-  wire [31:0] x_mag    = x_neg ? -x : x;
-  wire [31:0] y_mag    = y_neg ? -y : y;
-  wire        by_zero  = (y == 32'd0);
-  wire        ovf_case = d_signed && (x == 32'h8000_0000) && (y == 32'hFFFF_FFFF);
+  // operands are registered raw on start; magnitudes, signs and the special
+  // cases come from the registers one cycle later (R23 timing)
+  wire        x_neg    = d_sgn && d_x[31];
+  wire        y_neg    = d_sgn && d_y[31];
+  wire [31:0] x_mag    = x_neg ? -d_x : d_x;
+  wire [31:0] y_mag    = y_neg ? -d_y : d_y;
+  wire        d_zero   = (d_y == 32'd0);
+  wire        d_ovf    = d_sgn && (d_x == 32'h8000_0000) && (d_y == 32'hFFFF_FFFF);
+  // the special cases are checked on the second cycle, from registered compares,
+  // not on the forwarded operands of the start cycle (R23 timing)
   wire [32:0] d_r2     = {d_r[31:0], d_q[31]};
   wire        d_ge     = d_r2 >= {1'b0, d_div};
 
@@ -87,14 +91,21 @@ module ppc_muldiv
     if (rst) begin
       d_busy <= 1'b0;
     end else if (d_start) begin
-      d_special <= by_zero || ovf_case;
-      d_spec    <= (by_zero && !x_neg) ? 32'd0 : 32'hFFFF_FFFF;
-      d_neg     <= x_neg ^ y_neg;
-      d_q       <= x_mag;
-      d_div     <= y_mag;
+      d_first   <= 1'b1;
+      d_special <= 1'b0;
+      d_sgn     <= (op == OP_DIV);
+      d_x       <= x;
+      d_y       <= y;
       d_r       <= 33'd0;
       d_cnt     <= 6'd0;
       d_busy    <= 1'b1;
+    end else if (d_busy && d_first) begin
+      d_first   <= 1'b0;
+      d_special <= d_zero || d_ovf;
+      d_spec    <= (d_zero && !x_neg) ? 32'd0 : 32'hFFFF_FFFF;
+      d_neg     <= x_neg ^ y_neg;
+      d_q       <= x_mag;
+      d_div     <= y_mag;
     end else if (d_busy) begin
       if (d_special || d_cnt == 6'd32) begin
         d_busy <= 1'b0;
