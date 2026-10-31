@@ -41,6 +41,10 @@ package ppc_pkg;
     OP_BRANCH,
     OP_LOAD, OP_STORE,
     OP_SC, OP_RFI, OP_TRAP,
+    OP_MTSR, OP_MFSR,   // mtsr / mtsrin, mfsr / mfsrin: the SR number is y[31:28]
+    OP_TLBIE, OP_TLBL,  // tlbie; tlbld / tlbli (insn[6] = 1: tlbli). The EA is y
+    OP_ISYNC,           // refetches: context synchronizing
+    OP_FP,              // FP arithmetic, moves, compares and FPSCR ops (funit, fop, fsop)
     OP_NOP,
     OP_ILLEGAL
   } alu_op_t;
@@ -73,9 +77,7 @@ package ppc_pkg;
     logic [2:0]  crf;             // target CR field of cmp / mcrf / mcrxr
     logic [2:0]  crf_src;         // source field of mcrf
 
-    // rotate
-    logic [4:0]  sh;              // from instruction or rB[4:0] (sh_from_rb)
-    logic        sh_from_rb;
+    // rotate (the amount is y: SH as an immediate, or rB)
     logic [4:0]  mb, me;
     logic        rlw_insert;      // rlwimi
 
@@ -86,6 +88,11 @@ package ppc_pkg;
     logic        reserve;         // lwarx
     logic        cond;            // stwcx.
     logic        st_update;       // store with update: write EA to rA
+    logic [2:0]  cop;             // a data cache operation, as ppc_dcache's d_op: 1 dcbt / dcbtst,
+                                  // 2 dcbz, 3 dcbst, 4 dcbf, 5 dcbi (a load or store uop otherwise)
+    logic        icbi;            // icbi: EA (rA|0) + rB, its set index only (603e 3.7.8)
+    logic        sync;            // sync: waits for every access to be done
+    logic        priv;            // a privileged instruction in user mode (program, SRR1[13])
 
     // branch
     br_kind_t    bkind;
@@ -99,6 +106,24 @@ package ppc_pkg;
 
     logic [9:0]  spr;
     logic        last;            // last uop of the architectural instruction
+
+    // floating point (FP loads and stores are OP_LOAD / OP_STORE uops)
+    logic        fp;              // an FP instruction: MSR[FP] = 0 takes 0x800
+    logic [1:0]  funit;           // 0 none, 1 multiply-add, 2 divider, 3 small unit
+    logic [3:0]  fop;             // fma_op_t, div_op_t or misc_op_t (ppc_fpu_pkg)
+    logic        fsgl;            // opcode 59: single precision
+    logic [2:0]  fsop;            // FPSCR op (fs_op_t): mtfsf, mtfsfi, mtfsb0/1, mcrfs
+    logic        fpw;             // this uop writes FPR frD (insn[25:21])
+    logic        fua, fub, fuc;   // reads frA, frB, frC (frS for a store: the C port)
+    logic        fld, fst;        // FP load / store uop
+    logic        fdbl;            // lfd / stfd: two word beats, high word first
+    logic        fhi;             // lfd's first beat: the high word, no FPR write
+    logic        fsl;             // lfs / stfs: single-format conversion
+    logic        fiw;             // stfiwx
+    logic        fcmp;            // fcmpu / fcmpo
+    logic        frc;             // Rc = 1: CR1 from FPSCR[0-3]
+    logic        fsu;             // may change the FPSCR (arithmetic, compares, FPSCR ops)
+    logic        fser;            // waits in EX until no older FP op can change the FPSCR
   } uop_t;
 
 endpackage

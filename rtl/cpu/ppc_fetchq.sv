@@ -18,45 +18,58 @@
 // also switched off for this module alone (the core's MLAB files keep it).
 
 (* altera_attribute = "-name AUTO_RAM_RECOGNITION OFF" *)
-module ppc_fetchq (
+module ppc_fetchq #(
+  parameter int PDW = 5                  // predecode bits per entry
+)(
   input  logic        clk,
   input  logic        clear,         // a hard redirect: the queue empties
   input  logic        we,            // push, after the live entries
   input  logic [31:0] w_insn,
   input  logic [31:0] w_pc,
   input  logic        w_pred,
-  input  logic [4:0]  w_pd,          // predecode, carried with the word (ppc_core.sv)
-  input  logic        pop,           // decode took the head
+  input  logic [PDW-1:0] w_pd,       // predecode, carried with the word (ppc_core.sv)
+  input  logic [3:0]  pop,           // decode took the head: one copy per entry (fanout)
   output logic [2:0]  count,
   output logic [31:0] r_insn,
   output logic [31:0] r_pc,
   output logic        r_pred,
-  output logic [4:0]  r_pd
+  output logic [PDW-1:0] r_pd,
+  output logic [31:0] r1_insn,       // entry 1: the head after a pop
+  output logic [PDW-1:0] r1_pd
 );
 
   logic [31:0] qi [0:3];
   logic [31:0] qp [0:3];
   logic [3:0]  qd;
-  logic [4:0]  qx [0:3];
+  logic [PDW-1:0] qx [0:3];
   logic [2:0]  cnt;
 
-  // after the pop, entry k holds what was in k+1; the push goes to cnt - pop
-  wire [2:0] wpos = cnt - {2'd0, pop};
-
+  // After the pop, entry k holds what was in k+1; the push goes to cnt - pop.
+  // Each entry's next value is formed for both cases from the count and the
+  // push alone, and the pop, the decode stage's late decision, picks between
+  // them as the last mux before the register (R23 timing: the pop went through
+  // the write position and a clock enable on every bit).
   always_ff @(posedge clk) begin
     if (clear) cnt <= 3'd0;
-    else       cnt <= cnt + {2'd0, we} - {2'd0, pop};
+    else       cnt <= cnt + {2'd0, we} - {2'd0, pop[0]};
     for (int k = 0; k < 4; k++) begin
-      if (we && wpos == 3'(k)) begin
+      if (pop[k]) begin
+        if (we && cnt == 3'(k + 1)) begin
+          qi[k] <= w_insn;
+          qp[k] <= w_pc;
+          qd[k] <= w_pred;
+          qx[k] <= w_pd;
+        end else if (k < 3) begin
+          qi[k] <= qi[(k + 1) % 4];
+          qp[k] <= qp[(k + 1) % 4];
+          qd[k] <= qd[(k + 1) % 4];
+          qx[k] <= qx[(k + 1) % 4];
+        end
+      end else if (we && cnt == 3'(k)) begin
         qi[k] <= w_insn;
         qp[k] <= w_pc;
         qd[k] <= w_pred;
         qx[k] <= w_pd;
-      end else if (pop && k < 3) begin
-        qi[k] <= qi[k + 1];
-        qp[k] <= qp[k + 1];
-        qd[k] <= qd[k + 1];
-        qx[k] <= qx[k + 1];
       end
     end
   end
@@ -66,5 +79,7 @@ module ppc_fetchq (
   assign r_pc   = qp[0];
   assign r_pred = qd[0];
   assign r_pd   = qx[0];
+  assign r1_insn = qi[1];
+  assign r1_pd   = qx[1];
 
 endmodule

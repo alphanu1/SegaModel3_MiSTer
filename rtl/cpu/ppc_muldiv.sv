@@ -12,16 +12,23 @@
 //
 // PowerPC multiply and divide.
 //
-// Multiply: 33 x 33 signed on the DSPs, operands and product registered,
-// result three cycles after start (the CPI model's figure, study R22).
-// mullw, mulhw, mulhwu and mulli share the one product.
+// Multiply: 33 x 33 signed on the DSPs, result three cycles after start (the
+// CPI model's figure, study R22). mullw, mulhw, mulhwu and mulli share the one
+// product. The operands are the core's EX operand registers, stable while the
+// multiply is in EX, so the DSPs take them in the start cycle with no
+// register of their own (and are kept from making one, below); the partial products are registered (at the DSP
+// outputs) and summed in the next cycle into the product register. With the
+// operands registered here instead, Quartus put the product register at the
+// DSP outputs and the 64-bit sum of the partial products fell in the result
+// cycle, in front of OV and the core's result select (R23 timing).
 //
 // Divide: radix-2 restoring on magnitudes, one quotient bit a cycle, 35 cycles to the result.
 // divw / divwu are 0.2% of VF3's divide-free instruction stream (R12); area
 // matters more than speed here.
 //
-// The manual leaves divide by zero and 0x80000000 / -1 undefined. This follows
-// Supermodel, the emulator the games are known to run on: divw by zero gives 0
+// The manual leaves divide by zero and 0x80000000 / -1 undefined, the one place
+// an emulator is followed over it (study D-17). This follows Supermodel, the
+// emulator the games are known to run on: divw by zero gives 0
 // for a non-negative dividend and -1 for a negative one, 0x80000000 / -1 gives
 // -1, divwu by zero gives 0, and each sets OV.
 
@@ -31,6 +38,7 @@ module ppc_muldiv
   input  logic        clk,
   input  logic        rst,
   input  logic        start,
+  input  logic        en,          // EX holds a multiply or divide (a register)
   input  alu_op_t     op,
   input  logic [31:0] x,           // rA
   input  logic [31:0] y,           // rB or the mulli immediate
@@ -40,10 +48,19 @@ module ppc_muldiv
 );
 
   // ------------------------------------------------------------- multiply
-  logic        m_go1, m_go2;
-  alu_op_t     m_op1, m_op2;
-  logic signed [32:0] ma, mb;
-  logic signed [65:0] prod;
+  logic        m_go1, m_go2, m_lo2;
+  alu_op_t     m_op1;
+  logic signed [65:0] prod_p, prod;
+  // The operands reach the DSPs through a gate (en), so the fitter cannot
+  // pack a copy of the core's operand registers into the DSPs' input
+  // registers: it did, and the forwarding mux in front of those registers
+  // then ended in the DSP column, 1.3 to 1.7 ns away (the leading paths of
+  // every seed). The DSPs take the operands as inputs and register only
+  // their outputs.
+  wire  [31:0]        xg = x & {32{en}};
+  wire  [31:0]        yg = y & {32{en}};
+  wire  signed [32:0] ma = {(op != OP_MULHU) & xg[31], xg};
+  wire  signed [32:0] mb = {(op != OP_MULHU) & yg[31], yg};
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -53,23 +70,19 @@ module ppc_muldiv
       m_go1 <= start && (op == OP_MUL || op == OP_MULH || op == OP_MULHU);
       m_go2 <= m_go1;
     end
-    if (start) begin
-      m_op1 <= op;
-      ma    <= {(op != OP_MULHU) & x[31], x};
-      mb    <= {(op != OP_MULHU) & y[31], y};
-    end
-    prod  <= ma * mb;
-    m_op2 <= m_op1;
+    if (start) m_op1 <= op;
+    prod_p <= ma * mb;
+    prod   <= prod_p;
+    m_lo2 <= (m_op1 == OP_MUL);                        // mullw: the low word
   end
 
-  wire [31:0] m_res = (m_op2 == OP_MUL) ? prod[31:0] : prod[63:32];
   wire        m_ov  = (prod[63:32] != {32{prod[31]}});
 
   // --------------------------------------------------------------- divide
   logic        d_busy, d_fin, d_neg, d_special, d_first, d_sgn;
   logic [31:0] d_x, d_y;
   logic [5:0]  d_cnt;
-  logic [31:0] d_q, d_div, d_spec;
+  logic [31:0] d_q, d_div, d_spec, d_res_q;
   logic [32:0] d_r;
 
   wire        d_start  = start && (op == OP_DIV || op == OP_DIVU);
@@ -85,6 +98,7 @@ module ppc_muldiv
   // not on the forwarded operands of the start cycle (R23 timing)
   wire [32:0] d_r2     = {d_r[31:0], d_q[31]};
   wire        d_ge     = d_r2 >= {1'b0, d_div};
+  wire [31:0] d_res    = d_special ? d_spec : (d_neg ? -d_q : d_q);
 
   always_ff @(posedge clk) begin
     d_fin <= 1'b0;
@@ -108,8 +122,9 @@ module ppc_muldiv
       d_div     <= y_mag;
     end else if (d_busy) begin
       if (d_special || d_cnt == 6'd32) begin
-        d_busy <= 1'b0;
-        d_fin  <= 1'b1;
+        d_busy  <= 1'b0;
+        d_fin   <= 1'b1;
+        d_res_q <= d_res;                              // the quotient is final here
       end else begin
         d_r   <= d_ge ? (d_r2 - {1'b0, d_div}) : d_r2;
         d_q   <= {d_q[30:0], d_ge};
@@ -118,10 +133,13 @@ module ppc_muldiv
     end
   end
 
-  wire [31:0] d_res = d_special ? d_spec : (d_neg ? -d_q : d_q);
-
   assign done   = m_go2 || d_fin;
-  assign result = d_fin ? d_res : m_res;
+  // The result's sign is applied as the divide finishes, a cycle before d_fin,
+  // so the negation's carry chain is off the core's result path (R23 timing).
+  // The result is an AND-OR of one-hot selects, zero when not done, so the
+  // core can OR its held copy in with no mux level (the MMU work's timing).
+  assign result = ({32{d_fin}} & d_res_q) | ({32{m_go2 && m_lo2}} & prod[31:0]) |
+                  ({32{m_go2 && !m_lo2}} & prod[63:32]);
   assign ov     = d_fin ? d_special : m_ov;
 
 endmodule

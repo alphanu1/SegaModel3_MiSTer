@@ -1,0 +1,26 @@
+set_global_assignment -name FAMILY "Cyclone V"
+set_global_assignment -name DEVICE 5CSEBA6U23I7
+set_global_assignment -name TOP_LEVEL_ENTITY icache_spike_top
+set_global_assignment -name LAST_QUARTUS_VERSION "17.0.0 Lite Edition"
+set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+set_global_assignment -name SDC_FILE icache_spike.sdc
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_cache_pkg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_cache_ram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_icache.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_icache_pr.sv
+set_global_assignment -name SYSTEMVERILOG_FILE icache_spike_top.sv
+set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"
+set_global_assignment -name FINAL_PLACEMENT_OPTIMIZATION ALWAYS
+set_global_assignment -name PHYSICAL_SYNTHESIS_COMBO_LOGIC ON
+set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION ON
+set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING ON
+set_global_assignment -name OPTIMIZATION_TECHNIQUE SPEED
+set_global_assignment -name NUM_PARALLEL_PROCESSORS 4
+set_global_assignment -name SEED 1
+set_parameter -name PR 0
+set_instance_assignment -name VIRTUAL_PIN ON -to rst
+set_instance_assignment -name VIRTUAL_PIN ON -to i_*
+set_instance_assignment -name VIRTUAL_PIN ON -to hid*
+set_instance_assignment -name VIRTUAL_PIN ON -to icbi_*
+set_instance_assignment -name VIRTUAL_PIN ON -to icfi_ack
+set_instance_assignment -name VIRTUAL_PIN ON -to m_*

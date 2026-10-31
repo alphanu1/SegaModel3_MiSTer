@@ -40,11 +40,29 @@ module m3_cpu_mon #(
   input  logic        rt_gpr_we,
   input  logic [4:0]  rt_gpr,
   input  logic [31:0] rt_gpr_val,
-  output logic        busy,                      // a report is printing
+  output logic        busy,                      // a report is printing (or about to)
   output logic        tx
 );
 
   localparam int N = 11;
+
+  // Every input is registered once, clear and report with the events, so
+  // the counts are those of the unregistered form: the trace's GPR value is
+  // WB's load alignment, straight from the data port, and in front of the
+  // CRC it missed 100 MHz in the full build
+  logic        clear_q, report_q, rt_valid_q, rt_gpr_we_q;
+  logic [7:0]  ev_q;
+  logic [4:0]  rt_gpr_q;
+  logic [31:0] rt_gpr_val_q;
+  always_ff @(posedge clk) begin
+    clear_q      <= clear;
+    report_q     <= report && !rst;
+    ev_q         <= ev;
+    rt_valid_q   <= rt_valid;
+    rt_gpr_we_q  <= rt_gpr_we;
+    rt_gpr_q     <= rt_gpr;
+    rt_gpr_val_q <= rt_gpr_val;
+  end
 
   logic [31:0] cnt [0:8];
   logic [31:0] sig, runs;
@@ -64,18 +82,20 @@ module m3_cpu_mon #(
       runs <= 32'd0;
       sig  <= 32'hFFFF_FFFF;
       for (int i = 0; i < 9; i++) cnt[i] <= 32'd0;
-    end else if (clear) begin
+    end else if (clear_q) begin
       sig  <= 32'hFFFF_FFFF;
       for (int i = 0; i < 9; i++) cnt[i] <= 32'd0;
     end else begin
       cnt[0] <= cnt[0] + 32'd1;
-      for (int i = 0; i < 8; i++) if (ev[i]) cnt[i + 1] <= cnt[i + 1] + 32'd1;
-      if (rt_valid && rt_gpr_we) sig <= crc40(sig, {3'b000, rt_gpr, rt_gpr_val});
-      if (report) runs <= runs + 32'd1;
+      for (int i = 0; i < 8; i++) if (ev_q[i]) cnt[i + 1] <= cnt[i + 1] + 32'd1;
+      if (rt_valid_q && rt_gpr_we_q) sig <= crc40(sig, {3'b000, rt_gpr_q, rt_gpr_val_q});
+      if (report_q) runs <= runs + 32'd1;
     end
   end
 
   // ------------------------------------------------------------- printer
+  logic       p_busy;                          // the printer's
+  assign busy = p_busy || report_q;
   logic       u_valid, u_ready;
   logic [7:0] u_data, u_data_q;
   logic [3:0] line;
@@ -100,24 +120,24 @@ module m3_cpu_mon #(
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      busy    <= 1'b0;
+      p_busy  <= 1'b0;
       u_valid <= 1'b0;
       line    <= 4'd0;
       ch      <= 4'd0;
     end else begin
       u_valid <= 1'b0;
-      if (!busy && report) begin
+      if (!p_busy && report_q) begin
         for (int i = 0; i < 9; i++) lat[i] <= cnt[i];
         lat[9]  <= sig;
         lat[10] <= runs;
-        busy    <= 1'b1;
+        p_busy  <= 1'b1;
         line    <= 4'd0;
         ch      <= 4'd0;
-      end else if (busy && u_ready && !u_valid) begin
+      end else if (p_busy && u_ready && !u_valid) begin
         u_valid <= 1'b1;
         if (ch == 4'd14) begin
           ch <= 4'd0;
-          if (line == 4'(N - 1)) busy <= 1'b0;
+          if (line == 4'(N - 1)) p_busy <= 1'b0;
           else line <= line + 4'd1;
         end else ch <= ch + 4'd1;
       end
@@ -131,6 +151,6 @@ module m3_cpu_mon #(
   );
 
   // the byte goes out the cycle after it is chosen
-  always_ff @(posedge clk) if (busy && u_ready && !u_valid) u_data_q <= u_data;
+  always_ff @(posedge clk) if (p_busy && u_ready && !u_valid) u_data_q <= u_data;
 
 endmodule

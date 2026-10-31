@@ -1,4 +1,4 @@
-# Standalone fit of the 603e core (M0-A2). Quartus Prime Lite 17.0.
+# Standalone fit of the 603e core with its FPU. Quartus Prime Lite 17.0.
 set_global_assignment -name FAMILY "Cyclone V"
 set_global_assignment -name DEVICE 5CSEBA6U23I7
 set_global_assignment -name TOP_LEVEL_ENTITY cpu_spike_top
@@ -6,16 +6,37 @@ set_global_assignment -name LAST_QUARTUS_VERSION "17.0.0 Lite Edition"
 set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
 set_global_assignment -name SDC_FILE cpu_spike.sdc
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_pkg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu_pkg.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_decode.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_alu.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_muldiv.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_regfile.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpregfile.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fetchq.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu_lzc.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu_fma.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu_div.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu_misc.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu_ldst.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu_fpscr.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu_sfma.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu_rsqe.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_fpu_fast.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_core.sv
 set_global_assignment -name SYSTEMVERILOG_FILE cpu_spike_top.sv
 set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"
+# as Model3.qsf, so the standalone fit is the full build's (the FPU's stage
+# registers are placed for register retiming)
+set_global_assignment -name FINAL_PLACEMENT_OPTIMIZATION ALWAYS
+set_global_assignment -name PHYSICAL_SYNTHESIS_COMBO_LOGIC ON
+set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION ON
+set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING ON
+set_global_assignment -name OPTIMIZATION_TECHNIQUE SPEED
+set_global_assignment -name NUM_PARALLEL_PROCESSORS 4
 set_global_assignment -name SEED 1
 set_instance_assignment -name VIRTUAL_PIN ON -to rst
 set_instance_assignment -name VIRTUAL_PIN ON -to i_*
 set_instance_assignment -name VIRTUAL_PIN ON -to d_*
 set_instance_assignment -name VIRTUAL_PIN ON -to tb_tick
+set_instance_assignment -name VIRTUAL_PIN ON -to ext_int

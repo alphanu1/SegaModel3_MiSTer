@@ -10,7 +10,7 @@
 //
 // ---------------------------------------------------------------------------
 //
-// Reference instruction-set model for the 603e integer slice (M0-A2).
+// Reference instruction-set model for the 603e: integer, MMU and FP.
 //
 // Written from the instruction definitions in the 32-bit PowerPC Programming
 // Environments Manual and the MPC603e User's Manual, independently of the RTL,
@@ -22,13 +22,69 @@
 // 0x80000000 / -1 is -1, divwu by zero is 0. Traps, sc and illegal opcodes take
 // the program (0x700) and system call (0xC00) exceptions.
 //
-// Not modelled yet (as in the RTL): translation, floating point, interrupts,
-// timebase and decrementer reads, misaligned accesses.
+// The 603e MMU (603e manual ch. 5) and the exceptions it needs (ch. 4):
+// real mode, BAT and page translation with protection for fetch and data,
+// segment registers, the 64-entry two-way ITLB and DTLB with their LRU, the
+// software table-search resources (DMISS, DCMP, HASH1, HASH2, IMISS, ICMP,
+// RPA, tlbld, tlbli, tlbie, MSR[TGPR] with shadow r0-r3), DSI, ISI, the three
+// TLB miss exceptions, and the external and decrementer interrupts, which the
+// caller raises at an instruction boundary (interrupt()). The decrementer and
+// timebase values are the caller's (dec_read and friends), since their timing
+// is the bench's.
+//
+// Choices where the manual is ambiguous or self-contradictory (each also in
+// the RTL, ppc_core.sv):
+//   SRR1[15] (S/L) is 1 for a store miss: tables 4-5 and 4-17 and the example
+//     handler's DSISR[6] derivation; tables 5-4 and 5-10 say the reverse.
+//   DMISS, IMISS, DCMP and ICMP are read/write (2.1.2.2, 2.1.2.3); 1.x and 5.x
+//     call them read-only. HASH1/HASH2 are read-only and formed when read, from
+//     SDR1 and the DMISS/DCMP or IMISS/ICMP pair of the most recent miss
+//     (2.1.2.4: "constructed from the DMISS or IMISS contents").
+//   tlbld/tlbli: V and VSID from DCMP/ICMP, EA[4-14] and the set from rB (the
+//     instruction definition, 2.3.8: "EA <- (rB)"), the way from SRR1[WAY].
+//   SRR1[WAY] ("next TLB set to be replaced, set per LRU") is the way of the
+//     set not loaded most recently by tlbld/tlbli: replacement order, not use
+//     order. Use order would depend on speculative fetches and on accesses the
+//     core serves from its micro-TLBs without reading the TLB. A store that
+//     hits an entry with C = 0 gives the way that hit, so the handler's tlbld
+//     replaces that entry instead of making a second copy of it. tlbie leaves
+//     the order alone.
+//   A double TLB hit takes way 0 (a programming error; the core's software
+//     reload never makes one). A double BAT hit is undefined (5.3) and never
+//     generated: the RTL ORs the hits, this model takes the first.
+//   BAT physical address is BRPN | (EA & BL), as the PEM writes it (7.4.3).
+//   ISI SRR1[3] (N, T, guarded) and SRR1[4] (protection) are set
+//     independently; a page with T = 1 or N = 1 faults before the TLB is
+//     looked at (figure 5-6), so an N or T fault is never a TLB miss.
+//   Privilege (program exception for supervisor instructions with MSR[PR] =
+//     1), MSR[LE] and misaligned accesses are not modelled, as in the RTL.
+//
+// Floating point: every 603e FP instruction, the arithmetic, the FPSCR and
+// CR1 from sim/fpu/ppc_fpu_ref.h (its own MPFR model, written from the
+// manuals), the loads and stores here. Choices, each also in the RTL:
+//   fsqrt, fsqrts and every unassigned encoding of opcodes 59 and 63 are
+//     illegal whatever MSR[FP] is (603e table B-1, 4.5.7.2); FP unavailable
+//     (0x800) is for the instructions the 603e has (603e 4.5.8).
+//   MSR[FE0, FE1] other than 00 is precise mode, as the 603e implements the
+//     imprecise modes (603e 4.1, 4.5.7.1): after an instruction that may set
+//     the FPSCR (arithmetic, compares, mtfsf, mtfsfi, mtfsb0/1, mcrfs), FEX = 1
+//     takes the program exception with SRR0 that instruction and SRR1[11],
+//     its results written (PEM 3.3.6, table 6-16). FEX = 1 found at an
+//     instruction boundary with FE nonzero (only after an MSR write: mtmsr,
+//     rfi) is taken before that instruction, SRR0 it, SRR1[11] and SRR1[15]
+//     (PEM table 6-16: "SRR0 points to the instruction that would have
+//     executed next").
+//   lfd / stfd are two word accesses, high word first. A fault on the second
+//     leaves the first done (an update store's rA too). The 603e would take an
+//     alignment exception for a double crossing a page in page-translated
+//     memory (603e 4.5.6.1), which neither model has yet; the bench makes a
+//     few such doubles only to exercise the second word's replay.
 
 #pragma once
 #include <cstdint>
 #include <functional>
 #include <map>
+#include "ppc_fpu_ref.h"
 
 struct PpcIss {
   uint32_t gpr[32] = {};
@@ -36,9 +92,36 @@ struct PpcIss {
   bool     res = false;
   std::map<int, uint32_t> spr;
   uint32_t pvr = 0x00060101;
+  uint64_t fpr[32] = {};
+  uint32_t fpscr = 0;                                    // zero at hard reset (603e table 4-9)
+  std::function<void(int, uint64_t)>    on_fpw = [](int, uint64_t) {};   // each FPR write
+  static constexpr uint32_t MSR_FP = 0x2000, MSR_FE = 0x0900;
 
   std::function<uint8_t(uint32_t)>       rd8;
-  std::function<void(uint32_t, uint8_t)> wr8;
+  std::function<void(uint32_t, uint8_t)> wr8;            // data stores only
+  std::function<void(uint32_t)>          on_load = [](uint32_t) {};   // each data load, its physical address
+
+  // decrementer and timebase, the caller's: their values depend on when the
+  // instruction executes. The defaults are a counter that never ticks.
+  uint32_t dec = 0xFFFFFFFF;
+  uint64_t tbr = 0;
+  std::function<uint32_t()>              dec_read  = [this]() { return dec; };
+  std::function<void(uint32_t)>          dec_write = [this](uint32_t v) { dec = v; };
+  std::function<uint32_t(bool)>          tb_read   = [this](bool hi) { return uint32_t(hi ? tbr >> 32 : tbr); };
+  std::function<void(bool, uint32_t)>    tb_write  = [this](bool hi, uint32_t v) {
+    tbr = hi ? (tbr & 0xFFFFFFFFull) | (uint64_t(v) << 32) : (tbr & ~0xFFFFFFFFull) | v; };
+
+  // ------------------------------------------------------------------ MMU
+  static constexpr uint32_t MSR_TGPR = 0x00020000, MSR_EE = 0x8000, MSR_PR = 0x4000,
+                            MSR_IR = 0x20, MSR_DR = 0x10;
+  uint32_t sr[16] = {};
+  struct Tlb { bool v = false; uint32_t vsid = 0, pi = 0, rpn = 0; bool c = false; uint32_t wimg = 0, pp = 0; };
+  Tlb      itlb[32][2], dtlb[32][2];
+  uint8_t  ilru[32] = {}, dlru[32] = {};       // the way to replace next
+  uint32_t tgpr[4] = {};                       // r0-r3 while MSR[TGPR] = 0 is the other set
+  // 603e table-search registers and DSISR/DAR (all zero at hard reset, table 4-9)
+  uint32_t dsisr = 0, dar = 0, dmiss = 0, dcmp = 0, imiss = 0, icmp = 0;
+  bool     last_i = false;                     // the most recent TLB miss was the ITLB's
 
   static constexpr uint32_t MSR_MASK  = 0x0007FF73;
   static constexpr uint32_t SRR1_KEEP = 0x0000FF73;
@@ -53,9 +136,19 @@ struct PpcIss {
   static uint16_t bswap16(uint16_t v) { return (v >> 8) | (v << 8); }
 
   bool known_spr(int n) const {
-    return (n >= 272 && n <= 275) || n == 18 || n == 19 || n == 25 || n == 1008 || n == 1009 ||
-           n == 1010 || n == 282 || (n >= 976 && n <= 982) || (n >= 528 && n <= 543);
+    return (n >= 272 && n <= 275) || n == 25 || n == 1008 || n == 1009 ||
+           n == 1010 || n == 282 || n == 982 || (n >= 528 && n <= 543);
   }
+
+  // HASH1 / HASH2 (2.1.2.4, PEM 7.6.1.1): the PTEG addresses for the most
+  // recent miss's EA and VSID under the current SDR1
+  uint32_t hash(bool secondary) const {
+    uint32_t ea = last_i ? imiss : dmiss, cmp = last_i ? icmp : dcmp, sdr1 = spr.count(25) ? spr.at(25) : 0;
+    uint32_t h = ((cmp >> 7) & 0x7FFFF) ^ ((ea >> 12) & 0xFFFF);
+    if (secondary) h = ~h & 0x7FFFF;
+    return (sdr1 & 0xFE000000) | ((((sdr1 >> 16) & 0x1FF) | ((h >> 10) & sdr1 & 0x1FF)) << 16) | ((h & 0x3FF) << 6);
+  }
+  uint32_t sp(int n) const { auto i = spr.find(n); return i == spr.end() ? 0 : i->second; }
 
   void set_cr_field(int f, uint32_t v) { int sh = 28 - 4 * f; cr = (cr & ~(0xFu << sh)) | ((v & 0xF) << sh); }
   uint32_t cr_field(int f) const { return (cr >> (28 - 4 * f)) & 0xF; }
@@ -76,12 +169,95 @@ struct PpcIss {
   }
   static uint32_t rotl(uint32_t v, int n) { n &= 31; return n ? (v << n) | (v >> (32 - n)) : v; }
 
+  uint64_t exc_count[0x20] = {};              // exceptions taken, by vector / 0x100
+  uint64_t fp_prec = 0, fp_delayed = 0, fp_ops[ppcfpu::NUM_OPS] = {}, fp_ls[2] = {}, fp_supp = 0;
   void exception(uint32_t vec, uint32_t save_pc, uint32_t srr1_bits) {
+    exc_count[(vec >> 8) & 0x1F]++;
+    if (vec == 0x700 && (srr1_bits & 0x00100000)) (srr1_bits & 0x00010000 ? fp_delayed : fp_prec)++;
     srr0 = save_pc;
     srr1 = (msr & SRR1_KEEP) | srr1_bits;
     uint32_t ile = (msr >> 16) & 1;
     msr = (msr & ~0x0006EF33u) | ile;
     pc = ((msr >> 6) & 1 ? 0xFFF00000u : 0u) | vec;
+  }
+
+  // An asynchronous interrupt at this instruction boundary (4.5.5, 4.5.9):
+  // SRR0 is the instruction that would have executed next.
+  void interrupt(uint32_t vec) { exception(vec, pc, 0); }
+
+  // ---------------------------------------------------------- translation
+  // Effective to physical for one access (5.1.6, figures 5-5 and 5-6). On a
+  // fault the exception is taken here (SRR0 = this instruction) and false is
+  // returned; the instruction then has no further effect.
+  // The access's WIMG is left in last_wimg (real mode 0011, 603e 3.5). With
+  // probe set a fault takes no exception (dcbt / dcbtst, 3.7.2).
+  enum Acc { FETCH, LOAD, STORE };
+  uint32_t last_wimg = 3;
+  bool xlate(uint32_t ea, Acc acc, uint32_t &pa, bool probe = false) {
+    bool ifetch = acc == FETCH, store = acc == STORE;
+    last_wimg = 3;
+    if (!(msr & (ifetch ? MSR_IR : MSR_DR))) { pa = ea; return true; }      // 5.2 real mode
+    bool pr = msr & MSR_PR;
+    uint32_t st = store ? 0x02000000 : 0;                                   // DSISR[6]
+    auto dsi = [&](uint32_t bits) { if (probe) return false; dsisr = bits | st; dar = ea; exception(0x300, pc, 0); return false; };
+    auto isi = [&](uint32_t bits) { exception(0x400, pc, bits); return false; };
+    // BATs (5.3, PEM 7.4): Vs/Vp by MSR[PR], BEPI under the BL mask
+    int base = ifetch ? 528 : 536;
+    for (int i = 0; i < 4; i++) {
+      uint32_t u = sp(base + 2 * i), l = sp(base + 2 * i + 1);
+      if (!(pr ? (u & 1) : (u & 2))) continue;
+      uint32_t bl = (u >> 2) & 0x7FF, m = ~(bl << 17) & 0xFFFE0000;
+      if ((ea & m) != (u & m)) continue;
+      uint32_t pp = l & 3;                                                  // 00 none, x1 read, 10 read/write
+      if (ifetch) {
+        uint32_t bits = (pp == 0 ? 0x08000000 : 0) | ((l & 8) ? 0x10000000 : 0);   // SRR1[4], SRR1[3] (G)
+        if (bits) return isi(bits);
+      } else if (store ? pp != 2 : pp == 0) return dsi(0x08000000);        // DSISR[4]
+      pa = (l & 0xFFFE0000) | (ea & (bl << 17)) | (ea & 0x1FFFF);
+      last_wimg = (l >> 3) & 0xF;
+      return true;
+    }
+    // segment (5.4, figure 5-6): T = 1 is not supported by the 603e
+    uint32_t s = sr[ea >> 28];
+    if (s & 0x80000000) return ifetch ? isi(0x10000000) : dsi(0x04000000); // SRR1[3] / DSISR[5]
+    if (ifetch && (s & 0x10000000)) return isi(0x10000000);                 // N: no-execute
+    uint32_t vsid = s & 0xFFFFFF, set = (ea >> 12) & 31, pi = (ea >> 17) & 0x7FF;
+    uint32_t key = pr ? (s >> 29) & 1 : (s >> 30) & 1;                      // Kp : Ks
+    Tlb *t = ifetch ? itlb[set] : dtlb[set];
+    uint8_t *lru = ifetch ? &ilru[set] : &dlru[set];
+    int w = -1;
+    for (int k = 1; k >= 0; k--) if (t[k].v && t[k].vsid == vsid && t[k].pi == pi) w = k;
+    auto miss = [&](uint32_t way) {
+      if (probe) return false;
+      // 4.5.12-4.5.14, table 4-17: SRR1 holds CR0, KEY, D/I, WAY, S/L
+      uint32_t cmpv = 0x80000000 | (vsid << 7) | ((ea >> 22) & 0x3F);
+      if (ifetch) { imiss = ea; icmp = cmpv; } else { dmiss = ea; dcmp = cmpv; }
+      last_i = ifetch;
+      uint32_t bits = (cr & 0xF0000000) | (key << 19) | (ifetch ? 0x40000 : 0) | (way << 17) | (store ? 0x10000 : 0);
+      exception(ifetch ? 0x1000 : store ? 0x1200 : 0x1100, pc, bits);
+      msr |= MSR_TGPR;                                                      // table 4-8
+      return false;
+    };
+    if (w < 0) return miss(*lru);
+    const Tlb &e = t[w];
+    if (ifetch) {
+      uint32_t bits = ((key && e.pp == 0) ? 0x08000000 : 0) | ((e.wimg & 1) ? 0x10000000 : 0);
+      if (bits) return isi(bits);
+    } else {
+      bool ok = store ? (key ? e.pp == 2 : e.pp != 3) : (!key || e.pp != 0);   // PEM table 7-10
+      if (!ok) return dsi(0x08000000);
+      if (store && !e.c) return miss(uint32_t(w));                         // table 5-7: C = 0
+    }
+    pa = (e.rpn << 12) | (ea & 0xFFF);
+    last_wimg = e.wimg;
+    return true;
+  }
+  void tlb_load(bool inst, uint32_t ea) {                                    // tlbld / tlbli (2.3.8)
+    uint32_t set = (ea >> 12) & 31, w = (srr1 >> 17) & 1, cmpv = inst ? icmp : dcmp, rpa = sp(982);
+    Tlb &e = (inst ? itlb : dtlb)[set][w];
+    e.v = cmpv >> 31; e.vsid = (cmpv >> 7) & 0xFFFFFF; e.pi = (ea >> 17) & 0x7FF;
+    e.rpn = rpa >> 12; e.c = (rpa >> 7) & 1; e.wimg = (rpa >> 3) & 15; e.pp = rpa & 3;
+    (inst ? ilru : dlru)[set] = uint8_t(w ^ 1);
   }
 
   // add with carry-in; returns sum, sets carry and overflow out-parameters
@@ -93,8 +269,91 @@ struct PpcIss {
     return r;
   }
 
+  // ------------------------------------------------------- floating point
+  // The FP operation of an opcode 59 / 63 word, or -1: illegal. Opcode 59 is
+  // the single-precision A form; 63's A form is told from its X form by
+  // xo[5:1] (no X-form extended opcode has its low five bits in the A set).
+  static int fp_op(uint32_t in) {
+    using namespace ppcfpu;
+    int op = in >> 26, a = (in >> 1) & 31, x = (in >> 1) & 0x3FF;
+    switch (a) {
+      case 18: return FDIV;  case 20: return FSUB;  case 21: return FADD;  case 25: return FMUL;
+      case 28: return FMSUB; case 29: return FMADD; case 30: return FNMSUB; case 31: return FNMADD;
+      case 24: return op == 59 ? FRES : -1;
+      case 26: return op == 63 ? FRSQRTE : -1;
+      case 23: return op == 63 ? FSEL : -1;
+      case 22: return -1;                                       // fsqrt(s): not on the 603e
+      default: break;
+    }
+    if (op != 63) return -1;
+    switch (x) {
+      case 0: return FCMPU; case 32: return FCMPO; case 12: return FRSP; case 14: return FCTIW; case 15: return FCTIWZ;
+      case 40: return FNEG; case 72: return FMR; case 136: return FNABS; case 264: return FABS;
+      case 583: return MFFS; case 711: return MTFSF; case 134: return MTFSFI; case 70: return MTFSB0;
+      case 38: return MTFSB1; case 64: return MCRFS;
+      default: return -1;
+    }
+  }
+  // 0 not FP, 1 an FP load or store, 2 FP arithmetic / FPSCR
+  static int fp_kind(uint32_t in) {
+    int op = in >> 26, x = (in >> 1) & 0x3FF;
+    if (op >= 48 && op <= 55) return 1;
+    if (op == 31 && (x == 535 || x == 567 || x == 599 || x == 631 || x == 663 || x == 695 ||
+                     x == 727 || x == 759 || x == 983)) return 1;
+    if ((op == 59 || op == 63) && fp_op(in) >= 0) return 2;
+    return 0;
+  }
+  // may change the FPSCR: precise mode checks FEX after it
+  static bool fp_sets(uint32_t in) {
+    using namespace ppcfpu;
+    int o = fp_op(in);
+    return !(o == FSEL || o == FMR || o == FNEG || o == FABS || o == FNABS || o == MFFS);
+  }
+  void fp_arith(uint32_t in) {
+    using namespace ppcfpu;
+    int o = fp_op(in);
+    int fd = (in >> 21) & 31;
+    ppcfpu::In fi{};
+    fi.op = Op(o);
+    fi.single = (in >> 26) == 59;
+    fi.a = fpr[(in >> 16) & 31]; fi.b = fpr[(in >> 11) & 31]; fi.c = fpr[(in >> 6) & 31];
+    fi.fpscr = fpscr;
+    switch (o) {
+      case MTFSF:  fi.imm = (in >> 17) & 0xFF; break;
+      case MTFSFI: fi.imm = (((in >> 23) & 7) << 4) | ((in >> 12) & 15); break;
+      case MTFSB0: case MTFSB1: fi.imm = (in >> 21) & 31; break;
+      case MCRFS:  fi.imm = (in >> 18) & 7; break;
+      default: break;
+    }
+    ppcfpu::Out r = exec(fi);
+    fp_ops[o]++;
+    if (!r.wr && o != FCMPU && o != FCMPO && o < MFFS) fp_supp++;    // an enabled exception: no frD
+    if (r.wr) set_fpr(fd, r.frd);
+    fpscr = r.fpscr;
+    if (r.crw) set_cr_field((in >> 23) & 7, r.cr);             // fcmpu, fcmpo, mcrfs: crfD
+    bool rc = (in & 1) && o != FCMPU && o != FCMPO && o != MCRFS;
+    if (rc) set_cr_field(1, fpscr >> 28);                       // CR1: FX FEX VX OX (PEM table 2-2)
+  }
+
+  // One instruction. While MSR[TGPR] = 1, r0-r3 are the shadow set (5.5.2.1):
+  // they are swapped in for the instruction and back after, so gpr[] always
+  // holds the normal set when the caller looks.
+  void swap_tgpr() { for (int i = 0; i < 4; i++) std::swap(gpr[i], tgpr[i]); }
   void step() {
-    uint32_t in = rd32(pc);
+    bool t = msr & MSR_TGPR;
+    if (t) swap_tgpr();
+    step_body();
+    if (t) swap_tgpr();
+  }
+
+  void set_fpr(int r, uint64_t v) { fpr[r] = v; on_fpw(r, v); }
+
+  void step_body() {
+    // an enabled FP exception left pending by an MSR write (PEM table 6-16)
+    if ((msr & MSR_FE) && (fpscr & ppcfpu::FEX)) { exception(0x700, pc, 0x00110000); return; }
+    uint32_t ipa;
+    if (!xlate(pc, FETCH, ipa)) return;
+    uint32_t in = rd32(ipa);
     uint32_t npc = pc + 4;
     int op = in >> 26, rd = (in >> 21) & 31, ra = (in >> 16) & 31, rb = (in >> 11) & 31;
     int xo10 = (in >> 1) & 0x3FF, xo9 = (in >> 1) & 0x1FF;
@@ -122,16 +381,63 @@ struct PpcIss {
       bool cond_ok = (bo & 16) || (cr_bit(bi) == ((bo >> 3) & 1));
       return ctr_ok && cond_ok;
     };
+    // accesses are forced aligned, so one translation covers each
+    bool fault = false;
     auto ld = [&](uint32_t ea, int size, bool sgn, bool brev) -> uint32_t {
-      if (size == 4) { uint32_t v = rd32(ea & ~3u); return brev ? bswap32(v) : v; }
-      if (size == 2) { uint16_t h = rd16(ea & ~1u); if (brev) h = bswap16(h); return sgn ? uint32_t(int32_t(int16_t(h))) : h; }
-      return rd8(ea);
+      uint32_t a;
+      if (!xlate(ea, LOAD, a)) { fault = true; return 0; }
+      on_load(a & ~3u);
+      if (size == 4) { uint32_t v = rd32(a & ~3u); return brev ? bswap32(v) : v; }
+      if (size == 2) { uint16_t h = rd16(a & ~1u); if (brev) h = bswap16(h); return sgn ? uint32_t(int32_t(int16_t(h))) : h; }
+      return rd8(a);
     };
     auto st = [&](uint32_t ea, int size, uint32_t v, bool brev) {
-      if (size == 4) wr32(ea & ~3u, brev ? bswap32(v) : v);
-      else if (size == 2) wr16(ea & ~1u, brev ? bswap16(uint16_t(v)) : uint16_t(v));
-      else wr8(ea, uint8_t(v));
+      uint32_t a;
+      if (!xlate(ea, STORE, a)) { fault = true; return; }
+      if (size == 4) wr32(a & ~3u, brev ? bswap32(v) : v);
+      else if (size == 2) wr16(a & ~1u, brev ? bswap16(uint16_t(v)) : uint16_t(v));
+      else wr8(a, uint8_t(v));
     };
+
+    // ------------------------------------------------------- floating point
+    int fpk = fp_kind(in);
+    if (fpk) {
+      if (!(msr & MSR_FP)) { exception(0x800, pc, 0); return; }        // 603e 4.5.8
+      if (fpk == 1) {                                                   // loads and stores
+        bool x = op == 31;
+        int xo = x ? xo10 : 0;
+        bool isst = x ? (xo & 128) || xo == 983 : op >= 52;
+        bool dbl = x ? (xo & 64) && xo != 983 : (op & 2);
+        bool upd = x ? (xo & 32) && xo != 983 : (op & 1);
+        bool iw  = x && xo == 983;
+        uint32_t ea = (upd ? gpr[ra] : A0()) + (x ? gpr[rb] : uint32_t(simm));
+        fp_ls[isst]++;
+        if (!isst) {
+          uint32_t w0 = ld(ea, 4, false, false);
+          if (fault) return;
+          uint64_t v;
+          if (dbl) { uint32_t w1 = ld(ea + 4, 4, false, false); if (fault) return; v = (uint64_t(w0) << 32) | w1; }
+          else v = ppcfpu::lfs(w0);
+          set_fpr(rd, v);
+        } else {
+          uint64_t v = fpr[rd];
+          if (dbl) {
+            st(ea, 4, uint32_t(v >> 32), false); if (fault) return;
+            if (upd) gpr[ra] = ea;                                      // the first uop's (ppc_decode.sv)
+            st(ea + 4, 4, uint32_t(v), false); if (fault) return;
+          } else {
+            st(ea, 4, iw ? uint32_t(v) : ppcfpu::stfs(v), false); if (fault) return;
+          }
+        }
+        if (upd) gpr[ra] = ea;
+        pc = npc;
+        return;
+      }
+      fp_arith(in);
+      if (fp_sets(in) && (msr & MSR_FE) && (fpscr & ppcfpu::FEX)) { exception(0x700, pc, 0x00100000); return; }
+      pc = npc;
+      return;
+    }
 
     switch (op) {
       case 3: if (trap(gpr[ra], uint32_t(simm))) return; break;
@@ -187,7 +493,9 @@ struct PpcIss {
         bool upd = op & 1;
         uint32_t ea = (upd ? gpr[ra] : A0()) + uint32_t(simm);
         int size = (op & 8) ? 2 : (op & 2) ? 1 : 4;
-        gpr[rd] = ld(ea, size, (op & 0x0E) == 0x0A, false);
+        uint32_t v = ld(ea, size, (op & 0x0E) == 0x0A, false);
+        if (fault) return;
+        gpr[rd] = v;
         if (upd) gpr[ra] = ea;
         break;
       }
@@ -196,11 +504,13 @@ struct PpcIss {
         uint32_t ea = (upd ? gpr[ra] : A0()) + uint32_t(simm);
         int size = (op & 8) ? 2 : (op & 2) ? 1 : 4;
         st(ea, size, gpr[rd], false);
+        if (fault) return;
         if (upd) gpr[ra] = ea;
         break;
       }
-      case 46: { uint32_t ea = A0() + uint32_t(simm); for (int r = rd; r < 32; r++, ea += 4) gpr[r] = rd32(ea & ~3u); break; }
-      case 47: { uint32_t ea = A0() + uint32_t(simm); for (int r = rd; r < 32; r++, ea += 4) wr32(ea & ~3u, gpr[r]); break; }
+      // lmw / stmw: a fault part way leaves the earlier words done (4.5.3)
+      case 46: { uint32_t ea = A0() + uint32_t(simm); for (int r = rd; r < 32; r++, ea += 4) { uint32_t v = ld(ea, 4, false, false); if (fault) return; gpr[r] = v; } break; }
+      case 47: { uint32_t ea = A0() + uint32_t(simm); for (int r = rd; r < 32; r++, ea += 4) { st(ea, 4, gpr[r], false); if (fault) return; } break; }
       case 31: {
         uint32_t a = gpr[ra], b = gpr[rb], s = gpr[rd];
         bool xo = true;
@@ -268,34 +578,46 @@ struct PpcIss {
             bool upd = xo10 & 32;
             uint32_t ea = (upd ? a : A0()) + b;
             int size = (xo10 & 256) ? 2 : (xo10 & 64) ? 1 : 4;
-            gpr[rd] = ld(ea, size, xo10 == 343 || xo10 == 375, false);
+            uint32_t v = ld(ea, size, xo10 == 343 || xo10 == 375, false);
+            if (fault) return;
+            gpr[rd] = v;
             if (upd) gpr[ra] = ea;
             break;
           }
-          case 20:  gpr[rd] = ld(A0() + b, 4, false, false); res = true; break;
-          case 534: gpr[rd] = ld(A0() + b, 4, false, true); break;
-          case 790: gpr[rd] = ld(A0() + b, 2, false, true); break;
+          case 20:  { uint32_t v = ld(A0() + b, 4, false, false); if (fault) return; gpr[rd] = v; res = true; break; }
+          case 534: { uint32_t v = ld(A0() + b, 4, false, true);  if (fault) return; gpr[rd] = v; break; }
+          case 790: { uint32_t v = ld(A0() + b, 2, false, true);  if (fault) return; gpr[rd] = v; break; }
           case 151: case 215: case 407: case 183: case 247: case 439: {
             bool upd = xo10 & 32;
             uint32_t ea = (upd ? a : A0()) + b;
             int size = (xo10 & 256) ? 2 : (xo10 & 64) ? 1 : 4;
             st(ea, size, s, false);
+            if (fault) return;
             if (upd) gpr[ra] = ea;
             break;
           }
           case 150: {
-            if (res) st(A0() + b, 4, s, false);
+            // translated as a store whether or not it stores (4.5.3, table 5-8)
+            uint32_t a;
+            if (!xlate(A0() + b, STORE, a)) return;
+            if (res) wr32(a & ~3u, s);
             set_cr_field(0, (res ? 2 : 0) | so());
             res = false;
             break;
           }
-          case 662: st(A0() + b, 4, s, true); break;
-          case 918: st(A0() + b, 2, s, true); break;
+          case 662: st(A0() + b, 4, s, true); if (fault) return; break;
+          case 918: st(A0() + b, 2, s, true); if (fault) return; break;
           case 339: case 371: {
             int n = ra | (rb << 5);
             uint32_t v = 0;
             if (n == 1) v = xer; else if (n == 8) v = lr; else if (n == 9) v = ctr;
             else if (n == 26) v = srr0; else if (n == 27) v = srr1; else if (n == 287) v = pvr;
+            else if (n == 22) v = dec_read();
+            else if (n == 268 || n == 269) v = tb_read(n == 269);
+            else if (n == 18) v = dsisr; else if (n == 19) v = dar;
+            else if (n == 976) v = dmiss; else if (n == 977) v = dcmp;
+            else if (n == 978 || n == 979) v = hash(n == 979);
+            else if (n == 980) v = imiss; else if (n == 981) v = icmp;
             else if (known_spr(n)) v = spr[n];
             gpr[rd] = v;
             break;
@@ -304,7 +626,14 @@ struct PpcIss {
             int n = ra | (rb << 5);
             if (n == 1) xer = s & XER_MASK; else if (n == 8) lr = s; else if (n == 9) ctr = s;
             else if (n == 26) srr0 = s; else if (n == 27) srr1 = s;
-            else if (known_spr(n)) spr[n] = s;
+            else if (n == 22) dec_write(s);
+            else if (n == 284 || n == 285) tb_write(n == 285, s);
+            else if (n == 18) dsisr = s; else if (n == 19) dar = s;
+            else if (n == 976) dmiss = s; else if (n == 977) dcmp = s;
+            else if (n == 980) imiss = s; else if (n == 981) icmp = s;
+            // HID0[ICFI] and [DCFI] clear as the invalidation begins (table 2-2): they read 0
+            else if (n == 1008) spr[n] = s & ~0x00000C00u;
+            else if (known_spr(n)) spr[n] = s;                 // HASH1/HASH2 are read-only
             break;
           }
           case 19:  gpr[rd] = cr; break;
@@ -316,8 +645,42 @@ struct PpcIss {
           case 83:  gpr[rd] = msr; break;
           case 146: msr = s & MSR_MASK; break;
           case 512: set_cr_field(rd >> 2, xer >> 28); xer &= 0x0FFFFFFF; break;
-          case 54: case 86: case 246: case 278: case 470: case 982: case 598: case 854:
-          case 566: case 306: case 210: case 242: case 978: case 1010:
+          // segment registers (PEM 8: mtsr, mtsrin, mfsr, mfsrin)
+          case 210: sr[(in >> 16) & 15] = s; break;
+          case 242: sr[b >> 28] = s; break;
+          case 595: gpr[rd] = sr[(in >> 16) & 15]; break;
+          case 659: gpr[rd] = sr[b >> 28]; break;
+          // tlbie: both ways of the set, both TLBs (5.4.3.2)
+          case 306: { uint32_t set = (b >> 12) & 31; for (int w = 0; w < 2; w++) itlb[set][w].v = dtlb[set][w].v = false; break; }
+          case 978:  tlb_load(false, b); break;                 // tlbld
+          case 1010: tlb_load(true, b);  break;                 // tlbli
+          // Cache operations (3.7). Their effect on the caches is not modelled:
+          // the generator uses them where the result does not depend on what
+          // is cached. What is architectural is: dcbz zeroes the block; the
+          // translation and protection of each, as a load (dcbst, dcbf) or a
+          // store (dcbz, dcbi), table 7-31; dcbt and dcbtst never fault; dcbz
+          // to a W or I page takes the alignment exception (3.7.4, 4.5.6); dcbi
+          // is supervisor-only (3.7.1); icbi is not translated (3.7.8).
+          case 1014: {                                                   // dcbz
+            uint32_t ea = A0() + b, pa;
+            if (!xlate(ea, STORE, pa)) return;
+            if (last_wimg & 0xC) {
+              dsisr = (((in >> 1) & 3) << 15) | (((in >> 6) & 1) << 14) | (((in >> 7) & 15) << 10) | (((in >> 21) & 31) << 5) | ((in >> 16) & 31);
+              dar = ea;
+              exception(0x600, pc, 0);
+              return;
+            }
+            pa &= ~31u;
+            for (int k = 0; k < 32; k++) wr8(pa + k, 0);
+            break;
+          }
+          case 470:                                                      // dcbi
+            if (msr & MSR_PR) { exception(0x700, pc, 0x00040000); return; }
+            { uint32_t pa; if (!xlate(A0() + b, STORE, pa)) return; }
+            break;
+          case 54: case 86: { uint32_t pa; if (!xlate(A0() + b, LOAD, pa)) return; } break;   // dcbst dcbf
+          case 246: case 278: { uint32_t pa; xlate(A0() + b, LOAD, pa, true); } break;        // dcbtst dcbt
+          case 982: case 598: case 854: case 566:                        // icbi, sync, eieio, tlbsync
             break;
           default: illegal(); return;
         }

@@ -20,17 +20,50 @@
 //   lmw rD,d(rA)    step n: load r(rD+n) from rA + d + 4n, n = 0 .. 31-rD
 //   stmw rS,d(rA)   step n: store r(rS+n) to rA + d + 4n
 //
-// Update stores write their EA to rA within the store uop. Floating point,
-// translation and cache-block instructions arrive in later steps of M0-A2;
-// until then FP opcodes decode as illegal and the TLB, segment and cache ops as
-// no-ops.
+// Update stores write their EA to rA within the store uop. Every non-register
+// y operand is in imm, BSEL_ZERO and BSEL_MINUS1 included (0 and -1), and so is
+// the rotate amount of rlwinm / rlwimi, so the core captures y with one mux.
+//
+// Segment and TLB instructions carry their operand in y: rB for mtsrin, mfsrin,
+// tlbie, tlbld and tlbli, the SR number in y[31:28] for mtsr and mfsr (the
+// immediate is SR || 28 zeros), so the core reads the segment registers and
+// indexes the TLBs from one register. Cache-block instructions, sync, eieio and
+// tlbsync are no-ops (no caches yet; tlbsync with TLBISYNC negated, 5.4.3.2);
+// isync refetches.
+//
+// Floating point (PEM chapter 8, 603e table 6-5). FP loads and stores are
+// load and store uops with a word data bus, so a double takes two beats:
+//
+//   lfs, lfsx           one uop; the word converted to double in MEM/WB
+//   lfsu, lfsux         step 0: the load     step 1: rA = EA
+//   lfd, lfdx           step 0: the high word at EA (held)
+//                       step 1: the low word at EA + 4; frD written
+//   lfdu, lfdux         as lfd, then step 2: rA = EA
+//   stfs(u)(x), stfiwx  one uop (an update store writes rA within it)
+//   stfd(u)(x)          step 0: the high word at EA (stfdu: rA = EA)
+//                       step 1: the low word at EA + 4
+//
+// A double's step 1 takes its EA from step 0's (ppc_core.sv: EX's sum, or a
+// register holding it after a replay) plus the immediate 4, so it needs
+// neither rA (an update store has already written it) nor rB again.
+// Arithmetic, moves, compares and the FPSCR instructions are OP_FP with the
+// unit (funit) and its operation (fop, fsop) for ppc_fpu_pkg's units. fsqrt
+// and fsqrts are not on the 603e and are illegal (603e table B-1, 4.5.7.2),
+// as is every other unassigned encoding of opcodes 59 and 63, whatever
+// MSR[FP] is.
 
 module ppc_decode
-  import ppc_pkg::*;
+  import ppc_pkg::*, ppc_fpu_pkg::*;
+#(
+  // 0: opcodes 59 and 63 decode as illegal, as before the FPU (the core's
+  // fetch predecode, which has a shallow FP decoder of its own beside this)
+  parameter bit FPA = 1'b1
+)
 (
   input  logic [31:0] insn,
   input  logic [31:0] pc,
   input  logic [4:0]  step,
+  input  logic        pr,           // MSR[PR]: dcbi is supervisor-only (603e 3.7.1)
   output uop_t        u
 );
 
@@ -57,6 +90,101 @@ module ppc_decode
     endcase
   end
 
+  // One FP load or store: st (store), dbl (double), upd (update form), x
+  // (indexed), iw (stfiwx). Called from the comb block below; writes u.
+  task automatic fp_ls(input logic st, input logic dbl, input logic upd, input logic x, input logic iw);
+    u.fp    = 1'b1;
+    u.msize = 2'd2;
+    u.fdbl  = dbl;
+    u.fsl   = !dbl && !iw;
+    u.fiw   = iw;
+    u.rd_we = 1'b0;
+    if (!st && upd && step == (dbl ? 5'd2 : 5'd1)) begin
+      // the update: rA = rA + d (or rB), as an integer update load's step 1
+      u.op = OP_ADD; u.a_used = 1'b1; u.b_used = x; u.bsel = x ? BSEL_RB : BSEL_IMM; u.imm = simm;
+      u.rd = f_a; u.rd_we = 1'b1;
+    end else begin
+      u.op  = st ? OP_STORE : OP_LOAD;
+      u.fld = !st;
+      u.fst = st;
+      u.fuc = st;                                     // frS, read on the C port
+      if (dbl && step != 5'd0) begin
+        // the low word at step 0's EA + 4 (the core supplies x)
+        u.a_zero = 1'b1; u.bsel = BSEL_IMM; u.imm = 32'd4;
+        u.fpw = !st;
+        u.last = !(upd && !st);
+      end else begin
+        u.a_used = (f_a != 5'd0) || upd; u.a_zero = !upd;
+        u.b_used = x; u.bsel = x ? BSEL_RB : BSEL_IMM; u.imm = simm;
+        u.fhi = dbl && !st;
+        u.fpw = !dbl && !st;
+        u.last = !dbl && !(upd && !st);
+        if (st && upd) begin u.st_update = 1'b1; u.rd = f_a; u.rd_we = 1'b1; end
+      end
+    end
+  endtask
+
+  // Opcodes 59 (s = 0: single) and 63 (s = 1). The A form is told from the X
+  // form by xo[5:1]: no X-form extended opcode of opcode 63 has its low five
+  // bits in the A-form set (PEM appendix A).
+  task automatic fp_arith(input logic dbl);
+    logic ok;
+    ok = 1'b1;
+    u.op   = OP_FP;
+    u.fp   = 1'b1;
+    u.fsgl = !dbl;
+    u.frc  = rcb;
+    u.fpw  = 1'b1;
+    u.fsu  = 1'b1;
+    case (insn[5:1])
+      5'd18: begin u.funit = 2'd2; u.fop = 4'(DIV_DIV);   u.fua = 1'b1; u.fub = 1'b1; end   // fdiv(s)
+      5'd20: begin u.funit = 2'd1; u.fop = 4'(FMA_SUB);   u.fua = 1'b1; u.fub = 1'b1; end   // fsub(s)
+      5'd21: begin u.funit = 2'd1; u.fop = 4'(FMA_ADD);   u.fua = 1'b1; u.fub = 1'b1; end   // fadd(s)
+      5'd25: begin u.funit = 2'd1; u.fop = 4'(FMA_MUL);   u.fua = 1'b1; u.fuc = 1'b1; end   // fmul(s)
+      5'd28: begin u.funit = 2'd1; u.fop = 4'(FMA_MSUB);  u.fua = 1'b1; u.fub = 1'b1; u.fuc = 1'b1; end
+      5'd29: begin u.funit = 2'd1; u.fop = 4'(FMA_MADD);  u.fua = 1'b1; u.fub = 1'b1; u.fuc = 1'b1; end
+      5'd30: begin u.funit = 2'd1; u.fop = 4'(FMA_NMSUB); u.fua = 1'b1; u.fub = 1'b1; u.fuc = 1'b1; end
+      5'd31: begin u.funit = 2'd1; u.fop = 4'(FMA_NMADD); u.fua = 1'b1; u.fub = 1'b1; u.fuc = 1'b1; end
+      5'd24: if (!dbl) begin u.funit = 2'd2; u.fop = 4'(DIV_RES); u.fub = 1'b1; end else ok = 1'b0;     // fres
+      5'd26: if (dbl) begin u.funit = 2'd1; u.fop = 4'(FMA_RSQRTE); u.fub = 1'b1; end else ok = 1'b0;   // frsqrte (fast port)
+      5'd23: if (dbl) begin                                                                              // fsel
+               u.funit = 2'd3; u.fop = 4'(MSC_FSEL); u.fua = 1'b1; u.fub = 1'b1; u.fuc = 1'b1;
+               u.fsu = 1'b0; u.fser = rcb;
+             end else ok = 1'b0;
+      default: begin
+        ok = dbl;                                     // opcode 59 has no X form
+        u.fsu = 1'b1;
+        case (xo10)
+          10'd12: begin u.funit = 2'd1; u.fop = 4'(FMA_RSP);   u.fub = 1'b1; end                  // frsp
+          10'd14: begin u.funit = 2'd1; u.fop = 4'(FMA_CTIW);  u.fub = 1'b1; end                  // fctiw
+          10'd15: begin u.funit = 2'd1; u.fop = 4'(FMA_CTIWZ); u.fub = 1'b1; end                  // fctiwz
+          10'd0, 10'd32: begin                                                                    // fcmpu fcmpo
+            u.funit = 2'd3; u.fop = xo10[5] ? 4'(MSC_FCMPO) : 4'(MSC_FCMPU);
+            u.fua = 1'b1; u.fub = 1'b1; u.fcmp = 1'b1; u.fpw = 1'b0; u.frc = 1'b0; u.fser = 1'b1;
+          end
+          10'd40, 10'd72, 10'd136, 10'd264: begin                                                 // fneg fmr fnabs fabs
+            u.funit = 2'd3; u.fub = 1'b1; u.fsu = 1'b0; u.fser = rcb;
+            u.fop = (xo10 == 10'd40) ? 4'(MSC_FNEG) : (xo10 == 10'd72) ? 4'(MSC_FMR) :
+                    (xo10 == 10'd136) ? 4'(MSC_FNABS) : 4'(MSC_FABS);
+          end
+          10'd583: begin u.funit = 2'd3; u.fop = 4'(MSC_MFFS); u.fsu = 1'b0; u.fser = 1'b1; end   // mffs
+          10'd711: begin u.fsop = 3'(FS_MTFSF);  u.fub = 1'b1; u.fpw = 1'b0; u.fser = 1'b1; end   // mtfsf
+          10'd134: begin u.fsop = 3'(FS_MTFSFI); u.fpw = 1'b0; u.fser = 1'b1; end                 // mtfsfi
+          10'd70:  begin u.fsop = 3'(FS_MTFSB0); u.fpw = 1'b0; u.fser = 1'b1; end                 // mtfsb0
+          10'd38:  begin u.fsop = 3'(FS_MTFSB1); u.fpw = 1'b0; u.fser = 1'b1; end                 // mtfsb1
+          10'd64:  begin u.fsop = 3'(FS_MCRFS);  u.fpw = 1'b0; u.frc = 1'b0; u.fser = 1'b1; end   // mcrfs
+          default: ok = 1'b0;
+        endcase
+      end
+    endcase
+    // CR1 (Rc = 1) is a field write of field 1; mcrfs and the compares name theirs
+    if (u.frc) u.crf = 3'd1;
+    if (!ok) begin
+      u.op = OP_ILLEGAL; u.fp = 1'b0; u.funit = 2'd0; u.fsop = 3'd0; u.fpw = 1'b0; u.fsu = 1'b0;
+      u.fser = 1'b0; u.frc = 1'b0; u.fcmp = 1'b0; u.fua = 1'b0; u.fub = 1'b0; u.fuc = 1'b0;
+    end
+  endtask
+
   always_comb begin
     u          = '0;
     u.valid    = 1'b1;
@@ -71,7 +199,6 @@ module ppc_decode
     u.rd       = f_d;
     u.crf      = insn[25:23];
     u.crf_src  = insn[20:18];
-    u.sh       = f_b;
     u.mb       = insn[10:6];
     u.me       = insn[5:1];
     u.bo       = f_d;
@@ -116,9 +243,11 @@ module ppc_decode
         u.rd = f_a; u.rd_we = 1'b1; u.rc = (opcd[2:1] == 2'b10);
       end
       6'd20, 6'd21, 6'd23: begin                      // rlwimi rlwinm rlwnm
+        // the rotate amount is always y: SH as an immediate, or rB for rlwnm
         u.op = OP_RLW; u.x_from_s = 1'b1; u.s_used = 1'b1; u.rd = f_a; u.rd_we = 1'b1; u.rc = rcb;
         u.rlw_insert = (opcd == 6'd20); u.a_used = (opcd == 6'd20);
-        u.sh_from_rb = (opcd == 6'd23); u.b_used = (opcd == 6'd23);
+        u.b_used = (opcd == 6'd23);
+        if (opcd != 6'd23) begin u.bsel = BSEL_IMM; u.imm = {27'd0, f_b}; end
       end
 
       // ------------------------------------------------------------ branches
@@ -134,7 +263,7 @@ module ppc_decode
           10'd16:  begin u.op = OP_BRANCH; u.bkind = BR_BCLR;  end
           10'd528: begin u.op = OP_BRANCH; u.bkind = BR_BCCTR; end
           10'd50:  u.op = OP_RFI;
-          10'd150: u.op = OP_NOP;                     // isync
+          10'd150: u.op = OP_ISYNC;                   // isync
           10'd0, 10'd33, 10'd129, 10'd193, 10'd225, 10'd257, 10'd289, 10'd417, 10'd449:
                    u.op = OP_CRLOG;                   // mcrf and the eight CR logic ops
           default: u.op = OP_ILLEGAL;
@@ -162,12 +291,12 @@ module ppc_decode
       6'd46: begin                                    // lmw
         u.op = OP_LOAD; u.msize = 2'd2; u.a_used = (f_a != 5'd0); u.a_zero = 1'b1;
         u.bsel = BSEL_IMM; u.imm = simm + step4; u.rd = f_d + step; u.rd_we = 1'b1;
-        u.last = ((f_d + step) == 5'd31);
+        u.last = (step == ~f_d);                      // rD + step = 31
       end
       6'd47: begin                                    // stmw
         u.op = OP_STORE; u.msize = 2'd2; u.a_used = (f_a != 5'd0); u.a_zero = 1'b1;
         u.s_used = 1'b1; u.rs = f_d + step; u.bsel = BSEL_IMM; u.imm = simm + step4;
-        u.last = ((f_d + step) == 5'd31);
+        u.last = (step == ~f_d);
       end
 
       // -------------------------------------------------------------- X form
@@ -179,12 +308,12 @@ module ppc_decode
             9'd10:  begin u.op = OP_ADD;  u.set_ca = 1'b1; end                // addc
             9'd138: begin u.op = OP_ADD;  u.set_ca = 1'b1; u.cin = CIN_CA; end // adde
             9'd202: begin u.op = OP_ADD;  u.set_ca = 1'b1; u.cin = CIN_CA; u.bsel = BSEL_ZERO;   u.b_used = 1'b0; end // addze
-            9'd234: begin u.op = OP_ADD;  u.set_ca = 1'b1; u.cin = CIN_CA; u.bsel = BSEL_MINUS1; u.b_used = 1'b0; end // addme
+            9'd234: begin u.op = OP_ADD;  u.set_ca = 1'b1; u.cin = CIN_CA; u.bsel = BSEL_MINUS1; u.b_used = 1'b0; u.imm = 32'hFFFF_FFFF; end // addme
             9'd40:  begin u.op = OP_SUBF; u.cin = CIN_ONE; end                // subf
             9'd8:   begin u.op = OP_SUBF; u.cin = CIN_ONE; u.set_ca = 1'b1; end // subfc
             9'd136: begin u.op = OP_SUBF; u.cin = CIN_CA;  u.set_ca = 1'b1; end // subfe
             9'd200: begin u.op = OP_SUBF; u.cin = CIN_CA;  u.set_ca = 1'b1; u.bsel = BSEL_ZERO;   u.b_used = 1'b0; end // subfze
-            9'd232: begin u.op = OP_SUBF; u.cin = CIN_CA;  u.set_ca = 1'b1; u.bsel = BSEL_MINUS1; u.b_used = 1'b0; end // subfme
+            9'd232: begin u.op = OP_SUBF; u.cin = CIN_CA;  u.set_ca = 1'b1; u.bsel = BSEL_MINUS1; u.b_used = 1'b0; u.imm = 32'hFFFF_FFFF; end // subfme
             9'd104: begin u.op = OP_SUBF; u.cin = CIN_ONE; u.bsel = BSEL_ZERO; u.b_used = 1'b0; end // neg
             9'd235: u.op = OP_MUL;
             9'd75:  begin u.op = OP_MULH;  u.oe = 1'b0; end
@@ -255,21 +384,66 @@ module ppc_decode
             10'd83:  begin u.op = OP_MFMSR; u.rd_we = 1'b1; end
             10'd146: begin u.op = OP_MTMSR; u.s_used = 1'b1; end
             10'd512: u.op = OP_MCRXR;
-            // cache, TLB and segment operations: no-ops until the MMU and caches land
-            10'd54, 10'd86, 10'd246, 10'd278, 10'd470, 10'd982,            // dcbst dcbf dcbtst dcbt dcbi icbi
-            10'd598, 10'd854, 10'd566, 10'd306,                              // sync eieio tlbsync tlbie
-            10'd210, 10'd242, 10'd978, 10'd1010:                             // mtsr mtsrin tlbld tlbli
+            // segment registers and TLBs (603e 5.1.8, table 5-5)
+            10'd210, 10'd242: begin                                           // mtsr mtsrin
+              u.op = OP_MTSR; u.s_used = 1'b1;
+              if (xo10 == 10'd242) u.b_used = 1'b1;
+              else begin u.bsel = BSEL_IMM; u.imm = {insn[19:16], 28'd0}; end
+            end
+            10'd595, 10'd659: begin                                           // mfsr mfsrin
+              u.op = OP_MFSR; u.rd_we = 1'b1;
+              if (xo10 == 10'd659) u.b_used = 1'b1;
+              else begin u.bsel = BSEL_IMM; u.imm = {insn[19:16], 28'd0}; end
+            end
+            // FP loads and stores in the X form
+            10'd535, 10'd567, 10'd599, 10'd631,                              // lfsx lfsux lfdx lfdux
+            10'd663, 10'd695, 10'd727, 10'd759:                              // stfsx stfsux stfdx stfdux
+              fp_ls(xo10[7], xo10[6], xo10[5], 1'b1, 1'b0);
+            10'd983: fp_ls(1'b1, 1'b0, 1'b0, 1'b1, 1'b1);                    // stfiwx
+            10'd306:            begin u.op = OP_TLBIE; u.b_used = 1'b1; end   // tlbie
+            10'd978, 10'd1010:  begin u.op = OP_TLBL;  u.b_used = 1'b1; end   // tlbld tlbli
+            // Cache operations (603e 3.7), EA (rA|0) + rB, no GPR written.
+            // Translated and protected as a load (dcbt, dcbtst, dcbst, dcbf) or
+            // as a store (dcbz, dcbi; table 7-31); the cache gets d_op.
+            10'd278, 10'd246, 10'd54, 10'd86: begin                           // dcbt dcbtst dcbst dcbf
+              u.op = OP_LOAD; u.a_used = (f_a != 5'd0); u.a_zero = 1'b1; u.b_used = 1'b1; u.msize = 2'd2;
+              u.cop = (xo10 == 10'd54) ? 3'd3 : (xo10 == 10'd86) ? 3'd4 : 3'd1;
+            end
+            10'd1014, 10'd470: begin                                          // dcbz dcbi
+              if (xo10 == 10'd470 && pr) begin
+                u.op = OP_ILLEGAL; u.priv = 1'b1;                             // supervisor-only (3.7.1)
+              end else begin
+                u.op = OP_STORE; u.a_used = (f_a != 5'd0); u.a_zero = 1'b1; u.b_used = 1'b1; u.msize = 2'd2;
+                u.cop = (xo10 == 10'd1014) ? 3'd2 : 3'd5;
+              end
+            end
+            10'd982: begin                                                    // icbi: not translated (3.7.8)
+              u.op = OP_NOP; u.icbi = 1'b1; u.a_used = (f_a != 5'd0); u.a_zero = 1'b1; u.b_used = 1'b1;
+            end
+            10'd598: begin u.op = OP_NOP; u.sync = 1'b1; end                 // sync
+            10'd854, 10'd566:                                                // eieio tlbsync
               u.op = OP_NOP;
             default: u.op = OP_ILLEGAL;
           endcase
         end
       end
 
-      default: u.op = OP_ILLEGAL;                     // FP and reserved opcodes
+      // ------------------------------------------------- FP loads and stores
+      6'd48, 6'd49, 6'd50, 6'd51,                     // lfs lfsu lfd lfdu
+      6'd52, 6'd53, 6'd54, 6'd55: begin               // stfs stfsu stfd stfdu
+        fp_ls(opcd[2], opcd[1], opcd[0], 1'b0, 1'b0);
+      end
+
+      // ----------------------------------------------- FP arithmetic, FPSCR
+      6'd59, 6'd63: if (FPA) fp_arith(opcd[2]); else u.op = OP_ILLEGAL;
+
+      default: u.op = OP_ILLEGAL;                     // reserved opcodes
     endcase
 
-    if (u.op == OP_ILLEGAL || u.op == OP_SC || u.op == OP_RFI || u.op == OP_TRAP)
-      u.rd_we = 1'b0;
+
+    // (no clear of rd_we by the op here: every branch that sets rd_we names a
+    // legal op that writes rD, and the compare of the op after its priority
+    // mux was the deepest path into EX's registers)
   end
 
 endmodule
