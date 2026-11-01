@@ -216,12 +216,21 @@ module r3d_rast_texel #(
   logic          v4;
   logic [TW-1:0] tag4;
   logic [31:0]   c4 [4];
+  logic signed [8:0] dt4 [4], db4 [4];    // the u lerp's differences, b - a and d - c
   logic [7:0]    fu4, fv4;
+  logic [31:0]   d3 [4];
+  always_comb for (int k = 0; k < 4; k++) d3[k] = dec(fmt3, mq[bk3[k]]);
+  // the differences are taken here, from the decoded texels, so stage 5 is a product and
+  // an add (R87: the -40C path ran c4 -> subtract -> product -> add -> bot5)
   always_ff @(posedge clk) begin
     if (rst) v4 <= 1'b0;
     else if (en) v4 <= v3;
     if (en) begin
-      for (int k = 0; k < 4; k++) c4[k] <= dec(fmt3, mq[bk3[k]]);
+      for (int k = 0; k < 4; k++) c4[k] <= d3[k];
+      for (int c = 0; c < 4; c++) begin
+        dt4[c] <= $signed({1'b0, d3[1][8 * c +: 8]}) - $signed({1'b0, d3[0][8 * c +: 8]});
+        db4[c] <= $signed({1'b0, d3[3][8 * c +: 8]}) - $signed({1'b0, d3[2][8 * c +: 8]});
+      end
       fu4 <= fu3; fv4 <= fv3; tag4 <= tag3;
     end
   end
@@ -236,12 +245,9 @@ module r3d_rast_texel #(
     else if (en) v5 <= v4;
     if (en) begin
       for (int c = 0; c < 4; c++) begin
-        logic signed [8:0] dt, db;
         logic signed [17:0] pt, pb;
-        dt = $signed({1'b0, c4[1][8 * c +: 8]}) - $signed({1'b0, c4[0][8 * c +: 8]});
-        db = $signed({1'b0, c4[3][8 * c +: 8]}) - $signed({1'b0, c4[2][8 * c +: 8]});
-        pt = dt * $signed({1'b0, fu4});
-        pb = db * $signed({1'b0, fu4});
+        pt = dt4[c] * $signed({1'b0, fu4});
+        pb = db4[c] * $signed({1'b0, fu4});
         top5[c] <= 16'({c4[0][8 * c +: 8], 8'd0} + 16'(pt));
         bot5[c] <= 16'({c4[2][8 * c +: 8], 8'd0} + 16'(pb));
       end

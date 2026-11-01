@@ -38,7 +38,11 @@
 // An edge that is never used may wrap harmlessly.
 //
 // The row is a two-stage pipeline for 100 MHz: the rounds, then the order,
-// clamp and test.
+// clamp and test. The first rows' compares are made as stage 0 takes the
+// pair, side by side, and stage 1 only selects: two muxes and the offsets'
+// subtract (R87's -40C path ran from the rounds through two compares, two
+// muxes and the subtract). round(y) > b is y > b + 1/2 and round(y) < b is
+// y <= b - 1/2 on the 16.16 value, so those compares need no round.
 
 module r3d_rast_edge #(
   parameter int SCR_W = 496
@@ -92,6 +96,12 @@ module r3d_rast_edge #(
   logic signed [53:0] z_s12, z_s13, z_s23;
   logic signed [16:0] z_r1, z_r2, z_r3;
   logic        [8:0]  z_b0, z_b1;
+  logic               z_c1, z_c2, z_c21, z_c3;   // r1 > b0, r2 > b0, r2 > r1, r3 < b1
+
+  wire signed [16:0] i_r1 = round16(t_y1), i_r2 = round16(t_y2), i_r3 = round16(t_y3);
+  wire signed [32:0] h_b0 = {8'd0, t_b0, 16'h8000};                    // b0 + 1/2
+  wire signed [32:0] h_b1 = {8'd0, t_b1, 16'd0} - 33'sh8000;            // b1 - 1/2
+  wire signed [32:0] y1x = {t_y1[31], t_y1}, y2x = {t_y2[31], t_y2}, y3x = {t_y3[31], t_y3};
 
   logic               m_load;          // stage 0 moves into the walker
 
@@ -105,8 +115,11 @@ module r3d_rast_edge #(
         z_full <= 1'b1;
         z_x1 <= t_x1; z_x2 <= t_x2; z_y1 <= t_y1; z_y2 <= t_y2;
         z_s12 <= t_s12; z_s13 <= t_s13; z_s23 <= t_s23;
-        z_r1 <= round16(t_y1); z_r2 <= round16(t_y2); z_r3 <= round16(t_y3);
-        z_b0 <= t_b0; z_b1 <= t_b1;
+        z_r1 <= i_r1; z_r2 <= i_r2; z_r3 <= i_r3; z_b0 <= t_b0; z_b1 <= t_b1;
+        z_c1  <= y1x > h_b0;
+        z_c2  <= y2x > h_b0;
+        z_c21 <= i_r2 > i_r1;
+        z_c3  <= y3x <= h_b1;
       end
     end
   end
@@ -118,12 +131,13 @@ module r3d_rast_edge #(
   // in its own 3 x 56-bit accumulators and step copies); stage 0 holds the next
   // pair meanwhile.
 
-  // first row: max(r1, b0); last + 1: min(r3, b1)
+  // first row: max(r1, b0); last + 1: min(r3, b1); edge 2 -> 3's first row max(r2, ys)
   wire signed [16:0] b0s = {8'd0, z_b0};
   wire signed [16:0] b1s = {8'd0, z_b1};
-  wire signed [16:0] ys  = (z_r1 > b0s) ? z_r1 : b0s;
-  wire signed [16:0] ye  = (z_r3 < b1s) ? z_r3 : b1s;
-  wire signed [16:0] ys2 = (z_r2 > ys) ? z_r2 : ys;   // first row of edge 2 -> 3
+  wire               up0 = z_c2 && z_c21;          // r2 > max(r1, b0): the first row is above r2
+  wire signed [16:0] ys  = z_c1 ? z_r1 : b0s;
+  wire signed [16:0] ye  = z_c3 ? z_r3 : b1s;
+  wire signed [16:0] ys2 = up0 ? z_r2 : ys;
   // fy - y = (row << 16) + 2^15 - y >= 0, below 2^32
   /* verilator lint_off UNUSEDSIGNAL */
   wire signed [33:0] d1w = {ys[16], ys, 16'h8000} - {{2{z_y1[31]}}, z_y1};
@@ -218,7 +232,7 @@ module r3d_rast_edge #(
         a13    <= {{(AW-52){z_x1[31]}}, z_x1, 20'd0};
         a23    <= {{(AW-52){z_x2[31]}}, z_x2, 20'd0};
         w_y    <= ys;
-        w_up   <= (ys < z_r2);
+        w_up   <= up0;
         w_r2   <= z_r2;
         w_end  <= ye;
       end

@@ -34,6 +34,18 @@ read_sdc
 update_timing_netlist
 report_timing -setup -npaths 10 -detail summary -file paths.txt
 report_timing -setup -npaths 1 -detail full_path -file path1.txt
+# every corner (study D-35): its worst paths, paths_<corner>.txt
+delete_timing_netlist
+create_timing_netlist
+read_sdc
+update_timing_netlist
+puts "CORNERS: [get_available_operating_conditions]"
+foreach oc [get_available_operating_conditions] {
+  set_operating_conditions \$oc
+  update_timing_netlist
+  report_timing -setup -npaths 20 -detail summary -file paths_\$oc.txt
+  report_timing -setup -npaths 1 -detail full_path -file path1_\$oc.txt
+}
 TCL
 /home/ben/intelFPGA_lite/17.0/quartus/bin/quartus_sta -t paths.tcl > sta_paths.log 2>&1
 # keep the reports, drop the databases

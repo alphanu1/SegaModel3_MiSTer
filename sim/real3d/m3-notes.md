@@ -1769,3 +1769,716 @@ Area, section 8.4 technique by technique:
   difference it reported.
 - I typed the log2 table by hand first; about a third of the entries were wrong. It is now
   generated from 256 log2(1 + (i + 1/2) / 64).
+
+## 12, continued. Block 8, the polygon store, and block 9, the rasteriser's top level (D-20)
+
+The rasteriser is now whole: `r3d_rast.sv` takes the geometry's record stream (viewport
+records and SETUP4 set-up records) and writes a finished 3D layer into DDR3, bit for bit
+render_d25 (depth on 1/w, the normal's cull flag, fog, translucency 0, textures at level 0;
+`MIP = 1` the nearest level). Two new blocks and a small one:
+- `r3d_rast_store.sv` (block 8): D-20's binned store in DDR3.
+- `r3d_rast.sv` (block 9): the store, the fog records and the M2.5 viewer's chain from the
+  intake to the band (R74), with fog, the generation flag and MIP's wires added.
+- `r3d_rast_fogvp.sv`: a viewport's fog record, serial, once a viewport.
+
+### The census (`r3d_store_census`, `make measure_real3d_store`; 400 + 400 frames, 8-row bands)
+
+| | VF3 p50 / p99 / max | Bass Fishing p50 / p99 / max |
+|---|---|---|
+| Set-up records (triangles render_d25 draws) | 5,345 / 9,198 / 9,791 | 1,477 / 9,228 / 9,250 |
+| (record, band) pairs, the store's floor rule | 12,624 / 18,043 / 18,532 | 4,429 / 16,434 / 16,533 |
+| the same, the rows the front walks | 11,944 / 16,930 / 17,745 | 4,175 / 15,504 / 15,621 |
+| Alpha-list pairs | 818 / 5,162 / 6,296 | 86 / 5,044 / 5,191 |
+| Records in one band | 691 / 1,342 / 1,889 | 376 / 2,362 / 2,871 |
+| Records in one (band, list) bin | 629 / 1,216 / 1,284 | 310 / 2,011 / 2,442 |
+| Read bursts, consecutive records joined up to 64 beats | 3,922 / 5,710 / 6,232 | 1,432 / 4,096 / 4,140 |
+| (band, pass) Z generations | 50 / 98 / 98 | 47 / 118 / 118 |
+| Viewports a frame | 7 / 29 / 29 | 5 / 8 / 8 |
+
+R46's 17,890 pairs (VF3 p99, 8 rows) were polygon-band pairs; the set-up records are
+triangles, and there are about as many pairs of them (18,043). Their bytes are not: a
+set-up record is 92 bytes textured against R46's ~83 for a whole fan.
+
+### The layout, and what was costed before building
+
+Three layouts, VF3 p99 from the census:
+
+| Layout | DDR3 a frame | MB/s at 57.52 Hz | Read transactions | Note |
+|---|---|---|---|---|
+| Records copied into each bin | 3.31 MB | 190.6 | about 3,600 long bursts | every pair written whole |
+| Records once, a 16-bit pointer a pair | 2.50 MB | 144.0 | 18,043 record reads, one at a time | latency-bound: about 30 cycles a pair on m2_ddr3's contract |
+| **Records once, bins of runs (built)** | 2.30 MB measured | **132.0 measured** | 5,710 bursts | runs need no pointer traffic |
+
+A run is consecutive records of one list that are also contiguous in DDR3; a bin keeps
+runs, not records. Records of a mesh arrive together, so a run averages 3.2 records at
+the 64-beat cap. Its open (newest) run stays on chip with the bin's count of closed runs;
+a closed run goes to the bin's run list in DDR3 as one 32-bit entry. Nothing on chip grows
+with the frame.
+
+**Alpha lists come out backward for nothing.** Opaque lists grow up from their region's
+base, alpha lists down from its top. A run of consecutive alpha records is then contiguous
+newest first, so one ascending burst reads it in render_d25's reverse order, and the bin's
+run list is read from its end. There is no reordering buffer.
+
+**Packed records.** The store drops the polygon number and det (the rasteriser reads
+neither) and folds word 1's texture position and word 3 into one word with the viewport's
+number. Textured 21 words (11 beats, 88 B), untextured 15 (8 beats). The reader rebuilds
+the intake's SETUP4 record (det = 0) and returns word 3 as {viewport [13:8], new
+generation [7], word 3 [6:0]}.
+
+**Bands from floor(y).** A record's bands are floor(y) of its first and last sorted
+vertex: a 9-bit shifter on the FP32 y. That is conservative against the front's rows,
+which are round_fix of the 16.16 vertex (shown: the first row is never above floor(y0),
+and the last never below floor(y2)). It costs 6.6% more pairs (18,043 against 16,930)
+against a full FP32-to-16.16 conversion. An extra pair is a triangle the front walks with
+no rows.
+
+**On chip.** The bin table is 2 banks x 384 bins x 38 bits ({closed runs 13, open valid,
+start 17, beats 7}): 3 M10K. The replay FIFO is 256 beats: 2 M10K. The record and run
+buffers are MLAB. Two banks let frame N + 1 be binned while frame N is replayed. Each
+bank's 384 entries are swept to empty at b_begin (384 cycles), so nothing is cleared in
+reset.
+
+**DDR3, per bank** (defaults LB 17, BB 11):
+- 8 list regions of 1 MiB, about 11,900 textured records a list against a maximum of
+  7,247 in any list of any frame;
+- 384 run lists of 4,096 runs, against at most 2,442 records in a bin;
+- 16 MiB a bank, 32 MiB for both.
+
+An overflow drops the record from that bin or list and sets a flag. None occurred.
+
+**The port** is m2_ddr3's contract: request held to its acknowledge, a write beat a wacc
+(din and be live), a read beat a rvalid, one transaction at a time. That is D-20's switch
+to the second SDRAM (D-34). The binning and replay sides share it by owner. A read burst is
+issued only when the FIFO has room for all of it, because rvalid cannot be refused.
+
+### Block 9: the top level
+
+| Port | Contract | Traffic |
+|---|---|---|
+| store | m2_ddr3 | r3d_rast_store |
+| texture | pipelined reads, address held to t_ack, four beats a line later in order (m3_ddr3p's P port) | r3d_rast_tcache |
+| layer | m2_ddr3, write bursts | r3d_rast_band, 32 bits a pixel |
+
+No port is touched before the first f_begin, so a core meets R71 by holding f_begin until
+hps_io's first command and RESET low for 100 ms.
+
+**Frames.** f_begin, when f_ready says a bank is free, starts a frame's records into the
+store. f_end after its last record latches fb_base and the scroll fog for that bank. A full
+bank is replayed when the band stage is free: the band buffers cleared, the texture cache
+emptied, then band by band. done pulses when the last band's flush is in the layer, and
+the bank is released.
+
+**Ends of band.** The band ends when the store's reader is at its BANDEND marker and
+nothing is in flight before the band FIFO (the viewer's 15-cycle quiet), and the FIFO has
+room (below).
+
+**Generations.** The store marks a (band, pass)'s first record. The mark goes from the
+triangle to its first span and makes that span's first pair s_new. If the record has no
+rows in the band, the mark waits for the next span. A pass needs no drain: the Z band's
+own s_new handling (drain, sweep, stale verdicts dropped) is enough.
+
+**Fog.** A viewport record goes to `r3d_rast_fogvp`. It computes K = |density| / kz with a
+25-step restoring divide, fc = colour x ambient with one shift-add multiplier, and S =
+(start x 16448 + 2048) >> 12 as shifts and an add, clamped to [-4096, 1024]. The clamp is
+exact: lin = clamp(S + P, 0, 1024) with P in [0, 4096]. The record goes to a 128-entry table
+at {bank, viewport} (2 M10K).
+
+The table is read as the pixel leaves the interpolants, R to F1, on en_f so that it holds
+with the pixel:
+- K goes to `r3d_rast_fogp`. That block runs free on F1's held inputs, so its P is
+  ready 3 cycles after the pixel reaches F1 whatever the cache does. P goes to an MLAB ring
+  by pixel number.
+- S and fc go to an M10K ring at F1.
+
+The colour stage reads both rings by pixel number. Subnormal densities, kz and K are
+flushed to zero, where fogp's P is 0 either way. 3,000,000 random records, 0 wrong (all
+differences are on subnormal cases).
+
+**Scroll fog is an input of the frame.** render_d25's rule needs the viewport rectangle,
+the priority (node word 0) and node word 0x24. The geometry's viewport record (R62) carries
+none of them, so the rule cannot be formed in the rasteriser from the stream it gets. The
+bench gives it at f_end from `d25_scroll_fog`.
+
+### Two bugs the whole bench found, both also in the M2.5 viewer
+
+1. **The idle window was shorter than the interpolants.** A pixel takes 16-17 cycles from P
+   to n_valid with no valid showing, and the viewer's idle is 15 quiet cycles. VF3 frame
+   1800 ended band 2 with its last pixel still inside: 30 wrong pixels, and 43 in another
+   run. The texture cache can hold pixels for a whole fill latency the same way. Each now
+   has a count of the pixels inside it in the idle test (R1, R2).
+2. **Ends of band overflowed the band FIFO.** Empty bands end every few cycles, but a band
+   flush takes about 2,600 cycles, and an end of band was pushed without asking for room.
+   Eleven ends wrapped the 32-entry FIFO over a waiting pixel. That was 1 pixel in 5 VF3
+   frames (6330-6450, pixel (201, 16)). An end of band now waits for an entry; pixels stop
+   at 28 and ends at 31 (R13).
+
+The viewer has both: its idle is the same 15 cycles, and its sequencer pushes eob without a
+room test. It has passed because its store is slow (every band replays every triangle).
+
+### Checks (`make test_real3d_rast_top`)
+
+Every layer pixel of every frame against render_d25. Frames go in back to back, frame N + 1
+binned while N is replayed. Texture RAM is loaded between replays. The memory model
+enforces each port's rules:
+- store and layer: request held with addr, blen and we unchanged until ack, no take while
+  an ack is out;
+- texture: address held to t_ack, lines in flight capped.
+
+| Set | Ports | Frames | Pixels | Wrong | Rule violations |
+|---|---|---|---|---|---|
+| VF3 | p0: ack 1-3, BUSY 20%, latency 13-40, beat gaps 10%, 16 lines | 400 | 147,340,341 | 0 | 0 |
+| Bass Fishing | p0 | 400 | 60,210,676 | 0 | 0 |
+| VF3 | p1: ack 1-400 on 30% of store and layer requests, texture ack 1-400 on 2%, BUSY 60%, latency 20-200, gaps 30%, 8 lines, input gaps 50% | 400 | 147,340,341 | 0 | 0 |
+| Bass Fishing | p1 | 400 | 60,210,676 | 0 | 0 |
+| VF3, `MIP = 1` (render_d25 mip 1, lod 1, B from the list) | p0 | 4 | 1,340,236 | 0 | 0 |
+
+After the timing fix (registered output queue, registered cache ready) all four 400-frame
+sets were run again, with the same counts, 0 wrong and 0 violations.
+
+The pixel counts are R67's band bench counts exactly. No record was out of order in any
+list (buf rises), and no address was outside its port's region.
+
+### Frame time at 100 MHz (1,738,530 cycles a 57.52 Hz frame), level 0, 32 KiB
+
+| | VF3 p50 / p99 / max | Bass Fishing p50 / p99 / max |
+|---|---|---|
+| Replay, p0 | 63.1% / **148.9%** / 159.8% | 25.1% / **81.8%** / 82.0% |
+| Binning (beside the replay of the frame before), p0 | 20.1% / 33.8% / 36.4% | 4.8% / 29.5% / 29.5% |
+| End-of-band waits (the band's tail draining), p0 | 1.2% / 10.9% / 18.1% | 1.6% / 6.7% / 7.7% |
+| Replay, p1 (hostile) | 136.2% / 452.1% / 514.0% | 39.5% / 196.0% / 196.2% |
+
+R67's figures for level 0 at 32 KiB, VF3 p99: 302,324 fills; 90.7% on an ideal 64-bit
+port; 102.2 / 117.0 / 183.1% on DDR3 pipelined at latency 13 / 30 / 60. The bench's fills
+are R67's (302,413 p99), but the frame is 148.9%.
+
+**The texture cache binds, not the store or the top level.** The three worst VF3 frames
+under every memory profile:
+
+| Profile | f003240 | f010650 | f010680 |
+|---|---|---|---|
+| Ideal: latency 1, no BUSY, no gaps, 64 lines | 142.9% | 139.2% | 147.2% |
+| Latency 13 | 143.0% | 139.5% | 147.5% |
+| Latency 30 | 145.4% | 141.9% | 150.9% |
+| Latency 30, 32 lines | 145.4% | 141.9% | 150.9% |
+| p0 | 153.0% | 148.9% | 159.8% |
+
+Latency moves it by 3 points. In frame f003240 with ideal memory, 1,008,456 pixels go into
+the cache while the cache refuses input for 1,245,391 cycles: 3.9 cycles for each of its
+321,638 fills.
+
+The cause is the cache's write gate (`gate_ok`): a fill writes its line only when every
+pixel before the one that allocated it has read. So a fill's 4 write cycles cannot overlap
+the hits ahead of it, and a frame costs about pixels + 4 x fills. R67's fill tool lets
+fills overlap hits, which is where its 90.7% comes from.
+
+Blocks 8 and 9 cost little beside it:
+- the intake waited for the store 329 cycles a frame;
+- ends of band cost 1.2% at p50.
+
+A gate that waits only for the pixels that read the victim line would give about
+max(pixels, 4 x fills). The nearest mip level (R67, the geometry's B: 53,790 p99 fills)
+takes the fills down by four fifths.
+
+### DDR3, the store (measured; binning writes plus replay reads of the same frame)
+
+| | VF3 p50 / p99 | Bass Fishing p50 / p99 |
+|---|---|---|
+| Store, MB/s at 57.52 Hz | 90.7 / **132.0** (writes 45.3, reads 88.0) | 29.2 / **124.3** (writes 45.1, reads 79.1) |
+| Texture lines (32 B), MB/s, level 0 | 69,786 / 302,413 lines: 556.6 MB/s at p99 | 8,821 / 112,563: 207.2 MB/s |
+
+With the layer at 16 bits (D-6: 21.9 MB/s written, 21.9 scanned out) and polygon RAM
+(31.7, R46), VF3's p99 total is 132.0 + 43.8 + 31.7 = 207.5 MB/s, against D-20's estimate
+of about 180. With the layer at 32 bits, as built, it is 251.3 MB/s. Texture comes on top:
+556.6 MB/s at level 0, or about 99 MB/s with the nearest level and the geometry's B.
+
+### Planted faults
+
+`python3 sim/real3d/faults_rast.py S1_alpha_open_last ...`. Each fault is one edit to a copy of
+the RTL, run on 10 VF3 frames (p0) and 6 Bass Fishing frames on the hostile ports. It is
+caught on any wrong pixel, port rule, address, missing frame or hang (the bench's exit
+code, or its 1,200 s limit: "hang" below).
+
+The first campaign's Bass run used frames 200-205, which hold 6 triangles each. The faults
+it missed were run again on f003510-f003660 (the heaviest frames, with fog and scroll fog).
+
+| Fault | Where | VF3 | Bass, hostile | |
+|---|---|---|---|---|
+| S1 alpha bin's open run last | store replay | hang | 166,656 | caught |
+| S2 runs joined without contiguity | store binning | 1,049,101 | 0 | caught |
+| S3 last band dropped at a band's first row | store bands | 1,819 | 0 | caught |
+| S4 first band late at row 7 | store bands | 2,035 | 0 | caught |
+| S5 floor shift one bit | store bands | 1,368,297 | 0 | caught |
+| S6 run-list chunk a beat short | store replay | hang | 0 | caught |
+| S7 no FIFO room test | store replay | hang | 0 | caught |
+| S8 no new-generation mark | store reader | 1,315,952 | 0 | caught |
+| S9 det slot moved | store reader | 0 | 0 | equivalent: det is not read |
+| S10 word 1 shifted | store reader | 1,472,787 | 0 | caught |
+| S11 alpha lists grow up | store binning | 413,250 | 30 | caught |
+| S12 replay bank not toggled | store banks | hang | hang | caught |
+| S13 table sweep 256 entries | store binning | hang | 0 | caught |
+| S14 untextured padding 9 beats | store reader | hang | 95,298 | caught |
+| S15 run entries all in lane 0 | store binning | hang | 0 | caught |
+| S16 forward run index skips | store replay | hang | 0 | caught |
+| S17 planes a word off | store reader | 1,468,592 | 1,050,979 | caught |
+| R1 idle without the interpolants' count | top | 16 | 0 | caught |
+| R2 idle without the cache's count | top | 147 | 0 | caught |
+| R3 s_new on every pair of the span | top | 1,511 | 0 | caught |
+| R4 fog table read off en_f | top | 0 | 7 | caught (heavy Bass) |
+| R5 P written a cycle early | top | 1 | 0 | caught |
+| R6 S zero-extended | top | 0 | 0 | **not caught** |
+| R7 viewport field a bit low | top | 0 | 1,050,273 | caught (heavy Bass) |
+| R8 end of band without idle | top | 118,201 | 65,371 | caught |
+| R9 layer base from the binning bank | top | 1,121,127 | 190,464 | caught |
+| R10 generation mark not cleared | top | 269,473 | 0 | caught |
+| R11 viewport number one high | top | 0 | 1,050,142 | caught (heavy Bass) |
+| R12 S and fc written at F2 | top | 0 | 30 | caught (heavy Bass) |
+| R13 end of band without FIFO room | top | 0 | 0 | **not caught** here; the 400-frame run is what found it (VF3 6330-6450) |
+| V1 no rounding | fogvp | 25,666 random | | caught |
+| V2 start shift 5 | fogvp | 20,832 | | caught |
+| V3 fc rounding 127 | fogvp | 1,746 | | caught |
+| V4 density limit inclusive | fogvp | 2,352 | | caught |
+| V5 kz sign ignored | fogvp | 20,719 | | caught |
+| V6 no sticky bit | fogvp | 12,943 | | caught |
+
+33 of 36 caught. S9 is equivalent. The two misses:
+- **R6** needs a fogged triangle under a viewport with a negative fog start. Bass Fishing's
+  two such viewports draw nothing fogged in these frames, and the fog unit's random bench
+  tests S's sign at its own output, not in the colour stage.
+- **R13** needs eleven or more empty bands while a pixel waits behind the end of band.
+
+VF3's fog has no visible effect (every shaded pixel is fogged, but with density and start
+0), so every fog fault needs Bass Fishing.
+
+### Fits (Quartus 17.0, 5CSEBA6U23I7, standalone, 10 ns, three seeds)
+
+Whole rasteriser, `r3d_rast`, every port a virtual pin. The Quartus 17 builds of the
+default (MIP 0, 32 KiB cache):
+
+| Seed | ALM (pins' ALMs) | ALM without pins | Registers | M10K | DSP | Fmax slow 100C | Fmax slow -40C |
+|---|---|---|---|---|---|---|---|
+| 1 | 8,134 (383) | 7,751 | 10,798 | 100 | 45 | 101.68 MHz | 99.42 MHz: fails |
+| 2 | 8,157 (383) | 7,774 | 10,791 | 100 | 45 | 100.01 MHz | 97.30 MHz: fails |
+| 3 | 8,102 (383) | 7,719 | 10,791 | 100 | 45 | 102.71 MHz | 98.45 MHz: fails |
+
+It closes 10 ns at 100C on all three seeds (seed 2 by 0.001 ns), and at -40C on none.
+The worst paths are not in blocks 8 or 9:
+- seeds 1 and 2: the edge walker's product (`r3d_rast_edge` z_r1 / z_b0 to m_d2);
+- seed 3: the texel filter's v lerp (`r3d_rast_texel` u_tb c4 to bot5).
+
+Standalone those blocks close 104.8-107.2 MHz (front) and 106.1-109.2 MHz (texel) at -40C;
+assembled they lose 6-8 MHz. Every block so far was reported at 100C alone. The -40C corner
+is the lower one for most of them:
+- front 107.2 / 104.8 / 105.3;
+- texel 106.1 / 108.4 / 109.2;
+- interpolants 109.2 / 113.9 / 114.9;
+- band 120.1 / 122.5 / 121.8;
+- the Z band and the cache are about level.
+
+`quartus/r3d_rast100/summary.sh` now prints both corners.
+
+The first batch (seed 1 only, `rast_s1`) was 8,127 ALM, 101 M10K, 100.75 / 97.45 MHz. Its
+two worst paths were mine:
+- **the store's 4-entry output queue**, which Quartus put in an MLAB read asynchronously
+  into the intake (0.074 ns slack at 100C). It is now registers;
+- **the band FIFO's count compared into the cache's output-ready** (0.244 ns). That ready
+  is now registered, with pixels stopping at 27.
+
+At the same time the store's four base adders became one at the port (the store went from 931
+to 915 ALM; the whole moved +7 on seed 1).
+
+Against the ledger: R66/R67's built blocks were about 5,970 ALM, 75 M10K and 45 DSP. Here
+they come to 5,880-5,900 ALM, 74 M10K and 45 DSP. Blocks 8 and 9 add:
+
+| Block | ALM s1 / s2 / s3 | M10K | DSP | Estimate (section 12, R66) |
+|---|---|---|---|---|
+| Store, block 8 (`r3d_rast_store`) | 915 / 919 / 904 (82 of them its 4 MLABs) | 6: bin table 4, FIFO 2 | 0 | 750 ALM, 8-12 M10K |
+| Fog records (`r3d_rast_fogvp`) | 258 / 255 / 254 | 0 | 0 | (not estimated) |
+| Top level, block 9 (`r3d_rast` itself) | 566 / 574 / 566 without pins, plus 122-125 in its 3 MLABs | 20: table 1 9, table 2 2, rings A 2, B 2, C 1, D1 1, fog table 2, span queue 1 | 0 | 300-500 ALM, 4-8 M10K |
+| **Blocks 8 and 9** | **1,861 / 1,874 / 1,848** | **26** | **0** | 1,050-1,250 (store and control) |
+| **Rasteriser** | **7,751 / 7,774 / 7,719 of 8,000** | **100** | **45** | 7,300-7,700, 85-95 M10K |
+
+ALM is 226-281 under its 8,000. M10K is 100 against the 85-95 projected. 16 of block 9's 20
+are the viewer's tables and rings, which the projection did not count.
+
+### Area, section 8.4 technique by technique, blocks 8 and 9
+
+| Technique | Here | Effect |
+|---|---|---|
+| Storage out of flops | bin table (2 x 384 x 38) and replay FIFO in M10K; record, run and output buffers in MLAB; per-triangle tables, per-pixel rings and the fog table in M10K | 29 Kbit of bin state, 17 Kbit of FIFO, no flop arrays |
+| Narrower / exact rewrite | records packed: polygon number and det dropped, words 1 and 3 merged with the viewport's number | 23 to 21 words, 12 to 11 beats: -8% of store bytes |
+| Narrower / exact rewrite | bins of runs, not of records: consecutive contiguous records are one entry and one burst | 18,043 pairs to 5,710 reads at VF3 p99; 132.0 MB/s against 144.0 for per-pair pointers, 190.6 for copies |
+| Narrower / exact rewrite | S clamped to [-4096, 1024]: lin cannot tell | 14 bits in the fog table, not 18 |
+| Constants of the frame | the fog record (K, S, fc) once a viewport, not per pixel; scroll fog given as sf_out | no per-pixel division; per pixel only fogp's one product |
+| Built once and shared | one shift-add multiplier for the three fc products, beside the divide's 25 steps | 0 DSP, about 20 ALM |
+| Built once and shared | one memory port for binning and replay (by owner), one table read port (replay first), one adder for every DDR3 address | 3 adders of 25 bits fewer |
+| Reorder for free | alpha lists grow downward, so an ascending burst reads them newest first | no reorder buffer |
+| Conservative, cheaper | bands from floor(y), a 9-bit shifter, not a 16.16 conversion | +6.6% pairs, no lost rows |
+| Spare bits carry flags | the new-generation mark in word 3 bit 7; the mip level in ring A's spare M10K width | no side FIFO; MIP costs no M10K in the rings |
+| Free-running where held inputs allow | fogp runs on F1's held inputs with en = 1; its result is written to a ring by pixel number | no stall logic, no alignment registers |
+| No clear in reset | the bank's bin table swept to empty at b_begin | 384 cycles a frame |
+| MLAB / M10K trade | not taken: the span queue (8 x 11) went to an M10K, and the bin table to 4 M10K where 3 hold it | 2 M10K to win back |
+| Parameters | MIP, SB, LB, BB (store), RUNMAX, FB (store) | |
+| Did not work | the store's output queue as inferred memory (an MLAB read asynchronously) | the worst path of the first fit; registers now |
+
+### What the M2.5 viewer must change to use r3d_rast
+
+Not done here (the viewer is not mine to edit in this step). Exactly what has to change:
+
+1. **`m3v_setup`.**
+   - Drop word 0 ({nw, ymax, ymin}); the store bins from the vertices itself.
+   - Emit words 1..nw as the record, `o_last` on the last.
+   - Pass viewport records (vertex count 0) through whole instead of dropping them: the
+     fog table needs them.
+   - `o_list` is no longer used.
+2. **Remove `m3v_store` and `m3v_raster`** and instantiate `r3d_rast`:
+   - `i_*` from m3v_setup;
+   - `f_begin` in place of `st_clear`/`f_start`, given only when `f_ready`;
+   - `f_end` when `!geo_busy && !su_busy && !su_valid`;
+   - `fb_base` = the buffer not shown;
+   - `sf_*` = 0 (no scroll fog: the viewer cannot form it without the viewport geometry,
+     see above), or computed by the loader from the dump's viewport nodes;
+   - `store_base` = LISTS (0x800000): two banks of 16 MiB end exactly at TEX (0xC00000),
+     with no overlap;
+   - `tex_base` = TEX + slot 0x100000.
+3. **The sequencer** shrinks to: start the geometry when `f_ready`, then `f_begin`; after
+   the geometry, `f_end`; at `done`, `swap_pend`. `band_go`, `eob`, `new_gen` and the
+   per-band loop go, since r3d_rast runs them.
+4. **DDR3 arbitration.** Arbiter port 3 becomes `s_*` and port 4 `l_*`, and `pp_*[1]`
+   becomes `t_*` (`pp_blen[1]` stays 4).
+   - **`m3v_ddr_arb` must carry a byte enable per master.** It ties `m_be` to 8'hff, and
+     the store's run-list writes are one 32-bit entry with `be` 0x0F or 0xF0. Without it
+     every closed run overwrites its neighbour.
+5. **Overlay rows 8-11** (`st_cnt`, list counts) become `st_rec`, `st_pair`, `st_run`,
+   `st_drop`/`st_ovf`, and `n_pix` stays.
+6. **Makefile `VIEW_RTL`:** add r3d_rast_store, r3d_rast_fogvp, r3d_rast; drop m3v_store
+   and m3v_raster.
+7. **`tb_m3v.cpp`.**
+   - The store check, which reads records at LIST_BASE + l 2^19 + 16 i, must be removed or
+     rewritten for the new layout.
+   - The reference becomes render_d25 with fog on (the viewport records now arrive) and
+     cull 0 (the geometry's FACE_DROP has already culled).
+   - The overlap of binning and replay means the bench must not assume the geometry of
+     frame N + 1 waits for frame N's layer.
+8. **R71 is met as it is:** r3d_rast issues nothing before the first f_begin, and the
+   sequencer starts only once `loaded` (which includes `ddr_ok`).
+
+Both bugs the bench found (above) are in `m3v_raster` and are removed with it.
+
+### Not done
+
+- D-6's 16-bit layer is not built (R67's reason stands: four pixels a beat need four
+  banks a buffer or a two-cycle beat that a write burst cannot wait for).
+- Binning and replay overlap in the RTL, but the bench feeds the next frame as soon as a
+  bank is free. The whole Real3D (geometry + store + replay) in one frame is not measured.
+- Scroll fog needs fields the viewport record lacks (above).
+- An end-of-band token in the pixel stream, which would let the next band's records in
+  before the drain, is not built: 1.2% p50, 10.9% p99.
+- The cache's write gate (above) is block 6's.
+- -40C timing: the assembled rasteriser does not close 10 ns at -40C on any seed (97.3-99.4
+  MHz). The paths are in the front and the texel filter.
+- Two planted faults are missed on the harness frames (R6, R13).
+
+### Wrong turns
+
+- **I trusted the viewer's idle test** because the viewer is bit-exact on the board. It was
+  exact only because its store left time between bands. Two bugs followed: the
+  interpolants' latency is longer than the quiet window, and ends of band overflow the band
+  FIFO. Both are in m3v_raster too.
+- **I read the first p99 (148.9%) as memory latency.** The ideal-memory runs showed it is
+  the cache's write gate. Latency moves the worst frames by 3 points.
+- **The first fit's two worst paths were mine.** One was an inferred 4-entry memory read
+  asynchronously; the other a FIFO count compared straight into another block's ready.
+  Registers and a registered ready fixed both, and the remaining failures are in older
+  blocks.
+- **Bugs caught in review before the first simulation:**
+  - a zero-width cast in the run address with the default parameters (LB + 3 - 9 - BB = 0);
+  - the forward bin walk never reaching its open run;
+  - the record write's read-ahead reading a stale beat for the first beat of a burst;
+  - the binning side using replay-side signals before their declaration.
+- **A 1-bit bank stamp would not have cleared the bin table.** An entry untouched for one
+  frame reads valid again the frame after. The table is swept at b_begin instead.
+- **The faults' hostile run first used Bass Fishing frames with 6 triangles,** so it
+  tested nothing. One fault (R8) had its search string broken by my own end-of-band fix,
+  which crashed one fault group, so four faults had to be run again.
+- **R46's store estimate counted fans** (17,890 polygon-band pairs at 21-byte vertices).
+  The store holds per-triangle set-up records of 88 B, 11% more bytes a pair. Runs, not
+  pointers, bring the measured store to 132.0 MB/s, under the 144 a per-pair pointer
+  layout would take.
+
+## 12, continued. Tuning: the configuration that runs, the cache's write gate, -40C
+
+Four things on the whole rasteriser after R87: the frame time measured on the configuration
+that runs (MIP = 1, the geometry's B, 32 KiB), the texture cache's write gate, the two -40C
+paths R87 named and the ones behind them, and two M10K wins.
+
+### The configuration that runs (`make test_real3d_rast_top_mip`)
+
+`tb_r3d_rast --geo-lod VROM` gives each textured record the B the geometry sends
+(`r3d_geo_lod.h`, R75), and render_d25 the same word through `d25_opts::lodb`, so the
+record and the reference agree. Before, `--mip` used B from MAME's list (R87's 4 frames).
+11,181 of 11,181 textured records of the first two frames get a geometry word. RTL as R87
+left it, before any change below.
+
+| 400 + 400 frames, 0 wrong, 0 rule violations | VF3 p50 / p99 / max | Bass Fishing p50 / p99 / max |
+|---|---|---|
+| Replay, p0 | 54.2% / **83.6%** / 90.4% | 24.5% / **64.4%** / 66.0% |
+| Replay, p1 (hostile) | 94.1% / 128.7% / 137.0% | 38.4% / 103.0% / 104.2% |
+| Binning, p0 (beside the replay before) | 21.2% / 35.8% / 38.5% | 4.9% / 32.7% / 32.9% |
+| Binning, p1 | 102.0% / 149.4% / 154.5% | 29.7% / 134.8% / 135.4% |
+| End-of-band drain, p0 | 1.1% / 7.4% / 10.8% | 1.5% / 6.7% / 7.7% |
+| Texture fills (32 B lines) | 32,160 / **53,805** / 55,655 | 6,519 / **41,545** / 41,986 |
+
+(Share of a 100 MHz frame, 1,738,530 cycles at 57.52 Hz.) Pixels: VF3 147,130,498, Bass
+Fishing 60,298,211; level 0 had 147,340,341 and 60,210,676 (alpha-tested texels read at a
+coarser level change coverage).
+
+The fills are R75's prediction to within 0.03% (53,790 and 41,569 p99): the cache's fill
+tool and the RTL agree.
+
+**DDR3 by client, MB/s at 57.52 Hz, p0 (the bytes do not depend on the profile):**
+
+| Client | VF3 p50 / p99 / max | Bass Fishing p50 / p99 / max |
+|---|---|---|
+| Texture, P port | 59.2 / **99.0** / 102.4 | 12.0 / **76.5** / 77.3 |
+| Store (binning writes + replay reads) | 90.7 / **132.0** / 136.2 (writes 45.3, reads 88.0 at p99) | 29.2 / **124.3** / 124.9 |
+| Layer, 32 bits a pixel | 43.8 | 43.8 |
+| The three, p99 of each frame's sum | 194.1 / **265.4** / 270.9 | 85.6 / **216.3** / 216.9 |
+
+With the layer's scan-out (another 43.8 at 32 bits, 21.9 at 16) and polygon RAM (31.7, R46)
+VF3 comes to about 341 MB/s at p99, against R82's 642.9 MB/s at 8 in flight with background
+traffic. The frame time is not memory-bound at p0: see the next part.
+
+**What binds at mip.** On the four heaviest VF3 frames (about 1.0 M pixels each) the cache
+refuses input for 23-48 K cycles a frame and the Z band refuses pairs for 485-511 K: the
+shading lane at one pixel a clock is the floor (1.0 M cycles, 58% of a frame), and the frame
+is 1.19-1.35 M. Over all 400 VF3 frames the cache refuses 6.8% of the replay's cycles and the
+Z band 22.5% (level 0: 23.0% and 35.1%).
+
+### The cache's write gate by slot (`GATE = 1`, `r3d_rast_tcache.sv`)
+
+R87's gate wrote a fill only when every pixel before its allocator had read. It now waits only
+for the earlier pixels that read the victim's slot:
+- **Two true-dual-port M10K tables**, 1,024 x 7 each, hold the sequence number of the last
+  pixel to read each slot: x for banks 0-1, y for banks 2-3. A pixel's numbers are written the
+  cycle after it enters the FIFO, through both ports (the second only when its slot differs
+  from the first's). Banks on one line share a slot, so two ports are enough per table.
+- **An allocation reads its slot's two numbers the cycle after** (port a, from W's registered
+  set and way). Allocation and a_done never share a cycle, so a table is never read and
+  written on one edge, and every pixel before the allocator has been written before the read.
+- **The later of the two** is taken counting back from the allocator P (the nearer), kept in an
+  8-entry MLAB beside the fill queue. The fill may write when that pixel G has read:
+  G - rd_n >= P - rd_n on 7 bits, since the unread pixels are [rd_n, P), at most 63.
+- **A stale number** (a pixel read 128 or more pixels ago, or an unwritten word) can alias into
+  the window. It then only waits longer, and never past P itself, which is R87's gate. Once read
+  stays read, since rd_n only rises toward P.
+- **The fill sequence does not depend on the gate**: allocation is unchanged, so the bench's
+  fill check holds address for address.
+
+**The bug the whole rasteriser found.** The first form hung on VF3 frame f003240. With R87's
+gate no fill after an unread pixel's need can be written, so done_n - need stays in [-8, 0]
+and 5-bit counters were enough. With the new gate, fills allocated behind a waiting pixel are
+written while it waits, and the band stage holds the cache's output for thousands of cycles
+(a band flush is about 2,600): done_n ran 32 past a pixel's need, the modular test flipped
+and the pixel waited for ever. Behind a waiting pixel at most 4 fills a pixel for the 63
+behind it and the one in A can be written, under 4 x 64, so under GATE the counters and the
+need field are DB + 4 = 10 bits (the pixel FIFO's M10K word grows from 60 to 65 bits, still
+2 M10K). The cache bench missed it: its output stalls are single cycles. It now has `--hold
+LEN PERMILLE` (the output refused LEN cycles at a time), and the fault campaign runs it.
+
+**Checks, 0 wrong, the fill sequence address by address:**
+
+| Set | Pixels | Fills |
+|---|---|---|
+| VF3 400 frames, latency 20-40, gaps and stalls | 136,144,792 | 30,476,655 (R66's) |
+| Bass Fishing 400 frames, the same | 46,929,718 | 11,596,985 (R66's) |
+| Mip 1 / lod 1, 400 + 400 frames | 136,169,683 + 46,930,728 | 13,966,763 + 5,363,845 (R75's) |
+| `make test_real3d_rast100_tcache` (100 + 100 frames, random 2 M quads and 500 K at latency 2-4) and `_tcache64` | as R67 | as R67 |
+| Holds of 2,600 cycles on 0.1% of cycles: VF3 and Bass 100 frames, level 0 and mip; random 2 M | 28.6 M + 20.1 M, twice; 4 M | |
+
+The two counter widths and both gates pass every set above; GATE = 0 is R87's cache bit for
+bit (the counters and the FIFO word are R87's widths there).
+
+**Planted faults: 16 of 16 caught** (10 VF3 frames / 200,000 random quads / 10 frames with
+holds):
+
+| Fault | 10 frames | Random | Holds |
+|---|---|---|---|
+| K1 beat counters a bit short | - | - | caught |
+| K2 no fill gate | caught (4) | caught (24) | caught (268) |
+| K3 victim may be this pixel's way | - | caught | - |
+| K4 read a fill early | caught | caught | caught |
+| K5 lanes swapped | caught | caught | caught |
+| K6 no dedup of a shared line | caught | caught | caught |
+| K7 texel select swapped | caught | caught | caught |
+| K8 tag valid ignored | - | caught | - |
+| K9 no forward of Wq | caught | caught | caught |
+| K10 no forward of W | caught | caught | caught |
+| K12 A's rows not updated | - | caught | - |
+| K13 no re-read while C waits | caught | caught | caught |
+| K14 round-robin pointer stuck | caught | caught | caught |
+| K15 need counters at 5 bits (the hang) | - | - | caught (hang) |
+| K16 banks 2-3's table ignored | caught (1) | - | caught (3) |
+| K17 port b never writes | caught (1) | - | caught (1) |
+
+K1 is now caught only with holds (a full beat buffer needs fills to run ahead of a stalled
+reader, which the gate now allows only there). K16 and K17 are caught by 1-3 pixels in 10
+frames: a reader that loses its stamp must also be the one pixel still unread in the slot
+when the fill arrives. K2 alone is now weak too (4 pixels): the old gate's protection is
+needed only that rarely.
+
+**Frame time**, 400 + 400 frames each, all exact with 0 rule violations. "By slot" is the
+gate alone; "final" adds the timing changes below (the skid moves cycles by about 0.1%):
+
+| p0 | VF3 p50 / p99 / max | Bass Fishing p50 / p99 / max |
+|---|---|---|
+| Level 0, R87 | 63.1% / 148.9% / 159.8% | 25.1% / 81.8% / 82.0% |
+| Level 0, by slot | 61.1% / 138.7% / 149.2% | 24.7% / 79.4% / 79.7% |
+| Level 0, final | 61.0% / **138.6%** / 149.2% | 24.7% / **79.3%** / 79.6% |
+| Mip, R87 | 54.2% / 83.6% / 90.4% | 24.5% / 64.4% / 66.0% |
+| Mip, by slot | 53.4% / 82.2% / 90.2% | 24.2% / 63.4% / 65.1% |
+| Mip, final | 53.3% / **82.1%** / 90.2% | 24.2% / **63.3%** / 65.1% |
+
+| p1 (hostile) | VF3 p50 / p99 / max | Bass Fishing p50 / p99 / max |
+|---|---|---|
+| Level 0, R87 | 136.6% / 451.7% / 514.1% | 39.6% / 195.9% / 196.3% |
+| Level 0, final | 136.0% / 450.1% / 512.2% | 39.4% / 195.0% / 196.0% |
+| Mip, R87 | 94.1% / 128.7% / 137.0% | 38.4% / 103.0% / 104.2% |
+| Mip, final | 93.6% / 128.8% / 136.1% | 38.2% / 102.8% / 103.9% |
+
+On p1 the store binds (binning p99 148.4% VF3, 134.3% Bass Fishing at mip): its port takes
+acknowledges of up to 400 cycles on 30% of requests, one transaction at a time.
+
+Per frame at mip the new gate takes 0.2-4.4% off VF3's replay (p50 1.7%), and Bass Fishing's
+moves between -5.2% and +0.1%, with the same fill count in every frame.
+
+**It does not give max(pixels, 4 x fills).** R87 expected that. On f003240 at level 0
+(1,008,456 pixels, 321,638 fills; 4 x fills is 74.0% of a frame) the frame goes from 153.1% to
+142.7%. Instrumented under the cache bench, the gate now holds a fill on 1.2% of cycles; the
+fill window (8 fills from allocation to the write) is full on 40%, and the head pixel waits for
+its own fill on 57%. Each fill holds a slot for its latency, its four beats and its four write
+cycles, so 8 slots carry a line every 4.3-5 cycles at latency 13-40: (an estimate) the window, not the
+gate, binds next. With 16 (FB = 4), f003240 at level 0 is 121.7%; at mip the four heavy frames gain
+0.3-0.9%, and 2.7% at latency 60-120. Not taken: at mip it is worth under 3%, and it costs 4
+MLABs (the beat buffer doubles) and a bit on the beat counters, by estimate.
+
+### -40C
+
+R87's two paths, two of my own that the first moves made, and five older ones that came up
+behind them over four rounds of fits. Each moved without a cycle of latency: the whole bench's
+cycle counts on the four heaviest VF3 frames are unchanged by every change but the skid, which
+lets the Z walk run one pair ahead (-0.03 to -0.11%):
+
+| Path (fit that showed it) | What it was | Change |
+|---|---|---|
+| Edge, `z_r1 -> m_d2` (R87 s1, s2) | the rounds through two compares, two muxes and the 34-bit offset subtract | the compares made as stage 0 takes the pair, side by side; stage 1 only selects. round(y) > b is y > b + 1/2 and round(y) < b is y <= b - 1/2 on the 16.16 value, so two of them need no round |
+| Texel, `c4 -> bot5` (R87 s3) | the u lerp's subtract, the product and the add | the differences taken in stage 4 from the decoded texels; stage 5 is the product and the add |
+| Edge input, `o_y1 -> z_ys2` (my first try, -0.52 ns at 100C) | the whole first-row chain moved to stage 0: round, compare, mux, compare, mux | the split above |
+| Cache C, `w_v -> a_hit` (-0.26 ns) | W's and Wq's set compares in the forwarding | whether each bank's set is W's or Wq's registered a cycle early, from the set read that cycle |
+| Z band to Z walk, `a_y -> w_y, w_d4` (-0.41 ns at 100C, -0.21 at -40C) | the Z band's ready (its scoreboard test) through the top into every enable of the Z walk | a skid between them: the walk moves whenever the skid is empty, so its ready comes from registers |
+| Store reader, `gq -> g_hw` (-0.08 ns at -40C) | the word's decode, the add to the head and the FIFO test | the next word's op, address and last flag registered as gq moves |
+| Cache stamps, `lsx -> fs` (round 3, -0.19 ns at -40C) | the stamp tables' M10K output straight into the reduction | one more register (the M10K's output register); the stamps are known 3 cycles after the allocation, not 2, long before any line's beats |
+| Z band C to P, `c_m11 -> p_hi_q` (round 3, -0.32 / -0.19 ns) | R66's: the forward select, the 24-bit Z compare, the pass bits, the range mux and P's enable | P lives a cycle and is read only on p_v, so it loads every cycle; the range is formed from P's registers |
+| Fog unit, `cnt -> fc` (round 3, -0.07 ns at -40C) | a step's add and the channel's round in one cycle | the round a cycle after the channel's last step; the last channel's goes straight to o_fc |
+
+Fits (Quartus 17.0, standalone, 10 ns, every port a virtual pin, MIP = 0 as R87; ALM without
+the pins' 383-385):
+
+| Build | ALM | M10K | DSP | Slow 100C | Slow -40C |
+|---|---|---|---|---|---|
+| R87 | 7,717-7,772 | 100 | 45 | 100.0-102.7 MHz | 97.3-99.4 MHz |
+| Round 1: gate, edge chain in stage 0, texel, span queue, bin table 3 M10K | 7,815-7,842 | 100 | 45 | 95.0-97.4 | 93.1-96.3 |
+| Round 2: edge split, bin table back to 4, cache C | 7,815-7,841 | 101 | 45 | 96.0 / 102.9 / 106.8 | 97.9 / 99.2 / 105.9 |
+| Round 3: Z band skid, store reader | 7,882-7,902 | 101 | 45 | 103.0 / 100.7 / 96.9 | 98.2 / 100.2 / 98.1 |
+| **Round 4: cache stamps registered, Z band P, fog round** | **7,832-7,850** | **101** | **45** | **104.8 / 107.4 / 105.2** | **103.5 / 103.8 / 104.0** |
+
+Round 4 closes 10 ns at every corner on all three seeds: setup slack +0.34 to +0.69 ns (worst
+at -40C: the store's bin table into its write data, the texel's u product, the cache's
+allocation into the fill queue), hold at least +0.039 ns. Round 4 is smaller than round 3:
+loading P every cycle took about 30-45 ALM out of the Z band.
+
+**The configuration that runs, MIP = 1** (round 4's RTL, `set_parameter -name MIP 1`), three
+seeds: 8,266 / 8,279 / 8,266 ALM without pins (8,653-8,665 with them), 102 M10K, 45 DSP;
+105.2 / 102.0 / 104.1 MHz at 100C and 103.3 / 100.7 / 102.7 MHz at -40C, all closing; hold at
+least +0.056 ns. Seed 2's -40C margin is +0.068 ns, from table 2's M10K into the mip texel's
+address (u_tf v1b). MIP costs +423 to +447 ALM and +1 M10K here: the two texel instances
++300 (filter 417 to 576-578, address 152-154 to 291-295), the interpolants +45 to +65, the
+intake +30. **At MIP = 1 the rasteriser is 266-279 ALM over its 8,000.** R87's 7,719-7,774 was
+the MIP = 0 build, and R79's +390 to +419 for mip was the viewer's.
+
+**Checks after the timing changes** (every one exact, and cycle for cycle except the skid):
+- the whole rasteriser, 400 + 400 frames, p0 and p1, level 0 and mip: 0 wrong, 0 rule
+  violations (eight sets on the final RTL);
+- the front (400 + 400 frames, 0 of 29.9 M + 10.2 M spans wrong), the texel at level 0 and at
+  mip (136.1 M + 46.9 M texels, 3 M random), the interpolants and the intake at mip, the Z band
+  (`make test_real3d_rast100_zband`), the fog unit (3 M random records), the cache as above;
+- the M2.5 viewer (`make test_viewer`, which uses the same cache, edge, texel and Z band):
+  frame 7860, 0 of 190,464 pixels differ, video output matches.
+
+Planted faults on the changed blocks, after the last change: front E1-E4 4 of 4, texel T1-T5 5
+of 5, mip texel M3, M4, M8, M9 4 of 4, Z band B1-B11 11 of 11, fog V1-V6 6 of 6 (the same counts
+as R87's), cache K1-K17 16 of 16, and the top and store's S9, S14, S17, R1, R2, R3, R8 6 of 7. S9
+is R87's equivalent (det is not read). The edits that moved fault text: E2 (the compare at
+stage 0), K2 (the gate), K9 and K10 (the early set match), B9 (P's range), V3 (the round's
+operand), S9 and S17 (the decode function), R3 (the skid's s_new). T5's text matched twice
+since the MIP texel went in, so the harness had stopped running it; it now has context.
+
+### M10K
+
+- **Span queue to an MLAB:** -1 M10K, +10.8 ALM (one MLAB). Taken.
+- **Bin table, 4 to 3:** `max_depth = 256` makes Quartus build the 768 x 38 table from three
+  256 x 40 blocks, but adds a 38-bit 3:1 read mux and decode (44 ALM at map) in the table's
+  read-to-address path: -0.34 ns at 100C on round 1's seed 3. Not taken; a registered read
+  would change the store's timing.
+- **The gate's tables:** +2 M10K. The cache is 44 M10K (data 32, tags 8, pixel FIFO 2, stamps 2).
+
+Net: 101 M10K against R87's 100.
+
+### Area, section 8.4, change by change
+
+| Change | Technique | ALM | M10K | Note |
+|---|---|---|---|---|
+Per block, the fitter's "ALMs needed", R87's three seeds against round 4's (the same block
+moves 15-25 ALM between seeds, so small figures are noise):
+
+| Change | Technique (8.4) | ALM | M10K | Note |
+|---|---|---|---|---|
+| Write gate by slot, its stamps registered, C's set match early | storage out of flops: per-slot stamps in two true-dual-port M10K, the two ports writing a pixel's two banks; the later stamp reduced once, as the fill's entry is written, not at the gate | cache 842-849 to 865-872: +16 to +29 | +2 | stamps an 8-entry MLAB; counters 5 to 10 bits; the pixel FIFO word 60 to 65 bits in the same 2 M10K |
+| Edge first rows | reorder: the compares on the raw 16.16 value against a half-pixel offset, side by side, before the round is ever needed | front 1,278-1,288 to 1,293-1,297: +5 to +19 | 0 | four compare bits; r1, r3, b0, b1 kept |
+| Texel u lerp | reorder: the differences a stage earlier | filter 422-427 to 417: -5 to -10 | 0 | the 8 differences replace c4[1] and c4[3] |
+| Z band skid, P loaded every cycle | a registered ready (one pair, 163 bits); no enable where none is needed | Z band 635-653 to 682-685: +29 to +50 (the skid's mux is counted here) | 0 | round 3 had the skid alone at 711-729 |
+| Store reader decode | retime: the next word's op, address and last flag registered | store 904-919 to 916-918: within noise | 0 | |
+| Fog unit round | retime: the round a cycle later | 251-254 against 254-258: within noise | 0 | |
+| Span queue | MLAB / M10K trade | +10.8 | -1 | one MLAB |
+| Bin table 4 to 3 | MLAB / M10K trade (depth split) | +44 at map | -1 | not taken: its read mux failed timing |
+| **Rasteriser** | | **7,717-7,772 to 7,832-7,850: +60 to +126 (seed for seed +99, +60, +126)** | **100 to 101** | DSP 45 unchanged; 150-168 ALM under 8,000 |
+
+### Wrong turns
+
+- **The first gate deadlocked the whole rasteriser** on f003240, while the cache's own bench
+  passed 2.5 M pixels. The bench never held the output for long; the band stage does. 5-bit
+  counters were enough only because the old gate kept done_n behind every unread pixel.
+- **I expected max(pixels, 4 x fills), as R87 did.** The gate stopped binding at once and the
+  8-fill window took its place: level 0 gains 10 points at p99, not 75.
+- **I judged the gate first in the cache's bench.** Its memory drops 15% of beats and refuses
+  30% of requests whatever the flags say, so its return bus binds near 4.7 cycles a line; it
+  understated the gate's effect and hid the hang.
+- **At mip the gate was never going to matter much.** The cache refuses about 3% of a heavy
+  frame's cycles; the shading lane and the Z band bind. I should have read the stall split
+  first.
+- **Moving the edge's whole first-row chain into stage 0 only moved the failure** (-0.52 ns
+  on the new input path). The compares split from the selects closes.
+- **The bin table's depth split saved an M10K and cost a failing path** (-0.34 ns), in a read
+  the store uses for an address the same cycle.
+- **Each round of fits showed the next layer.** R87's two paths were fixed in round 2, and
+  rounds 2 and 3 each failed on paths that had sat just behind them (the cache's C stage, the
+  Z band's ready, then the Z band's own C stage, the stamps, the fog unit and the store). The
+  assembled rasteriser has many paths within 0.4 ns of 10 ns, and the seed moves a path by
+  about that much, so one seed closing proves little: seed 2 closed in rounds 2 and 3.
+- **My -40C path report never ran in round 1.** I matched the corner as `n40c`; Quartus 17
+  names it `7_slow_1100mv_-40c`, and the databases are deleted after the script. The script now
+  lists and reports every corner.
+- **A signed compare on a concatenation** (`{y[31], y} > h`) would have been unsigned; caught in
+  review and written with declared signed wires, then folded in Quartus (20 cases).
+- **T5's fault text matched twice** since the MIP texel path went in, so the harness would
+  have refused it; it now has the context to be unique.

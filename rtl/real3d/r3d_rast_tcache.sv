@@ -43,11 +43,18 @@
 // forwarded into A. This is R66's single lookup cycle cut in two (17.5 ns
 // from the tag word to the tag write).
 //
-// A fill's data waits in a buffer until every pixel before its own has read
-// (they may still want the victim's old line), then writes in four cycles.
-// Fills complete in order, so "fills allocated so far" is exact for an
-// in-order reader. inval (texture RAM written) re-sweeps the tags; C and A
-// hold for the sweep and one cycle after it.
+// A fill's data waits in a buffer until the pixels before its own that read
+// its slot have read (they may still want the victim's old line), then writes
+// in four cycles. GATE = 1: each slot keeps the sequence number of the last
+// pixel to read it (two true-dual-port M10K tables, banks 0-1 and 2-3, written
+// a cycle after the pixel enters the FIFO); an allocation reads its slot's two
+// numbers the cycle after, and the fill waits until the later has read. A
+// stale number can only make a fill wait longer, never past its own pixel.
+// GATE = 0: R66's rule, every earlier pixel has read (a frame then costs
+// about pixels + 4 x fills; study R87). Fills complete in order either way,
+// so "fills allocated so far" is exact for an in-order reader, and the fill
+// sequence does not depend on GATE. inval (texture RAM written) re-sweeps the
+// tags; C and A hold for the sweep and one cycle after it.
 
 /* verilator lint_off UNUSEDSIGNAL */
 module r3d_rast_tcache #(
@@ -55,7 +62,8 @@ module r3d_rast_tcache #(
   parameter int WAYS = 4,
   parameter int DB   = 6,    // log2 pixels ahead
   parameter int FB   = 3,    // log2 fills in flight
-  parameter int PW   = 32
+  parameter int PW   = 32,
+  parameter bit GATE = 1'b1  // 1: a fill waits only for earlier readers of its slot
 ) (
   input  logic          clk,
   input  logic          rst,
@@ -88,6 +96,12 @@ module r3d_rast_tcache #(
   localparam int D    = 1 << DB;
   localparam int F    = 1 << FB;
   localparam int XB   = (SB + 1) / 2, YB = SB / 2;
+  // fill counters. A pixel reads once done_n - need >= 0. With GATE = 0 no fill after an
+  // unread pixel's need can be written, so done_n - need lies in [-F, 0]: FB + 2 bits. With
+  // GATE = 1 fills allocated behind an unread pixel may be written while it waits (the band
+  // can hold the output for thousands of cycles), up to 4 a pixel for the D - 1 behind it and
+  // the one in A: under 4D, so DB + 4 bits.
+  localparam int NB   = GATE ? DB + 4 : FB + 2;
 
   function automatic logic [17:0] line_of(input logic [19:0] a);
     line_of = {a[19:11], a[9:1]};
@@ -147,7 +161,7 @@ module r3d_rast_tcache #(
   end
 
   // ---- sequence counters -------------------------------------------------------------------
-  logic [FB+1:0] alloc_n, iss_n, done_n;   // fills allocated, issued, written (mod 4F)
+  logic [NB-1:0] alloc_n, iss_n, done_n;   // fills allocated, issued, written (mod 2^NB)
   logic [DB:0]   pix_n, rd_n;              // pixels into the FIFO, pixels read
   logic [SB:0]   sw_n;                     // tag sweep: sets left
   logic          sw_q;                     // the cycle after the sweep: C's rows were read under it
@@ -182,15 +196,18 @@ module r3d_rast_tcache #(
   logic [PW-1:0] c_pay;
   logic [1:0]    c_j [4];
   logic [3:0]    c_eq [4], c_ss [4];       // the pixel's banks: same line, same set
-  // the rows as they stand: the read, Wq and W applied
+  // the rows as they stand: the read, Wq and W applied. Whether bank b's set is
+  // W's or Wq's is registered a cycle early, from the set read that cycle and the
+  // allocation's set (the compare was in R87's -40C C path)
   logic [RW-1:0] crow [4];
   logic [3:0]    c_hit;
   logic [WB-1:0] c_hway [4];
+  logic [3:0]    c_mw, c_mq;               // = w_v && set_of(c_ln[b]) == w_set; Wq's alike
   always_comb begin
     for (int b = 0; b < 4; b++) begin
       crow[b] = trq[b];
-      if (wq_v && set_of(c_ln[b]) == wq_set) crow[b] = put(crow[b], wq_way, wq_tg);
-      if (w_v  && set_of(c_ln[b]) == w_set)  crow[b] = put(crow[b], w_way, w_tg);
+      if (c_mq[b]) crow[b] = put(crow[b], wq_way, wq_tg);
+      if (c_mw[b]) crow[b] = put(crow[b], w_way, w_tg);
       c_hit[b] = 1'b0; c_hway[b] = '0;
       for (int w = 0; w < WAYS; w++) begin
         logic [EB-1:0] e;
@@ -245,10 +262,10 @@ module r3d_rast_tcache #(
   // fill queue {line, slot, allocating pixel}, indexed by the counters
   localparam int QW = 18 + LB + DB + 1;
   (* ramstyle = "MLAB, no_rw_check" *) logic [QW-1:0] fq [F];
-  wire fq_full = (alloc_n - done_n) == (FB+2)'(F);
+  wire fq_full = (alloc_n - done_n) == NB'(F);
 
   // pixel FIFO {need, payload, j x4, slot x4}
-  localparam int PFW = (FB + 2) + PW + 8 + 4 * LB;
+  localparam int PFW = NB + PW + 8 + 4 * LB;
   (* ramstyle = "M10K, no_rw_check" *) logic [PFW-1:0] pf [D];
   wire  [DB:0] pf_cnt  = pix_n - rd_n;
   wire         pf_full = pf_cnt >= (DB+1)'(D - 1);
@@ -285,7 +302,7 @@ module r3d_rast_tcache #(
   assign f_addr = fq_i[QW-1 -: 18];
   always_ff @(posedge clk) if (f_rvalid) bb[bb_wp[FB+1:0]] <= f_rdata;
   wire         beats4 = (bb_wp - bb_rp) >= (FB+3)'(4);
-  wire         gate_ok = rd_n == fq_r[DB:0];   // every pixel before the allocator has read
+  logic        gate_ok;
   wire         wr_go = (alloc_n != done_n) && (wk != 2'd0 || (beats4 && gate_ok));
   wire  [63:0] bq = bb[bb_rp[FB+1:0]];
   always_comb begin
@@ -294,10 +311,74 @@ module r3d_rast_tcache #(
     dwd1 = {bq[63:48], bq[31:16]};         // x = 3, x = 1
   end
 
+  // ---- the write gate ----------------------------------------------------------------------
+  // The fill at the head may write once no pixel before its allocator that reads its slot is
+  // still to read. Pixel numbers are DB + 1 bits; the unread ones are [rd_n, P), P the
+  // allocator, at most D - 1 of them, so a number G is unread when G - rd_n < P - rd_n.
+  // rd_n only rises toward P, so once read stays read.
+  generate if (GATE) begin : g_gate
+    // last reader of each slot: x through banks 0 and 1, y through 2 and 3. Port a: the
+    // first bank's write, or the read for an allocation; port b: the second bank's write
+    // when its slot is not the first's. Writes go a cycle after the pixel's a_done, reads
+    // a cycle after the allocation: alloc and a_done never share a cycle, so a table is
+    // never read and written on one edge, and every pixel before an allocator is written
+    // before the allocation's read.
+    (* ramstyle = "M10K, no_rw_check" *) logic [DB:0] lsx [1 << LB];
+    (* ramstyle = "M10K, no_rw_check" *) logic [DB:0] lsy [1 << LB];
+    logic          lw_v;
+    logic [3:0]    lw_use;
+    logic [LB-1:0] lw_s0, lw_s1, lw_s2, lw_s3;
+    logic [DB:0]   lw_px;
+    logic [DB:0]   w_px, lr_px;          // the allocator, with W and with the read
+    logic          lr_v;                 // the stamps of the allocation before last are out
+    logic [DB:0]   qx, qy;
+    logic          lq_v;                 // ... and registered once more (the M10K's output
+    logic [DB:0]   lq_px, qx2, qy2;      // went straight into the reduction: a -40C path)
+    wire  [LB-1:0] ax = lw_v ? lw_s0 : {w_set, w_way};
+    wire  [LB-1:0] ay = lw_v ? lw_s2 : {w_set, w_way};
+    wire           wxa = lw_v && lw_use[0];
+    wire           wxb = lw_v && lw_use[1] && !(lw_use[0] && lw_s1 == lw_s0);
+    wire           wya = lw_v && lw_use[2];
+    wire           wyb = lw_v && lw_use[3] && !(lw_use[2] && lw_s3 == lw_s2);
+    /* verilator lint_off MULTIDRIVEN */
+    always @(posedge clk) begin
+      if (wxa) lsx[ax] <= lw_px;
+      qx <= lsx[ax];
+    end
+    always @(posedge clk) if (wxb) lsx[lw_s1] <= lw_px;
+    always @(posedge clk) begin
+      if (wya) lsy[ay] <= lw_px;
+      qy <= lsy[ay];
+    end
+    always @(posedge clk) if (wyb) lsy[lw_s3] <= lw_px;
+    /* verilator lint_on MULTIDRIVEN */
+    // the later reader: the nearer of the two counting back from P (a stale number may
+    // alias nearer, which only waits longer)
+    wire [DB:0] dx = lq_px - qx2 - (DB+1)'(1), dy = lq_px - qy2 - (DB+1)'(1);
+    wire [DB:0] gl = lq_px - (DB+1)'(1) - ((dx < dy) ? dx : dy);
+    (* ramstyle = "MLAB, no_rw_check" *) logic [DB:0] fs [F];
+    logic [NB-1:0] st_n;                 // fills whose last reader is known
+    always_ff @(posedge clk) if (lq_v) fs[st_n[FB-1:0]] <= gl;
+    always_ff @(posedge clk) begin
+      lw_v <= a_done && !rst; lw_use <= a_use;
+      lw_s0 <= slot[0]; lw_s1 <= slot[1]; lw_s2 <= slot[2]; lw_s3 <= slot[3]; lw_px <= pix_n;
+      w_px <= pix_n; lr_px <= w_px;
+      lr_v <= w_v && !rst;
+      lq_v <= lr_v && !rst; lq_px <= lr_px; qx2 <= qx; qy2 <= qy;
+      if (rst) st_n <= '0;
+      else if (lq_v) st_n <= st_n + 1'b1;
+    end
+    wire [DB:0] g_dl = fs[done_n[FB-1:0]] - rd_n;
+    wire [DB:0] g_dp = fq_r[DB:0] - rd_n;
+    assign gate_ok = (st_n != done_n) && (g_dl >= g_dp);
+  end else begin : g_all
+    assign gate_ok = rd_n == fq_r[DB:0];   // every pixel before the allocator has read
+  end endgenerate
+
   // ---- R: the head, read a cycle ahead into ph --------------------------------------------------
   logic [PFW-1:0] ph;
   logic           ph_v;
-  wire  [FB+1:0]  ph_need = ph[PFW-1 -: FB+2];
+  wire  [NB-1:0]  ph_need = ph[PFW-1 -: NB];
   wire            out_free = !o_valid || o_ready;
   wire            r_go = ph_v && ($signed(done_n - ph_need) >= 0) && out_free;
   logic           r_v;
@@ -317,7 +398,7 @@ module r3d_rast_tcache #(
   always_ff @(posedge clk) begin
     if (rst) begin
       l0_v <= 1'b0; c_v <= 1'b0; a_v <= 1'b0; o_valid <= 1'b0; r_v <= 1'b0; ph_v <= 1'b0;
-      w_v <= 1'b0; wq_v <= 1'b0; sw_q <= 1'b0;
+      w_v <= 1'b0; wq_v <= 1'b0; sw_q <= 1'b0; c_mw <= '0; c_mq <= '0;
       alloc_n <= '0; iss_n <= '0; done_n <= '0; pix_n <= '0; rd_n <= '0;
       sw_n <= (SB+1)'(SETS); rr <= '0; bb_wp <= '0; bb_rp <= '0; wk <= 2'd0;
     end else begin
@@ -361,6 +442,10 @@ module r3d_rast_tcache #(
       // W, Wq
       w_v <= alloc; w_set <= a_set_mb; w_way <= vic; w_tg <= a_tag_mb; w_base <= a_rowe[mb];
       wq_v <= w_v && !sweeping; wq_set <= w_set; wq_way <= w_way; wq_tg <= w_tg;
+      for (int b = 0; b < 4; b++) begin    // tra is C's set next cycle
+        c_mw[b] <= alloc && tra[b] == a_set_mb;
+        c_mq[b] <= w_v && !sweeping && tra[b] == w_set;
+      end
       if (alloc) begin rr <= vic + WB'(1); alloc_n <= alloc_n + 1'b1; end
       if (a_done) pix_n <= pix_n + 1'b1;
       // fills

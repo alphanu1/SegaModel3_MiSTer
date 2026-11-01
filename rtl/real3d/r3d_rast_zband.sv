@@ -163,9 +163,15 @@ module r3d_rast_zband #(
   logic        p_v;
   logic [TW-1:0] p_tag;
   logic [EW-1:0] p_e;
-  logic [8:0]  p_lo_q, p_hi_q;
+  logic [8:0]  p_x1;
   wire  [2:0]  p_row = p_e[61:59];
   wire  [1:0]  p_m   = p_e[49:48];
+  // the pushed range, from P's own registers: P lives a cycle and is read only on p_v, so
+  // it loads every cycle and the C stage's pass bits end at P's D inputs (no c_push enable,
+  // no range mux after the compare: a -40C path)
+  wire  [8:0]  p_px = p_e[58:50];
+  wire  [8:0]  p_lo_q = p_m[0] ? p_px : p_x1;
+  wire  [8:0]  p_hi_q = p_m[1] ? p_x1 : p_px;
   logic [8:0] sb_lo [8];
   logic [8:0] sb_hi [8];
 
@@ -229,8 +235,6 @@ module r3d_rast_zband #(
   wire        cw0 = pb0 && c_zk == 2'd1;
   wire        cw1 = pb1 && c_zk == 2'd1;
   wire        c_push = adv && c_v && c_zk == 2'd2 && (c_pass != 2'b00);
-  wire [8:0]  p_lo = c_pass[0] ? c_x : c_x1;
-  wire [8:0]  p_hi = c_pass[1] ? c_x1 : c_x;
 
   // ---- RAM ports -----------------------------------------------------------------
   wire sw_go = sw_on && !(sw_left == 12'd1 && c_valid);
@@ -314,10 +318,7 @@ module r3d_rast_zband #(
       if (sw_go && sw_left == 12'd1) begin w1v0 <= 1'b0; w1v1 <= 1'b0; w2v0 <= 1'b0; w2v1 <= 1'b0; end
       // P, then the pending FIFO
       p_v <= c_push;
-      if (c_push) begin
-        p_tag <= c_tag; p_e <= {gen, c_y[2:0], c_x, c_pass, c_z1, c_z0};
-        p_lo_q <= p_lo; p_hi_q <= p_hi;
-      end
+      p_tag <= c_tag; p_e <= {gen, c_y[2:0], c_x, c_pass, c_z1, c_z0}; p_x1 <= c_x1;
       if (p_v) pf_wp <= pf_wp + CA'(1);
       if (v_take) begin
         v_full <= 1'b1;

@@ -1,0 +1,90 @@
+<misterromdescription>
+    <!--
+      Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1
+      SPDX-License-Identifier: GPL-3.0-or-later
+
+      Virtua Fighter 3 (Japan, Revision D). Stage A of study D-37: CPU, bus, tile generator, no sound,
+      no 3D. From MAME 0.289 model3.cpp ROM_START(vf3); sim/system/m3_mra.py
+      writes it, and packs the same image for the system bench.
+
+      SDRAM (bytes): 0x0000000 banked CROM, 64 MiB; 0x4000000 VROM, 32 MiB;
+      0x6000000 fixed CROM, 2 MiB; 0x6200000 backup RAM, 128 KiB of 00.
+      Word form: the PowerPC's 32-bit word at A is the little-endian word at
+      SDRAM A. The sound ROMs (68000 program, samples) are not loaded (D-8).
+    -->
+    <name>Virtua Fighter 3 (Japan, Revision D)</name>
+    <setname>vf3</setname>
+    <rbf>Model3</rbf>
+    <mameversion>0289</mameversion>
+    <year>1996</year>
+    <manufacturer>Sega</manufacturer>
+    <category>Fighter</category>
+
+    <rom index="0" zip="vf3.zip" md5="none">
+        <!-- 0x0000000  CROM0, 16 MiB (banks 0-1) -->
+        <interleave output="64">
+            <part name="mpr-19194.2" crc="66254702" map="21000000"/>
+            <part name="mpr-19193.1" crc="7bab33d2" map="00210000"/>
+            <part name="mpr-19196.4" crc="f386b850" map="00002100"/>
+            <part name="mpr-19195.3" crc="bd5e27a3" map="00000021"/>
+        </interleave>
+        <!-- 0x1000000  CROM1, 16 MiB (banks 2-3) -->
+        <interleave output="64">
+            <part name="mpr-19198.6" crc="d8ee5032" map="21000000"/>
+            <part name="mpr-19197.5" crc="a22d76c9" map="00210000"/>
+            <part name="mpr-19200.8" crc="74941091" map="00002100"/>
+            <part name="mpr-19199.7" crc="9f80d6fe" map="00000021"/>
+        </interleave>
+        <!-- 0x2000000  CROM2, 16 MiB (banks 4-5) -->
+        <interleave output="64">
+            <part name="mpr-19202.10" crc="aaa086c6" map="21000000"/>
+            <part name="mpr-19201.9" crc="7c4a8c31" map="00210000"/>
+            <part name="mpr-19204.12" crc="2f93310a" map="00002100"/>
+            <part name="mpr-19203.11" crc="0afa6334" map="00000021"/>
+        </interleave>
+        <!-- 0x3000000  CROM3, 16 MiB (banks 6-7) -->
+        <interleave output="64">
+            <part name="mpr-19206.14" crc="71a98d73" map="21000000"/>
+            <part name="mpr-19205.13" crc="199c328e" map="00210000"/>
+            <part name="mpr-19208.16" crc="08f30f71" map="00002100"/>
+            <part name="mpr-19207.15" crc="2ce1612d" map="00000021"/>
+        </interleave>
+        <!-- 0x4000000  VROM block 0, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19211.26" crc="9c8f5df1" map="00000021"/>
+            <part name="mpr-19212.27" crc="75036234" map="00002100"/>
+            <part name="mpr-19213.28" crc="67b123cf" map="00210000"/>
+            <part name="mpr-19214.29" crc="a6f5576b" map="21000000"/>
+        </interleave>
+        <!-- 0x4800000  VROM block 1, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19215.30" crc="c6fd9f0d" map="00000021"/>
+            <part name="mpr-19216.31" crc="201bb1ed" map="00002100"/>
+            <part name="mpr-19217.32" crc="4dadd41a" map="00210000"/>
+            <part name="mpr-19218.33" crc="cff91953" map="21000000"/>
+        </interleave>
+        <!-- 0x5000000  VROM block 2, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19219.34" crc="c610d521" map="00000021"/>
+            <part name="mpr-19220.35" crc="e62924d0" map="00002100"/>
+            <part name="mpr-19221.36" crc="24f83e3c" map="00210000"/>
+            <part name="mpr-19222.37" crc="61a6aa7d" map="21000000"/>
+        </interleave>
+        <!-- 0x5800000  VROM block 3, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19223.38" crc="1a8c1980" map="00000021"/>
+            <part name="mpr-19224.39" crc="0a79a1bd" map="00002100"/>
+            <part name="mpr-19225.40" crc="91a985eb" map="00210000"/>
+            <part name="mpr-19226.41" crc="00091722" map="21000000"/>
+        </interleave>
+        <!-- 0x6000000  fixed CROM, 2 MiB (FFE00000-FFFFFFFF) -->
+        <interleave output="64">
+            <part name="epr-19228d.18" crc="a2470c78" map="21000000"/>
+            <part name="epr-19227d.17" crc="8b650966" map="00210000"/>
+            <part name="epr-19230d.20" crc="43c08240" map="00002100"/>
+            <part name="epr-19229d.19" crc="6773f715" map="00000021"/>
+        </interleave>
+        <!-- 0x6200000  backup RAM, 128 KiB of 00 (Supermodel's fresh state; MAME fills FF) -->
+        <part repeat="0x20000">00</part>
+    </rom>
+</misterromdescription>

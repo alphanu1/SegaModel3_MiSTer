@@ -22,7 +22,11 @@
 // different victim shows as a wrong fill even when every texel is right.
 //
 //   Vr3d_rast_tcache --tris DIR --dumps DIR [--frames N] | --random N
-//   [--lat MIN MAX] [--gap PCT] [--stall PCT] [--mip]
+//   [--lat MIN MAX] [--gap PCT] [--stall PCT] [--hold LEN PERMILLE] [--mip]
+//
+// --hold: the output also refused for LEN cycles at a time, starting on PERMILLE
+// per mille of cycles (the band stage holds the cache for a flush, thousands of
+// cycles: fills behind a waiting pixel then run on past its need).
 //
 // --mip: render_d25 with mip = 1, lod = 1, each pixel's quad at its level
 // (texel_addr4 at d25_px::lv0, the addresses r3d_rast_texel MIP = 1 forms).
@@ -80,7 +84,7 @@ struct hook : d25_hook {
   }
 };
 
-int lat0 = 20, lat1 = 60, gap = 10, stall = 10;
+int lat0 = 20, lat1 = 60, gap = 10, stall = 10, hold_len = 0, hold_pm = 0;
 
 #ifndef TC_SB
 #define TC_SB 8
@@ -132,12 +136,14 @@ static uint64_t run(Vr3d_rast_tcache &t, texram const &tex, std::vector<req> con
   int beat = 0;
   size_t si = 0, oi = 0;
   uint64_t bad = 0, idle = 0;
+  int hold = 0;
   std::vector<uint32_t> want, got;
   for (auto const &q : v) cm.pixel(q, want);
   while (oi < v.size() && idle < 100000) {
     bool const offer = si < v.size() && !pct(gap);
     if (offer) { req const &q = v[si]; t.i_a0 = q.a[0]; t.i_a1 = q.a[1]; t.i_a2 = q.a[2]; t.i_a3 = q.a[3]; t.i_use = q.use; t.i_pay = uint32_t(si); }
-    t.i_valid = offer; t.o_ready = !pct(stall); t.inval = 0;
+    if (hold > 0) hold--; else if (hold_len && int(rng() % 1000) < hold_pm) hold = hold_len;
+    t.i_valid = offer; t.o_ready = !pct(stall) && hold == 0; t.inval = 0;
     t.f_ack = !pct(30);
     bool const rv = !mq.empty() && mq.front().due <= cyc && !pct(15);
     t.f_rvalid = rv;
@@ -182,6 +188,7 @@ int main(int argc, char **argv) {
     else if (a == "--frames") frames = std::atoi(nx().c_str()); else if (a == "--random") nrand = std::atoi(nx().c_str());
     else if (a == "--lat") { lat0 = std::atoi(nx().c_str()); lat1 = std::atoi(nx().c_str()); }
     else if (a == "--gap") gap = std::atoi(nx().c_str()); else if (a == "--stall") stall = std::atoi(nx().c_str());
+    else if (a == "--hold") { hold_len = std::atoi(nx().c_str()); hold_pm = std::atoi(nx().c_str()); }
     else if (a == "--mip") g_mip = true;
   }
   Verilated::commandArgs(argc, argv);
