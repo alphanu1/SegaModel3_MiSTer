@@ -19,6 +19,10 @@
   //                           (M3SCRIPTS_LOG). Measurement only.
   //   sm3-builds/supermodel-scripts  Supermodel copy with the 53C810 capture
   //                           (M3SCRIPTS_LOG). Measurement only.
+  //   sm3-builds/supermodel-sys  Supermodel clone with the tile dump and the
+  //                           system bus trace (M3BUS_TRACE). Measurement only.
+  //   sm3-builds/supermodel-sb   copy of supermodel-sys with the stage B Real3D
+  //                           memory dumps and frame grabs (M3SB_DIR). Measurement only.
   //   tools/sloppc603-ref     SloPPC603, a GPL-2.0+ 603e core under review.
   //   tools/ddr3test-ref      Robert Peip's MiSTerDDR3Test, read for its DDR3 reader.
   //   tools/*-ref             read-only reference clones of other cores.
@@ -35,6 +39,8 @@
     "sm3-builds/mame289-tg",
     "sm3-builds/mame289-scripts",
     "sm3-builds/supermodel-scripts",
+    "sm3-builds/supermodel-sys",
+    "sm3-builds/supermodel-sb",
     "tools/sloppc603-ref",
     "tools/ddr3test-ref"
   ],

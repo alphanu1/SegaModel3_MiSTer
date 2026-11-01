@@ -1,53 +1,33 @@
 # Handoff
 
-## Current state (2026-11-01)
+## Current state (2026-11-01, night)
 
-Committed today from a verified snapshot (see the log). The study's §15 R64–R82 and
-D-32–D-36 carry every finding and decision; this is the summary.
+The study's §15 R83–R94 and D-37–D-42 carry every finding and decision; this is the summary.
 
-- **CPU** (`rtl/cpu`):
-  - Timing pass: the spike runs at 108–110 MHz (R70).
-  - D-30 built: a 64-entry BTB looked up a request ahead, two-word fetch, and the 603e's
-    own branch look-ahead (R78). Frames lost in the CPI model: 360 → 15.
-  - On the board: every report identical to the simulation, P00 000011DA uncached and
-    00001E34 cached, P09 unchanged.
-  - Two-word fetch costs about 880 ALM for 5 frames lost. D-36 turns it off once the
-    regression passes with `FETCH2 = 0`; the default in the tree is still on.
-  - Full-build closure at 100 MHz holds on one seed in three per form. Most failing paths
-    are test-harness paths.
-- **Geometry** (`rtl/real3d`):
-  - D-32's M10K trade (R68).
-  - Two late-acknowledge bugs fixed (R73), with a hostile-timing bench to catch that kind.
-  - Set-up on the pool (`SETUP_OUT`, R76): 77% / 71% p99 for VF3 / Bass Fishing. Daytona 2
-    is at 118%.
-  - The LOD word for nearest mip (R75).
-  - Default build 7,505–7,526 ALM, meeting 100 MHz at both slow corners.
-- **Rasteriser:**
-  - Blocks 1–7 are built and exact: Z band, interpolants, fog depth, colour, texel,
-    texture cache at 100 MHz, band buffers (R66, R67).
-  - Nearest mip is built (R75).
-  - Blocks 8–9 (binned store, top level) are in progress and not in this commit.
-- **DDR3:**
-  - A pipelined master `m3_ddr3p`. On the board after a power cycle it reaches 794 MB/s at
-    16 reads in flight, and 486 MB/s at 4 with the frame-buffer and store traffic (R82).
-  - Every DDR3 client waits for hps_io and `RESET` low for 100 ms (R71). An early access
-    wedged the port until a power cycle (R72).
-  - Textures stay in DDR3 (D-33); the frame buffer stays too (D-34).
-- **M2.5 viewer** (`quartus/m3_viewer`): VF3 frame 7860, from a dump, on the MiSTer.
-  - Untextured (R64), textured (R74), and with the geometry's set-up and nearest mip (R79).
-  - All three are bit-exact against the simulation on the board.
-  - A frame still takes about 0.25 s, waiting for the binned store.
-- **Tile generator** (M0-E, R77): 553–560 ALM, 54 M10K, exact against both emulators.
-  Supermodel is the default. The stencil's bit order needs cabinet footage.
-- **53C810** (M0-F, R80): one opcode (MMOV), single-stepped, no VF3 quirk. 260 ALM.
-- **Builds:**
-  - Multicorner timing is on (D-35); the −40C corner had been hiding misses.
-  - Projection (R81): about 40.6K ALM without two-word fetch, against 41K usable.
+- **VF3 runs on the MiSTer with 3D** (R94). The integrated build at 90 MHz boots, shows the warning and SEGA logo,
+  then draws the attract fights textured over the tile layers: Aoi, Kage, Pai, Jacky, Lau and Lion on the beach
+  stage. A few glitches are untriaged (flat-coloured suits, a full-screen blur, particle sprays).
+- **Stage A** (R85, R92): the CPU, the bus (MPC105, system registers, IRQs), the 53C810, JTAG, I/O stubs, the tile
+  generator, the MRA loader (`mra/`, board path `_Arcade/_Model3/`) and a hex debug overlay with CPI on the UART.
+  The attract runs with tiles only at 100 MHz.
+- **Stage B** (R89, R94): Real3D command and status, memory windows written to both copies with deferred runs,
+  texture upload from a DDR3 ring, the compositor and a 7-port DDR3 arbiter. Exact against Supermodel on VF3's
+  trace.
+- **CPU fixes found on the board:**
+  - misaligned word accesses (R85/R86, D-39);
+  - integer load-with-update with rD = rB (R91).
+- **CPU additions:** the D-cache snoop port (R90, not wired yet). PVR stays 0x00060101 until the bus snoops (D-41).
+- **Rasteriser:** blocks 8–9 (R87), tuned (R88). VF3 p99 is 82% of a frame with nearest mip.
+- **Builds:** multicorner timing (D-35); one seed for test fits.
+- **Area:** 41,346 ALM (99%) without sound or I/O. The full release needs about 2,500+ ALM freed (R81, R93, R94).
+- **Timing:** the integrated build closes only at 90 MHz; the CPU spike runs 99–108 MHz at 9.09 ns.
 
-### In progress (uncommitted, in the working tree)
-- Rasteriser blocks 8–9: `r3d_rast_store`, `r3d_rast`, `r3d_rast_fogvp`, their benches and
-  the Makefile and `faults_rast.py` hunks.
-- D-36: the CPU regression with `FETCH2 = 0` before the default changes.
+### Next
+- Triage the 3D glitches against Supermodel: run the bench chain to the fights (`sm3-builds/sysb/ext2.sh`).
+- An area pass with targets per block: the viewer read adapters (~960), stage B, mip, CPU additions, M10K trades,
+  and a smaller 68000 before sound.
+- Wire the snoop (`m3_bus`), then PVR 0x00060103.
+- Timing back to 100 MHz, then 110 (D-38). The `lmw` held base (R91).
 
 ## State on 2026-10-30
 
@@ -133,6 +113,12 @@ second SDRAM).
 
 ## Findings this session, including the wrong turns
 
+- 2026-11-01 (night): VF3 crashed twice on CPU gaps that the core benches never generated: a misaligned word load
+  (R85), and lbzux with rD = rB (R91). Both were found from the board overlay plus the system bench; the
+  decrementer interrupt seen before the second crash was a red herring.
+- 2026-11-01: a build with only 1 ps of hold miss died at boot, while builds with -0.9 ns of setup slack ran.
+  Hold is now checked on every fit.
+- 2026-11-01: the 100 MHz integrated build (-2 ns) was dead on the board; at 90 MHz the 3D runs.
 - 2026-11-01: the first DDR3 probe builds touched the port at PLL lock, before Main releases
   the FPGA ports. That wedged the port across core reloads until a power cycle. Four rounds of
   diagnosis (owner queue, terminator, late take) ran on a dead port and were wrong (R71, R72).

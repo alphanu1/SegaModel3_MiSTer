@@ -15,9 +15,11 @@ sources section instead.
   `Template.qpf`, `Template.sdc` and `Template.srf` as the `Model3.*` project
   files; `rtl/pll.v`, `rtl/pll.qip`, `rtl/pll/`; `rtl/mycore.v`, `rtl/lfsr.v` and
   `rtl/cos.sv` as `rtl/video/` (the test picture).
-- Changed: `Model3.sv` adds the CPU bring-up system and drives `UART_TXD`;
+- Changed: `Model3.sv` is the stage-A system (`rtl/sys/m3_system.sv`), with the CPU
+  bring-up system behind `M3_CPUTEST`; both drive `UART_TXD`;
   the core name in `CONF_STR`; the PLL gains a second output (`outclk_1`, the
-  CPU clock) in `rtl/pll.v` and `rtl/pll/pll_0002.v`; `Model3.sdc` adds the CPU
+  CPU clock, and the stage-A system's 100 MHz) and a third (`outclk_2`, 100 MHz at
+  180 degrees, `SDRAM_CLK`) in `rtl/pll.v` and `rtl/pll/pll_0002.v`; `Model3.sdc` adds the CPU
   reset synchroniser's false path; `files.qip` lists this project's sources.
 
 ## Model 2 core (same author)
@@ -29,6 +31,24 @@ sources section instead.
 - Also taken, at `47edd9dc00`: `rtl/tgp/fp_mul.sv`, `fp_add.sv` and `fp_div.sv` as
   `rtl/real3d/r3d_fp_mul.sv`, `r3d_fp_add.sv` and `r3d_fp_div.sv` for the Real3D
   geometry (module names prefixed, timescale removed; used with SUBNORM = 1).
+
+- Also taken, at `47edd9dc00`: `rtl/io/m2_93c46.sv` as `rtl/io/m3_93c46.sv` (renamed;
+  a write-busy time `T_WP` added, sim/system/notes.md). `rtl/io/m3_io.sv` is written for
+  Model 3 from `rtl/io/m2_315_5649.sv` (the same chip): the port semantics are the same,
+  the bus lanes, port B, the DIP and analog defaults are Model 3's, and the port
+  function is a mux.
+- Also taken earlier, unchanged: `rtl/mem/m2_sdram.sv`, `rtl/video/m2_video_timing.sv`
+  (used by the stage-A system, `rtl/sys/m3_system.sv`).
+
+## Supermodel, Model 3 system behaviour (transcribed, stage A)
+
+- Source: https://github.com/trzy/supermodel, commit `036af1c`
+- Files: `Src/Model3/Model3.cpp` (the system registers, IRQ timing, Real3D status),
+  `Src/Model3/JTAG.cpp` / `JTAG.h` (the Step 1.0 scan chain, ID codes and register
+  lengths), `Src/Model3/IRQ.cpp`
+- Licence: GPL-3.0-or-later, the same as this project.
+- Taken: behaviour only, re-expressed in `rtl/sys/m3_bus.sv` and `rtl/sys/m3_jtag.sv`
+  (no code copied); the instrumentation is `tools/mame-census/supermodel-bus-trace.patch`.
 
 ## MAME 0.289, Real3D geometry (behaviour transcribed)
 

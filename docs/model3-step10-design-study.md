@@ -1092,7 +1092,13 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-33 | Texture memory goes on DDR3 behind a pipelined read master (R67): no 16-bit SDRAM form carries VF3, and the best is 220.6% of a frame. Before the cache size (32 or 64 KiB) and the number of fills in flight (8 or 16) are fixed, the viewer measures two things on the board: DDR3 read latency, and whether the f2sdram bridge takes several pending reads. Texture sampling uses the nearest mip level by default; trilinear stays a parameter, to come back if hardware footage shows the blend. The two equal each other to 0.01 dB, and trilinear costs VF3 99.7% of a frame at 32 KiB and latency 30, against 75.9% for nearest. This goes against §7.3 and D-6. There, texture sheets were ruled out of DDR3 on my Model 2 core (Model 2 R557, latency), and the core's DDR3 port was taken as about 100 MB/s usable. Those figures came from `m2_ddr3`'s one-request-at-a-time form. If the probe shows the pipelined master cannot do much better, neither memory carries VF3's textures. The fallbacks are a per-polygon texture prefetch (§7.3), a larger cache, or textures split across DDR3 and the second SDRAM. |
 | D-34 | With textures in DDR3 (D-33), the 3D layer and the binned polygon store may have to come out of DDR3 to the second SDRAM. That is decided by measurement, not now. The viewer's DDR3 probe measures texture-pattern reads, latency and MB/s at 1–16 in flight, in three cases: idle, with layer scan-out only, and with full drawing traffic. It also notes the framework scaler's share. R67's model puts VF3 nearest at 75.9% alone and 80.3% with 180 MB/s of other traffic, and it leaves the scaler out. If sharing costs too much, the move is cheap, because both clients already sit behind D-20's switchable request contract (`r3d_rast_band`'s flush on `m2_ddr3`/`m2_sdram`). A 16-bit layer is about 22 MB/s written and 22 MB/s scanned out, both sequential, which suits SDRAM. Until the measurement and the modules exist, D-6's placement stands. |
 | D-35 | Timing is analysed at every corner (`TIMEQUEST_MULTICORNER_ANALYSIS ON`) in `Model3.qsf`, the viewer and the probe, against the MiSTer template's OFF. With it off, the fitter optimised and timed the slow 100C model only, and the −40C misses went unseen (R73, R79). Compiles take longer. Block spikes report both slow corners from their own timing scripts. |
-| D-36 | Two-word fetch (`FETCH2`) is turned off, and the BTB and the 603e look-ahead stay. The projection (R81) is about 41.4K ALM with it, over the 41,000 ceiling, and about 40.6K without. It costs about 880 ALM for 5 frames lost in 56,700 (R78). It stays a parameter. The default changes only after the core regression has passed with `FETCH2 = 0`, `BTB = LA = 1`, a combination not yet benched on its own. |
+| D-36 | Two-word fetch (`FETCH2`) is turned off, and the BTB and the 603e look-ahead stay. The projection (R81) is about 41.4K ALM with it, over the 41,000 ceiling, and about 40.6K without. It costs about 880 ALM for 5 frames lost in 56,700 (R78). It stays a parameter. The default changes only after the core regression has passed with `FETCH2 = 0`, `BTB = LA = 1`, a combination not yet benched on its own. Built 2026-11-01 (R83): the saving measured about 520 ALM, not 880. |
+| D-37 | The first proof of concept is VF3's attract mode, without I/O or sound. Sound stays out (D-8). I/O is a stub: no coin, no buttons, service and test off, and the JVS/I/O board reads as idle, so the game runs its attract loop. Staged: (A) CPU, MPC105 bridge and memory map, board RAM, ROMs in SDRAM from the MRA, interrupts, the 53C810, the tile generator and video out, with the Real3D as a status-handshake stub. Pass: the warning and SEGA logo screens, which are tile layers (R84). (B) The Real3D fed live by the CPU and the 53C810: polygon RAM, textures and culling through the real geometry and rasteriser, composited with the tiles. Pass: the attract fights drawn. |
+| D-38 | The CPU's long-term target is 110 MHz, closing at every corner, rather than buying back frames with area. At 110 MHz the CPI model loses 0 frames at singles-at-4 and 3 at the built fast path (R83). That is what two-word fetch (about 520 ALM) would buy at 100 MHz, so it stays off (D-36). The release keeps 100 MHz until 110 closes. Every CPU timing fix now aims for margin toward 9.09 ns, not just closure at 10 ns. This revises R58's 110 MHz from an aim to the target, after D-30. |
+| D-39 | A misaligned integer access that crosses a 4 KB page is split in hardware inside a BAT block. It takes the alignment exception only when page-translated (MSR[DR]=1, no BAT hit) or when the crossing leaves the BAT block. The 603e manual's §4.5.6.1.1 is ambiguous for BAT regions; MAME splits and never traps; Supermodel has no MMU. Model 3's boot ROM treats every alignment exception as fatal, so no game relies on the trap: if the chip traps, games never do this, and if it splits, games that do it keep working. Misaligned accesses within a page are split in hardware as the manual says (R85). |
+| D-40 | Test builds may run up to about 41,500 ALM with loose slack; a release must close every corner and come in under budget, which may need optimisation. The attract proof of concept (D-37) has no sound (about 4,360 ALM, R81) and no real I/O, so it projects at about 22K (stage A, R85) + geometry 7.9K + rasteriser about 8K + stage B about 1K, about 39K: well under. |
+| D-41 | The CPU reports PVR 0x00060103 (603e rev 1.3, "Stretch") on Step 1.0, as MAME does; Supermodel uses 0x00071202 (603r). VF3's boot code and miss handler test the PVR. With version 6 and revision below 0x0103 they set W in every BAT and in the RPA, working round an early 603e bug, so the core's former 0x00060101 ran RAM write-through on a path neither emulator takes. At 1.3, RAM is copy-back. The board's real revision is unknown. The value is a parameter of `ppc_cpu`, set per step in the system (D-14). The CPU test harness keeps its own default, so its signatures do not move. Revised the same day: VF3 never flushes the D-cache before the 53C810 reads RAM. Its SCRIPTS lists and DMA sources can sit dirty, and the real board stays coherent only because the MPC105 snoops PCI master cycles and the 603e casts out the dirty line. Our D-cache has no snoop port. So board builds stay on 0x00060101 (write-through, DMA correct) until a snoop port is built and proven: DMA reads cast out dirty lines first, DMA writes invalidate. Then the system moves to 0x00060103. |
+| D-42 | Daytona 2's proof of concept accepts its geometry at about 118% of a frame (R76). Heavy frames then take two frames to draw, about 30 fps there, which is fine for a proof of concept. Its ROM beyond the 128 MiB SDRAM (about 200 MiB in all) goes to DDR3 while the second SDRAM is awaited: video ROM first, since it is read model by model and prefetchable (R82's numbers leave room). I want one core for every step, as D-14 says, not separate RBFs as on Model 2. Per-step hardware is selected at run time from the game ID wherever area allows. |
 
 ### Open
 
@@ -3941,8 +3947,7 @@ Supermodel's notes say the tile RAM fetches one layer of each pair per 16 pixels
 screen-space stencil. The colour offset is hardware behaviour, not a PC addition: Bass Fishing uses
 it for fades, so it is built (about 40 ALM).
 
-**Still open:** the stencil's bit order. On VF3's attract-mode portrait wipes the two emulators show
-mirror-image splits. This needs cabinet footage.
+**Still open:** the coordinate space and the pair form. The bit order is settled by R84: bit 15 is leftmost.
 
 **How it was established:**
 - Dumps of tile RAM, palette and registers came from patched emulator copies:
@@ -4170,7 +4175,7 @@ Hence D-36.
 **M10K projection:** about 380–400 of 553, with the palette at 52 (R77) and the geometry at 43.
 
 **R82 — After a power cycle, DDR3 works with several reads in flight: 794 MB/s at 16, and both
-viewers are bit-exact on the board.** Run on 2026-11-01 after Ben power-cycled the MiSTer.
+viewers are bit-exact on the board.** Run on 2026-11-01 after I power-cycled the MiSTer.
 
 **Peip's tester first, the R69 setting:** 158.4 MB/s, latency 12 min / 15 average / 105 max. The
 port was back.
@@ -4206,3 +4211,480 @@ with 0 pattern errors over 3–7 passes.
 - **Viewer v3, R79, seed 3** (2aba8ce6…): geometry set-up and nearest mip. It matches the bench's mip
   reference (`png_mip/f007860_rtl.png`) on every pixel outside the overlay. It differs from level 0 on
   51,299 pixels, as mip should.
+
+**R83 — D-36 carried out: two-word fetch is off by default.** The core regression passed with
+`FETCH2 = 0` and `BTB = LA = 1`, so the default changed in `ppc_core`, `ppc_icache` and
+`ppc_cpu`.
+
+**Regression:** the full R70/R78 set passes. Cycles with the real caches move very little:
+
+| Run | Change against R78 |
+|---|---|
+| Subsystem | +0.08% |
+| `--loops` | +0.07% |
+| Core bench at wait 9 | +19% |
+
+The core bench's +19% is not a real cost: it offers two words on 75% of cycles, which no real
+cache does.
+
+**Board harness:**
+- uncached P00 000011DA, unchanged;
+- cached P00 00001E4E against 00001E34 (+26 cycles of 7,732, +0.34%);
+- P09 0CA977DF.
+
+**Planted faults:**
+- BTB and pre-read port: 16 of 24, the same eight misses as R78.
+- Look-ahead: 8 of the 9 that still apply. `la_w1` is dead code with two-word fetch off.
+
+**CPI model, singles at 4, 100 MHz:** 18 frames lost (VF3 3 / Daytona 2 8 / Bass Fishing 7),
+against 15 with two-word fetch, so two-word fetch was worth 3 frames in 56,700.
+
+**Spike, 8.333 ns:** 102.5 / 108.9 / 109.2 MHz at slow 100C and 102.2 / 107.8 / 109.3 MHz at
+−40C, at 11,444–11,550 ALM. That is −321 to −427 ALM in the core alone, and the cache sheds about
+153 more. Seed 1's worst path is EX→MEM, not fetch.
+
+**CPI at the built fast path (L = 6):** 35 frames lost against 34. At 110 MHz it is 0 / 3, unchanged.
+
+**Full release builds, 100 MHz, multicorner on (D-35).** CPU-clock setup slack, slow 100C / slow −40C:
+
+| Form | Seed 1 | Seed 2 | Seed 3 | ALM |
+|---|---|---|---|---|
+| No cache | +0.008 / **−0.013** ns | −0.039 / −0.116 ns | −0.223 / −0.288 ns | 17,214–17,235 |
+| Cached | −0.177 / −0.203 ns | −0.117 / −0.243 ns | −0.232 / −0.231 ns | 18,680–18,735 |
+
+- The fast corners have more than 4 ns of margin, and hold is clean everywhere.
+- **No build closes at every corner.** Uncached seed 1 would have counted as closing under R78's single-corner check: it misses by 13 ps at −40C.
+- The worst paths move with the seed, and none is a fetch path: the harness ROM into the queue head, the DTLB MLAB read address, `op_y`, and the D-cache's `r_a`.
+
+**Area correction:** two-word fetch was worth about 520 ALM cached (−446 to −610 against R78), not R81's 880, because the spike and cache deltas had been added. The uncached build saves nothing, since its harness ties the second word low. R81's total without two-word fetch is therefore about **40,920 ALM**, about 80 under the 41,000 ceiling, not 440.
+
+**On the board** (2026-11-01, 11:06), both despite their small misses. My rule: small negative slack is fine for a board test, but a release must close every corner.
+- **Uncached, seed 1** (29c7f0d0…): 1,395 of 1,395 reports identical, P00 000011DA.
+- **Cached, seed 2** (060746af…): 1,392 of 1,392 identical, P00 00001E4E.
+
+P09 is 0CA977DF in both.
+
+**Open:** CPU closure at 100 MHz at every corner, for release. The misses are 0.01–0.29 ns.
+
+**R84 — The stencil's bit order, from cabinet footage: bit 15 is the leftmost span (Supermodel).
+The coordinate space and pair form are still open.**
+
+**What I believed:** R77 left the bit order open. On VF3's portrait wipes the two emulators showed
+mirror-image splits, and I took the wipe's "ghost" for a translucent layer.
+
+**What is now known:**
+- **One wipe, everywhere.** VF3's logo and portrait wipes are the same 16-step stencil wipe on pair
+  B, alternating by line. In step k, even lines have `FFFF>>k` and odd lines `FFFF<<k`, while pair A
+  stays `FFFF`. The ghost is every other line cleared. `f002040` and `f009360` are steps 5 and 8 of
+  it, with the line parity swapped.
+- **The cabinet's even lines open from the left.** The footage is YouTube kiv9COZRsys at 0:26–0:28,
+  the SEGA logo wiping to the Great Wall. That is Supermodel's bit 15 leftmost; MAME's bit 0 puts the
+  even lines on the right. The RTL default (`MASK_SCREEN = 1`) was already Supermodel's, so nothing
+  changes.
+- **The span grid matches both emulators:** spans start at x = 0 and are 32 px wide, span 15 is cut
+  to 16 px, and the white closes at x = 256, not the screen centre.
+- **One cabinet effect no form models:** on the lines that open from the right, the white run ends
+  3–6 px before the span boundary, leaving a clear column at x ≈ 250–257 at step 8. That is about
+  5 px × 192 lines a frame for 16 frames.
+
+**How it was established:**
+- Per-frame dumps of the wipe in both patched emulators: 512 frames, 0 px against each emulator's
+  own output.
+- The footage geometry was fitted from the stripe period (1.883 rows a line) and 62 logo edges
+  (offset −1.13 rows, rms 0.19).
+- A per-band correlation of each hypothesis's line pattern against the footage: Supermodel scores
+  +0.44 to +0.76 in every band, and MAME the exact negative. The verdict holds for any grid offset
+  from −1.95 to 0.0 rows.
+- The RTL is exact on the 38 wipe frames in both builds, and behind the hostile memory.
+- The comparison images (cabinet | MAME | Supermodel) are in `sm3-builds/tilegen/wipe_out/cmp/`.
+
+**Still open:**
+- Map against screen space, and the exclusive pair against a per-layer test. No dumped stencil crosses a
+  visible layer with X scroll; Scud Race or Lost World would.
+- The assumption that stencil word y applies to line y. Line-resolution Bass Fishing footage would
+  close it.
+- The early end of the white run.
+
+**Wrong turns:**
+- I read the ghost as a translucent layer.
+- The 718 lit rows were first taken as 384 lines.
+- A sign error in the stripe-phase fit first made the verdict look ambiguous.
+- A two-parameter logo fit on one band of lines.
+
+**R85 — Stage A boots VF3 on the board to the SEGA logo. The crash at the wipe is a CPU gap:
+misaligned loads.**
+
+**What runs on the board** (2026-11-01; system builds `sysa_s1` b155c886… and `sysb_s3` 8c848af9…, the
+`vf3` MRA, `vf3.zip` md5-checked):
+- The boot ROM runs, then the Japan-only warning screen, then the SEGA Presents tile screen with
+  "Insert Coin(s)" and "Credit 0/2".
+- **CPI on the UART:** 2.37 / 1.45 / 1.58 / 1.95 over the boot seconds, then 1.80 every second from
+  6 s to 16 s, against the CPI model's 1.77 for VF3. Load-use is 36.5% of cycles, fetch waiting
+  20.8%, data-memory wait 5.4%. With the Real3D stubbed this is the attract loop, not gameplay.
+- **In simulation:** the warning screen's tile state equals Supermodel's byte for byte, and the video
+  output matches the reference on all 190,464 pixels. The bus streams match Supermodel's through
+  frame 320.
+- **Area:** about 21.8–22.1K ALM in total; the system around the CPU is 3,393 ALM.
+- **Timing:** seed 3 closes the CPU. Its only failing paths are in the debug CPI monitor's CRC.
+
+**What I believed:** at 17 s the game stopped on the logo, and I first took it for a wait on the
+Real3D stub.
+
+**What is now known:** it is a data storage interrupt into the boot ROM's fatal handler. The overlay
+shows vector 0x300, SRR0 0x00054B08 and MSR 0x1000.
+- At 0x55134–0x55170, VF3 does `lwzx` with a base of FFFD4FD2, a word load at 2 mod 4 from a pointer
+  table in fixed CROM.
+- `ppc_core` forces misaligned accesses aligned, a gap left from R31. So it read 2FD2FFFD for
+  FFFD2FD2.
+- A later `lhau` on that pointer misses every BAT and PTE.
+
+Under the 603e manual (§4.5.6), misaligned integer accesses within a page are done in hardware. Only
+the listed cases take the alignment exception. The seed-3 build crashed the same way, so it is not
+timing.
+
+**Fix:** misaligned word and halfword loads and stores in `ppc_core`, by the manual. That is in
+progress, and the crash is being reproduced in the system bench before any fit.
+
+**R86 — CPU timing at every corner, then misaligned accesses (D-39): +350 ALM cached, and closure
+lost again.**
+
+**The timing pass.** Twenty restructures, each with a Verilator equivalence check, left aligned
+code cycle-identical. They took the D-36 core from 0 of 6 closing builds to 2 of 3 uncached and 1 of 3
+cached at 100 MHz with multicorner timing (round 3), at D-36's area (−20 uncached, +60 cached).
+
+**Misaligned support** (R85), required behaviour with no parameter:
+- **Split and merge:** crossing halfwords and words split in EX into two word accesses (+1 cycle
+  each) and merge in WB. This covers D, X, update and byte-reversed forms, cached and uncached.
+- **Alignment exception** (0x600, DSISR by form, DAR = EA, or EA+4 for lmw/stmw) for:
+  - lmw, stmw, lwarx and stwcx. not word-aligned;
+  - FP accesses not word-aligned;
+  - page crossings per D-39.
+- **Checks:**
+  - all 34 regression runs pass, including 15 misaligned ones (1,012 crossings of a word and 404 of a
+    page in 200 seeds, 139 of them with DR=1 inside a DBAT block);
+  - 20 of 20 planted faults caught;
+  - the board harness is unchanged.
+- **The one change to aligned code:** FP doubles crossing a page now trap.
+
+**Area:**
+
+| Form | Against D-36 |
+|---|---|
+| Uncached `ppc_core` | +215 to +245 ALM |
+| Cached `ppc_cpu` | **+350 ALM** |
+
+On R83's arithmetic, the core is now about 250–300 ALM over 41,000.
+
+**Timing after the misaligned support:**
+- **100 MHz:** uncached 1 of 3, cached 0 of 3.
+- **110 MHz:** the 9.09 ns spike runs 107.7 / 105.8 / 99.7 MHz at its worst corner.
+- **The paths to 110,** with estimated fixes, are in `sim/cpu/cpu-notes.md`:
+  - the interrupt → `ex_xcm` → split-hold chain (−0.94 ns);
+  - EX translation into MEM control;
+  - the FMA stage-1b shift count;
+  - the FP wait into the queue pop;
+  - the split merge;
+  - I-cache data into predecode;
+  - D-cache decisions into EX redirect;
+  - IBAT into the I-cache pa.
+
+  Together they are about +150–250 ALM.
+
+**On the board** (2026-11-01, 15:23): the uncached round-6 build with misaligned support (b7368660…)
+gave 1,395 of 1,395 reports identical. P00 000011DA, P01 00000661, P09 0CA977DF.
+
+**Wrong turns:**
+- One round launched from the repo root with a bad RTL path; it was killed before producing anything.
+- Flat queue entries put the pop through a LUT.
+- The split's byte offset from the ALU sum put a subtract into EX's hold (−1.03 ns).
+- A comment beginning "// synthesis" was read by Quartus as a pragma.
+- `pkill -x` killed a parallel quick check.
+
+**R87 — Rasteriser blocks 8 and 9: the whole rasteriser is bit-exact. At level 0, texture fills
+bind it through the cache's write gate.** `r3d_rast` takes the geometry's record stream (viewport
+and SETUP4 records) and writes a finished layer to DDR3.
+
+**Exact.** It matches `render_d25` (textured, fog, cull) on 400 VF3 + 400 Bass Fishing frames,
+207.6 M pixels, 0 wrong. That holds on board-like ports and on hostile ones (acks up to 400 cycles,
+BUSY 60%, latency to 200). The MIP = 1 build is exact on 4 frames.
+
+**Block 8, the D-20 store.** It bins set-up records by 8-row band, as runs:
+- consecutive records sit contiguous in DDR3 and are read in one burst each;
+- alpha lists grow downward, so they come out newest first for free;
+- records are packed, from 23 to 21 words.
+
+At VF3 p99 that is 18,043 (record, band) pairs but only 5,710 burst reads.
+
+| Store traffic, p99 | MB/s |
+|---|---|
+| VF3 | 132.0 |
+| Bass Fishing | 124.3 |
+| VF3, all DDR3 with a 16-bit layer and polygon RAM | 207.5 (D-20 estimated about 180) |
+| VF3, all DDR3 with the 32-bit layer as built | 251.3 |
+
+R82's board numbers carry this with room.
+
+**Block 9** is the top level. Fog is per viewport through `r3d_rast_fogvp`. Scroll fog is a frame
+input for now, because the R62 viewport record lacks the fields that its rule needs.
+
+**Area, three seeds, without pins:** 7,719–7,774 ALM, 100 M10K, 45 DSP, against the 8,000 budget.
+Blocks 8 + 9 are 1,848–1,874 ALM against R66's estimate of 1,050–1,250.
+
+**Timing:** 100.0–102.7 MHz at 100C on all three seeds. At −40C it fails on all three (97.3–99.4 MHz),
+in the front's edge product and the texel filter, which lose 6–8 MHz once assembled.
+
+**Frame time at level 0:** VF3 p99 is **148.9%** of a 100 MHz frame. Even with 1-cycle memory the
+worst frames take 139–147%. The cache writes a fill only after every earlier pixel has read, so a frame
+costs about pixels + 4 × fills, against R67's overlapped model (90.7%). Two levers:
+- the nearest mip level (R75 cuts fills at p99 from 302 K to 54 K);
+- a write gate that waits only for pixels reading the victim line.
+
+**Bugs found, both latent in the viewer's `m3v_raster`:**
+- the 15-cycle idle window was shorter than the interpolants' latency;
+- end-of-band marks overflowed the band FIFO across runs of empty bands.
+
+**Planted faults:** 33 of 36 caught. One is equivalent, and two need frames the harness does not have.
+
+**R88 — The rasteriser as it will run fits the frame. It closes at both slow corners, but the mip
+build is about 270 ALM over budget.**
+
+**The configuration that runs** (MIP = 1, the geometry's B, 32 KiB cache) is bit-exact against
+`render_d25` on 400 VF3 + 400 Bass Fishing frames, on both port profiles, with 0 port-rule violations.
+
+| p99 of a 100 MHz frame | VF3 | Bass Fishing |
+|---|---|---|
+| Board-like ports | **82.1%** | 63.3% |
+| Hostile ports (the store's binning binds) | 128.8% | 102.8% |
+
+- **Fills at p99** are 53,805 and 41,545, R75's prediction to within 0.06%.
+- **DDR3 at p99, VF3:** texture 99.0 + store 132.0 + layer 43.8 = 265.4 MB/s. That is well inside R82's board figures.
+- **What binds at mip** is the shading lane (one pixel a clock) and the Z band, not the cache.
+
+**The cache's write gate by slot.** A fill now waits only for earlier pixels reading its victim's
+slot, using two dual-port M10K of per-slot stamps.
+- Level 0's VF3 p99 goes from 148.9% to 138.6%, not to R87's max(pixels, 4 × fills).
+- The 8-fill window binds next. 16 fills would give the heaviest level-0 frame 121.7%, but under 3% at
+  mip, so they were not taken.
+- The gate first deadlocked the rasteriser. The band stage can hold the cache's output for thousands
+  of cycles, so a 5-bit need counter wrapped; it is now 10 bits. The cache bench missed this because
+  its stalls lasted one cycle, and it now has long holds (fault K15).
+
+**−40C closure.** Nine path moves with no latency change, across seven blocks over four fit rounds:
+the edge, texel, cache, Z band, store and fog unit, plus a 163-bit skid stage at the top level.
+Each round showed the next layer of paths.
+
+| Build | ALM | M10K | DSP | Slow 100C | Slow −40C |
+|---|---|---|---|---|---|
+| MIP = 0, three seeds | 7,832–7,850 | 101 | 45 | 104.8–107.4 MHz | 103.5–104.0 MHz |
+| MIP = 1, three seeds | **8,266–8,279** | 102 | 45 | 102.0–105.2 MHz | 100.7–103.3 MHz |
+
+Hold is clean. The MIP = 1 build is 266–279 ALM over the rasteriser's 8,000; mip costs +423 to +447 ALM,
+about 300 of it in the two texel instances.
+
+**M10K:** the span queue moved to an MLAB (−1 block). The bin table cannot drop to 3 blocks: its read
+mux then misses timing.
+
+**Wrong turns:**
+- The gate's gain was first judged on the cache bench, whose memory hid both the gain and the hang.
+- Moving the edge's whole compare chain to stage 0 only moved the failure.
+- The −40C report had never been written: the corner is named `7_slow_1100mv_-40c`, not `n40c`.
+
+**R89 — The stage B host blocks are built and exact against VF3's whole trace. They are over the
+"everything else" budget.** These are the Real3D's command and status block (`r3d_cmd`), its memory
+windows (`r3d_mem`), texture upload (`r3d_texup`), the compositor (`m3_compose`) and a seven-port DDR3
+arbiter (`m3_ddr_arb`).
+
+**Checks, against Supermodel dumps from a hooked copy whose bus trace is byte-identical to stage A's:**
+- every status read over 1,500 frames at the real frame length;
+- 43 draws of display-list RAM and polygon RAM;
+- 42 texture sheets (8 MiB each), checked again at replay end;
+- 98 culling RAM images;
+- 2,000 synthetic textures of every type and depth;
+- the compositor: 0 pixels differ from Supermodel's layer order (tiles below, 3D, tiles above), on five cases including DDR3 at 50% BUSY.
+
+All identical. VF3 uploads one texture format only (type 0, 16-bit, 256×256 with mips), so the synthetic set covers the rest. Planted faults: 27 of 32 caught; two are real misses.
+
+**What I believed:** the stage A plan doubled 8E and polygon RAM, with the two copies swapped at the flip.
+
+**What is now known:** a plain swap breaks VF3. Polygon models are written once, so its memory differs
+from Supermodel's at 1,236 of 1,500 flips. So `r3d_mem` writes both copies at once. Where the geometry
+is reading the read copy, the write is deferred as an address run (at most 37 polygon and 6 8E runs a
+frame) and copied over after the geometry. Each draw then sees memory exactly as at its flip.
+
+**Texture words** are staged in a DDR3 ring and decoded between frames up to a mark set at each draw,
+because frame N−1 is still drawing when frame N's words arrive.
+
+**Area, one seed, estimated in the system:**
+
+| Block | ALM | M10K |
+|---|---|---|
+| `r3d_cmd` | about 160 | 0 |
+| `r3d_mem` | about 385 | 3 |
+| `r3d_texup` | about 670 | 2 |
+| `m3_compose` | about 175 | 5 |
+| `m3_ddr_arb` | about 460 | 0 |
+| **Total** | **about 1,850** | **10** |
+
+That is against about 1,100 left of the "everything else" budget, about 750 over, to be paid back for
+release (D-40). Every block closes 100 MHz at both slow corners.
+
+**An RTL bug found by a planted fault:** `r3d_mem` deadlocked the bus when its run FIFO filled. VF3
+never fills it.
+
+**Open:**
+- Scroll fog needs viewport node words that the geometry's viewport record lacks, so it is tied off
+  for now.
+- The `m2_sdram` write burst: 8E writes cost about 40 SDRAM clocks each, up to 20% of the port at VF3's
+  peak.
+- Whether `tot_clks` in the status packet matters to any game.
+
+**R90 — The D-cache snoops 53C810 DMA (D-41): +108 ALM in the cache, about 0.4% of a frame.**
+Desk-only so far: not board-tested.
+
+**What I believed:** a snoop needs its own tag port, or must stall the CPU.
+
+**What is built** (`ppc_dcache` `SNOOP`, brought out through `ppc_cpu` as `sn_req`, `sn_addr[31:5]`,
+`sn_inv` and `sn_ack`):
+- The snoop waits until the cache has nothing in flight, as the 603e retries a snoop during a fill,
+  cast-out or tag write (§3.6.3, §3.6.8).
+- It then holds the read port for two cycles, as the cast-out copy does, and acts through the existing
+  dcbst/dcbf paths.
+- **A DMA read** pushes a modified line, which stays valid and clean. **A DMA write** pushes it, then
+  invalidates it.
+- `sn_ack` comes after the push's last beat.
+- A snooped write to the reservation's line clears the reservation (§2.3.6.1).
+- With HID0[DCE] = 0, nothing is snooped (§3.2.3.2).
+
+**Cost:** 0.68–1.34 CPU cycles per snoop, about 7,100 cycles in VF3's p99 frame (about 5,280 lines).
+
+**Checks:**
+- With `sn_req` low, the R70/R78/R86 regression is identical line for line, harness signatures included.
+- D-cache bench: 96 of 96 runs at latencies 1–80 under hostile memory.
+- Subsystem bench: 260 seeds, each DMA read checked against the stores made.
+- Planted faults: 14 of 14 caught in the cache bench, 7 of 9 in the subsystem bench.
+
+**Fit, seed 1:**
+- `ppc_dcache` 842 → 950 ALM, `ppc_cpu` +65 ALM, M10K unchanged.
+- CPU spike: 108.3 / 108.7 MHz at 9.09 ns.
+- Cached harness: −0.61 / −0.53 ns with the snoop driven, against −0.30 / −0.63 ns without it. The failing
+  paths are the known seed-sensitive ones, not the snoop's.
+
+**Open:** which snoop type the MPC105 uses for a PCI read. The 603e's table 3-6 invalidates on a
+non-inhibited global read; the build keeps the line valid. Both are coherent; only the later hit rate
+differs.
+
+**To finish D-41 in the system:**
+1. `m3_bus` snoops every 53C810 access to work RAM, one per line, before the data moves. ROM needs none.
+2. It keeps granting the CPU port while the snoop waits.
+3. It orders a DMA write before the CPU's next transaction.
+4. Then the PVR moves to 0x00060103.
+
+The I-cache is not snooped (603e §3.1): code written by DMA needs icbi, as on the chip.
+
+**R91 — VF3's crash at about 21 s is a CPU bug: an indexed load with update, when rD = rB.**
+`ppc_decode` cracks lbzux/lhzux/lhaux/lwzux into two uops: step 0 loads rD, then step 1 computes
+rA = rA + rB by reading rB again. When rD = rB, step 0 has already overwritten rB, so rA gets old rA plus
+the loaded data instead of the EA. The manual allows rD = rB; only rA = 0 and rA = rD are invalid forms.
+The FP update loads are safe for a different reason than I first wrote: they re-read rA + d / rB too, but their earlier steps write an FPR, so nothing is overwritten. Only stfdu's second word uses the held address.
+
+**How it shows in VF3:** at 0x4D040, `lbzux r4,r6,r4` reads a copy routine's block number from a table.
+The wrong r6 then sends the count read (`lbz r23,1(r6)`) to low RAM, which holds 0 instead of 3. So the
+outer copy loop never ends. It copies 128 KiB block after block, one every two frames, until its source
+pointer wraps past FFFFFFFF to 001E0D7C. The lwzx at 0x4D09C then misses at EA 0x00200000, which the game's
+own TLB attribute table leaves unmapped, and the handler takes its DSI to the boot ROM's fatal loop.
+
+**How it was established:**
+- The board overlay (R85's latch, made correct in build 6) showed the fatal DSI at SRR0 0x4D09C, after a
+  decrementer entry and a DTLB miss.
+- The system bench reproduced it exactly at frame 1,158, with r21 = 001E0D7C and r23 = −99.
+- The first wrong value is at frame 960.
+
+**Wrong turns:**
+- Because a decrementer interrupt was the last entry before the fatal, I first suspected interrupt state:
+  rfi, the TGPR shadows, an interrupt inside a misaligned split. It only happened to land inside the
+  runaway loop.
+- A first overlay latch keyed on PC ranges caught ordinary code at 0x1700. A second, keyed on SRR changes,
+  never fired, because the exception's own retirement record already carries the new SRRs.
+- The earlier static checks of the page table and BATs were right, but beside the point.
+
+**Why the regression missed it:** the core bench's generator evidently never made rD = rB for update
+loads. Every copy before 21 s was already the wrong length, silently.
+
+**Fix, built:** `ppc_core` `id_xuea` makes the second step of an integer update load take EX's EA through the existing forward path, with no new registers. `ppc_decode` only changes step 1's fields and comments.
+
+**Checks:**
+- The reproducer (`lbzux r4,r6,r4` and every other integer update load), cached and uncached, with a DTLB miss on step 0, passes in all four modes; the old RTL fails it at once.
+- A new `--alias` generator ran 1,500 seeds (core and subsystem), all passing; the old RTL fails them in the first seed.
+- The R70/R78/R86/R90 regression is identical line for line, and the harness signatures are unchanged.
+- 5 of 5 planted faults are caught.
+- The same logic exists as a patch for build 5's CPU (`sm3-builds/fix_lux/build5.patch`), for the stage A board build.
+
+**Timing, one seed:** the CPU spike at 9.09 ns ran 99.1 / 99.7 MHz, against 108.3 / 108.7 before. The worst path (EX translation into `m_rpq`) does not touch the change, and the fix's first form gave 107.8 / 108.1 on the same seed. So it is probably placement, but a three-seed batch must confirm that before any release fit.
+
+**Open, from the same review:**
+- `lmw` with rA inside the loaded range re-reads rA on each step. The manual calls the form invalid, and Supermodel and MAME keep the original base. My rule is to follow the emulators where the manual leaves behaviour undefined, so `lmw` should hold its base. That needs a held register on the `imm4_q` path.
+- R86's Verilator-only merge check misfires on cache ops (dcbst/dcbf/dcbt) at an EA that is not word-aligned. It should exclude them.
+
+**R92 — Stage A's goal is met: VF3 runs its attract loop on the MiSTer.** This is build 7 (9ae84cd8…): build
+6's system with build 5's CPU plus the R91 update-load fix, PVR 0x00060101, at 100 MHz. Setup is −0.29 /
+−0.33 ns at the slow corners, and hold is positive everywhere. It was loaded on 2026-11-01 at about 20:15, on
+my call, before the bench confirmed.
+
+VF3 passes the SEGA logo and runs its attract loop with no fatal entry for at least 55 s. On screen are the
+blue-sky backdrops with clouds, the character portraits (Kage, Lau), "Insert Coin(s)", "Credit 0/2" and the
+SEGA copyright: every tile layer the attract draws. There is no 3D yet, since the Real3D is a stub.
+
+The exception counter keeps rising through interrupts and TLB misses, and the fatal words stay zero.
+
+**CPI on the UART:** 1.80 to 16 s, then 2.5–4.1 through the attract. The attract does more copying and
+decompression, and waits on the Real3D stub.
+
+**R93 — The first integrated build (stage A + B) misses 100 MHz by 2 ns and does not boot on the board.**
+`sysb_s1` (89f65a14…), release form, seed 1:
+- **Timing:** setup −2.02 / −1.79 ns at the slow corners (about 83 / 85 MHz); hold positive.
+- **Area:** 41,138 of 41,910 ALM (98%), 300 M10K, 86 DSP.
+- **Worst path:** the scan-out request through the DDR3 arbiter's combinational grant into `m3_ddr3p` and the
+  f2sdram registers. At 98% full, every block slips about 1 ns: the CPU D-cache, the geometry, the texture
+  cache and texture upload.
+
+**Bench:** every Real3D DMA word is identical to Supermodel, and at frame 1,121 the layer drawn in the system
+equals `render_d25` on all 190,464 pixels.
+
+**On the board,** loaded anyway to see: dead from the first second (CPI 21.5), no screen.
+
+**Next:** the arbiter's grant gets a register, texture upload's compare is pipelined, and a 90 MHz build follows.
+
+**Area is now the binding problem.** This is without sound or real I/O. The release needs several thousand ALM
+freed (R81: about 2,500–2,750 against 41,000, with sound and I/O).
+
+**R94 — The first 3D on the board: VF3's attract fights draw on the MiSTer.** The integrated build of
+stage A + B (`sysb90_s1`, 5f02194c…) runs at 90 MHz:
+- setup +0.05 / −0.41 ns at the slow corners, hold positive;
+- 41,346 ALM (99%), 300 M10K, 86 DSP.
+
+The 90 MHz build follows two timing fixes after the 100 MHz build missed by 2 ns (R93): a registered owner in
+the DDR3 arbiter's grant, and registered end and jump tests in texture upload.
+
+On the board, 2026-11-01: boot, the warning screen and the SEGA logo, then **the attract fights in 3D,
+textured, over the tile layers.** Aoi, Kage, Pai, Jacky, Lau and Lion fight on the beach stage, with the sky and
+the character portraits, for at least 60 s with no fatal entry.
+
+**Glitches seen:**
+- a few frames show a fighter's suit flat-coloured, or a full-screen blur;
+- particle sprays appear.
+
+The fights are not yet compared with Supermodel in the bench: the fixed-CPU chain had reached frame 900. So
+these glitches are untriaged.
+
+**CPI through the fights:** 3.0–5.7. The game now waits on the real Real3D, and the CPU clock is 90 MHz.
+
+**Area is now the binding problem:** 99% full without sound or real I/O.
+
+| Largest blocks | ALM |
+|---|---|
+| `ppc_cpu` | 12,515 |
+| `r3d_rast` | 8,142 |
+| `r3d_geo` | 7,762 |
+| `ascal` | 2,112 |
+| the viewer's two read adapters, carried into the system | 963 |
+| `m3_cpu_mon` (debug) | 359 |

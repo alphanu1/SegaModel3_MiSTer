@@ -974,6 +974,61 @@ test_real3d_rast100_intake62: $(RAST_OBJ)/intake62/Vr3d_rast_intake
 	@./$(RAST_OBJ)/intake62/Vr3d_rast_intake --tris $(RAST_DIR)/tris_vf3 --frames 40 --oow
 	@./$(RAST_OBJ)/intake62/Vr3d_rast_intake --random 500000
 
+# ---- the whole rasteriser (blocks 8 and 9: r3d_rast_store, r3d_rast) against
+# render_d25 on 400 + 400 frames, behind DDR3 ports with their contracts
+# enforced; sim/real3d/m3-notes.md section 12. RAST_JOBS processes of
+# RAST_CHUNK frames each; logs in sm3-builds/rast/w_<game>_<profile>.log.
+RAST_TOP_RTL = rtl/real3d/r3d_div_lane.sv rtl/real3d/r3d_rast_div.sv rtl/real3d/r3d_rast_edge.sv rtl/real3d/r3d_rast_front.sv \
+  rtl/real3d/r3d_rast_intake.sv rtl/real3d/r3d_rast_zspan.sv rtl/real3d/r3d_rast_zband.sv rtl/real3d/r3d_rast_recip.sv \
+  rtl/real3d/r3d_rast_interp.sv rtl/real3d/r3d_rast_fogp.sv rtl/real3d/r3d_rast_texel.sv rtl/real3d/r3d_rast_tcache.sv \
+  rtl/real3d/r3d_rast_colour.sv rtl/real3d/r3d_ram.sv rtl/real3d/r3d_rast_band.sv rtl/real3d/r3d_rast_fogvp.sv \
+  rtl/real3d/r3d_rast_store.sv rtl/real3d/r3d_rast.sv
+RAST_JOBS  ?= 12
+RAST_CHUNK ?= 25
+# the port profiles: p0 board-like; p1 hostile acknowledges (up to 400 cycles
+# on 30% of store and layer requests, 2% of texture lines), BUSY 60%, latency
+# 20-200, beat gaps 30%, 8 lines in flight, input gaps 50%
+RAST_P0 =
+RAST_P1 = --ack 1 400 30 --tack 1 400 2 --busy 60 --lat 20 200 --gap 30 --maxrd 8 --igap 50
+$(RAST_OBJ)/rast/Vr3d_rast: $(RAST_TOP_RTL) sim/real3d/tb_r3d_rast.cpp sim/real3d/r3d_rast.cpp sim/real3d/r3d_rast_rtl.cpp sim/real3d/r3d_geo.cpp $(RAST_HDR) $(R3D_HDR)
+	@mkdir -p $(dir $@)
+	@$(VERILATOR) $(R3D_VFLAGS) --x-initial unique --x-assign unique --top-module r3d_rast -CFLAGS "-O2 -std=c++17 -ffp-contract=off -I$(PWD)/sim/real3d" \
+	  -LDFLAGS "-lz -pthread" --Mdir $(RAST_OBJ)/rast $(RAST_TOP_RTL) $(PWD)/sim/real3d/tb_r3d_rast.cpp $(PWD)/sim/real3d/r3d_rast.cpp \
+	  $(PWD)/sim/real3d/r3d_rast_rtl.cpp $(PWD)/sim/real3d/r3d_geo.cpp >/dev/null
+# the configuration that runs (study R75, R79): MIP = 1, B the geometry's LOD word
+$(RAST_OBJ)/rastm/Vr3d_rast: $(RAST_TOP_RTL) sim/real3d/tb_r3d_rast.cpp sim/real3d/r3d_rast.cpp sim/real3d/r3d_rast_rtl.cpp sim/real3d/r3d_geo.cpp $(RAST_HDR) $(R3D_HDR)
+	@mkdir -p $(dir $@)
+	@$(VERILATOR) $(R3D_VFLAGS) --x-initial unique --x-assign unique --top-module r3d_rast -GMIP=1 -CFLAGS "-O2 -std=c++17 -ffp-contract=off -I$(PWD)/sim/real3d" \
+	  -LDFLAGS "-lz -pthread" --Mdir $(RAST_OBJ)/rastm $(RAST_TOP_RTL) $(PWD)/sim/real3d/tb_r3d_rast.cpp $(PWD)/sim/real3d/r3d_rast.cpp \
+	  $(PWD)/sim/real3d/r3d_rast_rtl.cpp $(PWD)/sim/real3d/r3d_geo.cpp >/dev/null
+$(RAST_OBJ)/fogvp/Vr3d_rast_fogvp: rtl/real3d/r3d_rast_fogvp.sv sim/real3d/tb_r3d_rast_fogvp.cpp
+	@mkdir -p $(dir $@)
+	@$(VERILATOR) $(R3D_VFLAGS) --top-module r3d_rast_fogvp -CFLAGS "-O2 -std=c++17" --Mdir $(RAST_OBJ)/fogvp \
+	  rtl/real3d/r3d_rast_fogvp.sv $(PWD)/sim/real3d/tb_r3d_rast_fogvp.cpp >/dev/null
+$(RAST_OBJ)/r3d_store_census: sim/real3d/r3d_store_census.cpp sim/real3d/r3d_rast.cpp sim/real3d/r3d_rast_rtl.cpp $(RAST_HDR)
+	@mkdir -p $(dir $@)
+	@g++ -O2 -std=c++17 -ffp-contract=off -Isim/real3d -o $@ sim/real3d/r3d_store_census.cpp sim/real3d/r3d_rast.cpp sim/real3d/r3d_rast_rtl.cpp -lz -lpthread
+.PHONY: lint_real3d_rast_top test_real3d_rast_top test_real3d_rast_top_mip measure_real3d_store
+lint_real3d_rast_top:
+	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME rtl/real3d/r3d_rast_store.sv
+	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL rtl/real3d/r3d_rast_fogvp.sv
+	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-PINCONNECTEMPTY --top-module r3d_rast $(RAST_TOP_RTL)
+	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-PINCONNECTEMPTY --top-module r3d_rast -GMIP=1 $(RAST_TOP_RTL)
+test_real3d_rast_top: lint_real3d_rast_top $(RAST_OBJ)/rast/Vr3d_rast $(RAST_OBJ)/fogvp/Vr3d_rast_fogvp
+	@for s in 1 2 3; do ./$(RAST_OBJ)/fogvp/Vr3d_rast_fogvp 1000000 $$s || exit 1; done
+	@for g in vf3 bassdx; do echo "== r3d_rast, $$g, profile p0"; \
+	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rast/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_p0.log $(RAST_P0) || exit 1; \
+	  echo "== r3d_rast, $$g, profile p1"; \
+	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rast/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_p1.log $(RAST_P1) || exit 1; done
+# MIP = 1 with the geometry's B (render_d25 mip 1, lod 1, d25_opts::lodb); logs w_<game>_m<profile>.log
+test_real3d_rast_top_mip: lint_real3d_rast_top $(RAST_OBJ)/rastm/Vr3d_rast
+	@for g in vf3 bassdx; do echo "== r3d_rast MIP, $$g, profile p0"; \
+	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rastm/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_mp0.log --mip --geo-lod $(PWD)/sm3-builds/r3d/vrom_$$g.bin $(RAST_P0) || exit 1; \
+	  echo "== r3d_rast MIP, $$g, profile p1"; \
+	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rastm/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_mp1.log --mip --geo-lod $(PWD)/sm3-builds/r3d/vrom_$$g.bin $(RAST_P1) || exit 1; done
+measure_real3d_store: $(RAST_OBJ)/r3d_store_census
+	@for g in vf3 bassdx; do ./$(RAST_OBJ)/r3d_store_census --tris $(RAST_DIR)/tris_$$g; done
+
 # ---------------------------------------------------------------- tile generator (M0-E)
 # Dumps in sm3-builds/tilegen (tools/mame-census/README.md, "Tile generator dumps").
 # test_tilegen_ref: the reference renderers against MAME's draw_layer and Supermodel's DrawLine.
@@ -1049,3 +1104,45 @@ test_scripts: lint_scripts $(SC_DIR)/obj_l1/Vm3_scripts $(SC_DIR)/obj_l0/Vm3_scr
 	@cd $(SC_DIR) && ./obj_off/Vm3_scripts --off | grep -v "^  moved" | tail -n 3
 faults_scripts:
 	@python3 sim/scripts/faults.py
+
+# ==== D-37 stage B: the Real3D fed live (sim/system/notes.md, Stage B) ====
+SB_OBJ    ?= sm3-builds/sb/obj
+SB_ORACLE ?= sm3-builds/sb_oracle
+SB_TRACE  ?= sm3-builds/sys/sm_bus.bin
+SB_SDRAM  ?= sm3-builds/sys/vf3_sdram.bin
+SB_HOST_RTL = rtl/real3d/r3d_cmd.sv rtl/real3d/r3d_mem.sv rtl/real3d/r3d_texup.sv rtl/mem/m3_ddr_arb.sv \
+              rtl/mem/m2_sdram.sv rtl/mem/m3_ddr3p.sv sim/real3d/r3d_host_tb.sv
+SB_LIST   = $(shell cat $(SB_ORACLE)/list.txt 2>/dev/null)
+.PHONY: lint_sb test_sb_host
+lint_sb:
+	@for m in r3d_cmd r3d_mem r3d_texup m3_ddr_arb; do \
+	  $(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL --top-module $$m rtl/real3d/r3d_cmd.sv rtl/real3d/r3d_mem.sv rtl/real3d/r3d_texup.sv rtl/mem/m3_ddr_arb.sv || exit 1; done
+$(SB_OBJ)/host/Vr3d_host_tb: $(SB_HOST_RTL) sim/real3d/tb_r3d_host.cpp sim/system/sdram_dev.h
+	@mkdir -p $(SB_OBJ)/host
+	@$(VERILATOR) $(R3D_VFLAGS) --x-initial unique --x-assign unique --top-module r3d_host_tb -CFLAGS "-O2 -std=c++17" \
+	  --Mdir $(SB_OBJ)/host $(SB_HOST_RTL) $(PWD)/sim/real3d/tb_r3d_host.cpp >/dev/null
+SB_HOST = ./$(SB_OBJ)/host/Vr3d_host_tb --trace $(SB_TRACE) --sdram $(SB_SDRAM) --dump $(SB_ORACLE)/dump --quiet +verilator+rand+reset+2
+# test_sb_host: synthetic uploads of every type and depth; the trace with the
+# geometry overlapping the next frame's writes; the whole trace at real frame
+# length (about 13 minutes)
+test_sb_host: lint_sb $(SB_OBJ)/host/Vr3d_host_tb
+	@$(SB_HOST) --list 1 --to 300 --synth-tex 2000 | grep -v " 0 texels differ" | tail -n 3
+	@$(SB_HOST) --list $(SB_LIST) --to 1500 --geo 150000 400000 --rast 20000 150000 --minchk 20 | tail -n 3
+	@$(SB_HOST) --list $(SB_LIST) --fmin 1738525 --geo 350000 1560000 --rast 350000 1200000 --minchk 40 | tail -n 3
+SB_COMP_RTL = rtl/video/m3_compose.sv rtl/video/m2_fb_read.sv rtl/video/m2_video_timing.sv rtl/mem/m3_ddr3p.sv sim/video/m3_compose_tb.sv
+$(SB_OBJ)/comp/Vm3_compose_tb: $(SB_COMP_RTL) sim/video/tb_m3_compose.cpp
+	@mkdir -p $(SB_OBJ)/comp
+	@$(VERILATOR) $(R3D_VFLAGS) --x-initial unique --x-assign unique --top-module m3_compose_tb -CFLAGS "-O2 -std=c++17" \
+	  --Mdir $(SB_OBJ)/comp $(SB_COMP_RTL) $(PWD)/sim/video/tb_m3_compose.cpp >/dev/null
+.PHONY: test_sb_compose
+test_sb_compose: $(SB_OBJ)/comp/Vm3_compose_tb
+	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-PINCONNECTEMPTY -Wno-SYNCASYNCNET --top-module m3_compose rtl/video/m3_compose.sv rtl/video/m2_fb_read.sv
+	@./$(SB_OBJ)/comp/Vm3_compose_tb --surf $(SB_ORACLE)/tg/f001399.surf --layer $(SB_ORACLE)/layer_1400.bin --grab $(SB_ORACLE)/grab_1400.rgb --buf 1 --ppm $(SB_OBJ)/comp/f1400.ppm +verilator+rand+reset+2
+	@./$(SB_OBJ)/comp/Vm3_compose_tb --surf $(SB_ORACLE)/tg/f001499.surf --layer $(SB_ORACLE)/layer_1500.bin --grab $(SB_ORACLE)/grab_1500.rgb --buf 2 --busy 50 --lat 13 120 +verilator+rand+reset+2
+	@./$(SB_OBJ)/comp/Vm3_compose_tb --surf $(SB_ORACLE)/tg/f000999.surf --layer $(SB_ORACLE)/layer_1000.bin --grab $(SB_ORACLE)/grab_1000.rgb --show 0 --buf 3 +verilator+rand+reset+2
+	@./$(SB_OBJ)/comp/Vm3_compose_tb --surf $(SB_ORACLE)/tg/f001399.surf --synth 7 --buf 0 --busy 40 --lat 8 100 +verilator+rand+reset+2
+	@./$(SB_OBJ)/comp/Vm3_compose_tb --surf $(SB_ORACLE)/tg/f001374.surf --synth 9 --buf 3 +verilator+rand+reset+2
+	@./$(SB_OBJ)/comp/Vm3_compose_tb --surf $(SB_ORACLE)/tg/f001399.surf --synth 5 --show 0 --buf 1 +verilator+rand+reset+2
+.PHONY: faults_sb
+faults_sb:
+	@python3 sim/real3d/faults_sb.py
