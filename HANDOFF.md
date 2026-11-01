@@ -23,6 +23,13 @@ The study's §15 R83–R94 and D-37–D-42 carry every finding and decision; thi
 - **Timing:** the integrated build closes only at 90 MHz; the CPU spike runs 99–108 MHz at 9.09 ns.
 
 ### Next
+- **Frame rate: 14.5 fps on the board** (R95). Half the CPU's cycles wait on data memory: write-through RAM stores
+  (32% of cycles, D-41) and uncached CROM reads (18%). Wire the snoop and move to PVR 0x00060103 first.
+- **Limb trails** in attacks, and some polygons out of place (R95). Check against Supermodel's frames
+  (`sm3-builds/sysb/runp/`, frames 1300 and 1390).
+- Everything at 110 MHz if it closes, after a timing pass; otherwise only the CPU at 110.
+- On the board: `_Arcade/_Model3/` has the 3D build and "stage A, 2D only" (`M3stageA.rbf`, 9ae84cd8), for
+  recording progress.
 - Triage the 3D glitches against Supermodel: run the bench chain to the fights (`sm3-builds/sysb/ext2.sh`).
 - An area pass with targets per block: the viewer read adapters (~960), stage B, mip, CPU additions, M10K trades,
   and a smaller 68000 before sound.

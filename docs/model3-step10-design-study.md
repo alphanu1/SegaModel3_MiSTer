@@ -4688,3 +4688,47 @@ these glitches are untriaged.
 | `ascal` | 2,112 |
 | the viewer's two read adapters, carried into the system | 963 |
 | `m3_cpu_mon` (debug) | 359 |
+
+**R95 — The 3D attract runs at 14.5 fps; half the CPU's cycles wait on data memory, mostly write-through RAM stores.**
+Measured on the board (`sysb90_s1`, 5f02194c) from two overlay screenshots 30 s apart:
+
+| Over 30 s | Count | Rate |
+|---|---|---|
+| video frames | 1,725 | 57.5 Hz |
+| frames submitted | 447 | 14.9 /s |
+| frames drawn | 435 | 14.5 fps |
+| frames dropped | 8 | 1.8% |
+
+The Real3D draws nearly every frame it is given; the game submits one about every fourth vblank. The CPU
+counters: CPI 4.0–4.2 (stage A, tiles only: 1.80), 21.5–22.5 M instructions/s, 44–46 M of 90 M cycles waiting on
+data memory, longest bus wait 2,500–3,100 clocks.
+
+I had remembered VF3's need as about 17 M instructions/s. That is MAME's p50 (307,703 a frame), which R19
+superseded: MAME renders VF3 at 30 Hz. Supermodel's p50 is 566,640 a frame, 32.6 M/s at 57.5 fps. At 14.5 fps the
+game's busy work is about 8 M/s, so most of the 22 M/s is waiting.
+
+The system bench (`tb_m3_system --prof`, data-wait cycles by the region of the D-cache's last request; from the
+frame-1100 checkpoint) reproduces it at frames 1100–1110: CPI 3.19, data wait 50.2%.
+
+| Region | Share of all cycles | Requests in 10 frames |
+|---|---|---|
+| main RAM | 32.4% | 532,091 single writes, 12,804 line fills, 39 cast-outs |
+| CROM (FFxxxxxx) | 17.6% | 108,088 single reads, about 28 clocks each |
+| tile generator | 0.2% | 14,601 single writes |
+
+The Real3D status and command ports do not appear: this is not a handshake stall. The RAM writes are D-41's case.
+On PVR 0x00060101, VF3 marks all RAM write-through, so every store is a bus write of about 10.6 clocks. PVR
+0x00060103, with the snoop wired, should remove most of that third: a desk estimate of CPI 3.2 → 2.2, about 1.45×
+the frame rate. Not yet benched. Why the game reads CROM uncached, and whether the hardware pays the same per read,
+is open.
+
+Open issues seen on the board in the same build:
+- **Limb trails.** In attacks the arms and legs leave copies along their path (about five arms at once). The
+  arcade at 60 fps shows none; at 14.5 fps a fast limb moves four times as far between drawn frames, so it may be
+  stale data (a draw reading a copy of the Real3D memory that has not caught up) or the game's own effect seen at a
+  low rate. Supermodel's frames decide; the bench saves frames 1300 and 1390 in `sm3-builds/sysb/runp/`.
+- **Some polygons out of place.** Possibly the same cause.
+- **Earlier:** flat-coloured suits, a full-screen blur, particle sprays (R94).
+- **Clocks:** one 90 MHz clock drives the CPU, the SDRAM, the DDR3 port, the geometry, the rasteriser and the
+  video. I want everything at 110 MHz if it closes; at 100 MHz the integrated build misses by 2 ns (R93), so a
+  timing pass comes first. Failing that, only the CPU at 110 (D-38) with a clock-domain crossing.
