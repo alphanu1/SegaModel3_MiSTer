@@ -81,6 +81,10 @@ module ppc_pdw
                                             pd_x == 10'd759 || pd_x == 10'd983));
   wire  [5:0]  pd_op = w[31:26];
   wire  [9:0]  pd_x  = w[10:1];
+  // a store with update: its one uop (stfdu: its first) writes the EA to rA
+  wire         pd_stu = pd_op == 6'd37 || pd_op == 6'd39 || pd_op == 6'd45 || pd_op == 6'd53 || pd_op == 6'd55 ||
+                        (pd_op == 6'd31 && (pd_x == 10'd183 || pd_x == 10'd247 || pd_x == 10'd439 ||
+                                            pd_x == 10'd695 || pd_x == 10'd759));
   // 3: lfdu / lfdux, three uops (ppc_decode.sv)
   wire  [1:0]  pd_crack =
           (pd_op == 6'd46 || pd_op == 6'd47) ? 2'd2 :
@@ -104,34 +108,86 @@ module ppc_pdw
       10'd287: pd_mf_sel = 3'd7;  default: pd_mf_sel = 3'd0;
     endcase
   end
+  // one flat case, every SPR the core has listed (the BAT range too): as a
+  // range compare beside the case it was four LUT levels from i_data into
+  // the queue (the D-36 uncached full builds' i_data -> h0 spr_idx)
   always_comb begin
     pd_spr_hit = 1'b1;
     case (pd_spr)
-      10'd26:   pd_spr_idx = 6'd0;    // SRR0 (flip-flops, not the array)
-      10'd27:   pd_spr_idx = 6'd1;    // SRR1
-      10'd272:  pd_spr_idx = 6'd2;    10'd273: pd_spr_idx = 6'd3;      // SPRG0-3
-      10'd274:  pd_spr_idx = 6'd4;    10'd275: pd_spr_idx = 6'd5;
-      10'd18:   pd_spr_idx = 6'd6;    // DSISR
-      10'd19:   pd_spr_idx = 6'd7;    // DAR
-      10'd25:   pd_spr_idx = 6'd8;    // SDR1
-      10'd1008: pd_spr_idx = 6'd9;    // HID0
-      10'd1009: pd_spr_idx = 6'd10;   // HID1
-      10'd1010: pd_spr_idx = 6'd11;   // IABR
-      10'd282:  pd_spr_idx = 6'd12;   // EAR
-      10'd976:  pd_spr_idx = 6'd13;   10'd977: pd_spr_idx = 6'd14;     // DMISS DCMP
-      10'd978:  pd_spr_idx = 6'd15;   10'd979: pd_spr_idx = 6'd16;     // HASH1 HASH2
-      10'd980:  pd_spr_idx = 6'd17;   10'd981: pd_spr_idx = 6'd18;     // IMISS ICMP
-      10'd982:  pd_spr_idx = 6'd19;   // RPA
+      10'd26: pd_spr_idx = 6'd0;
+      10'd27: pd_spr_idx = 6'd1;
+      10'd272: pd_spr_idx = 6'd2;
+      10'd273: pd_spr_idx = 6'd3;
+      10'd274: pd_spr_idx = 6'd4;
+      10'd275: pd_spr_idx = 6'd5;
+      10'd18: pd_spr_idx = 6'd6;
+      10'd19: pd_spr_idx = 6'd7;
+      10'd25: pd_spr_idx = 6'd8;
+      10'd1008: pd_spr_idx = 6'd9;
+      10'd1009: pd_spr_idx = 6'd10;
+      10'd1010: pd_spr_idx = 6'd11;
+      10'd282: pd_spr_idx = 6'd12;
+      10'd976: pd_spr_idx = 6'd13;
+      10'd977: pd_spr_idx = 6'd14;
+      10'd978: pd_spr_idx = 6'd15;
+      10'd979: pd_spr_idx = 6'd16;
+      10'd980: pd_spr_idx = 6'd17;
+      10'd981: pd_spr_idx = 6'd18;
+      10'd982: pd_spr_idx = 6'd19;
+      10'd528: pd_spr_idx = 6'd20;
+      10'd529: pd_spr_idx = 6'd21;
+      10'd530: pd_spr_idx = 6'd22;
+      10'd531: pd_spr_idx = 6'd23;
+      10'd532: pd_spr_idx = 6'd24;
+      10'd533: pd_spr_idx = 6'd25;
+      10'd534: pd_spr_idx = 6'd26;
+      10'd535: pd_spr_idx = 6'd27;
+      10'd536: pd_spr_idx = 6'd28;
+      10'd537: pd_spr_idx = 6'd29;
+      10'd538: pd_spr_idx = 6'd30;
+      10'd539: pd_spr_idx = 6'd31;
+      10'd540: pd_spr_idx = 6'd32;
+      10'd541: pd_spr_idx = 6'd33;
+      10'd542: pd_spr_idx = 6'd34;
+      10'd543: pd_spr_idx = 6'd35;
+      default: begin pd_spr_idx = 6'd63; pd_spr_hit = 1'b0; end
+    endcase
+  end
+`ifdef VERILATOR
+  logic       ck_spr_hit;
+  logic [5:0] ck_spr_idx;
+  always_comb begin
+    ck_spr_hit = 1'b1;
+    case (pd_spr)
+      10'd26:   ck_spr_idx = 6'd0;    // SRR0 (flip-flops, not the array)
+      10'd27:   ck_spr_idx = 6'd1;    // SRR1
+      10'd272:  ck_spr_idx = 6'd2;    10'd273: ck_spr_idx = 6'd3;      // SPRG0-3
+      10'd274:  ck_spr_idx = 6'd4;    10'd275: ck_spr_idx = 6'd5;
+      10'd18:   ck_spr_idx = 6'd6;    // DSISR
+      10'd19:   ck_spr_idx = 6'd7;    // DAR
+      10'd25:   ck_spr_idx = 6'd8;    // SDR1
+      10'd1008: ck_spr_idx = 6'd9;    // HID0
+      10'd1009: ck_spr_idx = 6'd10;   // HID1
+      10'd1010: ck_spr_idx = 6'd11;   // IABR
+      10'd282:  ck_spr_idx = 6'd12;   // EAR
+      10'd976:  ck_spr_idx = 6'd13;   10'd977: ck_spr_idx = 6'd14;     // DMISS DCMP
+      10'd978:  ck_spr_idx = 6'd15;   10'd979: ck_spr_idx = 6'd16;     // HASH1 HASH2
+      10'd980:  ck_spr_idx = 6'd17;   10'd981: ck_spr_idx = 6'd18;     // IMISS ICMP
+      10'd982:  ck_spr_idx = 6'd19;   // RPA
       default: begin
         if (pd_spr >= 10'd528 && pd_spr <= 10'd543)
-          pd_spr_idx = 6'd20 + {2'b00, pd_spr[3:0]};                 // IBAT0U .. DBAT3L
+          ck_spr_idx = 6'd20 + {2'b00, pd_spr[3:0]};                 // IBAT0U .. DBAT3L
         else begin
-          pd_spr_idx = 6'd63;
-          pd_spr_hit = 1'b0;
+          ck_spr_idx = 6'd63;
+          ck_spr_hit = 1'b0;
         end
       end
     endcase
   end
+
+  always_ff @(posedge clk)
+    if (!rst && {ck_spr_hit, ck_spr_idx} != {pd_spr_hit, pd_spr_idx}) $fatal(1, "flat SPR index, %0d", pd_spr);
+`endif
 
   // the immediate's form, as the decoder builds id_u.imm for y
   logic [2:0] pd_immk;
@@ -237,6 +293,7 @@ module ppc_pdw
     pd.hh      = pd_op == 6'd31 && (pd_x == 10'd339 || pd_x == 10'd371) && (pd_spr == 10'd978 || pd_spr == 10'd979);
     pd.fdx     = pr_fdbl;
     pd.ra0     = w[20:16] == 5'd0;
+    pd.rda     = pr_xs || pd_stu;
     pd.ill     = pr_ill && !pa_op;
     pd.pop     = alu_op_t'(pr_op);
     // (ppc_decode's fp_arith and fp_ls, as checked in ID below)
@@ -268,6 +325,10 @@ module ppc_pdw
                        (pd_u.op == OP_CRLOG && pd_x == 10'd0) || pd_u.op == OP_MCRXR,
                        pd_u.op == OP_CRLOG && pd_x != 10'd0}))
       $fatal(1, "predecode raw compares against the decoder, word %h", w);
+  // the first uop's result register (pd.rda), wherever it writes a GPR
+  always_ff @(posedge clk)
+    if (!rst && !mark && pd_u.rd_we && pd_u.rd != (pd.rda ? w[20:16] : w[25:21]))
+      $fatal(1, "predecode rda against the decoder's rd, word %h", w);
 `endif
 
 endmodule

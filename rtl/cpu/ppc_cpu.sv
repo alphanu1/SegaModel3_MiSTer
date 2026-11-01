@@ -24,6 +24,16 @@
 // HID0's cache bits come from the core's flip-flops; the flash invalidates
 // are one-cycle pulses (the caches latch them). icbi goes from the core's MEM
 // to the I-cache. sync waits on the data cache's d_idle.
+//
+// Snoop (SNOOP = 1, study D-41): the data cache's snoop port, for another
+// master's access to memory (ppc_dcache.sv, "Snoop port"). sn_req is held
+// until the sn_ack pulse with sn_addr (the physical line) and sn_inv stable.
+// A push goes out on the memory port as an ordinary cast-out (MC_LINE_WR)
+// before sn_ack, so the port must keep being served while sn_req waits. After
+// an sn_ack with sn_inv = 1 the master's write must reach memory before any
+// later transaction of this port. The instruction cache is not snooped (603e
+// 3.1). SNOOP = 0: sn_ack answers a cycle later and nothing is coherent; tie
+// sn_req low.
 
 module ppc_cpu
   import ppc_pkg::*, ppc_cache_pkg::*;
@@ -31,8 +41,9 @@ module ppc_cpu
   parameter logic [31:0] RESET_PC = 32'hFFF0_0100,
   parameter logic [31:0] PVR      = 32'h0006_0101,
   parameter bit          BTB      = 1'b1,             // the core's BTB and the I-cache's pre-read port (D-30)
-  parameter bit          FETCH2   = 1'b1,             // two-word fetch (D-30)
-  parameter bit          LA       = 1'b1              // the 603e's CR look-ahead (D-30)
+  parameter bit          FETCH2   = 1'b0,             // two-word fetch (D-30; off by default, D-36)
+  parameter bit          LA       = 1'b1,             // the 603e's CR look-ahead (D-30)
+  parameter bit          SNOOP    = 1'b1              // the data cache's snoop port (D-41)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -47,6 +58,12 @@ module ppc_cpu
   input  logic        m_wnext,
   input  logic        m_rvalid,
   input  logic [31:0] m_rdata,
+
+  // snoop (above)
+  input  logic        sn_req,
+  input  logic [31:5] sn_addr,
+  input  logic        sn_inv,
+  output logic        sn_ack,
 
   input  logic        tb_tick,
   input  logic        ext_int,
@@ -83,7 +100,11 @@ module ppc_cpu
   output logic [3:0]  t_dwimg,
   output logic [2:0]  t_dop,
   output logic        t_dvalid,
-  output logic [31:0] t_drdata
+  output logic [31:0] t_drdata,
+  output logic [3:0]  t_dbe,
+  output logic [31:0] t_dwdata,
+  output logic        t_drsv,
+  output logic        t_dcnd
 );
 
   // ------------------------------------------------------------ the core
@@ -103,6 +124,7 @@ module ppc_cpu
   logic        hid_ice, hid_dce, hid_ilock, hid_dlock, hid_icfi, hid_dcfi, hid_noopti;
   logic        icbi_req, icbi_ack;
   logic [6:0]  icbi_set;
+  logic        d_resv, d_cond, res_kill;
 
   ppc_core #(.RESET_PC (RESET_PC), .PVR (PVR), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA)) u_core (
     .clk (clk), .rst (rst),
@@ -111,6 +133,7 @@ module ppc_cpu
     .i_pre (i_pre), .i_two (i_two), .i_w2 (i_w2), .i_data2 (i_data2),
     .d_req (d_req), .d_we (d_we), .d_addr (d_addr), .d_be (d_be), .d_wdata (d_wdata),
     .d_wimg (d_wimg), .d_op (d_op), .d_rdy (d_rdy), .d_idle (d_idle), .d_valid (d_valid), .d_rdata (d_rdata),
+    .d_resv (d_resv), .d_cond (d_cond), .res_kill (res_kill),
     .hid_ice (hid_ice), .hid_dce (hid_dce), .hid_ilock (hid_ilock), .hid_dlock (hid_dlock),
     .hid_icfi (hid_icfi), .hid_dcfi (hid_dcfi), .hid_noopti (hid_noopti),
     .icbi_req (icbi_req), .icbi_set (icbi_set), .icbi_ack (icbi_ack),
@@ -128,6 +151,10 @@ module ppc_cpu
   assign t_dop   = d_op;
   assign t_dvalid = d_valid;
   assign t_drdata = d_rdata;
+  assign t_dbe    = d_be;
+  assign t_dwdata = d_wdata;
+  assign t_drsv   = d_resv;
+  assign t_dcnd   = d_cond;
 
   // ------------------------------------------------------------ the caches
   logic        im_req, im_ack, im_rvalid;
@@ -151,12 +178,13 @@ module ppc_cpu
     .t_alloc (), .t_alloc_set (), .t_alloc_way (), .t_alloc_tag ()
   );
 
-  ppc_dcache u_dc (
+  ppc_dcache #(.SNOOP (SNOOP)) u_dc (
     .clk (clk), .rst (rst),
     .d_req (d_req), .d_we (d_we), .d_addr (d_addr), .d_be (d_be), .d_wdata (d_wdata), .d_wimg (d_wimg),
     .d_op (d_op), .d_rdy (d_rdy), .d_valid (d_valid), .d_rdata (d_rdata),
     .hid_dce (hid_dce), .hid_dlock (hid_dlock), .hid_dcfi (hid_dcfi), .hid_noopti (hid_noopti),
     .dcfi_ack (), .d_idle (d_idle),
+    .d_rsv (d_resv), .res_kill (res_kill), .sn_req (sn_req), .sn_addr (sn_addr), .sn_inv (sn_inv), .sn_ack (sn_ack),
     .m_req (dm_req), .m_cmd (dm_cmd), .m_addr (dm_addr), .m_be (dm_be), .m_wdata (dm_wdata),
     .m_ack (dm_ack), .m_wnext (dm_wnext), .m_rvalid (dm_rvalid), .m_rdata (m_rdata),
     .t_alloc (), .t_alloc_set (), .t_alloc_way (), .t_alloc_tag ()

@@ -29,7 +29,8 @@
 // (sim/cpu/tb_ppc_core.cpp), so the board run is checked, not only timed.
 
 module m3_cpu_mon #(
-  parameter int unsigned DIVISOR = 868          // 100 MHz / 115200
+  parameter int unsigned DIVISOR = 868,         // 100 MHz / 115200
+  parameter bit          SIG     = 1'b1         // the retire signature (0: reads FFFFFFFF; the system has no use for it)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -41,7 +42,8 @@ module m3_cpu_mon #(
   input  logic [4:0]  rt_gpr,
   input  logic [31:0] rt_gpr_val,
   output logic        busy,                      // a report is printing (or about to)
-  output logic        tx
+  output logic        tx,
+  output logic [8:0][31:0] counts                // the last report's counters 00-08 (the system's overlay)
 );
 
   localparam int N = 11;
@@ -97,9 +99,27 @@ module m3_cpu_mon #(
       for (int j = 0; j < 32; j++) sig_a[i] = sig_a[i] ^ (a_col[j][i] & sig[j]);
     end
   end
+  // the data's part the same way: crc40(0, d) as a flat XOR of d's bits per
+  // output bit (the loop's form was eight LUTs deep, rt_gpr_val_q into sd_q,
+  // a D-36 cached full build)
+  logic [31:0] d_col [0:36];
+  logic [36:0] sd_d;
+  logic [31:0] sd_n;
+  assign sd_d = {rt_gpr_q, rt_gpr_val_q};
+  always_comb begin
+    for (int j = 0; j < 37; j++) d_col[j] = crc40(32'd0, 40'd1 << j);
+    for (int i = 0; i < 32; i++) begin
+      sd_n[i] = 1'b0;
+      for (int j = 0; j < 37; j++) sd_n[i] = sd_n[i] ^ (d_col[j][i] & sd_d[j]);
+    end
+  end
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (sd_n != crc40(32'd0, {3'b000, rt_gpr_q, rt_gpr_val_q})) $fatal(1, "monitor CRC matrix");
+`endif
   always_ff @(posedge clk) begin
-    sd_q <= crc40(32'd0, {3'b000, rt_gpr_q, rt_gpr_val_q});
-    su_q <= rt_valid_q && rt_gpr_we_q && !rst && !clear_q;
+    sd_q <= sd_n;
+    su_q <= SIG && rt_valid_q && rt_gpr_we_q && !rst && !clear_q;
   end
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -124,6 +144,7 @@ module m3_cpu_mon #(
   logic [7:0] u_data, u_data_q;
   logic [3:0] line;
   logic [3:0] ch;          // 0 'P', 1 ' ', 2-3 index, 4 ' ', 5-12 value, 13 CR, 14 LF
+  logic [31:0] wq;         // lat[line], a cycle on (below)
 
   function automatic logic [7:0] hex(input logic [3:0] n);
     return (n < 4'd10) ? (8'h30 + {4'd0, n}) : (8'h37 + {4'd0, n});
@@ -138,9 +159,20 @@ module m3_cpu_mon #(
       4'd4:    u_data = " ";
       4'd13:   u_data = 8'h0D;
       4'd14:   u_data = 8'h0A;
-      default: u_data = hex(lat[line][31 - 4*(ch - 5) -: 4]);
+      default: u_data = hex(wq[31 - 4*(ch - 5) -: 4]);
     endcase
   end
+  // the line's word, registered every cycle: the value's first digit (ch 5)
+  // is chosen five characters after the line changes, so wq has long been
+  // lat[line] by then. Read through the 11-way select in front of the digit
+  // select and hex, line into u_data_q missed 100 MHz (a round-2 uncached
+  // full build, -0.23 ns)
+  always_ff @(posedge clk) wq <= lat[line];
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && p_busy && u_ready && !u_valid && ch >= 4'd5 && ch <= 4'd12 && wq != lat[line])
+      $fatal(1, "monitor printer's registered word");
+`endif
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -167,6 +199,8 @@ module m3_cpu_mon #(
       end
     end
   end
+
+  always_comb for (int i = 0; i < 9; i++) counts[i] = lat[i];
 
   m3_uart_tx #(.DIVISOR(DIVISOR)) u_tx (
     .clk (clk), .rst_n (!rst),

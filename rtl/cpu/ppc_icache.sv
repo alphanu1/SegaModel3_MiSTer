@@ -82,7 +82,7 @@ module ppc_icache
   parameter logic [19:0] RSV_TAG = 20'hF00FF,
   parameter bit          WAYPRED = 1'b1,
   parameter bit          PRE     = 1'b1,               // the pre-read port (above)
-  parameter bit          FETCH2  = 1'b1                // two-word answers (above)
+  parameter bit          FETCH2  = 1'b0                // two-word answers (above; off by default, D-36)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -275,6 +275,11 @@ module ppc_icache
   // cycle, I = 1 or the reserved page. Fetch translation makes i_wimg and
   // i_addr[31:12] late, so they are taken from registers here (wi_q, pa);
   // the first pending cycle is the tag check anyway, so this costs no cycle
+`ifdef VERILATOR
+  logic [31:2] pa_chk;                          // pa as loaded before, at a request's start only
+  always_ff @(posedge clk) if (!rst && !phit && !fast && i_req && !pend) pa_chk <= i_addr[31:2];
+  always_ff @(posedge clk) if (!rst && pend && pa != pa_chk) $fatal(1, "icache pa against its start-only load");
+`endif
   wire         p_ui     = p_unc || (pend_new && (wi_q || pa[31:12] == RSV_TAG));
   wire         chk      = pend && !p_ui && !p_line && ta_v && !ta_look && ta_idx == pa[11:5] && !t_haz && !wk_act;
   wire         look     = !pend && ta_v && ta_look && kl_v && ta_idx == kl[11:5] + 7'd1 && ta_exp == kl[31:12] &&
@@ -292,7 +297,17 @@ module ppc_icache
   logic [19:0] ppa_q;
   wire         pre_take = PRE && i_pv && fast && !wk_act && !f_act && hid_ice;
   wire         pfast    = PRE && i_req && i_pre && pre_q && !pend && ta_v && !ta_look && !t_haz && !wk_act && !f_act;
-  wire         phit     = pfast && tg[pw_q] == ppa_q && ppa_q != RSV_TAG;
+  // each way's tag against the page, the stored way choosing last: the way
+  // mux was in front of the compare, from the tag M10K into pend and nx (a
+  // D-36 cached full build)
+  logic [3:0]  pv;
+  always_comb
+    for (int w = 0; w < 4; w++) pv[w] = tg[w] == ppa_q;
+  wire         phit     = pfast && pv[pw_q] && ppa_q != RSV_TAG;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && phit != (pfast && tg[pw_q] == ppa_q && ppa_q != RSV_TAG)) $fatal(1, "phit per way");
+`endif
 
   // The read address and the data select depend on registers only; the
   // compare decides i_valid and the bookkeeping.
@@ -381,6 +396,12 @@ module ppc_icache
     tw_en_q  <= 2'd0;
     icfi_q   <= hid_icfi;
     wi_q     <= i_wimg[2];
+    // pa loads whenever no request is pending, not only as one starts: it is
+    // read only while pending (and in the bookkeeping registered beside it,
+    // which the first pending cycle ignores), so the same value is there. As
+    // the load of one branch it waited on phit and fast, and the fetch
+    // translation into pa led two round-1 cached full builds (p_tgt -> pa)
+    if (!pend) pa <= i_addr[31:2];
     da       <= rd_a;
     da_av    <= av({f_line[31:12], rd_a[9:3]}, rd_a[2:0], f_act, f_line, avail);
     ta_idx   <= ta_rd;
@@ -451,7 +472,6 @@ module ppc_icache
           end
         end else if (i_req && !pend) begin
           pend  <= 1'b1;
-          pa    <= i_addr[31:2];
           p_unc <= !hid_ice;
           fs_q  <= 1'b0;
           f2_q  <= 1'b0;

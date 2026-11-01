@@ -241,10 +241,30 @@ module ppc_fpu_fma
   // both sums formed, frC's (or 1.0's, exponent 0) picked after the adds:
   // the op decode in front of them missed 120 MHz by 0.32 ns
   exp_t esum_c, esum_1, ep00_c, ep00_1;
-  assign esum_c = ea0 + ec0 - eb0 + exp_t'(56);
-  assign esum_1 = ea0 - eb0 + exp_t'(56);
-  assign ep00_c = ea0 + ec0 - exp_t'(104);
+  // (frC's exponent, the late one, through the stfs and zero logic in front,
+  // goes into one add after the others' part: as written left to right it
+  // went through three carry chains, a D-36 cached full build's fc_q into
+  // esum; the sums are the same modulo the width: one chain after ec0)
+  // xe(e) = e' - 1023, e' being e with bit 0 forced to 1 where e = 0 (a zero
+  // exponent's -1022), so frB's and frC's exponents go into the sums raw,
+  // with no xe adder in front, and each sum is one (ternary) add after them.
+  // (Round 3 of the 100 MHz pass: frB's xe, then ea0 - eb0, + 56 and + ec0
+  // were four carry chains from fb_q into esum.)
+  wire  [10:0] b_x = {b_e[10:1], b_e[0] | b_e0};
+  wire  [10:0] c_x = {c_er[10:1], c_er[0] | (c_er == 11'd0)};
+  exp_t ea56, ea1079, ea1127;
+  assign ea56   = ea0 + exp_t'(56);
+  assign ea1079 = ea0 + exp_t'(1079);
+  assign ea1127 = ea0 - exp_t'(1127);
+  assign esum_1 = ea1079 - exp_t'({3'b000, b_x});
   assign ep00_1 = ea0 - exp_t'(104);
+  assign esum_c = ea56 + exp_t'({3'b000, c_x}) - exp_t'({3'b000, b_x});
+  assign ep00_c = ea1127 + exp_t'({3'b000, c_x});
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if ({esum_1, esum_c, ep00_c} != {ea0 - eb0 + exp_t'(56), ea0 + ec0 - eb0 + exp_t'(56), ea0 + ec0 - exp_t'(104)})
+      $fatal(1, "fma exponent sums from raw exponents");
+`endif
   assign esum   = has_c ? esum_c : esum_1;
   assign ep00   = has_c ? ep00_c : ep00_1;
   assign sh_cvt = exp_t'(52) - eb0;

@@ -55,7 +55,12 @@ module ppc_fetchq #(
   output logic [31:0] r1_insn,       // entry 1: the head after a pop
   output logic [PDW-1:0] r1_pd,
   output logic [PDW-1:0] r2_pd,      // entries 2 and 3's predecode (the CR look-ahead's scan)
-  output logic [PDW-1:0] r3_pd
+  output logic [PDW-1:0] r3_pd,
+  // a copy of entry 0's register fields and the predecode's low three bits,
+  // {insn[25:11], pd[2:0]} (ppc_pkg pd_t: sh), for the GPR file's read
+  // addresses: a register of its own, so the array's address is not on the
+  // queue head's wide nets
+  output logic [17:0]    r_rf
 );
 
   // entries 0 and 1: {insn, pc, pred, predecode}; the ring's two slots
@@ -98,6 +103,25 @@ module ppc_fetchq #(
     if (o[3]) rg[!rp] <= w_e;
   end
   localparam int HW = EW / 2;
+  // r_rf: a copy of entry 0's register fields and pd[2:0], loaded as entry 0
+  // is (preserve keeps it a register of its own), for the GPR file's read
+  // addresses. (A flat six-input form of entries 0 and 1, tried in round 2 of
+  // the 100 MHz pass, put the pop through a LUT in front of every entry bit
+  // and made the pop's paths worse: reverted.)
+  generate if (!F2) begin : g_flat
+    localparam int IB = EW - 32;                      // the word's bit 0 in an entry
+    (* preserve *) logic [17:0] h0r;
+    always_ff @(posedge clk)
+      if (pop[1])     h0r <= o[1] ? {w_e[IB+25:IB+11], w_e[2:0]} : {h1[IB+25:IB+11], h1[2:0]};
+      else if (o[0])  h0r <= {w_e[IB+25:IB+11], w_e[2:0]};
+    assign r_rf = h0r;
+`ifdef VERILATOR
+    always_ff @(posedge clk) if (cnt != 3'd0 && h0r != {h0[IB+25:IB+11], h0[2:0]}) $fatal(1, "fetch queue r_rf copy");
+`endif
+  end else begin : g_f2
+    assign r_rf = {h0[EW-7:EW-21], h0[2:0]};
+  end
+  endgenerate
   always_ff @(posedge clk) begin
     if (pop[0])     h0[EW-1:HW] <= o[1] ? w_e[EW-1:HW] : h1[EW-1:HW];
     else if (o[0])  h0[EW-1:HW] <= w_e[EW-1:HW];

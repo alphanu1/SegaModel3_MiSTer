@@ -71,12 +71,41 @@
 // from (an access to it bypasses the arrays). The dirty bits, MRU and PLRU of
 // a set are one MLAB word. Reset and HID0[DCFI] sweep the tags, one set a
 // cycle, 128 cycles; nothing is cleared in reset.
+//
+// Snoop port (SNOOP = 1; study D-41): another master's access to a line, as
+// the MPC105 broadcasts a PCI master's cycle on the 60x bus (603e 3.6,
+// table 3-6). sn_req is a level held until sn_ack, with sn_addr (the physical
+// line) stable; sn_inv = 0 for a read (a modified line is pushed and stays
+// valid and clean, the caching-inhibited read row of table 3-6), 1 for a
+// write (pushed if modified, then invalidated). sn_ack is a one-cycle pulse:
+// the line is not modified in the cache, or its push has been taken whole by
+// the memory port (MC_LINE_WR acknowledged, eight beats), and with sn_inv it
+// is invalid. With HID0[DCE] = 0 nothing is snooped (3.2.3.2).
+//   The snoop waits until the cache has nothing in flight (no miss, fill,
+// cast-out, single access, store buffer or decision), as the 603e retries a
+// snoop that meets a fill, a cast-out or a tag write (3.6.3, 3.6.8). It then
+// takes the read port for two cycles, as the cast-out copy does: the first
+// reads its set's tags, the second keeps the lookup stage empty while the
+// first's tags are compared, so no CPU lookup sees the set while the snoop
+// decides. If the lookup that ran during the first cycle left work, the
+// snoop keeps the port (no CPU lookups) until that work is done, and reads
+// again. Stores are not posted while it holds the port. A modified line goes
+// out through the cast-out buffer and the normal write-back, as dcbst does.
+// Every CPU access whose lookup came before the snoop's is in its push; every
+// later one sees its result.
+//   Reservations (603e 2.3.6.1, 3.6.6): d_rsv marks an lwarx's request. A
+// snooped write to the reservation's line clears the reservation (res_kill,
+// to ppc_core), until the next lwarx. An lwarx made while that snoop is in
+// progress, to its line, is cleared too.
 
 module ppc_dcache
   import ppc_cache_pkg::*;
 #(
   // a page in Model 3's I/O space (always mapped I = 1): its accesses are single
-  parameter logic [19:0] RSV_TAG = 20'hF00FF
+  parameter logic [19:0] RSV_TAG = 20'hF00FF,
+  // the snoop port; 0: sn_ack answers every request a cycle later, nothing is
+  // looked up, and res_kill is 0
+  parameter bit          SNOOP   = 1'b1
 )(
   input  logic        clk,
   input  logic        rst,
@@ -98,6 +127,13 @@ module ppc_dcache
   input  logic        hid_noopti,
   output logic        dcfi_ack,     // the flash invalidate began: the core clears HID0[DCFI]
   output logic        d_idle,       // nothing posted, buffered or in flight
+
+  input  logic        d_rsv,        // with d_req: the request is an lwarx's
+  output logic        res_kill,     // the reservation is lost (ppc_core)
+  input  logic        sn_req,       // snoop (above): held until sn_ack
+  input  logic [31:5] sn_addr,      // the physical line, stable with sn_req (from a register)
+  input  logic        sn_inv,       // 0 another master's read, 1 its write
+  output logic        sn_ack,
 
   output logic        m_req,
   output logic [1:0]  m_cmd,
@@ -246,6 +282,21 @@ module ppc_dcache
   typedef enum logic [2:0] { MP_IDLE, MP_RQ, MP_FILL, MP_WB, MP_SRD } mp_t;
   mp_t         mp;
 
+  // snoop: SN_W waits for the cache to have nothing in flight; SN_A and SN_B
+  // hold the read port (SN_A reads the set, SN_B compares its tags and keeps
+  // the lookup stage empty; it repeats until the cache is quiet); SN_C
+  // decides; SN_WB waits for the push's last beat
+  typedef enum logic [2:0] { SN_IDLE, SN_W, SN_A, SN_B, SN_C, SN_WB } sn_t;
+  sn_t         sn_st;
+  logic        sn_iq;                           // sn_inv, taken as the snoop starts
+  logic [3:0]  sn_hv;                           // its tags against the line, from SN_B
+  logic        sn_ack_q;
+  logic        rsv_q;                           // an lwarx was taken last edge (its line is in r_a)
+  logic [31:5] rv_pa;                           // the reservation's line (the latest lwarx)
+  logic        rv_kill;
+  wire         sn_rd  = SNOOP && (sn_st == SN_A || sn_st == SN_B);       // holds the read port
+  wire         sn_np  = SNOOP && (sn_st == SN_A || sn_st == SN_B || sn_st == SN_C);   // no posting, no sweep
+
   // ================================================================ lookup (L)
   // The cycle after R's read compares the tags. Only three things act on the
   // compare here: a load hit's answer, a store hit going into SB, and the way
@@ -291,12 +342,40 @@ module ppc_dcache
   wire  [8:0]  st     = (s_v && s_set == r_set) ? s_new : st_ram;
   wire  [1:0]  st_mru = st[4:3];
 
+  // Each way's tag is compared with both candidates, X's and R's, and a
+  // copy of x_v of its own (x_vc: x_v drives some 200 loads) chooses at the
+  // compare's last level, laid out by hand (keep): three-bit groups, the
+  // first six ANDed, then the select with the seventh. Through r_tag's select
+  // x_v was in front of the whole compare (a round-1 cached full build, x_v
+  // through the tags into d_rdy_q, x_v and d_valid); this way the tag's own
+  // depth is what it was.
+  (* preserve *) logic x_vc;
   logic [3:0]  hv, inv;
+  (* keep = 1 *) wire [27:0] hg_x, hg_r;           // [7w + g]: way w, bits 3g .. 3g + 2
+  (* keep = 1 *) wire [3:0]  ha_x, ha_r;           // groups 0-5 of way w
+  genvar hw_w, hw_g;
+  generate
+  for (hw_w = 0; hw_w < 4; hw_w = hw_w + 1) begin : g_hv
+    for (hw_g = 0; hw_g < 7; hw_g = hw_g + 1) begin : g_g
+      localparam LO = 3 * hw_g;
+      localparam HI = (hw_g == 6) ? 19 : 3 * hw_g + 2;
+      assign hg_x[7*hw_w + hw_g] = tg[hw_w][HI:LO] == x_a[12+HI:12+LO];
+      assign hg_r[7*hw_w + hw_g] = tg[hw_w][HI:LO] == r_a[12+HI:12+LO];
+    end
+    assign ha_x[hw_w] = &hg_x[7*hw_w +: 6];
+    assign ha_r[hw_w] = &hg_r[7*hw_w +: 6];
+  end
+  endgenerate
   always_comb
     for (int w = 0; w < 4; w++) begin
-      hv[w]  = tg[w] == r_tag;
+      hv[w]  = x_vc ? (ha_x[w] && hg_x[7*w + 6]) : (ha_r[w] && hg_r[7*w + 6]);
       inv[w] = tg[w] == RSV_TAG;
     end
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    for (int w = 0; w < 4; w++)
+      if (!rst && hv[w] != (tg[w] == r_tag)) $fatal(1, "dcache tag compare per candidate, way %0d", w);
+`endif
   wire         any    = |hv;
   wire  [1:0]  hw     = enc4(hv);
   wire  [1:0]  pw     = rw_v_l ? x_rw : st_mru; // the way the data output takes
@@ -321,11 +400,26 @@ module ppc_dcache
   // start (a dcbz in DQ starts ZU at the next edge, when SB would write)
   wire wp_free = !f_act && !z_act && !(dq_v && dq_k == K_DCBZ);
   wire dq_free = !dq_v && !mq_v && !uq_v;       // a miss or a single access can be taken
-  wire blk     = wk_act ||
-                 (dq_v && dq_set == r_set) ||
-                 (mq_v && mq_a[11:5] == r_set) || (f_act && f_a[11:5] == r_set) ||
-                 (cp_act && cp_set == r_set) || (z_act && z_set == r_set) ||
-                 (tw_en_q != 2'd0 && tw_set_q == r_set) || (tw_last && tw_lset == r_set);
+  // the set's blocks compared for both candidates (X's, R's) and chosen by
+  // x_v last: through r_set the x_v select was in front of every compare
+  // (a D-36 cached full build, r_a through the set compares into x_ph)
+  wire blk_x   = (dq_v && dq_set == x_a[11:5]) ||
+                 (mq_v && mq_a[11:5] == x_a[11:5]) || (f_act && f_a[11:5] == x_a[11:5]) ||
+                 (cp_act && cp_set == x_a[11:5]) || (z_act && z_set == x_a[11:5]) ||
+                 (tw_en_q != 2'd0 && tw_set_q == x_a[11:5]) || (tw_last && tw_lset == x_a[11:5]);
+  wire blk_r   = (dq_v && dq_set == r_a[11:5]) ||
+                 (mq_v && mq_a[11:5] == r_a[11:5]) || (f_act && f_a[11:5] == r_a[11:5]) ||
+                 (cp_act && cp_set == r_a[11:5]) || (z_act && z_set == r_a[11:5]) ||
+                 (tw_en_q != 2'd0 && tw_set_q == r_a[11:5]) || (tw_last && tw_lset == r_a[11:5]);
+  wire blk     = wk_act || (x_v ? blk_x : blk_r);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && (blk != (wk_act || (dq_v && dq_set == r_set) ||
+                         (mq_v && mq_a[11:5] == r_set) || (f_act && f_a[11:5] == r_set) ||
+                         (cp_act && cp_set == r_set) || (z_act && z_set == r_set) ||
+                         (tw_en_q != 2'd0 && tw_set_q == r_set) || (tw_last && tw_lset == r_set))))
+      $fatal(1, "blk per candidate against the plain form");
+`endif
   wire lk      = l_v && r_ph_l == 2'd0 && !blk;
 
   logic l_ans, l_sb, l_uq, l_dq, l_rw, l_ph1, l_ph2, l_st, l_dirty;
@@ -368,6 +462,19 @@ module ppc_dcache
       endcase
     end
   end
+
+  // ================================================================ snoop decision
+  // In SN_C, DQ's address and tags are the snoop's (taken in SN_B, when the
+  // lookup stage is empty), and DQ is free (the cache was quiet), so a hit
+  // goes through DQ's own outputs: the cast-out (do_cp), the tag write
+  // (do_tw) and the state write (d_st) of dcbst (sn_inv = 0) or dcbf (1).
+  // The set's state is read on a port of its own; nothing writes it between
+  // SN_B and SN_C.
+  wire  [8:0]  st_sn  = stm[dq_set];
+  wire         sn_c   = SNOOP && sn_st == SN_C;
+  wire         sn_hit = (|sn_hv) && hid_dce && dq_a[31:12] != RSV_TAG;
+  wire  [1:0]  sn_hw  = enc4(sn_hv);
+  wire         sn_dty = st_sn[5 + sn_hw];
 
   // ================================================================ decision (D)
   wire  [2:0]  d_ff     = first_free(dq_inv);
@@ -417,6 +524,10 @@ module ppc_dcache
           end
         default: ;
       endcase
+    end else if (sn_c && sn_hit) begin
+      op_way = sn_hw; d_st_new = st_sn;
+      if (sn_dty) begin do_cp = 1'b1; d_st = 1'b1; d_st_new[5 + sn_hw] = 1'b0; end
+      if (sn_iq) do_tw = 1'b1;                  // tw_tag: RSV_TAG
     end
   end
 
@@ -426,8 +537,10 @@ module ppc_dcache
   // one goes to SB is the next one safe. Nothing else may be in R or X: its
   // answer could come in the same cycle as the posted one.
   wire r_to_sb  = lr && r_post && r_k == K_ST && !r_byp && any && !wt;
+  // (not while a snoop holds the read port or decides: the posted store's
+  // lookup must come the next cycle and find what base_ok saw)
   wire base_ok  = !wk_act && !wk_req && !dq_v && !mq_v && !f_act && !cp_act && !z_act && !uq_v &&
-                  tw_en_q == 2'd0 && !rst;
+                  tw_en_q == 2'd0 && !sn_np && !rst;
   wire post     = d_req && d_we && d_op == 3'd0 && base_ok && !x_v && (!r_v || r_to_sb);
 
   // ============================================================ the fill
@@ -452,12 +565,14 @@ module ppc_dcache
   // ============================================================ read port
   // By registers alone: the cast-out copy, else X while it can be looked up,
   // else a parked R (also while X waits for memory, so R is fresh when X is
-  // answered), else the core's new address.
+  // answered), else the core's new address. A snoop takes the port as the
+  // copy does (RD_CP, the copy first): no lookup follows a cycle it reads.
   localparam logic [1:0] RD_NEW = 2'd0, RD_X = 2'd1, RD_R = 2'd2, RD_CP = 2'd3;
-  wire  [1:0]  rd_sel = cp_rd ? RD_CP : (x_v && x_ph == 2'd0) ? RD_X : (r_v && !(r_fresh && !x_v)) ? RD_R : RD_NEW;
+  wire  [1:0]  rd_sel = (cp_rd || sn_rd) ? RD_CP : (x_v && x_ph == 2'd0) ? RD_X : (r_v && !(r_fresh && !x_v)) ? RD_R : RD_NEW;
+  wire  [9:0]  rd_cp  = (!SNOOP || cp_rd) ? {cp_set, cp_base + cp_cnt[2:0]} : {sn_addr[11:5], 3'd0};
   always_comb
     case (rd_sel)
-      RD_CP:   rd_a = {cp_set, cp_base + cp_cnt[2:0]};
+      RD_CP:   rd_a = rd_cp;
       RD_X:    rd_a = x_a[11:2];
       RD_R:    rd_a = r_a[11:2];
       default: rd_a = d_addr[11:2];
@@ -488,8 +603,9 @@ module ppc_dcache
 
   // ============================================================ output
   // byte sources: the store just written, the store about to be, the word
-  wire sb_m  = sb_v  && sb_a  == r_a_l;
-  wire sbl_m = sbl_v && sbl_a == r_a_l;
+  // (both candidates compared, x_v choosing last, as for blk)
+  wire sb_m  = sb_v  && (x_v ? sb_a  == x_a : sb_a  == r_a);
+  wire sbl_m = sbl_v && (x_v ? sbl_a == x_a : sbl_a == r_a);
   logic [31:0] ld_word;
   always_comb
     for (int l = 0; l < 4; l++) begin
@@ -515,11 +631,12 @@ module ppc_dcache
   always_ff @(posedge clk) begin
     l_x <= rd_sel == RD_X;
     if (rst) begin
-      r_v <= 1'b0; r_fresh <= 1'b0; r_post <= 1'b0; x_v <= 1'b0; d_rdy_q <= 1'b0;
+      r_v <= 1'b0; r_fresh <= 1'b0; r_post <= 1'b0; x_v <= 1'b0; x_vc <= 1'b0; d_rdy_q <= 1'b0;
     end else begin
       r_v     <= r_v_n;
       r_fresh <= r_fresh_n;
       x_v     <= x_v_n;
+      x_vc    <= x_v_n;
       // the next cycle's d_rdy: R will be free at its end (empty, or looked up)
       d_rdy_q <= !r_v_n || (r_fresh_n && !x_v_n);
       if (d_req) r_post <= post;
@@ -569,8 +686,10 @@ module ppc_dcache
     s_v     <= l_st && !rst;
     s_set   <= r_set; s_st <= st; s_way <= hw; s_dirty <= l_dirty;
     dq_v    <= l_dq && !rst;
-    dq_k    <= r_k_l; dq_a <= r_a_l; dq_be <= r_be_l; dq_wd <= r_wd_l; dq_rsv <= r_rsv_l;
+    dq_k    <= r_k_l; dq_be <= r_be_l; dq_wd <= r_wd_l; dq_rsv <= r_rsv_l;
+    dq_a    <= (SNOOP && sn_st == SN_B) ? {sn_addr, 3'd0} : r_a_l;   // (SN_B: no lookup this cycle)
     dq_any  <= any; dq_hw <= hw; dq_inv <= inv; dq_st <= st; dq_tg <= tg;
+    for (int w = 0; w < 4; w++) sn_hv[w] <= tg[w] == sn_addr[31:12];
 
     if (rst) begin
       mq_v <= 1'b0; f_act <= 1'b0; cp_act <= 1'b0; z_act <= 1'b0; sb_v <= 1'b0; sbl_v <= 1'b0;
@@ -585,7 +704,7 @@ module ppc_dcache
         tw_d_q   <= {4{RSV_TAG}};
         wk_cnt   <= wk_cnt + 8'd1;
         if (wk_cnt == 8'd127) wk_act <= 1'b0;
-      end else if (wk_req && quiet && !r_v && !x_v) begin
+      end else if (wk_req && quiet && !r_v && !x_v && !sn_np) begin
         wk_req <= 1'b0; wk_act <= 1'b1; wk_cnt <= 8'd0; dcfi_ack <= 1'b1;
       end
 
@@ -701,6 +820,48 @@ module ppc_dcache
       endcase
     end
   end
+
+  // ============================================================ the snoop
+  // SN_W -> SN_A when nothing is in flight; SN_B goes on only when the lookup
+  // that ran during SN_A left nothing either, and no tag was written at the
+  // edge that read the tags it compares. The read was the snoop's: the cast-
+  // out copy, which has the port first, is not active once the cache is
+  // quiet. A hit's state write still pending (s_v) lands before SN_C reads
+  // the set's state. DQ is then free in SN_C, and every cast-out and write-
+  // back resource with it: nothing can start a fill, a copy or a write-back
+  // while the push is out, so the next write-back is the snoop's.
+  wire sn_ok_w = quiet && !wk_act;
+  wire sn_ok_b = quiet && !tw_last && !wk_act;
+  wire sn_wbd  = mp == MP_WB && m_wnext && wb_cnt == 3'd7;    // the push's last beat is taken
+  // the reservation: lost to a snooped write of its line while the snoop is
+  // in progress (from the cycle after sn_req is taken to the cycle before
+  // sn_ack), also when the lwarx is made during that time
+  wire sn_kw   = SNOOP && sn_st != SN_IDLE && sn_iq;
+  wire rv_new  = sn_kw && r_a[31:5] == sn_addr;               // with rsv_q: r_a is the lwarx's line
+  always_ff @(posedge clk) begin
+    sn_ack_q <= 1'b0;
+    rsv_q    <= d_req && d_rsv && !rst;
+    if (rsv_q) rv_pa <= r_a[31:5];
+    if (rst) begin
+      sn_st <= SN_IDLE; rv_kill <= 1'b0;
+    end else if (!SNOOP) begin
+      sn_ack_q <= sn_req && !sn_ack_q;
+    end else begin
+      rv_kill <= rsv_q ? rv_new : (rv_kill || (sn_kw && rv_pa == sn_addr));
+      case (sn_st)
+        SN_IDLE: if (sn_req && !sn_ack_q) begin sn_st <= SN_W; sn_iq <= sn_inv; end
+        SN_W:    if (sn_ok_w) sn_st <= SN_A;
+        SN_A:    sn_st <= SN_B;
+        SN_B:    if (sn_ok_b) sn_st <= SN_C;
+        SN_C:    if (sn_hit && sn_dty) sn_st <= SN_WB;
+                 else begin sn_st <= SN_IDLE; sn_ack_q <= 1'b1; end
+        SN_WB:   if (sn_wbd) begin sn_st <= SN_IDLE; sn_ack_q <= 1'b1; end
+        default: sn_st <= SN_IDLE;
+      endcase
+    end
+  end
+  assign sn_ack   = sn_ack_q;
+  assign res_kill = SNOOP && (rv_kill || (rsv_q && rv_new));
 
   assign m_wdata = (m_cmd == MC_WR) ? uq_wd : cb_zero ? 32'd0 : cbm[wb_cnt];
   assign d_idle  = !r_v && !x_v && quiet && !wk_act && !wk_req && !fb_v;

@@ -120,7 +120,47 @@ FAULTS = [
    'ppc_icache.sv', "ta_k_v = kl_v && kl[11:5] != 7'd127;", "ta_k_v = kl_v;"),
 ]
 
-def run(f):
+# The snoop port (study D-41): run with read and write snoops (bench arg 6 =
+# 2), the seeds cycling through three memory latencies, odd seeds with
+# SNOOP_HOSTILE's long acknowledge delays and beat gaps.
+SNOOP_FAULTS = [
+  ('s_no_push', 'd', 'snoop: a modified line is not pushed (taken as clean)',
+   'ppc_dcache.sv', "wire         sn_dty = st_sn[5 + sn_hw];", "wire         sn_dty = 1'b0;"),
+  ('s_ack_early', 'd', 'snoop: sn_ack as the push starts, not after its last beat',
+   'ppc_dcache.sv', "SN_C:    if (sn_hit && sn_dty) sn_st <= SN_WB;", "SN_C:    if (1'b0) sn_st <= SN_WB;"),
+  ('s_ack_beat0', 'd', 'snoop: sn_ack after the push\'s first beat',
+   'ppc_dcache.sv', "wire sn_wbd  = mp == MP_WB && m_wnext && wb_cnt == 3'd7;", "wire sn_wbd  = mp == MP_WB && m_wnext;"),
+  ('s_sb_miss', 'd', 'snoop: a store still in the store buffer is not waited for',
+   'ppc_dcache.sv', "wire sn_ok_b = quiet && !tw_last && !wk_act;",
+   "wire sn_ok_b = (quiet || sb_v) && !tw_last && !wk_act;"),
+  ('s_no_inv', 'd', 'snoop: a write snoop does not invalidate the line',
+   'ppc_dcache.sv', "if (sn_iq) do_tw = 1'b1;                  // tw_tag: RSV_TAG", ""),
+  ('s_rsv_keep', 'd', 'snoop: a snooped write does not clear the reservation',
+   'ppc_dcache.sv', "rv_kill <= rsv_q ? rv_new : (rv_kill || (sn_kw && rv_pa == sn_addr));",
+   "rv_kill <= rsv_q ? rv_new : rv_kill;"),
+  ('s_rsv_new', 'd', 'snoop: an lwarx made during the snoop keeps its reservation',
+   'ppc_dcache.sv', "rv_kill <= rsv_q ? rv_new : (rv_kill || (sn_kw && rv_pa == sn_addr));",
+   "rv_kill <= rsv_q ? 1'b0 : (rv_kill || (sn_kw && rv_pa == sn_addr));"),
+  ('s_rsv_late', 'd', 'snoop: an lwarx made in the window is cleared a cycle late',
+   'ppc_dcache.sv', "assign res_kill = SNOOP && (rv_kill || (rsv_q && rv_new));", "assign res_kill = SNOOP && rv_kill;"),
+  ('s_post', 'd', 'snoop: stores are still posted while it holds the read port',
+   'ppc_dcache.sv', "tw_en_q == 2'd0 && !sn_np && !rst;", "tw_en_q == 2'd0 && !rst;"),
+  ('s_one_steal', 'd', 'snoop: the port is held one cycle, so a lookup runs as it decides',
+   'ppc_dcache.sv', "wire         sn_rd  = SNOOP && (sn_st == SN_A || sn_st == SN_B);",
+   "wire         sn_rd  = SNOOP && (sn_st == SN_A);"),
+  ('s_no_recheck', 'd', 'snoop: decides on its tags even if the lookup beside it left work',
+   'ppc_dcache.sv', "wire sn_ok_b = quiet && !tw_last && !wk_act;", "wire sn_ok_b = 1'b1;"),
+  ('s_tw_last', 'd', 'snoop: tags read at the edge of a tag write are trusted',
+   'ppc_dcache.sv', "wire sn_ok_b = quiet && !tw_last && !wk_act;", "wire sn_ok_b = quiet && !wk_act;"),
+  ('s_rsv_page', 'd', 'snoop: the reserved (invalid-tag) page is looked up',
+   'ppc_dcache.sv', "wire         sn_hit = (|sn_hv) && hid_dce && dq_a[31:12] != RSV_TAG;",
+   "wire         sn_hit = (|sn_hv) && hid_dce;"),
+  ('s_sweep', 'd', 'snoop: a flash invalidate may start while it decides',
+   'ppc_dcache.sv', "end else if (wk_req && quiet && !r_v && !x_v && !sn_np) begin",
+   "end else if (wk_req && quiet && !r_v && !x_v) begin"),
+]
+
+def run(f, snoop=False):
   name, cache, what, fn, old, new = f
   d = os.path.join(OUT, name)
   shutil.rmtree(d, ignore_errors=True)
@@ -145,18 +185,24 @@ def run(f):
   if not os.path.exists(exe):
     return (name, what, 'BUILD FAILED')
   for seed in range(1, SEEDS + 1):
-    r = subprocess.run([exe, str(OPS), str(seed)], capture_output=True, text=True)
+    env = dict(os.environ)
+    args = [exe, str(OPS), str(seed)]
+    if snoop:
+      lat = [('12', '15'), ('1', '4'), ('20', '60')][seed % 3]
+      args += [lat[0], lat[1], '0', '2']
+      if seed % 2: env['SNOOP_HOSTILE'] = '1'
+    r = subprocess.run(args, capture_output=True, text=True, env=env)
     if r.returncode != 0:
       first = next((l for l in r.stdout.splitlines() + r.stderr.splitlines()
-                    if re.search(r'MISMATCH|ALLOC|SINGLE|MEMORY|TIMEOUT|Error|spurious', l)), '?')
+                    if re.search(r'MISMATCH|ALLOC|SINGLE|MEMORY|TIMEOUT|Error|spurious|SNOOP|RESERVATION', l)), '?')
       shutil.rmtree(os.path.join(d, 'obj'), ignore_errors=True)
       return (name, what, 'caught, seed %d: %s' % (seed, first.strip()[:110]))
   shutil.rmtree(os.path.join(d, 'obj'), ignore_errors=True)
   return (name, what, 'MISSED in %d seeds x %d' % (SEEDS, OPS))
 
 sel = sys.argv[1:]
-for f in FAULTS:
+for f in FAULTS + SNOOP_FAULTS:
   if sel and f[0] not in sel:
     continue
-  name, what, res = run(f)
+  name, what, res = run(f, f in SNOOP_FAULTS)
   print('%-15s %-62s %s' % (name, what, res), flush=True)

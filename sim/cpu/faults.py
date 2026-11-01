@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# Planted faults for the pipelined data port, the pipelined D-cache, the
+# Planted faults for the integer loads with update (corea, suba),
+# the pipelined data port, the pipelined D-cache, the
 # core's cache interface and the fast FPU port. Each fault is made in a copy
 # of rtl/ under
 # sm3-builds/ldp_faults/<name>, the bench that should see it is built from
@@ -43,6 +44,51 @@ NOCHK_FFBL  = '      if (ffbl_q != ((fr_at >> LS) != \'0)) $fatal(1, "ffbl_q");\
 
 # (name, file, old, new, benches)
 FAULTS = [
+  # misaligned accesses (603e 2.2.3, 4.5.6): the split, its merge and the
+  # alignment exception (benches corem, subm: --mis)
+  ('mis_s1_be', 'ppc_core.sv',
+   "        st_be   = ex_sp1 ? 4'(8'(smask) << (3'd4 - {1'b0, boff})) : smask >> boff;",
+   "        st_be   = smask >> boff;", ['corem']),
+  ('mis_rot', 'ppc_core.sv',
+   "(boff == 2'd1) ? {vl[7:0], vl[31:8]} :", "(boff == 2'd1) ? {vl[15:0], vl[31:16]} :", ['corem']),
+  ('mis_ea4', 'ppc_core.sv',
+   "op_x + op_y + {29'd0, ex_sp1, 2'b00};", "op_x + op_y;", ['corem']),
+  ('mis_merge', 'ppc_core.sv',
+   "    d = {w0, w1} << {bo, 3'b000};", "    d = {w1, w0} << {bo, 3'b000};", ['corem']),
+  ('mis_w0_fwd', 'ppc_core.sv',
+   "  wire  [31:0] mis_w0_m = (wb_adv && wb_sp0) ? ldw : mis_w0;", "  wire  [31:0] mis_w0_m = mis_w0;", ['corem', 'subm']),
+  ('mis_wb_hold', 'ppc_core.sv',
+   "  assign wb_hold  = wb_valid && ((wb_out && (!d_valid || wb_sp1))", "  assign wb_hold  = wb_valid && ((wb_out && !d_valid)", ['corem']),
+  ('mis_irq', 'ppc_core.sv',
+   "  wire  xc_irq   = irq_req && ex_first && !ex_s0ok;", "  wire  xc_irq   = irq_req && ex_first;", ['corem']),
+  ('mis_s0_rdwe', 'ppc_core.sv',
+   "      mx.rd_we = 1'b0;                                   // (an update store writes rA from the second)", "", ['corem']),
+  ('mis_qfmx', 'ppc_core.sv',
+   "!is_ld && !mis_hold && !algn;", "!is_ld && !algn;", ['corem']),
+  ('mis_ldw', 'ppc_core.sv',
+   "  wire wb_ldw     = wb_valid && wb_live_q && wb_rd_we && (!d_valid || wb_sp1);",
+   "  wire wb_ldw     = wb_valid && wb_live_q && wb_rd_we && !d_valid;", ['corem']),
+  ('mis_half3', 'ppc_core.sv',
+   "ex_msh && boff == 2'd3;", "1'b0;", ['corem']),
+  ('mis_half1', 'ppc_core.sv',
+   "(bo == 2'd1) ? w[23:8] : w[15:0];", "(bo == 2'd1) ? w[31:16] : w[15:0];", ['corem']),
+  ('algn_page', 'ppc_core.sv',
+   "(msr_q[MSR_DR] && ((mis_x && ea[11:2] == 10'h3FF) ||", "(msr_q[MSR_DR] && ((1'b0 && ea[11:2] == 10'h3FF) ||", ['corem']),
+  ('algn_fpdbl', 'ppc_core.sv',
+   "(ex_u.fp && ex_fd0 && ea[11:0] == 12'hFFC)", "1'b0", ['corem']),
+  ('algn_word', 'ppc_core.sv',
+   "(ex_u.fp || ex_u.reserve || ex_u.cond || (ex_lsm && ex_first)) && boff != 2'd0)",
+   "(ex_u.fp || ex_u.cond || (ex_lsm && ex_first)) && boff != 2'd0)", ['corem']),
+  ('algn_dar4', 'ppc_core.sv',
+   "m.result + {29'd0, m.algn && m.algd4, 2'b00};", "m.result;", ['corem']),
+  ('algn_dsisr_d', 'ppc_core.sv',
+   "        dsisr_q <= (m.insn[31:26] == 6'd31)", "        dsisr_q <= 1'b1", ['corem']),
+  ('d39_leave', 'ppc_core.sv',
+   "    db_leave = db_leave && &ea_x[16:12];", "    db_leave = 1'b0;", ['corem']),
+  ('d39_stay', 'ppc_core.sv',
+   "  wire         db_stay = db_any && !db_leave;", "  wire         db_stay = 1'b0;", ['corem']),
+  ('algn_fpw', 'ppc_core.sv',
+   "        wb_fpw    <= mem_adv && m.fpw && !m.rp && !m.algn;", "        wb_fpw    <= mem_adv && m.fpw && !m.rp;", ['corem']),
   ('load_use_mem', 'ppc_core.sv',
    "(m_ldw && lu_q(qe_m,", "(1'b0 && lu_q(qe_m,", ['core']),
   ('wb_fwd_early', 'ppc_core.sv',
@@ -379,6 +425,38 @@ FAULTS = [
   ('la_fp', 'ppc_core.sv',
    "  wire         la_crb = (q_cnt > 3'd0 && (q_pd.w_cr  || q_pd.fwcr))  || (q_cnt > 3'd1 && (q1_pd.w_cr || q1_pd.fwcr)) ||",
    "  wire         la_crb = (q_cnt > 3'd0 && (q_pd.w_cr))  || (q_cnt > 3'd1 && (q1_pd.w_cr)) ||", ['core']),
+] + [
+  # D-41: the data cache's snoop port, through the subsystem with a DMA master (--snoop 2)
+  ('sn_core_kill', 'ppc_core.sv',
+   "  wire        res_in = !res_kill && ((m.valid && m.res_set) ? 1'b1 : (m.valid && m.res_clr) ? 1'b0 : res_q);",
+   "  wire        res_in = ((m.valid && m.res_set) ? 1'b1 : (m.valid && m.res_clr) ? 1'b0 : res_q);", ['subs']),
+  ('sn_rsv_keep', 'ppc_dcache.sv',
+   "rv_kill <= rsv_q ? rv_new : (rv_kill || (sn_kw && rv_pa == sn_addr));", "rv_kill <= rsv_q ? rv_new : rv_kill;", ['subs']),
+  ('sn_rsv_late', 'ppc_dcache.sv',
+   "assign res_kill = SNOOP && (rv_kill || (rsv_q && rv_new));", "assign res_kill = SNOOP && rv_kill;", ['subs']),
+  ('sn_no_push', 'ppc_dcache.sv', "wire         sn_dty = st_sn[5 + sn_hw];", "wire         sn_dty = 1'b0;", ['subs']),
+  ('sn_ack_early', 'ppc_dcache.sv', "SN_C:    if (sn_hit && sn_dty) sn_st <= SN_WB;", "SN_C:    if (1'b0) sn_st <= SN_WB;", ['subs']),
+  ('sn_sb_miss', 'ppc_dcache.sv', "wire sn_ok_b = quiet && !tw_last && !wk_act;",
+   "wire sn_ok_b = (quiet || sb_v) && !tw_last && !wk_act;", ['subs']),
+  ('sn_no_inv', 'ppc_dcache.sv', "if (sn_iq) do_tw = 1'b1;                  // tw_tag: RSV_TAG", "", ['subs']),
+  ('sn_post', 'ppc_dcache.sv', "tw_en_q == 2'd0 && !sn_np && !rst;", "tw_en_q == 2'd0 && !rst;", ['subs']),
+  ('sn_one_steal', 'ppc_dcache.sv', "wire         sn_rd  = SNOOP && (sn_st == SN_A || sn_st == SN_B);",
+   "wire         sn_rd  = SNOOP && (sn_st == SN_A);", ['subs']),
+  # integer loads with update: step 1 writes rA from step 0's EA (VF3's lbzux
+  # r4,r6,r4). Benches corea / suba: --alias (rD = rB and the reproducer)
+  ('upd_rb_reread', 'ppc_core.sv',                     # the bug put back: rA + d / rB read again, after the load
+   # (and its raw-word check, so that the data compare must see it)
+   ["  wire id_xuea    = id_s1 && q_pd.crack == 2'd1 && !q_pd.fdx && !q_pd.fpw && !q_pd.ifault;",
+    '      $fatal(1, "update load kind of %08X (step 1 %b) against the raw word", q_hi, id_s1);\n'],
+   ["  wire id_xuea    = 1'b0;", "      ;\n"], ['corea', 'suba']),
+  ('upd_luse', 'ppc_core.sv',                          # step 1 waits on its own load: its EA has left EX
+   "  wire load_use   = !id_xuea &&", "  wire load_use   =", ['corea']),
+  ('upd_imm', 'ppc_core.sv',                           # y left at the form's immediate (d, or fimm_q's 4)
+   "    if (id_xuea) id_imm = 32'd0;", "", ['corea']),
+  ('upd_yreg', 'ppc_core.sv',                          # y from rB, as before
+   "  wire        id_yreg  = q_pd.yreg && !id_xfea && !id_xuea;", "  wire        id_yreg  = q_pd.yreg && !id_xfea;", ['corea']),
+  ('upd_xex', 'ppc_core.sv',                           # x not from EX's sum
+   " || (id_xuea && ex_valid);", ";", ['corea']),
 ]
 
 VFLAGS = ['--cc', '--exe', '--build', '-j', '8', '-O3', '-Wno-fatal', '-Wno-UNUSEDSIGNAL', '-Wno-DECLFILENAME']
@@ -386,8 +464,8 @@ VFLAGS = ['--cc', '--exe', '--build', '-j', '8', '-O3', '-Wno-fatal', '-Wno-UNUS
 def build_run(d, bench, drop=''):
     rtl = [os.path.join(d, 'rtl', 'cpu', f + '.sv') for f in CPU_RTL]
     sim = os.path.join(ROOT, 'sim')
-    if bench in ('core', 'sub', 'corel', 'subl'):
-        top = 'ppc_core' if bench in ('core', 'corel') else 'ppc_cpu'
+    if bench in ('core', 'sub', 'corel', 'subl', 'corem', 'subm', 'subs', 'corea', 'suba'):
+        top = 'ppc_core' if bench in ('core', 'corel', 'corem', 'corea') else 'ppc_cpu'
         defs = '' if top == 'ppc_core' else ' -DPPC_CPU'
         obj = os.path.join(d, 'obj_' + bench)
         cmd = ['verilator'] + VFLAGS + ['--top-module', top]
@@ -401,7 +479,18 @@ def build_run(d, bench, drop=''):
                 'sub':   [[exe, '80', '1', '1500', '80'], [exe, '80', '9001', '1500', '6']],
                 # D-30: programs with loops, calls and rewritten code (the BTB's paths)
                 'corel': [[exe, '300', '30001', '1500', '4', '--loops'], [exe, '150', '31001', '1500', '9', '--loops', '--rdy', '25']],
-                'subl':  [[exe, '100', '33001', '1500', '6', '--loops'], [exe, '100', '34001', '1500', '80', '--loops']]}[bench]
+                'subl':  [[exe, '100', '33001', '1500', '6', '--loops'], [exe, '100', '34001', '1500', '80', '--loops']],
+                # misaligned accesses
+                'corem': [[exe, '200', '40001', '1500', '4', '--mis'], [exe, '150', '41001', '1500', '9', '--mis', '--rdy', '25'],
+                          [exe, '150', '42001', '1500', '4', '--mis', '--dlat', '1']],
+                'subm':  [[exe, '100', '53001', '1500', '80', '--mis'], [exe, '60', '54001', '1500', '6', '--mis']],
+                # update forms with overlapping registers, the reproducer
+                'corea': [[exe, '200', '70001', '1500', '4', '--alias'], [exe, '150', '71001', '1500', '9', '--alias', '--mis'],
+                          [exe, '150', '72001', '1500', '4', '--alias', '--dlat', '1']],
+                'suba':  [[exe, '100', '73001', '1500', '80', '--alias'], [exe, '60', '74001', '1500', '6', '--alias']],
+                # the snoop port (D-41): reads and writes from a DMA master
+                'subs':  [[exe, '100', '60001', '1500', '80', '--snoop', '2'], [exe, '100', '61001', '1500', '6', '--snoop', '2'],
+                          [exe, '60', '62001', '1500', '20', '--snoop', '2', '--loops']]}[bench]
     elif bench == 'icpre':
         top = 'ppc_icache'
         obj = os.path.join(d, 'obj_' + bench)

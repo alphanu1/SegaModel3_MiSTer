@@ -443,6 +443,21 @@ module ppc_fpu_sfma
   assign bu5   = r4_q.kb + exp_t'(192) - lz5;
   assign bo5   = r4_q.kb - exp_t'(192) - lz5;
   assign base5 = (tiny5 & r4_q.sd.ue) ? bu5 : bn5;
+  // bnu0/1/2 each formed from kb and lz on an add of its own, the tiny and
+  // far selects last: base5 + 1 and + 2 after the selects were two carry
+  // chains behind lz's compares (a D-36 round-1 uncached full build, r4_q.lz
+  // into r5_q.bnu2). base5 itself is left for the check below.
+  // (the constants written out, in the form the lines above use)
+  exp_t bnj5 [0:2];
+  wire  bu_s5 = tiny5 & r4_q.sd.ue;
+  assign bnj5[0] = bu_s5 ? (r4_q.kb + exp_t'(192) - lz5) : far5 ? exp_t'(872) : (r4_q.kb - lz5);
+  assign bnj5[1] = bu_s5 ? (r4_q.kb + exp_t'(193) - lz5) : far5 ? exp_t'(873) : (r4_q.kb + exp_t'(1) - lz5);
+  assign bnj5[2] = bu_s5 ? (r4_q.kb + exp_t'(194) - lz5) : far5 ? exp_t'(874) : (r4_q.kb + exp_t'(2) - lz5);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    for (int j = 0; j < 3; j++)
+      if (!rst && bnj5[j] != base5 + exp_t'(j)) $fatal(1, "sfma bnu%0d against base5 + %0d", j, j);
+`endif
 
   typedef struct packed {
     logic [28:0] z, keep, one;
@@ -462,9 +477,9 @@ module ppc_fpu_sfma
     s5_d.ovf0   = ~far5 & (lz5 < r4_q.k54);
     s5_d.ovf_at = ~far5 & (lz5 == r4_q.k54);
     s5_d.den_at = ~far5 & (lz5 == r4_q.k200);
-    s5_d.bnu0 = bx_of(base5);
-    s5_d.bnu1 = bx_of(base5 + exp_t'(1));
-    s5_d.bnu2 = bx_of(base5 + exp_t'(2));
+    s5_d.bnu0 = bx_of(bnj5[0]);
+    s5_d.bnu1 = bx_of(bnj5[1]);
+    s5_d.bnu2 = bx_of(bnj5[2]);
     s5_d.bo0  = bx_of(bo5);
     s5_d.bo1  = bx_of(bo5 + exp_t'(1));
     s5_d.sign = r4_q.sign;  s5_d.effsub = r4_q.effsub;  s5_d.sd = r4_q.sd;

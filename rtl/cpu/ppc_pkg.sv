@@ -140,7 +140,6 @@ package ppc_pkg;
     logic       xs;          // first operand from rS
     logic [1:0] crack;       // 0 single uop, 1 update form, 2 lmw / stmw
     logic       ua, ub, us;  // reads rA, rB, rS
-    logic [2:0] sh;          // rA, rB, rS is a TGPR shadow: MSR[TGPR] and the field < 4
     logic       ifault;      // a fetch fault marker, not an instruction
     logic       l0;          // the first uop is the last (not cracked, or lmw / stmw of r31)
     logic       fua, fub, fuc, fpw;   // FPRs read (A, B, C port) and written
@@ -165,7 +164,14 @@ package ppc_pkg;
     // (a bclr / bcctr resolved taken without a BTB target cannot be), for
     // EX's check
     logic       lar;
+    // the first uop's GPR result is rA, not rD (logical, shift and rotate
+    // ops, update stores): ID's own rd for the early compares without the
+    // decoder in front (ppc_core.sv, id_rdf)
+    logic       rda;
+    // last, at bits 2:0, so the fetch queue can copy it beside the register
+    // fields for the GPR file's read addresses (ppc_fetchq r_rf)
+    logic [2:0] sh;          // rA, rB, rS is a TGPR shadow: MSR[TGPR] and the field < 4
   } pd_t;
-  localparam int PDW = 74;                             // (alu_op_t is 6 bits)
+  localparam int PDW = 75;                             // (alu_op_t is 6 bits)
 
 endpackage

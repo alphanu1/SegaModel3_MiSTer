@@ -50,7 +50,15 @@ module m3_cputest
 );
 
   // ------------------------------------------------------------ memories
-  (* ramstyle = "M10K" *) logic [31:0] rom   [0:8191];
+  // The code ROM in blocks 1,024 deep (max_depth): its address bits 14-12
+  // then select among the blocks' outputs from a register, and only bits
+  // 11-2 reach the blocks. Built 8,192 x 1 per block, bits 14-12 went to all
+  // 32 blocks' address ports, and those bits are the fetch translation's
+  // physical page (ppc_core i_pahi): the D-36 uncached full builds' worst
+  // path, redir_a_q through the IBAT compare into the ROM. The core with
+  // its I-cache has no such path (the cache indexes with bits 11-5 and
+  // registers the page). Same 32 M10K.
+  (* ramstyle = "M10K", max_depth = 1024 *) logic [31:0] rom   [0:8191];
   (* ramstyle = "M10K" *) logic [31:0] dinit [0:4095];
   (* ramstyle = "M10K" *) logic [7:0]  dram0 [0:4095];   // byte lanes, big-endian:
   (* ramstyle = "M10K" *) logic [7:0]  dram1 [0:4095];   // lane 0 is bits 31:24
@@ -87,6 +95,7 @@ module m3_cputest
     .i_two (1'b0), .i_w2 (), .i_data2 (32'd0),
     .d_req (d_req), .d_we (d_we), .d_addr (d_addr), .d_be (d_be), .d_wdata (d_wdata),
     .d_wimg (), .d_op (), .d_rdy (1'b1), .d_idle (1'b1), .d_valid (d_valid), .d_rdata (d_rdata),
+    .d_resv (), .d_cond (), .res_kill (1'b0),
     .hid_ice (), .hid_dce (), .hid_ilock (), .hid_dlock (), .hid_icfi (), .hid_dcfi (), .hid_noopti (),
     .icbi_req (icbi_req), .icbi_set (), .icbi_ack (icbi_req),
     .tb_tick (tb_tick), .ext_int (1'b0), .ev (ev), .ev_mmu (),
@@ -114,7 +123,6 @@ module m3_cputest
 
   // data port: the RAM, two cycles; the reload walks the same write port
   wire  [11:0] d_word = reload ? rl_addr : d_addr[13:2];
-  wire  [3:0]  d_wbe  = reload ? {4{rl_we}} : ((d_req && d_we) ? d_be : 4'd0);
   wire  [31:0] d_wd   = reload ? rl_word : d_wdata;
 
   // The read is registered once more for the same reason as the ROM's. A
@@ -126,11 +134,19 @@ module m3_cputest
   logic [31:0] d_q, w_wd, h_wd;
   logic [11:0] w_word;
   logic [3:0]  w_be, h_be;
+  // the posted write's lanes and its enable registered apart and ANDed after:
+  // the store's lanes come from EX's address sum and the request from its
+  // hold, and the two together into w_be missed 100 MHz by 0.04 ns (a
+  // round-2 uncached full build, op_x into w_be)
+  logic [3:0]  w_be_r;
+  logic        w_en;
+  assign w_be = w_en ? w_be_r : 4'd0;
   always_ff @(posedge clk) begin
     d_v1    <= d_req && !cpu_rst;
     d_valid <= d_v1 && !cpu_rst;
     w_word  <= d_word;
-    w_be    <= d_wbe;
+    w_be_r  <= reload ? {4{rl_we}} : d_be;
+    w_en    <= reload || (d_req && d_we);
     w_wd    <= d_wd;
     if (w_be[3]) dram0[w_word] <= w_wd[31:24];
     if (w_be[2]) dram1[w_word] <= w_wd[23:16];
@@ -156,16 +172,18 @@ module m3_cputest
   logic [31:0] m_addr, m_wdata, m_rdata;
   logic [3:0]  m_be;
 
-  ppc_cpu u_cpu (
+  ppc_cpu #(.SNOOP (1'b0)) u_cpu (
     .clk (clk), .rst (cpu_rst),
     .m_req (m_req), .m_cmd (m_cmd), .m_addr (m_addr), .m_be (m_be), .m_wdata (m_wdata),
     .m_ack (m_ack), .m_wnext (m_wnext), .m_rvalid (m_rvalid), .m_rdata (m_rdata),
+    .sn_req (1'b0), .sn_addr (27'd0), .sn_inv (1'b0), .sn_ack (),   // no DMA here
     .tb_tick (tb_tick), .ext_int (1'b0), .ev (ev), .ev_mmu (), .ev_btb (),
     .rt_valid (rt_valid), .rt_last (rt_last), .rt_pc (rt_pc), .rt_insn (rt_insn),
     .rt_gpr_we (rt_gpr_we), .rt_gpr (rt_gpr), .rt_gpr_sh (), .rt_irq (), .rt_gpr_val (rt_gpr_val),
     .rt_cr (), .rt_xer (), .rt_lr (), .rt_ctr (), .rt_msr (), .rt_srr0 (), .rt_srr1 (),
     .rt_fpscr (), .rt_fpq (), .rt_fw_en (), .rt_fw_idx (), .rt_fw_val (), .rt_dly (),
-    .t_dreq (), .t_dwe (), .t_daddr (), .t_dwimg (), .t_dop (), .t_dvalid (), .t_drdata ()
+    .t_dreq (), .t_dwe (), .t_daddr (), .t_dwimg (), .t_dop (), .t_dvalid (), .t_drdata (),
+    .t_dbe (), .t_dwdata (), .t_drsv (), .t_dcnd ()
   );
 
   localparam logic [1:0] C_IDLE = 2'd0, C_ACK = 2'd1, C_RD = 2'd2, C_WB = 2'd3;
@@ -289,7 +307,7 @@ module m3_cputest
   m3_cpu_mon #(.DIVISOR(DIVISOR)) u_mon (
     .clk (clk), .rst (rst), .clear (clear), .report (report), .ev (ev),
     .rt_valid (rt_valid), .rt_gpr_we (rt_gpr_we), .rt_gpr (rt_gpr), .rt_gpr_val (rt_gpr_val),
-    .busy (mon_busy), .tx (uart_tx)
+    .busy (mon_busy), .tx (uart_tx), .counts ()
   );
 
 endmodule

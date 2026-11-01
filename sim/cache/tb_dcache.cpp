@@ -11,19 +11,45 @@
 //     miss, write-through, the bypass page) against the reference's list, in
 //     order, with lanes and store data;
 //   - after a dcbf of every line, the whole memory image.
+// With snoops on (arg 6: 1 reads, 2 reads and writes; study D-41) a DMA
+// master snoops lines, mostly ones the CPU side has just stored to, at random
+// gaps (often back to back), and reads memory as soon as sn_ack comes. Each
+// byte it reads must be the line's value after every request answered by the
+// cycle sn_req rose, or a value one of the requests still unanswered then,
+// or made before sn_ack, gave it. Each snoop is applied to the reference as
+// it starts (a modified line written back; a read leaves it clean, a write
+// (sn_inv = 1) invalidates it). Where the order matters, the CPU side keeps
+// out of the way: for a read, no store, dcbz or dcbi to the line is
+// unanswered as it starts or made before sn_ack (they decide whether the
+// line is modified afterwards, which dcbi and DCFI expose), nor any
+// inhibited access (on a modified line that is 603e 3.6.4.1's boundedly
+// undefined case, and it would see memory before or after the push); for a
+// write, nothing to its set, except an lwarx made as an inhibited load (it
+// never looks at the arrays) to a line that was not modified, for the
+// reservation rule; the master's write then leaves memory as it was. A
+// write snoop of a clean line is sometimes started with a flash invalidate
+// (HID0[DCFI]), which may start before or after it. At sn_ack the master writes some of the
+// line's words, in memory and in the reference. Some word loads are made as
+// lwarx (d_rsv), and res_kill is checked every cycle against a model of the
+// rule in ppc_dcache.sv. SNOOP_HOSTILE=1 adds long acknowledge delays and
+// beat gaps on the memory side.
 // The address space is a few sets and many pages, so lines are evicted and
 // written back all the time. Some accesses to cacheable pages are made with
 // I = 1 or W = 1 while their line is resident, so an access that wrongly
 // looks at the arrays reads or writes a different value than the reference.
 //
-// usage: Vppc_dcache [ops] [seed] [lat_lo lat_hi] [stream]
+// usage: Vppc_dcache [ops] [seed] [lat_lo lat_hi] [stream] [snoop]
 
 #include "Vppc_dcache.h"
+#ifdef SN_DEBUG
+#include "Vppc_dcache___024root.h"
+#endif
 #include "verilated.h"
 #include "cache_mem.h"
 #include <algorithm>
 #include <deque>
 #include <cstdlib>
+#include <array>
 #include <map>
 #include <set>
 
@@ -58,6 +84,10 @@ struct Ref {
   }
   void writeback(unsigned s, unsigned w) {
     RefLine &L = c[s][w];
+#ifdef SN_DEBUG
+    { static long wa = getenv("WATCH") ? strtol(getenv("WATCH"), 0, 16) : -1;
+      if (((L.tag << 12) | (s << 5)) == (uint32_t(wa) & ~31u)) std::printf("   REF writeback %08X word %08X dirty %d\n", (L.tag << 12) | (s << 5), L.w[(wa >> 2) & 7], int(L.d)); }
+#endif
     for (int k = 0; k < 8; k++) mem.wr((L.tag << 12) | (s << 5) | (k << 2), L.w[k], 0xF);
     last_evict = (L.tag << 12) | (s << 5);
     wbs++;
@@ -141,6 +171,28 @@ struct Ref {
     int w = find(a); unsigned s = (a >> 5) & 127;
     if (w >= 0) { c[s][w].v = false; c[s][w].d = false; }
   }
+  // the line as another master sees it through the snoop: the cache's copy if
+  // modified, else memory (a clean copy differs from memory only after an
+  // inhibited store to a resident line, 603e 3.6.4.1's boundedly undefined
+  // case, and a snoop does not push it)
+  void view(uint32_t line, uint32_t v[8]) {
+    int w = find(line); unsigned s = (line >> 5) & 127;
+    bool d = w >= 0 && c[s][w].d;
+    for (int k = 0; k < 8; k++) v[k] = d ? c[s][w].w[k] : mem.rd(line | (k << 2));
+  }
+  // a snooped read (the caching-inhibited read of 603e table 3-6): written
+  // back if modified, then clean
+  void snoop_rd(uint32_t line) {
+    if ((line >> 12) == RSV || !dce) return;
+    int w = find(line); unsigned s = (line >> 5) & 127;
+    if (w >= 0 && c[s][w].d) { writeback(s, w); c[s][w].d = false; }
+  }
+  // a snooped write (603e table 3-6): written back if modified, invalidated
+  void snoop_inv(uint32_t line) {
+    if ((line >> 12) == RSV || !dce) return;
+    int w = find(line); unsigned s = (line >> 5) & 127;
+    if (w >= 0) { if (c[s][w].d) writeback(s, w); c[s][w].v = false; c[s][w].d = false; }
+  }
   void flash() { for (auto &s : c) for (auto &l : s) { l.v = false; l.d = false; } for (auto &p : plru) p = 0; }
 };
 
@@ -149,7 +201,7 @@ static std::mt19937 rng;
 static int rnd(int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); }
 
 enum { OP_LD, OP_ST, OP_TCH, OP_DCBZ, OP_DCBST, OP_DCBF, OP_DCBI };
-struct Op { int k; uint32_t a; unsigned be; uint32_t d; unsigned wimg; uint32_t exp; uint64_t t0; bool ref_hit; };
+struct Op { int k; uint32_t a; unsigned be; uint32_t d; unsigned wimg; uint32_t exp; uint64_t t0; bool ref_hit; bool rsv = false; };
 
 // pages: cacheable, write-through, inhibited, the bypass page
 static const uint32_t PG_C[]  = { 0x00000, 0x00001, 0x00002, 0x00003, 0x00004, 0x00005, 0x00006, 0x00007,
@@ -193,7 +245,10 @@ int main(int argc, char **argv) {
   unsigned seed = argc > 2 ? atoi(argv[2]) : 1;
   int lat_lo = argc > 3 ? atoi(argv[3]) : 12, lat_hi = argc > 4 ? atoi(argv[4]) : 15;
   bool stream_only = argc > 5 && atoi(argv[5]);
+  int snoop_mode = argc > 6 ? atoi(argv[6]) : 0;
   rng.seed(seed);
+  std::mt19937 srng(seed ^ 0x3C6EF372u);          // the DMA master's own choices
+  auto srnd = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(srng); };
 
   Vppc_dcache *t = new Vppc_dcache;
   Ref ref;
@@ -201,6 +256,7 @@ int main(int argc, char **argv) {
   Memory dmem;
   MemAgent ma; ma.rng = &rng; ma.mem = &dmem; ma.lat_lo = lat_lo; ma.lat_hi = lat_hi;
   if (getenv("CACHE_FIXED")) { ma.ack_max = 0; ma.lat_wide = 0; ma.gap_max = 0; }   // deterministic memory: ack at once, beats every cycle
+  if (snoop_mode && getenv("SNOOP_HOSTILE")) { ma.ack_max = 24; ma.gap_max = 6; ma.lat_wide = 30; }
 
   uint64_t cyc = 0;
   int errors = 0;
@@ -208,6 +264,7 @@ int main(int argc, char **argv) {
 
   t->rst = 1; t->d_req = 0; t->hid_dce = 1; t->hid_dlock = 0; t->hid_dcfi = 0; t->hid_noopti = 0;
   t->m_ack = 0; t->m_wnext = 0; t->m_rvalid = 0; t->m_rdata = 0;
+  t->sn_req = 0; t->sn_addr = 0; t->sn_inv = 0; t->d_rsv = 0;
   for (int i = 0; i < 4; i++) tick();
   t->rst = 0;
 
@@ -238,17 +295,53 @@ int main(int argc, char **argv) {
       script.push_back({(i & 1) ? OP_LD : OP_ST, a | (((i >> 1) & 7) << 2), 15, (uint32_t)(0x2000 + i), 0, 0, 0, false});
   }
   size_t script_i = 0;
+
+  // ---- the DMA master (snoop_mode)
+  struct ViewLog { uint64_t seq; uint32_t line; uint32_t vb[8], va[8]; };
+  std::deque<ViewLog> vlog;                     // the latest requests that changed a line's view
+  uint64_t n_seq = 0, n_ans = 0;                // requests made, answered
+  struct Snoop {
+    bool act = false, inv = false; uint32_t line = 0; uint64_t t0 = 0;
+    uint32_t v0[8]; std::vector<std::array<uint32_t, 8>> maybe; int kind = 0; bool same = false;
+  } sn;
+  uint32_t force_line = 0; bool force = false;   // a write snoop to start with a flash invalidate
+  int dcfi_pend = -1;                            // cycles until that flash invalidate fires
+  uint64_t sn_dcfi = 0, sn_rsv_in = 0;
+  int sn_gap = 50;
+  std::deque<uint32_t> recent_st, recent_rq;   // lines the CPU side stored to, or touched, lately
+  uint64_t sn_n[2] = {}, sn_kind[2][3] = {}, sn_lat_sum[2][3] = {}, sn_lat_max[2][3] = {}, sn_bytes = 0;
+  uint64_t sn_race_out = 0, sn_race_mem = 0, sn_race_win = 0, sn_race_st = 0, sn_b2b = 0, sn_dmaw = 0;
+  uint64_t n_rsv = 0, n_kill_cyc = 0, n_kill_set = 0;
+  uint64_t sn_race_sb = 0, sn_race_fill = 0, sn_race_evict = 0, sn_race_miss = 0;
+  std::map<uint32_t, uint64_t> last_st_cyc, last_alloc_cyc;   // by line: the latest store made, allocation decided
+  uint64_t last_miss_cyc = 0; uint32_t last_evict_seen = 0; uint64_t last_evict_cyc = 0;
+  // the reservation rule's model (ppc_dcache.sv, "the snoop")
+  bool m_rsvq = false, m_rvkill = false; uint32_t m_rvpa = 0, m_rsvline = 0;
+  uint64_t last_ack = 0;
+  auto log_view = [&](uint32_t line, const uint32_t *vb) {
+    ViewLog e; e.seq = n_seq; e.line = line;
+    for (int k = 0; k < 8; k++) e.vb[k] = vb[k];
+    ref.view(line, e.va);
+    if (memcmp(e.vb, e.va, sizeof e.va)) {
+      vlog.push_back(e); if (vlog.size() > 64) vlog.pop_front();
+      if (sn.act && line == sn.line) { std::array<uint32_t, 8> v; for (int k = 0; k < 8; k++) v[k] = e.va[k]; sn.maybe.push_back(v); sn_race_win++; }
+    }
+  };
   uint64_t s_t0 = 0, s_mark[4] = {};
 
   long max_cyc = nops * 200 + 200000;
   while (phase != DONE && (long)cyc < max_cyc) {
     // ---------------------------------------------------- outputs of the last edge
     bool dv = t->d_valid; uint32_t drd = t->d_rdata;
-    if (t->t_alloc) dut_allocs.push_back({t->t_alloc_set, t->t_alloc_way, t->t_alloc_tag});
+    if (t->t_alloc) {
+      dut_allocs.push_back({t->t_alloc_set, t->t_alloc_way, t->t_alloc_tag});
+      if (snoop_mode) { last_alloc_cyc[(t->t_alloc_tag << 12) | (t->t_alloc_set << 5)] = cyc; last_miss_cyc = cyc; }
+    }
+    if (snoop_mode && ref.last_evict != last_evict_seen) { last_evict_seen = ref.last_evict; last_evict_cyc = cyc; }
 
-    t->d_req = 0;
+    t->d_req = 0; t->d_rsv = 0;
     if (dv && !outq.empty()) {
-      cur = outq.front(); outq.pop_front();
+      cur = outq.front(); outq.pop_front(); n_ans++;
       unsigned lat = cyc - cur.t0;
       int cls = (cur.k == OP_LD) ? (cur.ref_hit ? 0 : 1) : (cur.k == OP_ST) ? (cur.ref_hit ? 2 : 3) : -1;
       if (cls >= 0) { lat_sum[cls] += lat; lat_n[cls]++; lat_min[cls] = std::min<uint64_t>(lat_min[cls], lat); lat_max[cls] = std::max<uint64_t>(lat_max[cls], lat); }
@@ -272,12 +365,23 @@ int main(int argc, char **argv) {
       if (phase == RUN && script_i >= script.size() && issued >= nops) { phase = FLUSH; }
       if (phase == RUN && script_i >= script.size() && !stream_only && rnd(0, 999) < 3) { phase = HID_WAIT; hid_kind = rnd(0, 9); }
       if (stream_only && script_i >= script.size() && phase == RUN) phase = FLUSH;
-      if (phase == HID_WAIT) {
-        if (t->d_idle && ma.idle() && quiet_cpu) {
+      if (phase == HID_WAIT && dcfi_pend > 0) dcfi_pend--;
+      else if (phase == HID_WAIT && dcfi_pend == 0) {
+        t->hid_dcfi = 1; dcfi_hold = 0; phase = DCFI_WAIT; ref.flash(); n_dcfi++; dcfi_pend = -1;
+      } else if (phase == HID_WAIT) {
+        if (t->d_idle && ma.idle() && quiet_cpu && !sn.act) {
           if (hid_kind < 3) { ref.dce = !ref.dce; t->hid_dce = ref.dce; n_dce++; phase = RUN; }
           else if (hid_kind < 6) { ref.dlock = !ref.dlock; t->hid_dlock = ref.dlock; n_dlock++; phase = RUN; }
           else if (hid_kind < 7) { ref.noopti = !ref.noopti; t->hid_noopti = ref.noopti; n_noopti++; phase = RUN; }
-          else if (ref.dce) { t->hid_dcfi = 1; dcfi_hold = 0; phase = DCFI_WAIT; ref.flash(); n_dcfi++; }
+          else if (ref.dce) {
+            if (snoop_mode >= 2 && srnd(0, 1))           // a clean resident line, snooped (written) as DCFI starts
+              for (int k = 0; k < 64 && !force; k++) {
+                unsigned st = k < 16 ? SETS[k & 3] : srnd(0, 127), w = srnd(0, 3);
+                if (ref.c[st][w].v && !ref.c[st][w].d && ref.c[st][w].tag != RSV) { force = true; force_line = (ref.c[st][w].tag << 12) | (st << 5); }
+              }
+            if (force) dcfi_pend = srnd(0, 4);           // the snoop starts now, DCFI 0-4 cycles later
+            else { t->hid_dcfi = 1; dcfi_hold = 0; phase = DCFI_WAIT; ref.flash(); n_dcfi++; }
+          }
           else phase = RUN;
           // keep the cache mostly enabled and unlocked
           if (phase == RUN && !ref.dce && rnd(0, 1)) { ref.dce = true; t->hid_dce = 1; }
@@ -292,8 +396,8 @@ int main(int argc, char **argv) {
           cur = {OP_DCBF, flush_list[flush_i++], 15, 0, 0, 0, cyc, false};
           ref.dcbf(cur.a);
           t->d_req = 1; t->d_we = 0; t->d_addr = cur.a; t->d_be = 15; t->d_wdata = 0; t->d_wimg = 0; t->d_op = 4;
-          outq.push_back(cur);
-        } else if (t->d_idle && ma.idle() && quiet_cpu) phase = DONE;
+          outq.push_back(cur); n_seq++;
+        } else if (t->d_idle && ma.idle() && quiet_cpu && !sn.act) phase = DONE;
       } else if (phase == RUN && gap > 0) {
         gap--;
       } else if (phase == RUN && script_i == 1 && !(quiet_cpu && t->d_idle)) {
@@ -312,10 +416,21 @@ int main(int argc, char **argv) {
           int r = rnd(0, 99);
           int cls;
           o.a = pick_addr(o.wimg, cls);
+          for (int tries = 0; sn.act && sn.inv && ((o.a >> 5) & 127) == ((sn.line >> 5) & 127) && tries < 20; tries++)
+            o.a = pick_addr(o.wimg, cls);
+          if (sn.act && sn.inv && ((o.a >> 5) & 127) == ((sn.line >> 5) & 127)) o.a ^= 1u << 5;   // the next set
           o.k = r < 45 ? OP_LD : r < 85 ? OP_ST : r < 88 ? OP_TCH : r < 91 ? OP_DCBZ : r < 94 ? OP_DCBST :
                 r < 97 ? OP_DCBF : OP_DCBI;
-          if (o.k == OP_LD || o.k == OP_ST) pick_size(o.a, o.be); else o.be = 15;
+          if (sn.act && !sn.inv && (o.a & ~31u) == sn.line) {      // (a read snoop's line: see the header)
+            if (o.k == OP_ST || o.k == OP_DCBZ || o.k == OP_DCBI) o.k = OP_LD;
+            if (cls == 0) o.wimg &= ~4u;
+          }
+          bool rsv_in = sn.act && sn.inv && sn.kind != 2 && srnd(0, 3) == 0;   // an lwarx in a write snoop's window, to its line
+          if (rsv_in) { o.k = OP_LD; o.a = sn.line | (srnd(0, 7) << 2); o.wimg = 4; sn.same = true; sn_rsv_in++; }
+          if (rsv_in) o.be = 15;
+          else if (o.k == OP_LD || o.k == OP_ST) pick_size(o.a, o.be); else o.be = 15;
           o.d = rng();
+          if (snoop_mode && o.k == OP_LD && o.be == 15 && (rsv_in || srnd(0, 99) < 10)) o.rsv = true;   // an lwarx
           issued++;
         }
         o.t0 = cyc;
@@ -331,6 +446,8 @@ int main(int argc, char **argv) {
           (void)b;
           o.d = sd;
         }
+        uint32_t vb[8];
+        ref.view(wa & ~31u, vb);
         switch (o.k) {
           case OP_LD:    o.exp = ref.load(wa, o.be, o.wimg); n_ld++; break;
           case OP_ST:    ref.store(wa, o.be, o.d, o.wimg); n_st++; break;
@@ -341,6 +458,18 @@ int main(int argc, char **argv) {
           case OP_DCBI:  ref.dcbi(wa); break;
         }
         n_ops[o.k]++;
+#ifdef SN_DEBUG
+        { static long w = getenv("WATCH") ? strtol(getenv("WATCH"), 0, 16) : -1;
+          if (w >= 0 && (wa & ~31u) == (uint32_t(w) & ~31u))
+            std::printf("   REQ c%lu k %d a %08X be %X d %08X wimg %X seq %lu\n", (unsigned long)cyc, o.k, o.a, o.be, o.d, o.wimg, (unsigned long)n_seq); }
+#endif
+        log_view(wa & ~31u, vb);
+        n_seq++;
+        if (snoop_mode) {
+          if (o.k == OP_ST) { recent_st.push_back(wa & ~31u); if (recent_st.size() > 8) recent_st.pop_front(); last_st_cyc[wa & ~31u] = cyc; }
+          recent_rq.push_back(wa & ~31u); if (recent_rq.size() > 16) recent_rq.pop_front();
+        }
+        t->d_rsv = o.rsv; n_rsv += o.rsv;
         t->d_req = 1; t->d_we = (o.k == OP_ST); t->d_addr = wa; t->d_be = o.be; t->d_wdata = o.d;
         t->d_wimg = o.wimg;
         t->d_op = (o.k == OP_LD || o.k == OP_ST) ? 0 : (o.k == OP_TCH) ? 1 : (o.k == OP_DCBZ) ? 2 :
@@ -353,6 +482,139 @@ int main(int argc, char **argv) {
     if (getenv("DC_TRACE") && cyc < 400)
       std::printf("  cyc %lu: rdy %d req %d %s %08X | valid %d %08X | q %zu\n", (unsigned long)cyc, int(t->d_rdy), int(t->d_req),
                   t->d_we ? "st" : "ld", t->d_addr, int(dv), drd, outq.size());
+    // ---------------------------------------------------- the DMA master
+    if (snoop_mode) {
+      bool sack = t->sn_ack;                    // (from the last edge)
+      bool inW  = sn.act && sn.inv && cyc > sn.t0 && !sack;   // the snoop in progress in the cache
+      if (sack && !sn.act) { std::printf("SNOOP: sn_ack with no snoop at cycle %lu\n", (unsigned long)cyc); errors++; }
+      if (sn.act && sack) {
+        // the master reads the line from memory now
+        unsigned lat = cyc - sn.t0;
+        sn_lat_sum[sn.inv][sn.kind] += lat; sn_lat_max[sn.inv][sn.kind] = std::max<uint64_t>(sn_lat_max[sn.inv][sn.kind], lat);
+        for (int k = 0; k < 8; k++) {
+          uint32_t m = dmem.rd(sn.line | (k << 2));
+          for (int b = 0; b < 4; b++) {
+            auto by = [&](uint32_t x) { return (x >> (24 - 8 * b)) & 0xFF; };
+            bool ok = by(m) == by(sn.v0[k]);
+            for (auto &v : sn.maybe) ok = ok || by(m) == by(v[k]);
+            sn_bytes++;
+            if (!ok) {
+              if (errors < 10) std::printf("SNOOP %s line %08X word %d byte %d: memory %02X, expected %02X (%zu later values) at cycle %lu, snoop from %lu\n",
+                                           sn.inv ? "write" : "read", sn.line, k, b, by(m), by(sn.v0[k]), sn.maybe.size(),
+                                           (unsigned long)cyc, (unsigned long)sn.t0);
+              errors++;
+            }
+          }
+        }
+        if (sn.inv && !sn.same) {               // the master's write: some words of the line
+          int mask = srnd(1, 255);
+          for (int k = 0; k < 8; k++) if (mask & (1 << k)) {
+            uint32_t d = srng();
+            dmem.wr(sn.line | (k << 2), d, 0xF); ref.mem.wr(sn.line | (k << 2), d, 0xF);
+          }
+          sn_dmaw++;
+        }
+        sn.act = false; last_ack = cyc;
+        int g = srnd(0, 9);
+        sn_gap = g < 4 ? 0 : g < 8 ? srnd(1, 20) : srnd(20, 200);
+      } else if (sn.act && cyc - sn.t0 > 20000) {
+        std::printf("SNOOP: no sn_ack for line %08X since cycle %lu\n", sn.line, (unsigned long)sn.t0); errors++; sn.act = false;
+      } else if (!sn.act && ((phase == RUN && script_i >= script.size()) || force) && (ref.dce || force)) {
+        // eager: straight after a store, an allocation or a cast-out, at that line
+        int eager = 0;
+        if (!recent_st.empty() && cyc - last_st_cyc[recent_st.back()] <= 2 && srnd(0, 3) == 0) eager = 1;
+        else if (cyc - last_miss_cyc <= 3 && srnd(0, 7) == 0) eager = 2;
+        else if (last_evict_seen && cyc - last_evict_cyc <= 3 && srnd(0, 3) == 0) eager = 3;
+        if (force) eager = 4;
+        if (sn_gap > 0 && !eager) sn_gap--;
+        else {
+          int r = srnd(0, 99);
+          uint32_t line;
+          if (eager == 4) { line = force_line; force = false; sn_dcfi++; }
+          else if (eager == 1) line = recent_st.back();
+          else if (eager == 2) { line = recent_rq.empty() ? 0 : recent_rq.back(); for (auto &kv : last_alloc_cyc) if (kv.second == last_miss_cyc) line = kv.first; }
+          else if (eager == 3) line = last_evict_seen & ~31u;
+          else if (r >= 90 && r < 95 && n_rsv) line = m_rsvq ? m_rsvline : m_rvpa;   // the reservation's line
+          else if (r < 45 && !recent_st.empty()) line = recent_st[srnd(0, recent_st.size() - 1)];
+          else if (r < 70 && !recent_rq.empty()) line = recent_rq[srnd(0, recent_rq.size() - 1)];
+          else if (r < 85) line = (PG_C[srnd(0, 3)] << 12) | (SETS[srnd(0, 3)] << 5);
+          else if (r < 90) line = (PG_C[srnd(0, 15)] << 12) | (srnd(0, 127) << 5);
+          else line = ((srnd(0, 1) ? PG_I[srnd(0, 1)] : RSV) << 12) | (srnd(0, 127) << 5);
+          bool inv = snoop_mode >= 2 && (eager == 4 || srnd(0, 99) < (r >= 90 && r < 95 && n_rsv ? 80 : 35)), rd_ok = true;
+          for (auto &o : outq) {
+            if (((o.a >> 5) & 127) == ((line >> 5) & 127)) inv = false;
+            if ((o.a & ~31u) == line && (o.k == OP_ST || o.k == OP_DCBZ || o.k == OP_DCBI || (o.wimg & 4))) rd_ok = false;
+          }
+          if (!inv && !rd_ok) { sn_gap = 1; goto sn_drive; }
+          sn.act = true; sn.inv = inv; sn.line = line; sn.t0 = cyc; sn.maybe.clear(); sn.same = false;
+          ref.view(line, sn.v0);
+          bool oldest = true;                   // undo what requests not yet answered did to the line
+          for (auto it = vlog.begin(); it != vlog.end(); ++it)
+            if (it->seq >= n_ans && it->line == line) {
+              if (oldest) { memcpy(sn.v0, it->vb, sizeof sn.v0); oldest = false; }
+              std::array<uint32_t, 8> v; for (int k = 0; k < 8; k++) v[k] = it->va[k]; sn.maybe.push_back(v);
+            }
+          int w = ref.find(line); unsigned st = (line >> 5) & 127;
+          sn.kind = w < 0 ? 0 : ref.c[st][w].d ? 2 : 1;
+          sn_n[inv]++; sn_kind[inv][sn.kind]++;
+          sn_race_out += !outq.empty(); sn_race_mem += !ma.idle(); sn_race_st += !sn.maybe.empty();
+          sn_b2b += (cyc == last_ack + 1);
+          { auto i = last_st_cyc.find(line); sn_race_sb += i != last_st_cyc.end() && cyc - i->second <= 3; }
+          { auto i = last_alloc_cyc.find(line); sn_race_fill += i != last_alloc_cyc.end() && cyc - i->second <= 24; }
+          sn_race_evict += line == last_evict_seen && cyc - last_evict_cyc <= 24;
+          sn_race_miss  += cyc - last_miss_cyc <= 24 && !(last_alloc_cyc.count(line) && cyc - last_alloc_cyc[line] <= 24);
+          if (inv) ref.snoop_inv(line); else ref.snoop_rd(line);
+        }
+      }
+    sn_drive:
+      t->sn_req = sn.act; t->sn_addr = sn.line >> 5; t->sn_inv = sn.inv;
+      // the reservation rule, as res_kill must show it this cycle
+      t->clk = 0; t->eval();
+      bool exp_kill = m_rvkill || (m_rsvq && inW && m_rsvline == sn.line);
+      if (bool(t->res_kill) != exp_kill) {
+        if (errors < 10) std::printf("RESERVATION res_kill %d, expected %d at cycle %lu (lwarx line %08X, snoop line %08X, window %d)\n",
+                                     int(t->res_kill), int(exp_kill), (unsigned long)cyc, m_rsvq ? m_rsvline : m_rvpa, sn.line, int(inW));
+        errors++;
+      }
+      n_kill_cyc += exp_kill;
+      bool kill_n;
+      if (m_rsvq) { kill_n = inW && m_rsvline == sn.line; m_rvpa = m_rsvline; }
+      else kill_n = m_rvkill || (inW && m_rvpa == sn.line);
+      n_kill_set += kill_n && !m_rvkill;
+      m_rvkill = kill_n;
+      m_rsvq = t->d_req && t->d_rsv;
+      if (m_rsvq) m_rsvline = t->d_addr & ~31u;
+    }
+
+#ifdef SN_DEBUG
+    { static long wa = getenv("WATCH") ? strtol(getenv("WATCH"), 0, 16) : -1;
+      static uint32_t pd = 0, pr = 0, pv = 0; static bool first = true;
+      if (wa >= 0) {
+        uint32_t v[8]; ref.view(uint32_t(wa) & ~31u, v);
+        uint32_t d = dmem.rd(wa), rm = ref.mem.rd(wa), vw = v[(wa >> 2) & 7];
+        if (first || d != pd || rm != pr || vw != pv)
+          std::printf("   WATCH c%lu dmem %08X ref.mem %08X ref view %08X (resident %d)\n", (unsigned long)cyc, d, rm, vw, ref.find(wa) >= 0);
+        pd = d; pr = rm; pv = vw; first = false;
+      }
+    }
+    {
+      static long t_lo = getenv("SN_T0") ? atol(getenv("SN_T0")) : -1, t_hi = getenv("SN_T1") ? atol(getenv("SN_T1")) : -1;
+      if ((long)cyc >= t_lo && (long)cyc <= t_hi) {
+        auto *r = t->rootp;
+        std::printf("  c%lu sn_st %d req %d %08X inv %d ack %d | quiet %d cp %d wbp %d mp %d dq %d mq %d f %d sb %d s %d uq %d | r_v %d x_v %d rdsel %d | dreq %d %s %08X be %X | dv %d\n",
+          (unsigned long)cyc, int(r->ppc_dcache__DOT__sn_st), int(t->sn_req), t->sn_addr << 5, int(t->sn_inv), int(t->sn_ack),
+          int(r->ppc_dcache__DOT__quiet), int(r->ppc_dcache__DOT__cp_act), int(r->ppc_dcache__DOT__wb_pend), int(r->ppc_dcache__DOT__mp),
+          int(r->ppc_dcache__DOT__dq_v), int(r->ppc_dcache__DOT__mq_v), int(r->ppc_dcache__DOT__f_act), int(r->ppc_dcache__DOT__sb_v),
+          int(r->ppc_dcache__DOT__s_v), int(r->ppc_dcache__DOT__uq_v), int(r->ppc_dcache__DOT__r_v), int(r->ppc_dcache__DOT__x_v),
+          int(r->ppc_dcache__DOT__rd_sel), int(t->d_req), t->d_we ? "st" : "ld", t->d_addr, int(t->d_be), int(t->d_valid));
+        if (r->ppc_dcache__DOT__sn_st == 4)
+          std::printf("     C: hv %X hit %d hw %d dty %d st_sn %03X dq_a %08X tg %05X %05X %05X %05X | ref kind %d\n",
+            int(r->ppc_dcache__DOT__sn_hv), int(r->ppc_dcache__DOT__sn_hit), int(r->ppc_dcache__DOT__sn_hw), int(r->ppc_dcache__DOT__sn_dty),
+            int(r->ppc_dcache__DOT__st_sn), uint32_t(r->ppc_dcache__DOT__dq_a) << 2,
+            int(r->ppc_dcache__DOT__dq_tg[0]), int(r->ppc_dcache__DOT__dq_tg[1]), int(r->ppc_dcache__DOT__dq_tg[2]), int(r->ppc_dcache__DOT__dq_tg[3]), sn.kind);
+      }
+    }
+#endif
     // ---------------------------------------------------- memory side
     ma.step(t->m_req, t->m_cmd, t->m_addr, t->m_be, t->m_wdata);
     t->m_ack = ma.ack; t->m_rvalid = ma.rvalid; t->m_wnext = ma.wnext; t->m_rdata = ma.rdata;
@@ -412,6 +674,26 @@ int main(int argc, char **argv) {
                 (double)lat_sum[c] / lat_n[c], (unsigned long)lat_max[c], (unsigned long)lat_n[c]);
   std::printf("  hit streams, cycles per access: 64 loads %.2f, 64 stores %.2f, 32 store+load pairs %.2f per pair\n",
               (s_mark[1] - s_mark[0]) / 64.0, (s_mark[2] - s_mark[1]) / 64.0, (s_t0 - s_mark[2]) / 32.0);
+  if (snoop_mode) {
+    const char *kn[3] = {"miss", "clean", "modified"};
+    for (int i = 0; i < 2; i++) {
+      std::printf("  snoops (%s) %lu:", i ? "write" : "read", (unsigned long)sn_n[i]);
+      for (int k = 0; k < 3; k++) if (sn_kind[i][k])
+        std::printf(" %s %lu (mean %.1f, max %lu cycles)", kn[k], (unsigned long)sn_kind[i][k],
+                    (double)sn_lat_sum[i][k] / sn_kind[i][k], (unsigned long)sn_lat_max[i][k]);
+      std::printf("\n");
+    }
+    std::printf("  snoop races: CPU requests outstanding %lu, memory port busy %lu, line changed by an unanswered request %lu,"
+                " changed during the snoop %lu, back to back %lu; DMA writes %lu; bytes checked %lu\n",
+                (unsigned long)sn_race_out, (unsigned long)sn_race_mem, (unsigned long)sn_race_st, (unsigned long)sn_race_win,
+                (unsigned long)sn_b2b, (unsigned long)sn_dmaw, (unsigned long)sn_bytes);
+    std::printf("  snoop races: a store to the line in the 3 cycles before %lu, its allocation (fill) in the 24 before %lu,"
+                " its cast-out in the 24 before %lu, a CPU miss to another line in the 24 before %lu\n",
+                (unsigned long)sn_race_sb, (unsigned long)sn_race_fill, (unsigned long)sn_race_evict, (unsigned long)sn_race_miss);
+    std::printf("  write snoops started with DCFI %lu, lwarx to a write snoop's line in its window %lu\n", (unsigned long)sn_dcfi, (unsigned long)sn_rsv_in);
+    std::printf("  lwarx %lu, reservations cleared %lu, cycles cleared %lu\n", (unsigned long)n_rsv, (unsigned long)n_kill_set,
+                (unsigned long)n_kill_cyc);
+  }
   std::printf("%s: %d error(s)\n", errors ? "FAIL" : "PASS", errors);
   delete t;
   return errors ? 1 : 0;

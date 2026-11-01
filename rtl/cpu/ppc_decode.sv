@@ -16,11 +16,15 @@
 // Cracked instructions, so that no uop writes more than one GPR:
 //
 //   update loads (lbzu, lhzu, lhau, lwzu and their x forms)
-//       step 0: the load into rD        step 1: rA = rA + d (or rB)
+//       step 0: the load into rD        step 1: rA = step 0's EA
 //   lmw rD,d(rA)    step n: load r(rD+n) from rA + d + 4n, n = 0 .. 31-rD
 //   stmw rS,d(rA)   step n: store r(rS+n) to rA + d + 4n
 //
-// Update stores write their EA to rA within the store uop. Every non-register
+// An update load's step 1 takes step 0's EA as x (ppc_core.sv: EX's sum as
+// step 0 leaves EX) and adds the immediate 0. It reads no register: rD may be
+// rB (a valid form, PEM 8 lbzux: EA <- (rA) + (rB), rD <- MEM(EA), rA <- EA),
+// and step 0 has written rD by then, so rA + rB read again would be rA + the
+// loaded value. Update stores write their EA to rA within the store uop. Every non-register
 // y operand is in imm, BSEL_ZERO and BSEL_MINUS1 included (0 and -1), and so is
 // the rotate amount of rlwinm / rlwimi, so the core captures y with one mux.
 //
@@ -100,7 +104,8 @@ module ppc_decode
     u.fiw   = iw;
     u.rd_we = 1'b0;
     if (!st && upd && step == (dbl ? 5'd2 : 5'd1)) begin
-      // the update: rA = rA + d (or rB), as an integer update load's step 1
+      // the update: rA = rA + d (or rB). Neither has been written by the
+      // earlier steps (frD is an FPR), so they are read again here
       u.op = OP_ADD; u.a_used = 1'b1; u.b_used = x; u.bsel = x ? BSEL_RB : BSEL_IMM; u.imm = simm;
       u.rd = f_a; u.rd_we = 1'b1;
     end else begin
@@ -275,8 +280,8 @@ module ppc_decode
       6'd33, 6'd35, 6'd41, 6'd43: begin               // and their update forms
         u.msize   = (opcd[3]) ? 2'd1 : (opcd[1] ? 2'd0 : 2'd2);
         u.msigned = (opcd[3:1] == 3'b101);
-        if (opcd[0] && step == 5'd1) begin            // update: rA = rA + d
-          u.op = OP_ADD; u.a_used = 1'b1; u.bsel = BSEL_IMM; u.imm = simm; u.rd = f_a; u.rd_we = 1'b1;
+        if (opcd[0] && step == 5'd1) begin            // update: rA = step 0's EA (the core supplies x)
+          u.op = OP_ADD; u.a_zero = 1'b1; u.bsel = BSEL_IMM; u.imm = 32'd0; u.rd = f_a; u.rd_we = 1'b1;
         end else begin
           u.op = OP_LOAD; u.a_used = (f_a != 5'd0); u.a_zero = !opcd[0];
           u.bsel = BSEL_IMM; u.imm = simm; u.rd_we = 1'b1; u.last = !opcd[0];
@@ -354,8 +359,8 @@ module ppc_decode
             10'd23, 10'd87, 10'd279, 10'd343, 10'd55, 10'd119, 10'd311, 10'd375: begin
               u.msize   = (xo10[8]) ? 2'd1 : (xo10[6] ? 2'd0 : 2'd2);
               u.msigned = (xo10 == 10'd343) || (xo10 == 10'd375);
-              if (xo10[5] && step == 5'd1) begin
-                u.op = OP_ADD; u.a_used = 1'b1; u.b_used = 1'b1; u.rd = f_a; u.rd_we = 1'b1;
+              if (xo10[5] && step == 5'd1) begin          // update: rA = step 0's EA (the core supplies x)
+                u.op = OP_ADD; u.a_zero = 1'b1; u.bsel = BSEL_IMM; u.imm = 32'd0; u.rd = f_a; u.rd_we = 1'b1;
               end else begin
                 u.op = OP_LOAD; u.a_used = (f_a != 5'd0); u.a_zero = !xo10[5]; u.b_used = 1'b1;
                 u.rd_we = 1'b1; u.last = !xo10[5];

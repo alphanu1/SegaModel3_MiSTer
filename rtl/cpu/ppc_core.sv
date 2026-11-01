@@ -62,9 +62,15 @@
 // sync waits in EX until nothing is outstanding and d_idle. HID0's cache
 // bits are flip-flops here and go to the caches (rtl/cpu/ppc_cpu.sv).
 //
-// Not yet here: misaligned accesses (forced aligned), the alignment
-// exception for them, privilege checks other than dcbi's (MSR[PR] selects
-// keys and BAT valid bits), MSR[LE].
+// Misaligned accesses (603e 2.2.3, 4.5.6; see "memory access" below): an
+// integer halfword or word that crosses a word boundary is split in EX into
+// two word accesses, the first made while EX holds a cycle; one inside its
+// word is a single access on its lanes. The alignment exception (0x600) is
+// taken for lmw, stmw, lwarx, stwcx. and FP accesses not word-aligned, and for
+// any access crossing a page with MSR[DR] = 1.
+//
+// Not yet here: privilege checks other than dcbi's (MSR[PR] selects keys and
+// BAT valid bits), MSR[LE].
 //
 // Memory ports. Addresses are physical.
 //   Fetch: a request is accepted on the edge where i_req is high; i_valid
@@ -81,6 +87,10 @@
 //   answer (the whole pipeline behind it holds); one that arrives while the
 //   uop is still in MEM is kept for it. d_req, d_we, d_addr, d_be and
 //   d_wdata come from EX's translation and are late in the cycle (R32).
+//   d_resv marks an lwarx's request (d_cond an stwcx.'s). res_kill: the
+//   reservation has been lost to another master's write of its line (603e
+//   2.3.6.1, through ppc_dcache's snoop); a stwcx. in EX then fails. Tie it
+//   low without a snooping cache.
 
 module ppc_core
   import ppc_pkg::*, ppc_fpu_pkg::*;
@@ -97,8 +107,9 @@ module ppc_core
   parameter bit BTB = 1'b1,
   parameter int BTB_N = 64,
   // FETCH2 = 1: two-word fetch, the I-cache's fast path answering a
-  // sequential request with the word and the next (ppc_icache FETCH2)
-  parameter bit FETCH2 = 1'b1,
+  // sequential request with the word and the next (ppc_icache FETCH2); off
+  // by default (D-36: about 520 ALM cached for 1-3 frames lost in 56,700)
+  parameter bit FETCH2 = 1'b0,
   // LA = 1: the 603e's CR look-ahead (603e 2.3.4.4): a conditional branch
   // whose CR bit and CTR no instruction in flight may change is resolved as
   // its word arrives; otherwise the static rule (the y bit) predicts it
@@ -143,6 +154,9 @@ module ppc_core
   input  logic        d_idle,       // nothing buffered or in flight on the memory side (sync)
   input  logic        d_valid,
   input  logic [31:0] d_rdata,
+  output logic        d_resv,       // with d_req: lwarx (the D-cache snoops its line, D-41)
+  output logic        d_cond,       // with d_req: stwcx. (verification)
+  input  logic        res_kill,     // the reservation is lost to a snooped write (ppc_dcache)
 
   // HID0's cache bits (603e table 2-2); ICFI and DCFI are one-cycle pulses as
   // they are written (the bits read 0: they clear as the invalidation begins)
@@ -301,6 +315,10 @@ module ppc_core
     logic [1:0]  hcfi;                                 // mtspr HID0: ICFI, DCFI as written
     logic        rtm;                                  // a bclr / bcctr the BTB predicted to the wrong
                                                        // target: MEM refetches from sprv (its target)
+    // misaligned accesses: the first word of a split (no effect of its own; a
+    // load's word is kept, mis_w0), a split load's second word (merged with
+    // mis_w0), the alignment exception from EX (with lmw / stmw, DAR = EA + 4)
+    logic        sp0, sp1, algn, algd4;
   } mem_t;
   mem_t m;
   (* preserve *) logic m_rpq;                          // = m.rp, for the queue's hold (below)
@@ -317,6 +335,7 @@ module ppc_core
   logic [63:0] wb_fdat_q;                              // the small unit's result
   // the data answer: WB waits for it (pipelined loads, see "Memory ports")
   logic        wb_iss, wb_got, wb_isld, wb_fhi, wb_c2; // a request made; answered; a load; lfd's high word; held last cycle
+  logic        wb_sp0, wb_sp1;                         // a split's first word; a split load's second (its merge)
   logic        wb_fl;                                  // wb_fpw && wb_isld: an FP load
   logic        wb_live_q;                              // wb_isld && !wb_got, as its own register
   logic [1:0]  wb_msize, wb_boff;
@@ -601,6 +620,7 @@ module ppc_core
   // (declared here, before the look-ahead's scan uses them: Quartus 17 wants
   // a struct declared before its fields are named)
   pd_t         pd_w, pd_w2, q_pd, q1_pd;
+  logic [17:0] q_rf;                                   // the queue head's {rS, rA, rB, sh}, a copy for the GPR file
   logic [PDW-1:0] q2_pdv, q3_pdv;
   pd_t         q2_pd, q3_pd;
   assign q2_pd = pd_t'(q2_pdv);
@@ -751,15 +771,15 @@ module ppc_core
     end else begin
       // (a failed check made in the cycle of a hard redirect is dropped here,
       // a cycle on, so EX's late decision does not reach bmis_q)
-      redir_q      <= redirect_f || f_soft || (bmis_q && !redir_hard_q);
-      redir_hard_q <= redirect_f;
+      redir_q      <= m_z ? (rdf_z1 || f_soft || (bmis_q && !redir_hard_q)) : (rdf_z0 || f_soft || (bmis_q && !redir_hard_q));
+      redir_hard_q <= m_z ? rdf_z1 : rdf_z0;
       // the candidates load every cycle; only the 2-bit choice waits on the
       // redirect decision (R23 timing). A failed BTB check's redirect is a
       // soft one, its address loaded from a register (cr_tgt_q).
       redir_a_q    <= redirect_pc;
       redir_b_q    <= redirect_pc_b;
       redir_s_q    <= bmis_q ? {cr_tgt_q, 2'b00} : (pw_pred || !FETCH2) ? pw_tgt : pw2_tgt;
-      redir_k_q    <= !redirect ? 2'd2 : redirect_sel ? 2'd0 : 2'd1;
+      redir_k_q    <= m_z ? (!rdf_z1 ? 2'd2 : redirect_sel ? 2'd0 : 2'd1) : (!rdf_z0 ? 2'd2 : redirect_sel ? 2'd0 : 2'd1);
       if (f_issue)      f_pc <= fetch_pc + (i_w2 ? 32'd8 : 32'd4);
       else if (redir_q) f_pc <= redir_pc_q;
       else if (s_ok)    f_pc <= f_rsp_pc;              // fetch it again, now translated
@@ -1005,7 +1025,7 @@ module ppc_core
     .w2_insn (i_data2), .w2_pc ({f_rsp4, 2'b00}), .w2_pred (w2_prd), .w2_pd (pd_w2f),
     .pop (q_pop), .count (q_cnt),
     .r_insn (q_hi), .r_pc (q_hp), .r_pred (q_hd), .r_pd (q_pd),
-    .r1_insn (q1_hi), .r1_pd (q1_pd), .r2_pd (q2_pdv), .r3_pd (q3_pdv)
+    .r1_insn (q1_hi), .r1_pd (q1_pd), .r2_pd (q2_pdv), .r3_pd (q3_pdv), .r_rf (q_rf)
   );
 
   // ==================================================================== decode
@@ -1043,21 +1063,32 @@ module ppc_core
   // WB's load forwards only in the cycle its answer arrives: with MEM empty,
   // WB's wait does not hold EX, so a consumer would otherwise enter EX with
   // the port's word before it is the load's
-  wire wb_ldw     = wb_valid && wb_live_q && wb_rd_we && !d_valid;
+  wire wb_ldw     = wb_valid && wb_live_q && wb_rd_we && (!d_valid || wb_sp1);
   // (the register compares are made a cycle early: qe_*, below)
   logic [3:0] qe_e, qe_m, qe_w;
   function automatic logic lu_q(input logic [3:0] qe, input logic ua, input logic ub, input logic us);
     lu_q = (ua && qe[0]) || (ub && qe[1]) || (us && qe[3]);
   endfunction
-  wire load_use   = (ex_is_load && ex_u.rd_we && lu_q(qe_e, q_pd.ua, q_pd.ub, q_pd.us)) ||
-                    (m_ldw && lu_q(qe_m, q_pd.ua, q_pd.ub, q_pd.us)) ||
-                    (wb_ldw && lu_q(qe_w, q_pd.ua, q_pd.ub, q_pd.us)) ||
-                    hash_wait;
+  logic id_s0, id_s1, id_lst_q;
+  // An integer update load's step 1 (lbzu lhzu lhau lwzu and the x forms:
+  // cracked, not an FP double, no FPR written) writes rA from step 0's EA,
+  // EX's sum as step 0 leaves EX (x_ex, below), not from rA + d / rB read
+  // again: rD may be rB (a valid form, PEM 8 lbzux: EA <- (rA) + (rB),
+  // rD <- MEM(EA), rA <- EA), and step 0 has written rD by then (VF3's lbzux
+  // r4,r6,r4 at 0x4D040). It reads no register, so it waits on no load, its
+  // own step 0's above all. It never resumes from a replay (an add makes no
+  // access), so EX always holds its step 0 as it leaves ID. From predecode
+  // flops already in the queue: no register of its own.
+  wire id_xuea    = id_s1 && q_pd.crack == 2'd1 && !q_pd.fdx && !q_pd.fpw && !q_pd.ifault;
+  wire load_use   = !id_xuea &&
+                    ((ex_is_load && ex_u.rd_we && lu_q(qe_e, q_pd.ua, q_pd.ub, q_pd.us)) ||
+                     (m_ldw && lu_q(qe_m, q_pd.ua, q_pd.ub, q_pd.us)) ||
+                     (wb_ldw && lu_q(qe_w, q_pd.ua, q_pd.ub, q_pd.us)) ||
+                     hash_wait);
 
   // the uop that finishes the instruction: on a first uop from the predecode;
   // after it from a flag registered as the step advances (an update form's
   // second uop; lmw / stmw at rD + step = 31, from rS's counted index)
-  logic id_s0, id_s1, id_lst_q;
   wire  id_last = id_s0 ? q_pd.l0 : id_lst_q;
 
   logic ex_hold, mem_hold, mem_adv;
@@ -1170,6 +1201,17 @@ module ppc_core
     if (!rst && id_valid && id_u.fpw && id_u.rd != q_hi[25:21])
       $fatal(1, "%08X: an FPR write whose frD is not the word's [25:21]", q_hi);
 `endif
+  // an integer word / halfword load or store that may be split (EX's ex_msw
+  // / ex_msh), from the raw word (through the decoder it led a round-6 full
+  // build, h0 into ex_msw); checked against the decoder's fields in EX
+  wire [9:0]  id_xo  = q_hi[10:1];
+  wire        id_x31 = q_hi[31:26] == 6'd31;
+  wire        id_mw  = q_hi[31:26] == 6'd32 || q_hi[31:26] == 6'd33 || q_hi[31:26] == 6'd36 || q_hi[31:26] == 6'd37 ||
+                       (id_x31 && (id_xo == 10'd23 || id_xo == 10'd55 || id_xo == 10'd151 || id_xo == 10'd183 ||
+                                   id_xo == 10'd534 || id_xo == 10'd662));
+  wire        id_mh  = (q_hi[31:26] >= 6'd40 && q_hi[31:26] <= 6'd45) ||
+                       (id_x31 && (id_xo == 10'd279 || id_xo == 10'd311 || id_xo == 10'd343 || id_xo == 10'd375 ||
+                                   id_xo == 10'd407 || id_xo == 10'd439 || id_xo == 10'd790 || id_xo == 10'd918));
   logic [8:0] ex_rsel;
   logic [3:0] ex_ltt;
   logic       ex_ext_h;
@@ -1222,7 +1264,20 @@ module ppc_core
   // id_s0, id_rs_q next cycle; a redirect is left out (ID then holds no uop)
   wire        hn_s0 = h_adv ? id_last : id_s0;             // (EX free; held: id_s0, id_rs_q)
   logic [3:0][4:0] qe_rd;                              // the producers: ID, EX, MEM, WB
-  assign qe_rd = {wb_rd, m.rd, ex_u.rd, id_u.rd};
+  // ID's own rd without the decoder in front (the decoder's rd selection was
+  // five LUT levels from the queue head in front of these compares: the D-36
+  // full builds' h0 -> qe_e). The first uop's is rA or rD by the predecode
+  // (pd.rda); a later uop's is rA (an update) or, for lmw, rD + step, which
+  // is id_rs_q. Equal to id_u.rd wherever the uop writes a GPR, the only
+  // case in which qe_e is used (ex_w, and the load-use hazard's rd_we)
+  wire  [4:0] id_rdf = id_s0 ? (q_pd.rda ? q_hi[20:16] : q_hi[25:21])
+                             : (q_pd.crack == 2'd2 ? id_rs_q : q_hi[20:16]);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && id_valid && id_u.rd_we && id_rdf != id_u.rd)
+      $fatal(1, "id_rdf %0d against the decoder's rd %0d (%08X, step %0d)", id_rdf, id_u.rd, q_hi, id_step);
+`endif
+  assign qe_rd = {wb_rd, m.rd, ex_u.rd, id_rdf};
   // [producer][field] for next cycle's head: qe_hk where EX holds (entry 0,
   // else the arriving word), qe_hf where it is free (entry 1 after a take)
   // (every candidate compared, then chosen: the take is not in front of a
@@ -1254,9 +1309,15 @@ module ppc_core
   // writer's own (every change of TGPR redirects, so no uop of the other mode
   // is in flight)
   wire m_sh = msr_q[MSR_TGPR] && m.rd[4:2] == 3'd0;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && id_valid && ({q_rf[2], q_rf[12:8], q_rf[1], q_rf[7:3], q_rf[0], id_s0 ? q_rf[17:13] : id_rs_q} !=
+                             {q_pd.sh[2], id_u.ra, q_pd.sh[1], id_u.rb, q_pd.sh[0], id_rs}))
+      $fatal(1, "GPR read addresses from the queue's copy against the head's");
+`endif
   ppc_regfile u_rf (
     .clk (clk),
-    .ra  ({q_pd.sh[2], id_u.ra}), .rb ({q_pd.sh[1], id_u.rb}), .rs ({q_pd.sh[0], id_rs}),
+    .ra  ({q_rf[2], q_rf[12:8]}), .rb ({q_rf[1], q_rf[7:3]}), .rs ({q_rf[0], id_s0 ? q_rf[17:13] : id_rs_q}),
     .qa  (rf_ra),   .qb (rf_rb),   .qs (rf_rs),
     .we  (wb_adv && wb_rd_we),                        // written as WB is left
     .wa  ({wb_rd_sh, wb_rd}),
@@ -1304,12 +1365,14 @@ module ppc_core
   // as step 0 leaves EX, y the immediate 4 (ppc_decode.sv); after a replay
   // resumed at step 1, x is 0 and y the immediate fea4_q, step 0's EA + 4 kept
   // for it. Either way nothing is added in front of x's register read.
+  // An integer update load's step 1 (rA = EA) takes x the same way, EX's sum
+  // as step 0 leaves EX, with the immediate 0 (id_xuea, above).
   logic       ex_fd0;                                  // EX holds an FP double's step 0
   logic [31:0] fea_q, fea4_q;
   logic [31:0] fimm_q;                                 // step 1's immediate: 4, or after a replay fea4_q
   wire        id_xfea  = q_pd.fdx && id_s1;
-  wire        id_xz    = id_xzero || id_xfea;
-  wire        id_yreg  = q_pd.yreg && !id_xfea;
+  wire        id_xz    = id_xzero || id_xfea || id_xuea;
+  wire        id_yreg  = q_pd.yreg && !id_xfea && !id_xuea;
   // y's immediate, by the predecoded form (the decoder's id_u.imm, built here
   // from the raw fields)
   logic [31:0] id_imm;
@@ -1331,12 +1394,13 @@ module ppc_core
       default: id_imm = {{16{q_hi[15]}}, q_hi[15:0]};
     endcase
     if (id_xfea) id_imm = fimm_q;
+    if (id_xuea) id_imm = 32'd0;                      // an update load's rA = step 0's EA + 0
   end
 
   // (both fields compared, then chosen: the compare does not wait on the
   // field mux)
   wire        x_ex  = (!id_xz && ex_w && (id_xs ? qe_e[2] : qe_e[0])) ||
-                      (id_xfea && ex_valid && ex_fd0);
+                      (id_xfea && ex_valid && ex_fd0) || (id_xuea && ex_valid);
   wire        y_ex  = id_yreg && ex_w && qe_e[1];
   wire        a_ex  = ex_w && qe_e[0];
   wire        s_ex  = ex_w && qe_e[3];
@@ -1350,13 +1414,25 @@ module ppc_core
   wire        a_wb  = wb_valid && qf_w[0];
   wire        s_wb  = wb_valid && qf_w[3];
 `ifdef VERILATOR
+  // an integer update load's step 1 leaves ID only behind its own step 0 in EX
+  always_ff @(posedge clk)
+    if (!rst && id_adv && id_xuea && !(ex_valid && ex_first && !ex_ifault && ex_u.op == OP_LOAD && ex_u.insn == q_hi))
+      $fatal(1, "update load %08X: step 1 leaves ID without its step 0 in EX", q_hi);
+  // id_xuea from the predecode against the raw word, wherever ID holds a uop
+  always_ff @(posedge clk)
+    if (!rst && id_valid && !q_pd.ifault &&
+        id_xuea != (id_s1 && (q_hi[31:26] == 6'd33 || q_hi[31:26] == 6'd35 || q_hi[31:26] == 6'd41 || q_hi[31:26] == 6'd43 ||
+                              (q_hi[31:26] == 6'd31 && (q_hi[10:1] == 10'd55 || q_hi[10:1] == 10'd119 ||
+                                                        q_hi[10:1] == 10'd311 || q_hi[10:1] == 10'd375)))))
+      $fatal(1, "update load kind of %08X (step 1 %b) against the raw word", q_hi, id_s1);
   // the early compares against the live ones, wherever ID holds a uop
   always_ff @(posedge clk)
     if (!rst && id_valid)
       for (int p = 0; p < 3; p++) begin
         automatic logic [4:0] rd = p == 0 ? ex_u.rd : p == 1 ? m.rd : wb_rd;
         automatic logic [3:0] qe = p == 0 ? qe_e : p == 1 ? qe_m : qe_w;
-        if (qe != {rd == id_rs, rd == q_hi[25:21], rd == q_hi[15:11], rd == q_hi[20:16]})
+        // (EX's from id_rdf: the decoder's rd where a valid EX uop writes a GPR)
+        if ((p != 0 || (ex_valid && ex_u.rd_we)) && qe != {rd == id_rs, rd == q_hi[25:21], rd == q_hi[15:11], rd == q_hi[20:16]})
           $fatal(1, "early register compare, stage %0d: %b against %b", p, qe,
                  {rd == id_rs, rd == q_hi[25:21], rd == q_hi[15:11], rd == q_hi[20:16]});
       end
@@ -1494,11 +1570,11 @@ module ppc_core
       $fatal(1, "CR bit from the writer ahead: %b%b against %b%b (kinds %b %b)", cr_a, cr_b,
              m.cr[5'd31 - ex_u.crba], m.cr[5'd31 - ex_u.crbb], ex_cra_s, ex_crb_s);
 `endif
-  wire        cr_b   = ex_crb_s[0] ? m_cr0[2'd3 - ex_u.crbb[1:0]] :
-                       ex_crb_s[1] ? m.cmpv[2'd3 - ex_u.crbb[1:0]] :
+  wire        cr_bn  = ex_crb_s[1] ? m.cmpv[2'd3 - ex_u.crbb[1:0]] :
                        ex_crb_s[2] ? m.crlb : ex_crb_s[3] ? m.crf4[2'd3 - ex_u.crbb[1:0]] :
                        ex_crb_s[4] ? m.mtcb : ex_crb;
-  wire        res_in = (m.valid && m.res_set) ? 1'b1 : (m.valid && m.res_clr) ? 1'b0 : res_q;
+  wire        cr_b   = ex_crb_s[0] ? m_cr0[2'd3 - ex_u.crbb[1:0]] : cr_bn;
+  wire        res_in = !res_kill && ((m.valid && m.res_set) ? 1'b1 : (m.valid && m.res_clr) ? 1'b0 : res_q);
   // EX is an mcrf of CR0 with CR0's Rc producer in MEM (its value taken in MEM)
   wire        ex_mcrf0 = ex_valid && ex_u.op == OP_CRLOG && ex_u.insn[10:1] == 10'd0 &&
                          fs_rc0 && ex_u.crf_src == 3'd0;
@@ -1562,22 +1638,51 @@ module ppc_core
   end
   wire [31:0] id_spr_v = (m.valid && m.spr_we && m.spr == id_spr_idx) ? m.sprv :
                          (id_spr_idx == 6'd0) ? srr0_q : (id_spr_idx == 6'd1) ? srr1_q :
-                         id_isf ? id_fspr : spr_mem[id_spr_idx];
+                         id_isf ? id_fspr : spr_mem[spr_ra];
   wire [31:0] xer_nx   = (m.valid && m.xer_we) ? m.xer : xer_q;
   wire [31:0] lr_nx    = (m.valid && m.lr_we)  ? m.lr  : lr_q;
   wire [31:0] ctr_nx   = (m.valid && m.ctr_we) ? m.ctr : ctr_q;
-  logic [31:0] id_mfv;
+  // id_mfv as one AND-OR of every source under a select formed from the
+  // queue head's predecode alone (two levels), MEM's SPR forward choosing
+  // last: as the case, the SPR index's decode and the forward compare were
+  // five levels of select in front of ex_mfv (a round-2 cached full build,
+  // h0 into ex_mfv, -0.57 ns). id_mfv_c is the case form, kept for the check.
+  wire        mk0   = !q_pd.mfcr && !q_pd.mfmsr;
+  wire        ksp   = mk0 && id_mf_sel == 3'd0 && id_spr_hit;
+  wire [5:0]  ix    = id_spr_idx;
+  // the array's read address through a LUT of its own (as the register
+  // files'): Quartus otherwise copies the queue head into the array's
+  // address register, and the pop's next state then reaches it (a round-2
+  // cached full build, wk_act into spr_mem's rdaddr_reg)
+  (* keep = 1 *) wire [5:0] spr_ra = id_spr_idx;
+  wire        k_arr = ksp && !(ix == 6'd0 || ix == 6'd1 || ix == 6'd6 || ix == 6'd7 || (ix >= 6'd13 && ix <= 6'd18));
+  wire [31:0] id_mfb = ({32{q_pd.mfcr && !q_pd.mfmsr}} & (m.valid ? m_cr : cr_q)) | ({32{q_pd.mfmsr}} & msr_q) |
+                       ({32{mk0 && id_mf_sel == 3'd1}} & xer_nx) | ({32{mk0 && id_mf_sel == 3'd2}} & lr_nx) |
+                       ({32{mk0 && id_mf_sel == 3'd3}} & ctr_nx) | ({32{mk0 && id_mf_sel == 3'd7}} & PVR) |
+                       ({32{ksp && ix == 6'd0}} & srr0_q) | ({32{ksp && ix == 6'd1}} & srr1_q) |
+                       ({32{ksp && ix == 6'd6}} & dsisr_q) | ({32{ksp && ix == 6'd7}} & dar_q) |
+                       ({32{ksp && ix == 6'd13}} & dmiss_q) | ({32{ksp && ix == 6'd14}} & dcmp_q) |
+                       ({32{ksp && ix == 6'd15}} & hash1) | ({32{ksp && ix == 6'd16}} & hash2) |
+                       ({32{ksp && ix == 6'd17}} & imiss_q) | ({32{ksp && ix == 6'd18}} & icmp_q) |
+                       ({32{k_arr}} & spr_mem[spr_ra]);
+  wire        mfwd  = ksp && m.valid && m.spr_we && m.spr == ix;
+  wire [31:0] id_mfv = mfwd ? m.sprv : id_mfb;
+  logic [31:0] id_mfv_c;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && id_valid && id_mfv != id_mfv_c) $fatal(1, "flat move-from value %08X against %08X", id_mfv, id_mfv_c);
+`endif
   always_comb begin
     case (id_mf_sel)
-      3'd1:    id_mfv = xer_nx;
-      3'd2:    id_mfv = lr_nx;
-      3'd3:    id_mfv = ctr_nx;
-      3'd7:    id_mfv = PVR;
-      3'd0:    id_mfv = id_spr_hit ? id_spr_v : 32'd0;
-      default: id_mfv = 32'd0;                         // DEC, TBL, TBU: read in EX
+      3'd1:    id_mfv_c = xer_nx;
+      3'd2:    id_mfv_c = lr_nx;
+      3'd3:    id_mfv_c = ctr_nx;
+      3'd7:    id_mfv_c = PVR;
+      3'd0:    id_mfv_c = id_spr_hit ? id_spr_v : 32'd0;
+      default: id_mfv_c = 32'd0;                         // DEC, TBL, TBU: read in EX
     endcase
-    if (q_pd.mfcr)  id_mfv = m.valid ? m_cr : cr_q;
-    if (q_pd.mfmsr) id_mfv = msr_q;
+    if (q_pd.mfcr)  id_mfv_c = m.valid ? m_cr : cr_q;
+    if (q_pd.mfmsr) id_mfv_c = msr_q;
   end
   // EX's selects: mf_b the captured value; mf_f a writer one step ahead of
   // XER, LR, CTR, an SPR, CR; mf_c0 its CR0 from Rc; mf_t DEC, TBL, TBU
@@ -1594,8 +1699,20 @@ module ppc_core
   // (mf_c0's CR0 from Rc, behind MEM's zero detect, joins EX's result in its
   // late part, r_late, not here)
   wire  [31:0] mf_c0v  = {{4{mf_c0}} & m_cr0, 28'd0};
+  // mfcr after a CR writer in MEM: mf_f[4] & m_crn with the select folded
+  // into the mask a cycle early (mf4c = mf_f[4] & m.crm, mf4o = mf_f[4] &
+  // ~m.crm, registered as EX is loaded), so the writer's bits are one LUT from
+  // MEM's registers: through m_crn's merge and then the select, m.cmp_we
+  // into EX's result led a round-1 uncached full build (into op_a)
+  logic [31:0] mf4c, mf4o;
+  wire  [31:0] m_crw   = m.cmp_we ? {8{m.cmpv}} : m.mcrf0 ? {8{cr_q[31:28]}} : m.cr;
   wire  [31:0] mf_nowe = ({32{mf_b}} & ex_mfv) | ({32{mf_f[0]}} & m.xer) | ({32{mf_f[1]}} & m.lr) |
-                         ({32{mf_f[2]}} & m.ctr) | ({32{mf_f[3]}} & m.sprv) | ({32{mf_f[4]}} & m_crn);
+                         ({32{mf_f[2]}} & m.ctr) | ({32{mf_f[3]}} & m.sprv) | (mf4o & cr_q) | (mf4c & m_crw);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && (mf4c != ({32{mf_f[4]}} & m.crm) || mf4o != ({32{mf_f[4]}} & ~m.crm)))
+      $fatal(1, "mfcr's registered CR masks against mf_f[4] and m.crm");
+`endif
   wire  [31:0] mf_now  = mf_nowe | mf_c0v;
   wire  [31:0] mf_val  = mf_nowe | ({32{mf_t[0]}} & dec_q) | ({32{mf_t[1]}} & tb_q[31:0]) | ({32{mf_t[2]}} & tb_q[63:32]);
 
@@ -1661,10 +1778,28 @@ module ppc_core
   wire        brt_z0    = br_tk(cra_z0, ex_u.bkind, br_ctr_ok, bo_nocond, bo_cond);
   wire        brt_z1    = br_tk(cra_z1, ex_u.bkind, br_ctr_ok, bo_nocond, bo_cond);
   wire        br_taken  = m_z ? brt_z1 : brt_z0;
+  // b's and bc's displacement, from the raw word as it enters EX (ex_bd):
+  // the decoder's imm, used in EX for nothing else, was through its case
+  // structure from the queue head into ex_u.imm (a D-36 cached full build)
+  logic [31:0] ex_bd;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && ex_valid && ex_u.op == OP_BRANCH && (ex_u.bkind == BR_B || ex_u.bkind == BR_BC) && ex_bd != ex_u.imm)
+      $fatal(1, "branch displacement %08X against the decoder's %08X", ex_bd, ex_u.imm);
+`endif
+`ifdef VERILATOR
+  // ex_fsfld from the raw word against the decoder's form, for FPSCR ops
+  logic [2:0] ex_fsfld_d;
+  always_ff @(posedge clk) begin
+    if (!ex_hold) ex_fsfld_d <= id_u.fsop == 3'(FS_MCRFS) ? id_u.insn[20:18] : id_u.insn[25:23];
+    if (!rst && ex_valid && ex_fsop != 3'd0 && ex_fsfld != ex_fsfld_d)
+      $fatal(1, "FPSCR op field %0d against the decoder's %0d", ex_fsfld, ex_fsfld_d);
+  end
+`endif
   logic [31:0] br_target;
   always_comb begin
     case (ex_u.bkind)
-      BR_B, BR_BC: br_target = (ex_u.aa ? 32'd0 : ex_u.pc) + ex_u.imm;
+      BR_B, BR_BC: br_target = (ex_u.aa ? 32'd0 : ex_u.pc) + ex_bd;
       BR_BCLR:     br_target = {lr_in[31:2], 2'b00};
       default:     br_target = {ctr_in[31:2], 2'b00};
     endcase
@@ -1684,19 +1819,64 @@ module ppc_core
   wire        is_ld   = ex_u.op == OP_LOAD;
   wire        is_st   = ex_u.op == OP_STORE;
   wire        st_ok   = !ex_u.cond || res_in;           // stwcx. stores only when reserved
-  wire [1:0]  boff    = (ex_u.msize == 2'd2) ? 2'd0 : (ex_u.msize == 2'd1) ? {ea[1], 1'b0} : ea[1:0];
-  logic [31:0] st_data, sv;
-  logic [3:0]  st_be;
+  // the byte offset in the word, any size: from the operands' own two bits,
+  // not the ALU's sum (its input logic for subtract was in front of the
+  // split's hold and EX's redirect in a round-5 cached full build)
+  wire [1:0]  boff    = op_x[1:0] + op_y[1:0];
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && ex_valid && (is_ld || is_st) && boff != ea[1:0]) $fatal(1, "boff against the EA");
+`endif
+
+  // Misaligned accesses (603e 2.2.3, 4.5.6). An integer halfword or word that
+  // crosses a word boundary (mis_x) is split: in its first cycle in EX (mis_hold,
+  // EX holding) the word at EA goes out on the lanes from EA on, as a uop of
+  // its own into MEM with no effect but the access (m.sp0); in the next
+  // (ex_sp1) the uop itself goes out at EA + 4 (ea_x's carry-in) on the rest.
+  // A load's first word is kept as it leaves WB (mis_w0) and merged with the
+  // second, which WB takes a cycle for (wb_sp1). The alignment exception
+  // instead (algn, taken from MEM as dcbz's, m_algc), before any access:
+  // lmw / stmw (at step 0), lwarx, stwcx. and FP accesses not word-aligned;
+  // with MSR[DR] = 1 a halfword or word crossing a page, or an FP double
+  // (4.5.6.1.1: every DR = 1 access, a BAT's included, "no special handling
+  // for accesses that fall into BAT regions"). With DR = 0 a page crossing is
+  // split. String and LE accesses do not exist here.
+  logic        ex_sp1, ex_s0ok, ex_lsm;                // the split's second cycle; its first word went; lmw / stmw
+  // (ex_msw / ex_msh: an integer word / halfword access that may split,
+  // registered from ID, so the split's hold is one LUT of registers and the
+  // sum's low bits: from the op decode it led a round-4 full build, ex_u.op
+  // through EX's hold into the fetch queue)
+  logic        ex_msw, ex_msh;
+  wire        ls_mem  = (is_ld || is_st) && ex_u.cop == 3'd0;
+  wire        mis_x   = ex_msw ? boff != 2'd0 : ex_msh && boff == 2'd3;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && ex_valid && !ex_ifault && {ex_msw, ex_msh} != ({2{ls_mem && !ex_u.fp && !ex_u.reserve && !ex_u.cond && !ex_lsm}} &
+                                                 {ex_u.msize == 2'd2, ex_u.msize == 2'd1}))
+      $fatal(1, "the split kind's registered bits: %b%b insn %08X op %0d cop %0d msize %0d step %0d first %b ifault %b", ex_msw, ex_msh, ex_u.insn, ex_u.op, ex_u.cop, ex_u.msize, ex_step, ex_first, ex_ifault);
+`endif
+  // (an exception in the uop's place, ex_xcm, is not held for; a replay or
+  // the alignment exception, known late, holds the cycle and then leaves as
+  // without a split, with no access: ex_s0ok says the first word went)
+  wire        mis_hold = ex_valid && mis_x && !ex_sp1 && !ex_xcm;
+  wire        algn    = ls_mem && (((ex_u.fp || ex_u.reserve || ex_u.cond || (ex_lsm && ex_first)) && boff != 2'd0) ||
+                                   (msr_q[MSR_DR] && !db_stay && ((mis_x && ea_lo[11:2] == 10'h3FF) ||
+                                                                  (ex_u.fp && ex_fd0 && ea_lo[11:0] == 12'hFFC))));
+  // a store's lanes and data: the value left-justified (vl), shifted to EA's
+  // lane, or for a split's second word the rest from lane 0
+  logic [31:0] st_data, sv, vl;
+  logic [3:0]  st_be, smask;
   always_comb begin
     sv = ex_fst ? fsv : s_val;
+    vl    = (ex_u.msize == 2'd2) ? (ex_u.brev ? {sv[7:0], sv[15:8], sv[23:16], sv[31:24]} : sv)
+                                 : {ex_u.brev ? {sv[7:0], sv[15:8]} : sv[15:0], 16'd0};
+    smask = (ex_u.msize == 2'd2) ? 4'b1111 : 4'b1100;
+    // (one rotation serves both words of a split: each takes its own lanes)
     case (ex_u.msize)
-      2'd2: begin
-        st_data = ex_u.brev ? {sv[7:0], sv[15:8], sv[23:16], sv[31:24]} : sv;
-        st_be   = 4'b1111;
-      end
-      2'd1: begin
-        st_data = ex_u.brev ? {2{sv[7:0], sv[15:8]}} : {2{sv[15:0]}};
-        st_be   = boff[1] ? 4'b0011 : 4'b1100;
+      2'd2, 2'd1: begin
+        st_data = (boff == 2'd0) ? vl : (boff == 2'd1) ? {vl[7:0], vl[31:8]} :
+                  (boff == 2'd2) ? {vl[15:0], vl[31:16]} : {vl[23:0], vl[31:24]};
+        st_be   = ex_sp1 ? 4'(8'(smask) << (3'd4 - {1'b0, boff})) : smask >> boff;
       end
       default: begin
         st_data = {4{sv[7:0]}};
@@ -1722,7 +1902,10 @@ module ppc_core
   // carry the MSR[PR] they were made under, so it never holds what the TLB,
   // the segment registers or the key would no longer give.
   logic        ex_mfsr;                                // mfsr(in) in EX
-  wire  [31:0] ea_x    = op_x + op_y;                // = ea for loads and stores
+  // (+ 4 for a split's second word, ex_sp1: its word index, and with DR = 0
+  // its page; with DR = 1 that word is in the first's page, so the DBAT and
+  // micro-TLB compares below give the first's translation)
+  wire  [31:0] ea_x    = op_x + op_y + {29'd0, ex_sp1, 2'b00};   // = ea for loads and stores
   wire  [31:0] fsr     = fsr_mem[op_y[31:28]];         // mfsr(in)'s copy of the segment registers
   logic [3:0]  db_hit, db_go;
   logic [14:0] db_pa;
@@ -1749,11 +1932,33 @@ module ppc_core
       else            ok[j] = (x[17 + j] ^ y[17 + j] ^ bepi[j]) == gx[(j + 14) % 15];
     dbat_hit = valid && &ok;
   endfunction
+  // dbat_hit laid out by hand (keep), as the micro-TLB's compare below: each
+  // bit's carry-free test as one LUT of x, y and BEPI at the bit and the one
+  // below (db_cf), then the bit's outcome by its static kind (masked, a run's
+  // lowest against the sum, else the test: db_ok), then the AND. Left to
+  // Quartus it took five levels from op_y, and a round-3 cached full build
+  // ran op_y through it and xl_rp into the data cache's posted answer (d_valid).
+  (* keep = 1 *) wire [59:0] db_cf, db_ok;          // [15k + j]: DBAT k, BEPI bit j (EA bit 17 + j)
+  genvar dbk, dbj;
+  generate
+  for (dbk = 0; dbk < 4; dbk = dbk + 1) begin : g_db
+    wire [14:0] um = {4'b1111, ~bat_bl[4 + dbk]};
+    for (dbj = 0; dbj < 15; dbj = dbj + 1) begin : g_b
+      if (dbj == 0) begin : g_0
+        assign db_cf[15*dbk + dbj] = 1'b0;           // (bit 17 is always a run's lowest where unmasked)
+        assign db_ok[15*dbk + dbj] = !um[0] || ea_x[17] == bat_bepi[4 + dbk][0];
+      end else begin : g_j
+        assign db_cf[15*dbk + dbj] = (op_x[17+dbj] ^ op_y[17+dbj] ^ bat_bepi[4 + dbk][dbj]) ==
+                                     ((op_x[16+dbj] & op_y[16+dbj]) | ((op_x[16+dbj] ^ op_y[16+dbj]) & ~bat_bepi[4 + dbk][dbj-1]));
+        assign db_ok[15*dbk + dbj] = !um[dbj] || (!um[dbj-1] ? ea_x[17+dbj] == bat_bepi[4 + dbk][dbj] : db_cf[15*dbk + dbj]);
+      end
+    end
+  end
+  endgenerate
   always_comb begin
     db_pa = 15'd0; db_wimg = 4'd0;
     for (int k = 0; k < 4; k++) begin
-      db_hit[k] = dbat_hit(op_x[31:17], op_y[31:17], ea_x[31:17], bat_bepi[4 + k], bat_bl[4 + k],
-                           msr_q[MSR_PR] ? bat_vp[4 + k] : bat_vs[4 + k]);
+      db_hit[k] = (msr_q[MSR_PR] ? bat_vp[4 + k] : bat_vs[4 + k]) && &db_ok[15*k +: 15];
       // BAT protection (PEM 7.4.4): PP = 00 none, 10 read/write, x1 read only
       db_go[k]  = db_hit[k] && (is_st ? bat_pp[4 + k] == 2'd2 : bat_pp[4 + k] != 2'd0);
       db_pa   = db_pa   | ({15{db_hit[k]}} & (bat_brpn[4 + k] | {4'd0, ea_x[27:17] & bat_bl[4 + k]}));
@@ -1761,6 +1966,18 @@ module ppc_core
     end
   end
   wire         db_any  = |db_hit;
+  // D-39: an access crossing a page inside a DBAT block is split (both words
+  // translated by that BAT); one leaving the block, or with no BAT hit, takes
+  // the alignment exception. The block ends at EA's last word when EA[16:2]
+  // and EA's bits under the hitting BAT's BL are all ones.
+  logic        db_leave;
+  always_comb begin
+    db_leave = 1'b0;
+    for (int k = 0; k < 4; k++)
+      db_leave = db_leave | (db_hit[k] && &(ea_x[27:17] | ~bat_bl[4 + k]));
+    db_leave = db_leave && &ea_x[16:12];
+  end
+  wire         db_stay = db_any && !db_leave;
 `ifdef VERILATOR
   always_ff @(posedge clk)
     for (int k = 0; k < 4; k++)
@@ -1781,6 +1998,9 @@ module ppc_core
   logic [3:0]        du_use;                           // hit, and this access may use it
   logic [19:0]       du_pahi;
   logic [3:0]        du_wimg_s;
+  // (no + 4 for a split's second word here: its carry into bit 12 differs
+  // only for a word crossing the page, which with DR = 1 is the alignment
+  // exception, and with DR = 0 the micro-TLB is not used)
   wire  [12:0]       ea_lo = {1'b0, op_x[11:0]} + {1'b0, op_y[11:0]};
   function automatic logic sum_is(input logic [19:0] x, input logic [19:0] y, input logic [19:0] k,
                                   input logic cin);
@@ -1795,16 +2015,55 @@ module ppc_core
   // entry refused for a store is never beside another for the same page:
   // the refusal is a replay that faults (DSI, DTLB store miss), and the
   // handler's tlbld or tlbie empties the micro-TLB before a refill.
+  // The compare is laid out by hand, each level a LUT (keep): a bit's test
+  // (x ^ y ^ K against the carry the sum K needs, six inputs), five bits ANDed
+  // (the entry's live bit, valid under this MSR[PR], in the first group), the four groups
+  // ANDed into the hit. Left to synthesis the bit's test came out as two
+  // levels and the hit as five, and the micro-TLB hit into the data cache's
+  // address register led all three D-36 cached full builds (op_y -> r_a).
   logic [3:0]  du_hit;
+  (* keep = 1 *) wire [79:0] du_mb;                  // [20k + i]: entry k, page bit i
+  (* keep = 1 *) wire [15:0] du_g;                   // [4k + j]: entry k, bits 5j .. 5j + 4
+  (* keep = 1 *) wire [3:0]  du_lv;                  // entry k is valid under this MSR[PR]
+  genvar duk, dui;
+  generate
+  for (duk = 0; duk < 4; duk = duk + 1) begin : g_du
+    for (dui = 0; dui < 20; dui = dui + 1) begin : g_b
+      if (dui == 0) begin : g_0
+        assign du_mb[20*duk + dui] = (op_x[12] ^ op_y[12] ^ du_pg[duk][0]) == ea_lo[12];
+      end else begin : g_i
+        assign du_mb[20*duk + dui] = (op_x[12+dui] ^ op_y[12+dui] ^ du_pg[duk][dui]) ==
+                                 ((op_x[11+dui] & op_y[11+dui]) | ((op_x[11+dui] ^ op_y[11+dui]) & ~du_pg[duk][dui-1]));
+      end
+    end
+    assign du_lv[duk]      = du_v[duk] && du_pr[duk] == msr_q[MSR_PR];   // registers only
+    assign du_g[4*duk]     = &du_mb[20*duk +: 5] && du_lv[duk];
+    assign du_g[4*duk + 1] = &du_mb[20*duk + 5 +: 5];
+    assign du_g[4*duk + 2] = &du_mb[20*duk + 10 +: 5];
+    assign du_g[4*duk + 3] = &du_mb[20*duk + 15 +: 5];
+  end
+  endgenerate
   always_comb begin
     du_pahi = 20'd0; du_wimg_s = 4'd0;
     for (int k = 0; k < 4; k++) begin
-      du_hit[k] = du_v[k] && du_pr[k] == msr_q[MSR_PR] && sum_is(op_x[31:12], op_y[31:12], du_pg[k], ea_lo[12]);
+      du_hit[k] = &du_g[4*k +: 4];
       du_use[k] = du_hit[k] && (is_ld || du_wr[k]);
       du_pahi   = du_pahi | ({20{du_hit[k]}} & du_pa[k]);
       du_wimg_s = du_wimg_s | ({4{du_hit[k]}} & du_wimg[k]);
     end
   end
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    for (int k = 0; k < 4; k++)
+      if (!rst && du_hit[k] != (du_v[k] && du_pr[k] == msr_q[MSR_PR] &&
+                                sum_is(op_x[31:12], op_y[31:12], du_pg[k], ea_lo[12])))
+        $fatal(1, "micro-TLB %0d: the laid-out compare against sum_is", k);
+`endif
+  // the page's AND-OR of entries 0-2 as one level, so the page and the real
+  // mode select after it are a second (d_pahi below)
+  (* keep = 1 *) wire [19:0] du_p012 = ({20{du_hit[0]}} & du_pa[0]) | ({20{du_hit[1]}} & du_pa[1]) |
+                                       ({20{du_hit[2]}} & du_pa[2]);
+  (* keep = 1 *) wire        du_n012 = !(du_hit[0] || du_hit[1] || du_hit[2]);
   wire         d_xl    = msr_q[MSR_DR] && (is_ld || is_st);
   // the access goes ahead from EX when a BAT allows it or the micro-TLB does;
   // anything else, a BAT protection fault included, is translated in MEM
@@ -1816,8 +2075,15 @@ module ppc_core
   // no select by db_any (the select was a level of the R63 full builds' EX
   // address paths); where neither hits there is no request.
   wire         du_any  = |du_hit;
+  wire  [19:0] du_p3   = {20{du_hit[3]}} & du_pa[3];
   wire  [19:0] d_pahi  = !msr_q[MSR_DR] ? ea_x[31:12] :
-                         {db_pa | du_pahi[19:5], du_any ? du_pahi[4:0] : ea_x[16:12]};
+                         {db_pa | du_p012[19:5] | du_p3[19:5],
+                          du_p012[4:0] | du_p3[4:0] | ({5{du_n012 && !du_hit[3]}} & ea_x[16:12])};
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && msr_q[MSR_DR] && d_pahi != {db_pa | du_pahi[19:5], du_any ? du_pahi[4:0] : ea_x[16:12]})
+      $fatal(1, "d_pahi's laid-out form against the plain one");
+`endif
   // the access's WIMG: real mode 0011 (603e 3.5), the DBAT's, the micro-TLB's
   wire  [3:0]  d_wimg_x = !msr_q[MSR_DR] ? 4'b0011 : db_wimg | du_wimg_s;
 `ifdef VERILATOR
@@ -1864,7 +2130,7 @@ module ppc_core
   // (not while WB waits for an older answer: the kill and its commit go
   // together as MEM is left)
   // (a touch whose translation faults completes as a no-op: no kill, tnop)
-  wire         m_algc   = m.dz && !m.rp && msr_q[MSR_DR] && (m.dbany ? m.dbwi : m.duwi);
+  wire         m_algc   = (m.dz && !m.rp && msr_q[MSR_DR] && (m.dbany ? m.dbwi : m.duwi)) || m.algn;
   // (as two products: a replay's, then the rest)
   (* keep = 1 *) wire m_kp1 = m.valid && m.rp && sl_done && !(m.tch && (sl_dsi_q || sl_tm_q));
   (* keep = 1 *) wire m_kp2 = m.valid && (m.resync || m.rtm || m_fpxr || m_algc);
@@ -1888,13 +2154,16 @@ module ppc_core
   // sync waits until every access before it is done (an answer is only an
   // acknowledge: a store may still be buffered on the memory side, d_idle)
   wire sync_wait = ex_valid && ex_u.sync && (wb_mayh || (m.valid && m_iss) || !d_idle);
-  assign ex_hold = mem_hold || md_wait || fp_wait || ser_wait || sync_wait || (ex_valid && ex_ls && !d_rdy);
+  // (ex_hold_o: every hold but a split's first cycle, mis_hold, which still
+  // makes its request and sends its first word to MEM)
+  wire   ex_hold_o = mem_hold || md_wait || fp_wait || ser_wait || sync_wait || (ex_valid && ex_ls && !d_rdy);
+  assign ex_hold = ex_hold_o || mis_hold;
   // the queue's copy (q_take above): the same terms, kept apart
-  (* keep = 1 *) wire qh_1 = m.valid && wb_valid && wb_iss && !wb_got && !d_valid;
+  (* keep = 1 *) wire qh_1 = m.valid && wb_valid && wb_iss && !wb_got && (!d_valid || wb_sp1);
   (* keep = 1 *) wire qh_2 = m.valid && wb_valid && wb_fl && !(wb_got && wb_c2 && !fr_at[0] && !wb_blk);
   (* keep = 1 *) wire qh_3 = m.valid && ((m_rpq && !sl_done) || (m.fsm && (fr_at[1] || wb_blk)));
   (* keep = 1 *) wire qh_4 = m.valid && ((m.fpser && !m_fsok) || (m.icbi && !m_ibdone && !icbi_ack));
-  (* keep = 1 *) wire qh_x = md_wait || fp_wait || ser_wait_q || sync_wait_q || (ex_valid && ex_ls && !d_rdy);
+  (* keep = 1 *) wire qh_x = md_wait || fp_wait || ser_wait_q || sync_wait_q || (ex_valid && ex_ls && !d_rdy) || mis_hold;
   // (the queue's copies of ser_wait and sync_wait take MEM's request from
   // m_rpq, a copy of m.rp of their own: m.rp drives some 65 loads, and led
   // the queue pop's paths in the R63 batch-7 full builds)
@@ -1924,25 +2193,33 @@ module ppc_core
   // an instruction. Only where the uop leaves EX (ex_adv) and MEM does not
   // kill it does this act, so it is formed from registers alone and EX's hold
   // and MEM's kill are not in front of MEM's fields
-  wire  xc_irq   = irq_req && ex_first;
+  // (not in a split's second cycle once its first word has gone, ex_s0ok:
+  // the instruction completes, and the interrupt is taken before the next)
+  wire  xc_irq   = irq_req && ex_first && !ex_s0ok;
   wire  xc_fpx   = fpx_cond && ex_first;
   wire  ex_xcm   = ex_ifault || xc_irq || xc_fpx || ex_fpun;
 
   // the early forward selects' write bits (qe_hk / qe_hf, qf_m, qf_w above)
-  wire        qf_mx = ex_u.rd_we && !ex_xcm && !is_ld;   // mx.rd_we && !mx.is_load
+  wire        qf_mx = ex_u.rd_we && !ex_xcm && !is_ld && !mis_hold && !algn;   // mx.rd_we && !mx.is_load
   wire        qf_wm = m.rd_we && !m.rp;                  // wb_rd_we as WB takes MEM's uop
   always_ff @(posedge clk) begin
     qf_m <= mem_hold ? qe_hk[2] & {4{m.rd_we && !m.is_load}} : (ex_hold ? qe_hk[1] : qe_hf[1]) & {4{qf_mx}};
     qf_w <= wb_hold  ? (ex_hold ? qe_hk[3] : qe_hf[3]) & {4{wb_rd_we}} : (ex_hold ? qe_hk[2] : qe_hf[2]) & {4{qf_wm}};
   end
 
-  assign d_req   = ex_adv && (is_ld || (is_st && st_ok)) && !xl_rp && !ex_xcm && !m_kp;
+  assign d_req   = ex_valid && !ex_hold_o && (is_ld || (is_st && st_ok)) && !xl_rp && !ex_xcm && !m_kp && !algn;
+  // a split's first word goes into MEM as a uop of its own (m.sp0) when it
+  // makes its request; otherwise (a replay, an exception) MEM takes nothing
+  // this cycle, and the uop goes next cycle as without a split
+  wire   mis_go = mis_hold && !ex_hold_o && !xl_rp && !ex_xcm && !algn;
   assign d_we    = is_st && ex_u.cop == 3'd0;
   assign d_addr  = {d_pahi, ea_x[11:2], 2'b00};
   assign d_be    = st_be;                              // a load's lanes too (an inhibited load is made with them)
   assign d_wdata = st_data;
   assign d_wimg  = d_wimg_x;
   assign d_op    = ex_u.cop;
+  assign d_resv  = ex_u.reserve;
+  assign d_cond  = ex_u.cond;
 
   // ============================================================ floating point
   // 603e chapter 2.3.4.2 and 6.4.3; the units are ppc_fpu*.sv.
@@ -2121,12 +2398,20 @@ module ppc_core
   // it names an FPR
   always_comb
     fp_haz = id_valid && id_s0 && (hd_val ? hd_fz : (q_pd.fua || q_pd.fub || q_pd.fuc || q_pd.fpw));
+  // the set's gate as one LUT of the MEM kill's two products (keep), and
+  // each bit's held part apart (keep), so the kill is two LUTs from pend:
+  // through m_kp, fp_go and a shared AND it was four (a round-2 cached full
+  // build, m.duwi into pend)
+  (* keep = 1 *) wire        pend_g = ex_adv && !m_kp1 && !m_kp2 && !ex_xcm && ex_frw;   // = fp_go && ex_frw
+  (* keep = 1 *) logic [31:0] pend_h;
+  always_comb
+    for (int i = 0; i < 32; i++)
+      pend_h[i] = pend[i] && !(fo_valid && fo_tag == 5'(i)) && !(fw_wbp && wb_frd == 5'(i)) &&
+                  !(mem_adv && m.fpw && (m.rp || m.algn) && m.rd == 5'(i));
   always_ff @(posedge clk)
     for (int i = 0; i < 32; i++)
       if (rst) pend[i] <= 1'b0;
-      else     pend[i] <= (pend[i] && !(fo_valid && fo_tag == 5'(i)) && !(fw_wbp && wb_frd == 5'(i)) &&
-                           !(mem_adv && m.fpw && m.rp && m.rd == 5'(i))) ||
-                          (fp_go && ex_frw && ex_froh[i]);
+      else     pend[i] <= pend_h[i] || (pend_g && ex_froh[i]);
 
   wire  [63:0] fa_cap = f_hit_id[0] ? fw_fdt : rf_fa;
   wire  [63:0] fb_cap = f_hit_id[1] ? fw_fdt : rf_fb;
@@ -2442,7 +2727,20 @@ module ppc_core
   end
   // CR values written, without the CR logic op's bit (cr_f), and that bit
   // (cr_lb): for mx.cra / mx.crb
-  wire         cr_lb = ex_u.crop[{cr_a, cr_b}];
+  // Formed for both values of MEM's zero detect, as the branch's decision
+  // (cra_z0 / cra_z1 above), m_z choosing last: a CR logic op reading CR0
+  // from an Rc producer in MEM had the zero detect in front of its crop
+  // lookup (a round-2 uncached full build, m.result into m.cr)
+  wire         cna_z0 = ex_cra_s[0] ? m_cr0z0[2'd3 - ex_u.crba[1:0]] : cr_an;
+  wire         cna_z1 = ex_cra_s[0] ? m_cr0z1[2'd3 - ex_u.crba[1:0]] : cr_an;
+  wire         cnb_z0 = ex_crb_s[0] ? m_cr0z0[2'd3 - ex_u.crbb[1:0]] : cr_bn;
+  wire         cnb_z1 = ex_crb_s[0] ? m_cr0z1[2'd3 - ex_u.crbb[1:0]] : cr_bn;
+  wire         clb_z0 = ex_u.crop[{cna_z0, cnb_z0}];
+  wire         clb_z1 = ex_u.crop[{cna_z1, cnb_z1}];
+  wire         cr_lb = m_z ? clb_z1 : clb_z0;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && cr_lb != ex_u.crop[{cr_a, cr_b}]) $fatal(1, "cr_lb by m_z against crop");
+`endif
   logic [3:0]  cr_f4;
   always_comb begin
     cr_f4 = 4'd0;
@@ -2471,6 +2769,13 @@ module ppc_core
     mx.req     = is_ld || (is_st && st_ok);
     mx.msize   = ex_u.msize;
     mx.boff    = boff;
+    mx.sp0     = mis_hold;
+    mx.sp1     = ex_sp1 && is_ld;
+    mx.algd4   = ex_lsm;
+    if (mis_hold) begin
+      mx.rd_we = 1'b0;                                   // (an update store writes rA from the second)
+      mx.last  = 1'b0;
+    end
     mx.msigned = ex_u.msigned;
     mx.brev    = ex_u.brev;
     mx.spr     = ex_spr_idx;
@@ -2520,7 +2825,7 @@ module ppc_core
           end
         else
           begin
-            cr_n[5'd31 - ex_u.crbd]   = ex_u.crop[{cr_a, cr_b}];
+            cr_n[5'd31 - ex_u.crbd]   = cr_lb;
             mx.crm[5'd31 - ex_u.crbd] = 1'b1;
           end
         mx.cr_we = 1'b1;
@@ -2668,8 +2973,18 @@ module ppc_core
       mx.msr  = (msr_q & ~MSR_XCLR) | {31'd0, msr_q[MSR_ILE]};
       mx.xvec = 13'h0700;
     end
-    mx.req  = mx.req && !ex_xcm;
-    mx.rp   = xl_rp && !ex_xcm;
+    mx.req  = mx.req && !ex_xcm && !algn;
+    mx.rp   = xl_rp && !ex_xcm && !algn;
+    // the alignment exception in place of the uop (its FPR write is dropped
+    // in WB, and its scoreboard bit cleared, as a replay's)
+    mx.algn = algn && !ex_xcm;
+    if (algn && !ex_xcm) begin
+      mx.last    = 1'b1;
+      mx.rd_we   = 1'b0;
+      mx.is_load = 1'b0;
+      mx.sp0     = 1'b0;
+      mx.sp1     = 1'b0;
+    end
     mx.dz   = is_st && ex_u.cop == 3'd2 && !ex_xcm;
     mx.dbany = db_any;
     mx.dbwi = db_wi;
@@ -2798,6 +3113,15 @@ module ppc_core
       $fatal(1, "branch at %08X resolved at fetch, mispredicted in EX", ex_u.pc);
 `endif
   (* keep = 1 *) wire redirect_f = redirect_c || (br_go && br_mis);
+  // fetch's own three registers (redir_q, redir_hard_q, redir_k_q) take the
+  // redirect for both values of m_z and choose by it last: through
+  // redirect_f's 58 loads, m.result's zero detect into redir_k_q led a
+  // round-2 uncached full build
+  (* keep = 1 *) wire rdf_z0 = redirect_c || (br_go && (brt_z0 != ex_pred));
+  (* keep = 1 *) wire rdf_z1 = redirect_c || (br_go && (brt_z1 != ex_pred));
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && (m_z ? rdf_z1 : rdf_z0) != redirect) $fatal(1, "redirect by m_z");
+`endif
 
   // the MSR that fetch continues under, loaded with every redirect (a trap's
   // first redirect, to the next instruction, keeps the MSR; a fired trap's
@@ -2820,6 +3144,8 @@ module ppc_core
   always_ff @(posedge clk) begin
     if (rst) begin
       ex_valid   <= 1'b0;
+      ex_sp1     <= 1'b0;
+      ex_s0ok    <= 1'b0;
       ex_md_busy <= 1'b0;
       md_have    <= 1'b0;
       md_drop    <= 1'b0;
@@ -2837,6 +3163,12 @@ module ppc_core
         if ((ex_md_busy || md_start) && !md_done) md_drop <= 1'b1;
       end
       if (ex_hold && m_kill) ex_valid <= 1'b0;         // a held uop killed from MEM leaves
+      // the split's second word: from the cycle after its first (made, or
+      // given up for a replay or exception) until the uop leaves EX
+      if (!ex_hold || m_kill)                  ex_sp1 <= 1'b0;
+      else if (mis_hold && !ex_hold_o && !m_kp) ex_sp1 <= 1'b1;
+      if (!ex_hold || m_kill)                  ex_s0ok <= 1'b0;
+      else if (mis_go && !m_kp)                ex_s0ok <= 1'b1;
       if (!ex_hold) begin
         md_have  <= 1'b0;
         ex_valid <= id_adv;
@@ -2844,6 +3176,8 @@ module ppc_core
         // redirect decision (R23 timing)
         ex_u       <= id_u;
         ex_u.op    <= id_opf;                          // (= id_u.op)
+        ex_bd      <= q_hi[27] ? {{6{q_hi[25]}}, q_hi[25:2], 2'b00}            // b (18), else bc (16)
+                               : {{16{q_hi[15]}}, q_hi[15:2], 2'b00};
         ex_pred    <= id_pred;
         ex_rsel    <= id_rsel;
         ex_ld      <= id_opf == OP_LOAD || h_mfsr;
@@ -2851,6 +3185,9 @@ module ppc_core
         ex_isync   <= h_isync;
         ex_md      <= id_rsel[7] && !q_pd.ifault;       // a marker's word is not run
         ex_first   <= id_s0;
+        ex_lsm     <= q_pd.crack == 2'd2;                 // lmw / stmw
+        ex_msw     <= id_mw && id_s0 && !q_pd.ifault;   // (an update load's second uop is its add)
+        ex_msh     <= id_mh && id_s0 && !q_pd.ifault;
         ex_step    <= id_step;
         ex_ifault  <= q_pd.ifault;
         ex_bk      <= {q_pd.bslot, q_pd.bpp, q_pd.bsq};
@@ -2881,6 +3218,8 @@ module ppc_core
                                      id_spr_idx == 6'd17 || id_spr_idx == 6'd18);
         ex_mfv     <= id_mfv;
         mf_f       <= id_mf_f;
+        mf4c       <= {32{id_mf_f[4]}} & mx.crm;           // (m.crm next cycle: EX moves on)
+        mf4o       <= {32{id_mf_f[4]}} & ~mx.crm;
         mf_c0      <= q_pd.mfcr && ex_valid && ex_u.rc;
         mf_b       <= id_rsel[8] && id_mf_t == 3'd0 && id_mf_f == 5'd0;
         mf_t       <= id_mf_t;
@@ -2905,7 +3244,9 @@ module ppc_core
         ex_fsx     <= q_pd.ffsx;
         ex_f2c     <= q_pd.ff2c;
         ex_mw      <= q_pd.fmw;
-        ex_fsfld   <= id_u.fsop == 3'(FS_MCRFS) ? id_u.insn[20:18] : id_u.insn[25:23];
+        // (mcrfs from the raw word, not the decoder's fsop: the field is used
+        // only by an FPSCR op, and of those only mcrfs has opcode 63, xo 64)
+        ex_fsfld   <= (q_hi[31:26] == 6'd63 && q_hi[10:1] == 10'd64) ? q_hi[20:18] : q_hi[25:23];
         fs_cr      <= ex_valid && ex_w_cr;
         fs_rc0     <= ex_valid && ex_u.rc;
         // a bit of the field an mcrf of CR0 writes (its value taken in MEM,
@@ -2934,6 +3275,8 @@ module ppc_core
         if (mem_adv) begin
           mf_b  <= mf_b || mf_f != 5'd0 || mf_c0;
           mf_f  <= 5'd0;
+          mf4c  <= 32'd0;
+          mf4o  <= 32'd0;
           mf_c0 <= 1'b0;
         end
         // the producer in MEM commits when MEM advances; then read the register
@@ -2968,7 +3311,9 @@ module ppc_core
   wire ans_m  = d_valid && !wb_out && m_out;
   // an FP load leaves once its word has been here a cycle (lfs's conversion
   // is registered: wb_c2) and the FPU port is free (wb_fpok)
-  assign wb_hold  = wb_valid && ((wb_out && !d_valid) || (wb_fl && !wb_fpok));
+  // (a split load's second word holds WB the cycle it arrives, its merge
+  // registered: wb_sp1)
+  assign wb_hold  = wb_valid && ((wb_out && (!d_valid || wb_sp1)) || (wb_fl && !wb_fpok));
   assign wb_adv   = wb_valid && !wb_hold;
   // icbi: its set to the I-cache, MEM held until it is taken
   logic m_ibdone;
@@ -2977,7 +3322,7 @@ module ppc_core
   // as four products of at most six inputs, then their OR (it feeds EX's
   // hold and the fetch queue's pop): a small-unit result (m.fsm) is never a
   // replay, so !m.rp is not needed with it
-  (* keep = 1 *) wire mh_1 = m.valid && wb_valid && wb_iss && !wb_got && !d_valid;
+  (* keep = 1 *) wire mh_1 = m.valid && wb_valid && wb_iss && !wb_got && (!d_valid || wb_sp1);
   (* keep = 1 *) wire mh_2 = m.valid && wb_valid && wb_fl && !(wb_got && wb_c2 && !fr_at[0] && !wb_blk);
   (* keep = 1 *) wire mh_3 = m.valid && ((m.rp && !sl_done) || (m.fsm && (fr_at[1] || wb_blk)));
   (* keep = 1 *) wire mh_4 = m.valid && ((m.fpser && !m_fsok) || (m.icbi && !m_ibdone && !icbi_ack));
@@ -3036,11 +3381,12 @@ module ppc_core
   assign mem_adv  = m.valid && !mem_hold;
 
   // a load's word to its value: lane, byte reversal, extension
+  // (bo: the byte offset; a halfword at 1 is bytes 1-2, inside its word)
   function automatic logic [31:0] ld_align(input logic [31:0] w, input logic [1:0] sz, input logic [1:0] bo,
                                            input logic sx, input logic rv);
     logic [15:0] h;
     logic [7:0]  b;
-    h = bo[1] ? w[15:0] : w[31:16];
+    h = (bo == 2'd0) ? w[31:16] : (bo == 2'd1) ? w[23:8] : w[15:0];
     if (rv) h = {h[7:0], h[15:8]};
     b = w[5'd31 - {bo, 3'b000} -: 8];
     case (sz)
@@ -3049,17 +3395,48 @@ module ppc_core
       default: ld_align = {24'd0, b};
     endcase
   endfunction
+  // a split load's value from its two words: bytes bo .. bo + size - 1 of
+  // {w0, w1}, then byte reversal and extension
+  function automatic logic [31:0] ld_mrg(input logic [31:0] w0, input logic [31:0] w1, input logic [1:0] sz,
+                                         input logic [1:0] bo, input logic sx, input logic rv);
+    logic [63:0] d;
+    logic [31:0] v;
+    logic [15:0] h;
+    d = {w0, w1} << {bo, 3'b000};
+    v = d[63:32];
+    h = rv ? {v[23:16], v[31:24]} : v[31:16];
+    ld_mrg = (sz == 2'd2) ? (rv ? {v[7:0], v[15:8], v[23:16], v[31:24]} : v) :
+             (sz == 2'd1) ? (sx ? {{16{h[15]}}, h} : {16'd0, h}) : {24'd0, v[31:24]};
+  endfunction
+  logic [31:0] mis_w0;                                 // a split load's first word
   // WB's, on the forward path: the word straight from the port
   assign ld_val   = ld_align(d_rdata, wb_msize, wb_boff, wb_msigned, wb_brev);
   // MEM's, for an answer that came while the uop was in MEM: into wb_result
-  assign ld_val_m = ld_align(m_got ? m_dq : d_rdata, m.msize, m.boff, m.msigned, m.brev);
+  // (the first word as it leaves WB, in the cycle it does: the second's answer
+  // may come in that cycle, while it is in MEM)
+  wire  [31:0] mis_w0_m = (wb_adv && wb_sp0) ? ldw : mis_w0;
+  // One merge serves MEM's early answer (a split's second word, or any load:
+  // its word twice) and WB's split second word arriving there (mg_wb): WB
+  // then holds, so MEM's uop is not taking its value in that cycle.
+  wire         mg_wb = wb_valid && wb_sp1 && !wb_got;
+  wire  [31:0] mg_w1 = mg_wb ? d_rdata : (m_got ? m_dq : d_rdata);
+  wire  [31:0] mg_w0 = mg_wb ? mis_w0 : m.sp1 ? mis_w0_m : mg_w1;
+  wire  [31:0] ld_mg = ld_mrg(mg_w0, mg_w1, mg_wb ? wb_msize : m.msize, mg_wb ? wb_boff : m.boff,
+                              mg_wb ? wb_msigned : m.msigned, mg_wb ? wb_brev : m.brev);
+  assign ld_val_m = ld_mg;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && !mg_wb && m.valid && m.is_load && m.req && !m.rp && !m.xc && !m.sp1 && !m.sp0 &&
+        ld_mg != ld_align(m_got ? m_dq : d_rdata, m.msize, m.boff, m.msigned, m.brev))
+      $fatal(1, "the shared merge against ld_align for an unsplit load: %08X %08X sz %0d bo %0d rv %b w0 %08X w1 %08X", ld_mg, ld_align(m_got ? m_dq : d_rdata, m.msize, m.boff, m.msigned, m.brev), m.msize, m.boff, m.brev, mg_w0, mg_w1);
+`endif
 
   always_ff @(posedge clk) begin
     if (rst) begin
       m.valid <= 1'b0;
     end else if (!mem_hold) begin
       m <= mx;
-      m.valid <= ex_adv && !m_kp;
+      m.valid <= (ex_adv || mis_go) && !m_kp;
     end
     if (!mem_hold) m_rpq <= mx.rp;
     // CR1 as the FPSCR settles, for an arithmetic op with Rc = 1 held in MEM:
@@ -3104,6 +3481,36 @@ module ppc_core
       sl_bh[k] = bat_match(sl_ea[31:17], bat_bepi[4 + k], bat_bl[4 + k], msr_q[MSR_PR] ? bat_vp[4 + k] : bat_vs[4 + k]);
   wire        sl_bat  = |sl_bh;
   wire        sl_prot = sl_bat || (!sl_t && sl_hit && (m.st ? !sl_wpp : !sl_rok));
+  // The registered outcomes below from each way's own fields, the hit
+  // choosing last: through sl_e (the hit's mux of the entry) the protection
+  // and C terms sat behind the tag compare, and the DTLB read address into
+  // sl_tm_q / sl_dsi_q led a D-36 cached full build. pd_w: the access is
+  // refused by way w's PP under the key; ok_w: a store may use way w (PP,
+  // key, C), as sl_w_q.
+  function automatic logic sl_pf(input logic [1:0] pp, input logic key, input logic st);
+    sl_pf = st ? !(key ? pp == 2'd2 : pp != 2'd3) : !(!key || pp != 2'd0);
+  endfunction
+  wire        sl_pd0  = sl_pf(sl_t0[1:0], sl_key, m.st);
+  wire        sl_pd1  = sl_pf(sl_t1[1:0], sl_key, m.st);
+  wire        sl_cs0  = m.st && !sl_pd0 && !sl_t0[6];    // a store to an allowed entry with C = 0
+  wire        sl_cs1  = m.st && !sl_pd1 && !sl_t1[6];
+  wire        sl_prw  = sl_h0 ? sl_pd0 : sl_h1 && sl_pd1;   // the hit's PP refuses it
+  wire        sl_csw  = sl_h0 ? sl_cs0 : sl_h1 ? sl_cs1 : 1'b1;   // a miss, or C = 0 on a store
+  wire        sl_dsi_n = sl_bat || (!sl_t ? sl_prw : 1'b1);
+  wire        sl_tm_n  = !sl_bat && !sl_t && sl_csw;
+  wire        sl_prot_n = sl_bat || (!sl_t && sl_prw);
+  function automatic logic sl_wf(input logic [1:0] pp, input logic key, input logic c);
+    sl_wf = (key ? pp == 2'd2 : pp != 2'd3) && c;
+  endfunction
+  wire        sl_w_n   = sl_h0 ? sl_wf(sl_t0[1:0], sl_key, sl_t0[6]) : sl_wf(sl_t1[1:0], sl_key, sl_t1[6]);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst &&
+        (sl_dsi_n != ((!sl_bat && sl_t) || sl_prot) ||
+         sl_tm_n != (!sl_bat && !sl_t && (!sl_hit || (m.st && !sl_prot && !sl_e[6]))) ||
+         sl_prot_n != sl_prot || sl_w_n != (sl_wpp && sl_e[6])))
+      $fatal(1, "slow translation's per-way outcome against the hit's entry");
+`endif
   logic       sl_done, sl_dsi_q, sl_tm_q, sl_prot_q, sl_t_q, sl_key_q, sl_way_q, sl_w_q;
   logic [19:0] sl_pa0_q, sl_pa1_q;                      // both ways' RPN, chosen at the fill
   logic [3:0]  sl_wimg0_q, sl_wimg1_q;                  // and WIMG
@@ -3114,14 +3521,14 @@ module ppc_core
     else if (m.valid && m.rp) sl_done <= 1'b1;
     if (!sl_done) begin
       sl_t_q    <= !sl_bat && sl_t;
-      sl_prot_q <= sl_prot;
-      sl_dsi_q  <= (!sl_bat && sl_t) || sl_prot;
-      sl_tm_q   <= !sl_bat && !sl_t && (!sl_hit || (m.st && !sl_prot && !sl_e[6]));
+      sl_prot_q <= sl_prot_n;
+      sl_dsi_q  <= sl_dsi_n;
+      sl_tm_q   <= sl_tm_n;
       sl_key_q  <= sl_key;
       // SRR1[WAY]: replacement order, or for a store that hit an entry with
       // C = 0 the way that hit, so the handler's tlbld replaces it
       sl_way_q  <= (sl_hit && m.st) ? !sl_h0 : dlru[sl_ea[16:12]];
-      sl_w_q    <= sl_wpp && sl_e[6];                  // a store may use it: PP, key, C
+      sl_w_q    <= sl_w_n;                  // a store may use it: PP, key, C
       sl_pa0_q  <= sl_t0[26:7];
       sl_pa1_q  <= sl_t1[26:7];
       sl_wimg0_q <= sl_t0[5:2];
@@ -3256,8 +3663,10 @@ module ppc_core
         dar_q   <= m.result;
       end
       if (m_alg) begin                                  // table 4-14, X form; [22-26] from the field
-        dsisr_q <= {15'd0, m.insn[2:1], m.insn[6], m.insn[10:7], m.insn[25:21], m.insn[20:16]};
-        dar_q   <= m.result;
+        dsisr_q <= (m.insn[31:26] == 6'd31)
+                   ? {15'd0, m.insn[2:1], m.insn[6], m.insn[10:7], m.insn[25:21], m.insn[20:16]}
+                   : {17'd0, m.insn[26], m.insn[30:27], m.insn[25:21], m.insn[20:16]};   // D form
+        dar_q   <= m.result + {29'd0, m.algn && m.algd4, 2'b00};   // lmw / stmw: EA + 4 (4.5.6.2)
       end
       if (m_tmiss) begin                                // tables 5-9, 5-11
         if (m.imiss) begin
@@ -3341,8 +3750,13 @@ module ppc_core
     end
   end
 
+  // the array's write address through a LUT of its own (keep): fed straight
+  // from a duplicate of m.spr placed beside it, the MLAB's write address
+  // register missed hold by 0.085 ns (a round-2 cached full build); the
+  // setup side of that path has some 8 ns to spare
+  (* keep = 1 *) wire [5:0] spr_wa = m.spr;
   always_ff @(posedge clk) begin
-    if (m_ok && m.spr_we && m.spr >= 6'd2) spr_mem[m.spr] <= m.sprv;
+    if (m_ok && m.spr_we && m.spr >= 6'd2) spr_mem[spr_wa] <= m.sprv;
     if (rst) begin
       srr0_q <= 32'd0;
       srr1_q <= 32'd0;
@@ -3383,13 +3797,15 @@ module ppc_core
         wb_live_q <= m.is_load && !(m_got || ans_m);
         wb_dq     <= m_got ? m_dq : d_rdata;
         wb_isld   <= m.is_load;
-        wb_fhi    <= m.fhi && !m.rp;
+        wb_fhi    <= m.fhi && !m.rp && !m.algn;
+        wb_sp0    <= m.sp0 && !m.rp;
+        wb_sp1    <= m.sp1 && !m.rp;
         wb_msize  <= m.msize;
         wb_boff   <= m.boff;
         wb_msigned <= m.msigned;
         wb_brev   <= m.brev;
-        wb_fpw    <= mem_adv && m.fpw && !m.rp;
-        wb_fl     <= mem_adv && m.fld && !m.rp;
+        wb_fpw    <= mem_adv && m.fpw && !m.rp && !m.algn;
+        wb_fl     <= mem_adv && m.fld && !m.rp && !m.algn;
         wb_fsl    <= m.is_load && m.fsl;
         wb_frd    <= m.rd;
         wb_fdat_q <= ms_res_m;
@@ -3401,10 +3817,13 @@ module ppc_core
           wb_got    <= 1'b1;
           wb_live_q <= 1'b0;
           wb_dq     <= d_rdata;
+          // a split load's second word, merged a cycle (WB holds for it)
+          if (wb_sp1) wb_result <= ld_mg;
         end
       end
     end
     if (wb_adv && wb_fhi) fhi_q <= ldw;
+    if (wb_adv && wb_sp0) mis_w0 <= ldw;                 // a split's first word, kept for its second
   end
 
   // =================================================================== events

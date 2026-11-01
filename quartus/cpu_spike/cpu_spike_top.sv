@@ -53,6 +53,7 @@ module cpu_spike_top (
     .i_pre (i_pre), .i_two (i_two), .i_w2 (i_w2), .i_data2 (i_data2),
     .d_req (d_req), .d_we (d_we), .d_addr (d_addr), .d_be (d_be), .d_wdata (d_wdata),
     .d_wimg (d_wimg), .d_op (d_op), .d_rdy (d_rdy), .d_idle (d_idle), .d_valid (d_valid), .d_rdata (d_rdata),
+    .d_resv (), .d_cond (), .res_kill (1'b0),
     .hid_ice (hid[0]), .hid_dce (hid[1]), .hid_ilock (hid[2]), .hid_dlock (hid[3]), .hid_icfi (hid[4]),
     .hid_dcfi (hid[5]), .hid_noopti (hid[6]),
     .icbi_req (icbi_req), .icbi_set (icbi_set), .icbi_ack (icbi_ack),

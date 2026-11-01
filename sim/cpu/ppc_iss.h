@@ -57,7 +57,20 @@
 //     independently; a page with T = 1 or N = 1 faults before the TLB is
 //     looked at (figure 5-6), so an N or T fault is never a TLB miss.
 //   Privilege (program exception for supervisor instructions with MSR[PR] =
-//     1), MSR[LE] and misaligned accesses are not modelled, as in the RTL.
+//     1) and MSR[LE] are not modelled, as in the RTL.
+//   Misaligned accesses (603e 2.2.3, 4.5.6). An integer halfword or word that
+//     is not naturally aligned is done in hardware: byte for byte here, one or
+//     two word accesses in the RTL (the trace sees each word a load reads).
+//     The alignment exception (0x600; SRR0 the instruction, DSISR from its
+//     encoding by table 4-13, DAR the EA) is taken instead, before anything
+//     is done, for: lmw, stmw, lwarx and stwcx. not word-aligned (lmw / stmw:
+//     DAR = EA + 4, 4.5.6.2); an FP load or store not word-aligned; a halfword,
+//     word or FP double crossing a page with MSR[DR] = 1 (4.5.6.1.1, EA ending
+//     0xFFF, 0xFFD-0xFFF, 0xFF9-0xFFF) with no DBAT hit, or leaving the DBAT
+//     block it hits (D-39: 4.5.6.1.1 is ambiguous for BAT regions; a crossing
+//     inside one block is split, both words translated by the BAT). SR[T] = 1
+//     is checked as a page access: a direct-store segment gives the alignment
+//     exception, not the DSI. With DR = 0 a page crossing is done in hardware.
 //
 // Floating point: every 603e FP instruction, the arithmetic, the FPSCR and
 // CR1 from sim/fpu/ppc_fpu_ref.h (its own MPFR model, written from the
@@ -74,11 +87,9 @@
 //     rfi) is taken before that instruction, SRR0 it, SRR1[11] and SRR1[15]
 //     (PEM table 6-16: "SRR0 points to the instruction that would have
 //     executed next").
-//   lfd / stfd are two word accesses, high word first. A fault on the second
-//     leaves the first done (an update store's rA too). The 603e would take an
-//     alignment exception for a double crossing a page in page-translated
-//     memory (603e 4.5.6.1), which neither model has yet; the bench makes a
-//     few such doubles only to exercise the second word's replay.
+//   lfd / stfd are two word accesses, high word first. A double crossing a
+//     page with MSR[DR] = 1 takes the alignment exception (603e 4.5.6.1.1,
+//     above), so the second word never faults where the first did not.
 
 #pragma once
 #include <cstdint>
@@ -171,6 +182,9 @@ struct PpcIss {
 
   uint64_t exc_count[0x20] = {};              // exceptions taken, by vector / 0x100
   uint64_t fp_prec = 0, fp_delayed = 0, fp_ops[ppcfpu::NUM_OPS] = {}, fp_ls[2] = {}, fp_supp = 0;
+  // misaligned integer accesses done: inside a word, then crossing a word, a
+  // doubleword, a 32-byte line and (MSR[DR] = 0) a page; [5] stores of them all
+  uint64_t mis_n[7] = {};                              // [6]: page crossings with DR = 1 (inside a DBAT block)
   void exception(uint32_t vec, uint32_t save_pc, uint32_t srr1_bits) {
     exc_count[(vec >> 8) & 0x1F]++;
     if (vec == 0x700 && (srr1_bits & 0x00100000)) (srr1_bits & 0x00010000 ? fp_delayed : fp_prec)++;
@@ -381,22 +395,70 @@ struct PpcIss {
       bool cond_ok = (bo & 16) || (cr_bit(bi) == ((bo >> 3) & 1));
       return ctr_ok && cond_ok;
     };
-    // accesses are forced aligned, so one translation covers each
+    // One translation covers each access: with MSR[DR] = 1 none crosses a page
+    // (the alignment exception), and with DR = 0 the address is the EA.
     bool fault = false;
+    // table 4-13: indexed (X form, opcode 31) or immediate-index (D form)
+    auto align_exc = [&](uint32_t dar_v) {
+      bool xf = (in >> 26) == 31;
+      dsisr = (xf ? (((in >> 1) & 3) << 15) | (((in >> 6) & 1) << 14) | (((in >> 7) & 15) << 10)
+                  : (((in >> 26) & 1) << 14) | (((in >> 27) & 15) << 10)) |
+              (((in >> 21) & 31) << 5) | ((in >> 16) & 31);
+      dar = dar_v;
+      exception(0x600, pc, 0);
+      fault = true;
+    };
+    // D-39: with MSR[DR] = 1 a crossing inside one DBAT block is done (split);
+    // with no BAT hit, or leaving the block, it takes the alignment exception
+    auto dbat_of = [&](uint32_t ea) -> int {
+      bool pr = msr & MSR_PR;
+      for (int i = 0; i < 4; i++) {
+        uint32_t u = sp(536 + 2 * i);
+        if (!(pr ? (u & 1) : (u & 2))) continue;
+        uint32_t bl = (u >> 2) & 0x7FF, m = ~(bl << 17) & 0xFFFE0000;
+        if ((ea & m) == (u & m)) return i;
+      }
+      return -1;
+    };
+    auto pg_cross = [&](uint32_t ea, int size) {
+      if (!(msr & MSR_DR) || (ea & 0xFFF) + uint32_t(size) <= 0x1000) return false;
+      int k = dbat_of(ea);
+      return k < 0 || dbat_of(ea + uint32_t(size) - 1) != k;
+    };
+    auto mis_count = [&](uint32_t a, int size, bool isst) {
+      if (size == 1 || !(a & uint32_t(size - 1))) return;
+      uint32_t e = a + uint32_t(size) - 1;
+      int k = (e >> 12) != (a >> 12) ? 4 : (e >> 5) != (a >> 5) ? 3 : (e >> 3) != (a >> 3) ? 2 : (e >> 2) != (a >> 2) ? 1 : 0;
+      mis_n[k]++;
+      if (isst) mis_n[5]++;
+      if (k == 4 && (msr & MSR_DR)) mis_n[6]++;
+    };
     auto ld = [&](uint32_t ea, int size, bool sgn, bool brev) -> uint32_t {
       uint32_t a;
+      if (size > 1 && pg_cross(ea, size)) { align_exc(ea); return 0; }
       if (!xlate(ea, LOAD, a)) { fault = true; return 0; }
+      mis_count(a, size, false);
       on_load(a & ~3u);
-      if (size == 4) { uint32_t v = rd32(a & ~3u); return brev ? bswap32(v) : v; }
-      if (size == 2) { uint16_t h = rd16(a & ~1u); if (brev) h = bswap16(h); return sgn ? uint32_t(int32_t(int16_t(h))) : h; }
-      return rd8(a);
+      if ((a & 3) + uint32_t(size) > 4) on_load((a & ~3u) + 4);       // the second word of a split
+      uint32_t v;
+      if (size == 4 && !(a & 3)) v = rd32(a);
+      else if (size == 2 && !(a & 1)) v = rd16(a);
+      else if (size == 1) v = rd8(a);
+      else { v = 0; for (int k = 0; k < size; k++) v = (v << 8) | rd8(a + k); }
+      if (size == 4) return brev ? bswap32(v) : v;
+      if (size == 2) { uint16_t h = uint16_t(v); if (brev) h = bswap16(h); return sgn ? uint32_t(int32_t(int16_t(h))) : h; }
+      return v;
     };
     auto st = [&](uint32_t ea, int size, uint32_t v, bool brev) {
       uint32_t a;
+      if (size > 1 && pg_cross(ea, size)) { align_exc(ea); return; }
       if (!xlate(ea, STORE, a)) { fault = true; return; }
-      if (size == 4) wr32(a & ~3u, brev ? bswap32(v) : v);
-      else if (size == 2) wr16(a & ~1u, brev ? bswap16(uint16_t(v)) : uint16_t(v));
-      else wr8(a, uint8_t(v));
+      mis_count(a, size, true);
+      if (brev) v = size == 4 ? bswap32(v) : bswap16(uint16_t(v));
+      if (size == 4 && !(a & 3)) wr32(a, v);
+      else if (size == 2 && !(a & 1)) wr16(a, uint16_t(v));
+      else if (size == 1) wr8(a, uint8_t(v));
+      else for (int k = 0; k < size; k++) wr8(a + k, uint8_t(v >> (8 * (size - 1 - k))));
     };
 
     // ------------------------------------------------------- floating point
@@ -412,6 +474,7 @@ struct PpcIss {
         bool iw  = x && xo == 983;
         uint32_t ea = (upd ? gpr[ra] : A0()) + (x ? gpr[rb] : uint32_t(simm));
         fp_ls[isst]++;
+        if ((ea & 3) || (dbl && pg_cross(ea, 8))) { align_exc(ea); return; }   // 4.5.6, 4.5.6.1.1
         if (!isst) {
           uint32_t w0 = ld(ea, 4, false, false);
           if (fault) return;
@@ -509,8 +572,8 @@ struct PpcIss {
         break;
       }
       // lmw / stmw: a fault part way leaves the earlier words done (4.5.3)
-      case 46: { uint32_t ea = A0() + uint32_t(simm); for (int r = rd; r < 32; r++, ea += 4) { uint32_t v = ld(ea, 4, false, false); if (fault) return; gpr[r] = v; } break; }
-      case 47: { uint32_t ea = A0() + uint32_t(simm); for (int r = rd; r < 32; r++, ea += 4) { st(ea, 4, gpr[r], false); if (fault) return; } break; }
+      case 46: { uint32_t ea = A0() + uint32_t(simm); if (ea & 3) { align_exc(ea + 4); return; } for (int r = rd; r < 32; r++, ea += 4) { uint32_t v = ld(ea, 4, false, false); if (fault) return; gpr[r] = v; } break; }
+      case 47: { uint32_t ea = A0() + uint32_t(simm); if (ea & 3) { align_exc(ea + 4); return; } for (int r = rd; r < 32; r++, ea += 4) { st(ea, 4, gpr[r], false); if (fault) return; } break; }
       case 31: {
         uint32_t a = gpr[ra], b = gpr[rb], s = gpr[rd];
         bool xo = true;
@@ -584,7 +647,8 @@ struct PpcIss {
             if (upd) gpr[ra] = ea;
             break;
           }
-          case 20:  { uint32_t v = ld(A0() + b, 4, false, false); if (fault) return; gpr[rd] = v; res = true; break; }
+          case 20:  { if ((A0() + b) & 3) { align_exc(A0() + b); return; }
+                      uint32_t v = ld(A0() + b, 4, false, false); if (fault) return; gpr[rd] = v; res = true; break; }
           case 534: { uint32_t v = ld(A0() + b, 4, false, true);  if (fault) return; gpr[rd] = v; break; }
           case 790: { uint32_t v = ld(A0() + b, 2, false, true);  if (fault) return; gpr[rd] = v; break; }
           case 151: case 215: case 407: case 183: case 247: case 439: {
@@ -599,8 +663,9 @@ struct PpcIss {
           case 150: {
             // translated as a store whether or not it stores (4.5.3, table 5-8)
             uint32_t a;
+            if ((A0() + b) & 3) { align_exc(A0() + b); return; }
             if (!xlate(A0() + b, STORE, a)) return;
-            if (res) wr32(a & ~3u, s);
+            if (res) wr32(a, s);
             set_cr_field(0, (res ? 2 : 0) | so());
             res = false;
             break;

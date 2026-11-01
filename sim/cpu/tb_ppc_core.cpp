@@ -67,6 +67,20 @@
 // DEC / timebase read was decided.
 //
 //   tb_ppc_core [seeds] [first_seed] [length] [max_wait] [--mode n] [--dlat n] [--ilat n] [--rdy p] [--loops]
+//
+// --alias: update forms whose registers overlap, a third of the memory ops
+// (alias_mem, and FP in fp_mem): loads with rD = rB and rA = rB, stores with
+// rS = rB, rS = rA and rS = rA = rB, back-to-back updates of one base, some
+// misaligned. rD = rB is a valid form (PEM 8, lbzux: EA <- (rA) + (rB),
+// rD <- MEM(EA), rA <- EA). Before it the generator never gave a load with
+// update an rD equal to its rB (dst() leaves out r3 and r6), so a step 1 that
+// read rB after the load had written it went unseen (VF3, lbzux r4,r6,r4).
+// The program also ends with the reproducer for each integer load with
+// update, D and X form (real mode: lis r4,1; li r6,0x10; lbzux r4,r6,r4 with
+// the byte at 0x10010 = 0x55; translated: through 8 seg 6 pages of its own
+// (Layout::vrep), each after a tlbie so that step 0 takes a DTLB miss), and
+// the bench checks the RTL's
+// and the model's rD and rA against the expected values (Gen::expect).
 
 #ifdef PPC_CPU
 // rtl/cpu/ppc_cpu.sv: the core with both caches, behind the caches' memory
@@ -74,6 +88,21 @@
 // retirement is compared as for the core alone. Not compared: the data
 // access stream (the port carries lines) and the final memory (dirty lines
 // stay in the D-cache).
+//   --snoop n (n = 1 reads, 2 reads and writes; study D-41): a DMA master on
+// the data cache's snoop port. A shadow of memory takes every store request
+// the core makes, in order; after each sn_ack the master reads the line from
+// memory, and each byte must be the shadow's after every request answered by
+// the cycle sn_req rose, or a value a request unanswered then or made before
+// sn_ack gave it (lines ever accessed cache-inhibited are not checked: an
+// inhibited access to a resident line is boundedly undefined, 603e 3.6.4.1).
+// A write snoop is followed, as sn_ack comes, by the master's write of the
+// line: in real-mode programs, to a data line no request has touched for 400
+// cycles, new words, which the model's memory takes too; otherwise the line
+// as the requests answered by then left it, which no access can tell apart.
+// Reservations: a stwcx. that stores while the snoop rule (ppc_dcache.sv)
+// has its reservation lost fails the seed; one that fails where the model
+// would succeed is accepted only if that rule cleared the reservation since
+// its lwarx, and the model's reservation is then cleared.
 #include "Vppc_cpu.h"
 #include "cache_mem.h"
 using Top = Vppc_cpu;
@@ -91,6 +120,7 @@ using Top = Vppc_core;
 #include <deque>
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -99,7 +129,10 @@ namespace {
 bool dtrace = getenv("DTRACE") != nullptr;   // every data request, answer and retirement
 int g_dlat = 0, g_ilat = 0, g_rdy = 0;
 bool g_board = false;
-bool g_loops = false;                         // --loops: backward branches, calls and (real mode) rewritten code                         // --emit: the board harness without caches cannot dcbz       // fixed data / fetch wait (0: random), % of cycles with d_rdy low
+bool g_mis = false;                           // --mis: misaligned accesses (mis_mem)
+bool g_alias = false;                         // --alias: overlapping registers in update forms (alias_mem)
+bool g_loops = false;
+int g_snoop = 0;                              // --snoop n (PPC_CPU only)                         // --loops: backward branches, calls and (real mode) rewritten code                         // --emit: the board harness without caches cannot dcbz       // fixed data / fetch wait (0: random), % of cycles with d_rdy low
 
 // ---------------------------------------------------------------- memory
 struct Mem {
@@ -252,6 +285,7 @@ struct Layout {
   uint32_t sdr1 = 0;
   uint32_t bat[16] = {};                     // IBAT0U, IBAT0L, ... DBAT3L
   uint32_t vd1 = 0x60340000, vd1b = 0x60360000, vd2 = 0x70080000;
+  uint32_t vrep = 0x60350000;                // --alias: the reproducer's 8 pages, read/write under both VSIDs
   uint32_t code_frame[32] = {};
 };
 
@@ -268,6 +302,7 @@ struct Gen {
   Layout L;
   std::map<uint32_t, uint32_t> pteg_used;    // PTEG address -> slots taken
   bool fp = true;                            // FP instructions in the mix
+  std::vector<std::pair<int, uint32_t>> expect;   // --alias: GPR values the program must end with
   uint64_t fpool[FPOOL_N] = {};
   explicit Gen(uint32_t seed, int mode_) : rng(seed), mode(mode_), xl(mode_ == 1 || mode_ == 2), irq(mode_ >= 2) {
     fp = rng() % 8 != 0;
@@ -390,7 +425,154 @@ struct Gen {
     reg = k ? 1 : 2;
     return reg == 1 ? L.vd1 : L.vd1b;
   }
+  // --mis: misaligned accesses (603e 2.2.3, 4.5.6): halfwords and words of
+  // every form, 1-3 bytes past a word, doubleword, cache-line or page
+  // boundary (so most cross it), and an in-word halfword at offset 1; with
+  // them the forms that take the alignment exception when misaligned (lmw,
+  // stmw, lwarx, stwcx.) and, in fp_mem, FP accesses not word-aligned
+  uint32_t mis_off(uint32_t room) {
+    static const uint32_t bnd[] = {4, 8, 32, 0x1000};
+    uint32_t b = bnd[rnd(4)];
+    if (rnd(6) == 0) return ((r32() % room) & ~3u) + 1;                       // a halfword inside its word
+    return ((r32() % room) & ~(b - 1)) + b - 1 - uint32_t(rnd(3));            // EA & 3 = 3, 2 or 1
+  }
+  void mis_mem() {
+    int base_r;
+    uint32_t bv = data_base(base_r);
+    int k = rnd(15);
+    if (k == 14) {                                       // D-39: across a page inside DBAT0's block, or out of it
+      if (!xl) return;
+      uint32_t ea = L.vd2 + (rnd(2) ? 0x1000u * uint32_t(1 + rnd(30)) : 0x20000u) - 1 - uint32_t(rnd(3));
+      li32(6, ea - 0x100);
+      static const int ops[] = {32, 40, 36, 44};
+      int op = ops[rnd(4)];
+      int rt = (op < 36 || op == 40) ? dst() : src(); if (rt == 6) rt = 7;
+      if ((op == 40) && (ea & 3) != 3) { emit(D(op, rt, 6, 0x100 + (3 - (ea & 3)))); return; }   // a halfword at 0xFFF
+      emit(D(op, rt, 6, 0x100));
+      return;
+    }
+    if (k >= 12) {                                       // a word stored, then loaded back (VF3's own check):
+      // offset 1, 2 or 3 inside a doubleword or across a 32-byte line, D or X form
+      uint32_t room = g_span / 4 - 0x2000;
+      uint32_t off = (k == 12) ? ((r32() % room) & ~7u) + 1 + uint32_t(rnd(3))
+                               : ((r32() % room) & ~31u) + 29 + uint32_t(rnd(3));
+      int rt = dst(); if (base_r == 12 && rt == 12) rt = 13;
+      if (rnd(2)) { emit(D(36, src(), base_r, off)); emit(D(32, rt, base_r, off)); }
+      else { emit(D(14, 3, 0, off)); emit(X(src(), base_r, 3, 151)); if (rt == 3) rt = 7; emit(X(rt, base_r, 3, 23)); }
+      return;
+    }
+    if (k < 5) {                                         // D form
+      static const int ops[] = {32, 40, 42, 36, 44};
+      int op = ops[rnd(5)];
+      bool isld = op == 32 || op == 40 || op == 42;
+      int rt = isld ? dst() : src();
+      if (base_r == 12 && isld && rt == 12) rt = 13;
+      emit(D(op, rt, base_r, mis_off(g_span / 2 - 0x2000)));
+    } else if (k < 7) {                                  // update forms through r6
+      static const int ops[] = {33, 41, 43, 37, 45};
+      int op = ops[rnd(5)];
+      li32(6, bv + mis_off(g_span / 2 - 0x2000) - 0x100);
+      int rt = dst(); if (rt == 6) rt = 7;
+      emit(D(op, (op & 4) ? src() : rt, 6, 0x100));
+    } else if (k < 10) {                                 // indexed through r3, plain, update, byte-reversed
+      static const int ops[] = {23, 279, 343, 151, 407, 55, 311, 375, 183, 439, 534, 790, 662, 918};
+      int x = ops[rnd(14)];
+      bool isst = (x == 151 || x == 407 || x == 183 || x == 439 || x == 662 || x == 918);
+      bool upd = (x == 55 || x == 311 || x == 375 || x == 183 || x == 439);
+      emit(D(14, 3, 0, mis_off(g_span / 4 - 0x2000)));
+      int rt = isst ? src() : dst();
+      if (upd) { li32(6, bv); if (rt == 6 || rt == 3) rt = 7; emit(X(rt, 6, 3, x)); }
+      else { if (base_r == 12 && !isst && rt == 12) rt = 13; emit(X(rt, base_r, 3, x)); }
+    } else if (k < 11) {                                 // lwarx / stwcx. misaligned: alignment exception
+      emit(D(14, 3, 0, ((r32() % (g_span / 4 - 0x100)) & ~3u) + 1 + uint32_t(rnd(3))));
+      if (rnd(2)) { int rt = dst(); if (base_r == 12 && rt == 12) rt = 13; emit(X(rt, base_r, 3, 20)); }
+      else emit(X(src(), base_r, 3, 150, 1));
+    } else {                                             // lmw / stmw misaligned: alignment exception
+      emit(D(rnd(2) ? 46 : 47, 24 + rnd(8), 1, ((r32() % (g_span / 2 - 0x800)) & ~3u) + 1 + uint32_t(rnd(3))));
+    }
+  }
+  // --alias: the update forms with overlapping registers. Every EA is in the
+  // data region; rB, when it is not rA, is a random value with rA = EA - rB.
+  void alias_mem() {
+    int base_r;
+    uint32_t bv = data_base(base_r);
+    static const int lx[] = {55, 119, 311, 375}, sx[] = {183, 247, 439}, ld[] = {33, 35, 41, 43}, sd[] = {37, 39, 45};
+    auto xsz = [](int xo) { return (xo & 256) ? 2 : (xo & 64) ? 1 : 4; };
+    auto dsz = [](int op) { return (op & 8) ? 2 : (op & 2) ? 1 : 4; };
+    bool mis = rnd(4) == 0;                              // a quarter misaligned: the split (R86)
+    auto ea_of = [&](int sz) {
+      uint32_t room = g_span / 2 - 0x2000;
+      return bv + (mis && sz > 1 ? mis_off(room) : (r32() % room) & ~uint32_t(sz - 1));
+    };
+    int k = rnd(8);
+    if (k < 2) {                                         // load, rD = rB
+      int x = lx[rnd(4)]; uint32_t ea = ea_of(xsz(x)), b = rnd(2) ? r32() : uint32_t(rnd(0x800));
+      int rt = dst();
+      li32(6, ea - b); li32(rt, b); emit(X(rt, 6, rt, x));
+    } else if (k == 2) {                                 // load, rA = rB: EA = 2 x rA
+      int x = lx[rnd(4)]; uint32_t ea = ea_of(xsz(x)) & ~1u;
+      li32(6, ea >> 1); emit(X(dst(), 6, 6, x));
+    } else if (k == 3) {                                 // store, rS = rB
+      int x = sx[rnd(3)]; uint32_t ea = ea_of(xsz(x)), b = rnd(2) ? r32() : uint32_t(rnd(0x800));
+      int rs = dst();
+      li32(6, ea - b); li32(rs, b); emit(X(rs, 6, rs, x));
+    } else if (k == 4) {                                 // store, rS = rA: the old rA is stored
+      if (rnd(2)) { int op = sd[rnd(3)]; uint32_t ea = ea_of(dsz(op)); li32(6, ea - 0x100); emit(D(op, 6, 6, 0x100)); }
+      else { int x = sx[rnd(3)]; uint32_t ea = ea_of(xsz(x)); uint32_t b = uint32_t(rnd(0x4000));
+             li32(6, ea - b); li32(3, b); emit(X(6, 6, 3, x)); }
+    } else if (k == 5) {                                 // store, rS = rA = rB
+      int x = sx[rnd(3)]; uint32_t ea = ea_of(xsz(x)) & ~1u;
+      li32(6, ea >> 1); emit(X(6, 6, 6, x));
+    } else if (k == 6) {                                 // two loads, rD = rB, back to back through r6, then both used
+      int x1 = lx[rnd(4)], x2 = lx[rnd(4)];
+      uint32_t ea = ea_of(4) & ~7u, b1 = r32(), b2 = 8 * uint32_t(rnd(64));
+      int r1 = dst(), r2 = dst(); while (r2 == r1) r2 = dst();   // (r1 + 1 could be a base: r1, r6)
+      li32(6, ea - b1); li32(r1, b1); li32(r2, b2);
+      emit(X(r1, 6, r1, x1)); emit(X(r2, 6, r2, x2));
+      emit(XO(dst(), 6, r2, 266, 0, rnd(2)));            // add: r6 (the second EA) and the second load
+    } else {                                             // D form: two updates of r6 back to back, then r6 as rB
+      int o1 = ld[rnd(4)], o2 = ld[rnd(4)];
+      uint32_t ea = ea_of(4) & ~7u;
+      li32(6, ea - 0x40);
+      emit(D(o1, dst(), 6, 0x20)); emit(D(o2, dst(), 6, 0x20));
+      int rt = dst(); li32(rt, 0); emit(X(rt, 6, rt, lx[rnd(4)]));   // an X form, rD = rB, from the updated r6
+    }
+  }
+  // --alias: the reproducer for each integer load with update, at the end of
+  // the program, with the values rD and rA must hold (expect). In translated
+  // programs each goes through its own seg 6 page after a tlbie, so its step
+  // 0 takes a DTLB miss and the instruction is run again by the handler's rfi.
+  void repro() {
+    if (xl && (cur_msr & M_PR)) { emit(17u << 26 | 2); cur_msr &= ~M_PR; }   // sc: supervisor, for tlbie
+    static const int op[8]  = {119, 311, 375, 55, 35, 41, 43, 33};   // lbzux lhzux lhaux lwzux, lbzu lhzu lhau lwzu
+    static const int rdk[8] = {4, 5, 8, 11, 14, 15, 16, 17};
+    static const int rak[8] = {6, 7, 10, 13, 18, 19, 20, 21};
+    static const uint32_t w[8] = {0x55667788, 0x8899AABB, 0x8899AABB, 0x12345678,
+                                  0xC3A5F00F, 0xF1E2D3C4, 0x8ED0BA98, 0x0BADF00D};
+    for (int k = 0; k < 8; k++) {
+      uint32_t ea = xl ? L.vrep + 0x10 + 0x1000 * uint32_t(k) : 0x10010 + 0x20 * uint32_t(k);
+      li32(12, ea); li32(22, w[k]); emit(D(36, 22, 12, 0));           // stw: the word at EA
+      if (xl) { emit(TLBIE(12)); emit(SYNC); }
+      int rd = rdk[k], ra = rak[k];
+      bool xf = k < 4;
+      int sz = xf ? ((op[k] & 256) ? 2 : (op[k] & 64) ? 1 : 4) : ((op[k] & 8) ? 2 : (op[k] & 2) ? 1 : 4);
+      bool alg = xf ? op[k] == 375 : op[k] == 43;
+      if (xf) {                                          // lis rD,1; addi rA = EA - 0x10000; op rD,rA,rD
+        emit(D(15, rd, 0, 1));
+        if (!xl && k == 0) emit(D(14, ra, 0, 0x10));     // li r6,0x10: the reproducer as found
+        else li32(ra, ea - 0x10000);
+        emit(X(rd, ra, rd, op[k]));
+      } else {
+        li32(ra, ea - 0x10); emit(D(op[k], rd, ra, 0x10));
+      }
+      uint32_t v = sz == 4 ? w[k] : sz == 2 ? w[k] >> 16 : w[k] >> 24;
+      if (alg) v = uint32_t(int32_t(int16_t(v)));
+      expect.push_back({rd, v}); expect.push_back({ra, ea});
+    }
+  }
   void mem() {
+    if (g_mis && rnd(3) == 0) { mis_mem(); return; }
+    if (g_alias && rnd(3) == 0) { alias_mem(); return; }
     int base_r;
     uint32_t bv = data_base(base_r);
     int k = rnd(16);
@@ -668,6 +850,18 @@ struct Gen {
   void fp_mem() {
     int base_r;
     uint32_t bv = data_base(base_r);
+    if (g_mis && rnd(8) == 0) {                          // not word-aligned: alignment exception
+      static const int ops[] = {48, 50, 52, 54};
+      emit(D(ops[rnd(4)], fr(), base_r, ((r32() % (g_span / 2 - 0x100)) & ~7u) + 1 + uint32_t(rnd(7))));
+      if (rnd(2)) return;
+    }
+    if (g_alias && rnd(3) == 0) {                        // update forms, rA = rB: EA = 2 x rA
+      static const int xo[] = {567, 631, 695, 759};      // lfsux lfdux stfsux stfdux
+      uint32_t ea = bv + ((r32() % (g_span / 2 - 0x800)) & ~7u);
+      li32(6, ea >> 1); emit(X(fr(), 6, 6, xo[rnd(4)]));
+      if (rnd(2)) emit(XO(dst(), 6, 6, 266, 0, 0));       // r6 straight after: the EA
+      return;
+    }
     bool pool = !xl && rnd(2);
     int k = rnd(10);
     if (xl && rnd(16) == 0) {
@@ -881,6 +1075,9 @@ struct Gen {
           static const uint32_t pps[] = {2, 2, 2, 0, 1, 3};
           pte(L.vsid6[v], win + 0x1000 * uint32_t(p), frames[fi++ % frames.size()], (r32() & 6), pps[rnd(6)], rnd(2), rnd(2));
         }
+    if (g_alias)                                 // frames 40-47 of the 64: the data pages take at most 32
+      for (int v = 0; v < 2; v++)
+        for (int p = 0; p < 8; p++) pte(L.vsid6[v], L.vrep + 0x1000 * uint32_t(p), frames[40 + p], (r32() & 6), 2, 1, 1);
     for (int p = 0; p < 64; p++) pte(L.sr[10] & 0xFFFFFF, 0xA0000000 + 0x1000 * uint32_t(p), 0x50000, 0, 2, 1, 0);
     pte(L.sr[11] & 0xFFFFFF, 0xB0001000, 0x51000, 1, 2, 1, 0);              // guarded: the handler's ISI
     junk_ptes(300);
@@ -934,7 +1131,7 @@ struct Gen {
       init_regs();
       if (irq) set_msr(pick_msr());
     }
-    if (irq) dec_reload = 50 + rnd(1500);
+    if (irq) dec_reload = (g_mis ? 600 : 50) + rnd(1500);   // (--mis: no period shorter than the handler at wait 80)
     while (int(code.size()) < len) {
       if (fp && rnd(100) < 25) { fp_insn(); continue; }
       int k = rnd(100);
@@ -951,6 +1148,7 @@ struct Gen {
       else if (k < 97) { if (g_loops && rnd(3) == 0) loop_form(); else branch(); }
       else exc();
     }
+    if (g_alias) repro();
     if (fp) emit(FX(fr(), 0, 0, 583));                    // mffs: the FP state settles before the end
     emit(END_INSN);
   }
@@ -984,7 +1182,7 @@ void install(Mem &m, const Gen &g, std::mt19937 &rng) {
     for (uint32_t i = 0; i < 4; i++) m.wr32(base + 0x800 + 4 * i, FPUN_HANDLER[i]);
     m.wr32(base + 0xC00, XL(0, 0, 0, 50));                        // sc: rfi (SRR0 is pc+4)
   }
-  if (g.xl || g.irq) {
+  if (g.xl || g.irq || g_mis || g_alias) {
     Asm a;
     const uint32_t hb = 0xFFF00000;
     // DSI: read DSISR and DAR (compared through r9), skip the instruction
@@ -1019,10 +1217,24 @@ struct Cov {
   uint64_t btb[4] = {};                       // ev_btb: predicted targets, failed checks, MEM refetches, writes
   uint64_t insns[4] = {}, cycles[4] = {};
   uint64_t fpc = 0, fprec = 0, fpdel = 0, fpsupp = 0, fpld = 0, fpst = 0, fpops[ppcfpu::NUM_OPS] = {};
+  uint64_t mis[7] = {};                       // misaligned accesses done (PpcIss::mis_n)
+  // update forms completed with overlapping registers: integer load rD = rB,
+  // load rA = rB (FP too), integer store rS = rB, rS = rA, store rA = rB (FP
+  // too); and the reproducer's values checked (--alias)
+  uint64_t alias[5] = {}, alias_chk = 0;
+  uint64_t sn_n[2] = {}, sn_b2b = 0, sn_eager = 0, sn_bytes = 0, sn_unchk = 0, sn_dmaw_new = 0, sn_dmaw_same = 0;
+  uint64_t sn_lat = 0, sn_lat_max = 0, sn_rsv_lost = 0;
   void add(const Cov &c) {
+    for (int i = 0; i < 2; i++) sn_n[i] += c.sn_n[i];
+    sn_b2b += c.sn_b2b; sn_eager += c.sn_eager; sn_bytes += c.sn_bytes; sn_unchk += c.sn_unchk;
+    sn_dmaw_new += c.sn_dmaw_new; sn_dmaw_same += c.sn_dmaw_same; sn_lat += c.sn_lat; sn_rsv_lost += c.sn_rsv_lost;
+    sn_lat_max = std::max(sn_lat_max, c.sn_lat_max);
     fpc += c.fpc; fprec += c.fprec; fpdel += c.fpdel; fpsupp += c.fpsupp; fpld += c.fpld; fpst += c.fpst;
     for (int i = 0; i < ppcfpu::NUM_OPS; i++) fpops[i] += c.fpops[i];
     for (int i = 0; i < 0x20; i++) vec[i] += c.vec[i];
+    for (int i = 0; i < 7; i++) mis[i] += c.mis[i];
+    for (int i = 0; i < 5; i++) alias[i] += c.alias[i];
+    alias_chk += c.alias_chk;
     ext += c.ext; dec += c.dec; sh_writes += c.sh_writes; replays += c.replays; fslow += c.fslow;
     for (int i = 0; i < 4; i++) btb[i] += c.btb[i];
     for (int i = 0; i < 4; i++) { insns[i] += c.insns[i]; cycles[i] += c.cycles[i]; }
@@ -1096,7 +1308,7 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
   bool irq_mode = g.irq;
   std::mt19937 irng(seed ^ 0x2545F491u);
   int tick_div = 1 + int(irng() % 6);
-  uint32_t int_rate = 1500 + irng() % 6000;
+  uint32_t int_rate = g_mis ? 150 + irng() % 600 : 1500 + irng() % 6000;   // (--mis: often, to meet a split's second cycle)
   int pend_run = 0;
   uint64_t insns_here = 0;
   Cov cov; cov.seeds[mode]++;
@@ -1123,6 +1335,30 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
   std::mt19937 mrng(seed ^ 0x6A09E667u);
   MemAgent ma; ma.rng = &mrng; ma.mem = &cmem; ma.lat_lo = 1; ma.lat_hi = max_wait > 1 ? max_wait : 1;
   top.clk = 0; top.rst = 1; top.m_ack = 0; top.m_rvalid = 0; top.m_wnext = 0; top.m_rdata = 0; top.tb_tick = 0; top.ext_int = 0;
+  top.sn_req = 0; top.sn_addr = 0; top.sn_inv = 0;
+  // ---- the DMA master (--snoop)
+  Mem smem = rtl_mem;                                  // memory as the core's requests have written it
+  struct BLog { uint64_t seq; uint32_t a; uint8_t old, nw; };
+  std::deque<BLog> blog;                               // the latest bytes written, by request number
+  uint64_t n_seq = 0, n_ans = 0;
+  std::map<uint32_t, uint64_t> line_req;               // by line: the cycle of the latest request
+  std::set<uint32_t> line_inh;                         // lines accessed cache-inhibited
+  std::deque<uint32_t> rq_lines;
+  uint32_t last_st_line = 0; uint64_t last_st_cyc = 0;
+  std::mt19937 srng(seed ^ 0x3C6EF372u);
+  auto srnd = [&](int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(srng); };
+  struct Snoop { bool act = false, inv = false, chk = true; uint32_t line = 0; uint64_t t0 = 0; uint8_t v0[32];
+                 std::vector<std::pair<int, uint8_t>> maybe; } sn;
+  int sn_gap = 40;
+  uint64_t last_ack = 0;
+  bool m_rsvq = false, m_rvkill = false; uint32_t m_rvpa = 0, m_rsvline = 0;
+  std::vector<bool> lw_kill;                           // by lwarx request: its reservation was lost since
+  uint64_t n_lw_ret = 0;
+  auto view_at = [&](uint32_t line, uint64_t k, uint8_t *v) {   // the line after the first k requests
+    for (int b = 0; b < 32; b++) v[b] = smem.rd8(line + b);
+    for (auto it = blog.rbegin(); it != blog.rend() && it->seq >= k; ++it)
+      if ((it->a & ~31u) == line) v[it->a & 31] = it->old;
+  };
 #else
   top.clk = 0; top.rst = 1; top.i_valid = 0; top.d_valid = 0; top.tb_tick = 0; top.ext_int = 0;
   top.i_way = 0; top.i_arr = 0; top.i_pa = 0;          // no I-cache: the BTB's pre-read is not used
@@ -1154,6 +1390,69 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
     int_h[hist(0)] = int_drv;
     // responses for this cycle
 #ifdef PPC_CPU
+    bool sn_inw = false;                                 // a write snoop is in progress in the cache this cycle
+    if (g_snoop) {
+      bool sack = top.sn_ack;
+      sn_inw = sn.act && sn.inv && cycles > sn.t0 && !sack;
+      if (sack && !sn.act) { printf("seed %u: sn_ack with no snoop at cycle %llu\n", seed, (unsigned long long)cycles); return false; }
+      if (sn.act && sack) {
+        if (sn.chk) {
+          for (int b = 0; b < 32; b++) {
+            uint8_t m = uint8_t(cmem.rd((sn.line + b) & ~3u) >> (24 - 8 * (b & 3)));
+            bool ok = m == sn.v0[b];
+            for (auto &mv : sn.maybe) ok = ok || (mv.first == b && mv.second == m);
+            cov.sn_bytes++;
+            if (!ok) {
+              printf("seed %u: DMA %s of line %08X byte %d reads %02X, expected %02X (%zu later values), snoop %llu-%llu\n", seed,
+                     sn.inv ? "write snoop" : "read", sn.line, b, m, sn.v0[b], sn.maybe.size(), (unsigned long long)sn.t0,
+                     (unsigned long long)cycles);
+              return false;
+            }
+          }
+        } else cov.sn_unchk++;
+        if (sn.inv) {                                    // the master's write
+          auto it = line_req.find(sn.line);
+          bool quiet_line = !g.xl && sn.line >= DATA && sn.line + 32 <= DATA + g_span &&
+                            (it == line_req.end() || cycles - it->second > 400 + (cycles - sn.t0));
+          uint8_t v[32];
+          view_at(sn.line, n_ans, v);
+          if (quiet_line) {
+            int mask = srnd(1, 255);
+            for (int w = 0; w < 8; w++) if (mask & (1 << w))
+              for (int b = 0; b < 4; b++) v[4 * w + b] = uint8_t(srng());
+            for (int b = 0; b < 32; b++) { smem.wr8(sn.line + b, v[b]); iss_mem.wr8(sn.line + b, v[b]); }
+            cov.sn_dmaw_new++;
+          } else cov.sn_dmaw_same++;
+          for (int w = 0; w < 8; w++)
+            cmem.wr(sn.line + 4 * w, (v[4 * w] << 24) | (v[4 * w + 1] << 16) | (v[4 * w + 2] << 8) | v[4 * w + 3], 0xF);
+        }
+        cov.sn_lat += cycles - sn.t0; cov.sn_lat_max = std::max<uint64_t>(cov.sn_lat_max, cycles - sn.t0);
+        sn.act = false; last_ack = cycles;
+        int gg = srnd(0, 9);
+        sn_gap = gg < 4 ? 0 : gg < 8 ? srnd(1, 30) : srnd(30, 300);
+      } else if (sn.act && cycles - sn.t0 > 30000) {
+        printf("seed %u: no sn_ack for line %08X since cycle %llu\n", seed, sn.line, (unsigned long long)sn.t0); return false;
+      } else if (!sn.act) {
+        bool eager = cycles - last_st_cyc <= 2 && srnd(0, 3) == 0;
+        if (sn_gap > 0 && !eager) sn_gap--;
+        else {
+          int r = srnd(0, 99);
+          uint32_t line;
+          if (eager) line = last_st_line;
+          else if (r < 50 && !rq_lines.empty()) line = rq_lines[srnd(0, int(rq_lines.size()) - 1)];
+          else if (r < 75 && !lw_kill.empty()) line = m_rsvq ? m_rsvline : m_rvpa;     // the reservation's line
+          else if (r < 90) line = (DATA + uint32_t(srnd(0, int(g_span) - 32))) & ~31u;
+          else line = uint32_t(srnd(0, 0x1FFFFF)) & ~31u;
+          sn.act = true; sn.line = line; sn.t0 = cycles; sn.maybe.clear();
+          sn.inv = g_snoop >= 2 && srnd(0, 99) < (r >= 50 && r < 75 ? 80 : 30);
+          sn.chk = !line_inh.count(line);
+          view_at(line, n_ans, sn.v0);
+          for (auto &e : blog) if (e.seq >= n_ans && (e.a & ~31u) == line) sn.maybe.push_back({int(e.a & 31), e.nw});
+          cov.sn_n[sn.inv]++; cov.sn_b2b += cycles == last_ack + 1; cov.sn_eager += eager;
+        }
+      }
+      top.sn_req = sn.act; top.sn_addr = sn.line >> 5; top.sn_inv = sn.inv;
+    }
     ma.step(top.m_req, top.m_cmd, top.m_addr, top.m_be, top.m_wdata);
     top.m_ack = ma.ack; top.m_rvalid = ma.rvalid; top.m_wnext = ma.wnext; top.m_rdata = ma.rdata;
     if (ma.err) { printf("seed %u: memory agent protocol error\n", seed); return false; }
@@ -1182,6 +1481,44 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
     if (fptrace && top.rt_fpscr != last_fs) { printf("    rtl   fpscr %08X (cycle %llu)\n", top.rt_fpscr, (unsigned long long)cycles); last_fs = top.rt_fpscr; }
 #ifdef PPC_CPU
     if (top.t_dreq && top.t_dwe && top.t_daddr == ACK) int_drv = false;  // the handler's acknowledge
+    if (g_snoop) {
+      // the reservation rule this cycle (ppc_dcache.sv, "the snoop")
+      bool exp_kill = m_rvkill || (m_rsvq && sn_inw && m_rsvline == sn.line);
+      if (exp_kill && !lw_kill.empty()) lw_kill.back() = true;
+      if (top.t_dreq && top.t_dcnd && exp_kill) {
+        printf("seed %u: stwcx. stored at cycle %llu with its reservation lost to a snooped write\n", seed, (unsigned long long)cycles);
+        return false;
+      }
+      bool kn;
+      if (m_rsvq) { kn = sn_inw && m_rsvline == sn.line; m_rvpa = m_rsvline; }
+      else kn = m_rvkill || (sn_inw && m_rvpa == sn.line);
+      m_rvkill = kn;
+      m_rsvq = top.t_dreq && top.t_drsv;
+      if (m_rsvq) { m_rsvline = top.t_daddr & ~31u; lw_kill.push_back(false); }
+      if (getenv("SNTRACE") && (m_rsvq || exp_kill != m_rvkill || (top.t_dreq && top.t_dcnd)))
+        printf("    cyc %llu: lwarx %d stwcx %d addr %08X kill %d->%d n_lw %zu ret %llu sn %d inv %d line %08X\n", (unsigned long long)cycles,
+               int(m_rsvq), int(top.t_dreq && top.t_dcnd), top.t_daddr, int(exp_kill), int(m_rvkill), lw_kill.size(),
+               (unsigned long long)n_lw_ret, int(sn.act), int(sn.inv), sn.line);
+      // answers, then this cycle's request into the shadow
+      if (top.t_dvalid) n_ans++;
+      if (top.t_dreq) {
+        uint32_t a = top.t_daddr & ~3u, line = a & ~31u;
+        auto put = [&](uint32_t x, uint8_t v) {
+          blog.push_back({n_seq, x, smem.rd8(x), v}); if (blog.size() > 1024) blog.pop_front();
+          smem.wr8(x, v);
+          if (sn.act && (x & ~31u) == sn.line) sn.maybe.push_back({int(x & 31), v});
+        };
+        if (top.t_dop == 0 && top.t_dwe) {
+          for (int b = 0; b < 4; b++) if (top.t_dbe & (8 >> b)) put(a + b, uint8_t(top.t_dwdata >> (24 - 8 * b)));
+          last_st_line = line; last_st_cyc = cycles;
+        } else if (top.t_dop == 2 && !(top.t_dwimg & 0xC))
+          for (int b = 0; b < 32; b++) put(line + b, 0);
+        if (top.t_dwimg & 4) line_inh.insert(line);
+        line_req[line] = cycles;
+        rq_lines.push_back(line); if (rq_lines.size() > 16) rq_lines.pop_front();
+        n_seq++;
+      }
+    }
     if (dtrace && (top.t_dreq || top.t_dvalid))
       printf("    cyc %llu: %s%s op %d %08X wimg %X | ans %d %08X\n", (unsigned long long)cycles, top.t_dreq ? "req " : "",
              top.t_dreq ? (top.t_dwe ? "st" : "ld") : "", int(top.t_dop), top.t_daddr, int(top.t_dwimg), int(top.t_dvalid), top.t_drdata);
@@ -1301,6 +1638,13 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
       if (top.rt_insn == END_INSN) {
         if (!top.rt_fpq) { printf("seed %u: FP state not settled at the end\n", seed); return false; }
         if (!fp_quiet()) return false;
+        for (auto &e : g.expect)
+          if (gpr[e.first] != e.second || iss.gpr[e.first] != e.second) {
+            printf("seed %u: reproducer r%d rtl %08X model %08X, expected %08X\n", seed, e.first, gpr[e.first],
+                   iss.gpr[e.first], e.second);
+            return false;
+          }
+        cov.alias_chk += g.expect.size();
 #ifndef PPC_CPU
         for (uint32_t a = 0; a < rtl_mem.lo.size(); a++)
           if (rtl_mem.lo[a] != iss_mem.lo[a]) { printf("seed %u: memory %08X rtl %02X model %02X\n", seed, a, rtl_mem.lo[a], iss_mem.lo[a]); return false; }
@@ -1324,6 +1668,7 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
         for (int i = 0; i < 0x20; i++) cov.vec[i] = iss.exc_count[i];
         cov.fprec = iss.fp_prec; cov.fpdel = iss.fp_delayed; cov.fpsupp = iss.fp_supp;
         cov.fpld = iss.fp_ls[0]; cov.fpst = iss.fp_ls[1];
+        for (int i = 0; i < 7; i++) cov.mis[i] = iss.mis_n[i];
         for (int i = 0; i < ppcfpu::NUM_OPS; i++) cov.fpops[i] = iss.fp_ops[i];
         cov.insns[mode] = insns_here; cov.cycles[mode] = cycles;
         cov.fpc = fp_checks;
@@ -1334,8 +1679,40 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
       // an interrupt that stays requested with EE = 1 must be taken soon
       if (want) { if (++pend_run > 4) { printf("seed %u: interrupt requested with EE = 1 and not taken by pc %08X\n", seed, rpc); return false; } }
       else pend_run = 0;
+#ifdef PPC_CPU
+      bool is_lwarx = (top.rt_insn >> 26) == 31 && ((top.rt_insn >> 1) & 0x3FF) == 20;
+      bool st_done = false;
+      if (g_snoop && (top.rt_insn >> 26) == 31 && ((top.rt_insn >> 1) & 0x3FF) == 150 && iss.res && !(top.rt_cr & 0x20000000)) {
+        // completed, not an exception in its place (a DTLB miss after a replay)?
+        PpcIss probe = iss; probe.res = false; probe.wr8 = [](uint32_t, uint8_t) {}; probe.on_load = [](uint32_t) {};
+        probe.step();
+        st_done = probe.pc == rpc + 4;
+      }
+      if (st_done) {
+        // the RTL's stwcx. failed where the model's would store: only if the
+        // snoop rule cleared the reservation since its lwarx
+        if (n_lw_ret == 0 || n_lw_ret > lw_kill.size() || !lw_kill[n_lw_ret - 1]) {
+          printf("seed %u: stwcx. at %08X failed with its reservation not cleared (lwarx %llu of %zu made)\n", seed, rpc, (unsigned long long)n_lw_ret, lw_kill.size()); return false;
+        }
+        iss.res = false; cov.sn_rsv_lost++;
+      }
+#endif
       { uint32_t f0 = iss.fpscr, in0 = top.rt_insn;
       iss.step();
+      if (iss.pc == rpc + 4) {                            // completed: the update forms with overlapping registers
+        int op = in0 >> 26, xo = (in0 >> 1) & 0x3FF, rd = (in0 >> 21) & 31, ra = (in0 >> 16) & 31, rb = (in0 >> 11) & 31;
+        bool xl_ = op == 31 && (xo == 55 || xo == 119 || xo == 311 || xo == 375), xf = op == 31 && (xo == 567 || xo == 631);
+        bool xs_ = op == 31 && (xo == 183 || xo == 247 || xo == 439), xfs = op == 31 && (xo == 695 || xo == 759);
+        bool ds_ = op == 37 || op == 39 || op == 45;
+        if (xl_ && rd == rb) cov.alias[0]++;
+        if ((xl_ || xf) && ra == rb) cov.alias[1]++;
+        if (xs_ && rd == rb) cov.alias[2]++;
+        if ((xs_ || ds_) && rd == ra) cov.alias[3]++;
+        if ((xs_ || xfs) && ra == rb) cov.alias[4]++;
+      }
+#ifdef PPC_CPU
+      if (is_lwarx && iss.res && iss.pc == rpc + 4) n_lw_ret++;          // (completed: not an exception in its place)
+#endif
       if (fptrace && iss.fpscr != f0) printf("    model fpscr %08X (pc %08X insn %08X)\n", iss.fpscr, rpc, in0); }
       insns++; insns_here++;
     }
@@ -1403,6 +1780,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--ilat") && i + 1 < argc) g_ilat = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--rdy") && i + 1 < argc) g_rdy = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--loops")) g_loops = true;
+    else if (!strcmp(argv[i], "--mis")) g_mis = true;
+    else if (!strcmp(argv[i], "--alias")) g_alias = true;
+    else if (!strcmp(argv[i], "--snoop") && i + 1 < argc) g_snoop = atoi(argv[++i]);
     else pos.push_back(argv[i]);
   }
   int seeds = pos.size() > 0 ? atoi(pos[0]) : 200;
@@ -1437,6 +1817,22 @@ int main(int argc, char **argv) {
          (unsigned long long)c.vec[3], (unsigned long long)c.vec[4], (unsigned long long)c.ext, (unsigned long long)c.vec[7],
          (unsigned long long)c.dec, (unsigned long long)c.vec[0xC], (unsigned long long)c.vec[0x10],
          (unsigned long long)c.vec[0x11], (unsigned long long)c.vec[0x12], (unsigned long long)c.vec[6]);
+  if (g_mis)
+    printf("  misaligned done: in a word %llu, across a word %llu, a doubleword %llu, a line %llu, a page %llu (with DR = 1, in a DBAT block: %llu; stores %llu)\n",
+           (unsigned long long)c.mis[0], (unsigned long long)c.mis[1], (unsigned long long)c.mis[2],
+           (unsigned long long)c.mis[3], (unsigned long long)c.mis[4], (unsigned long long)c.mis[6], (unsigned long long)c.mis[5]);
+  if (g_alias)
+    printf("  aliased update forms done: load rD = rB %llu, load rA = rB %llu, store rS = rB %llu, store rS = rA %llu,"
+           " store rA = rB %llu; reproducer values checked %llu\n",
+           (unsigned long long)c.alias[0], (unsigned long long)c.alias[1], (unsigned long long)c.alias[2],
+           (unsigned long long)c.alias[3], (unsigned long long)c.alias[4], (unsigned long long)c.alias_chk);
+  if (g_snoop)
+    printf("  snoops: reads %llu, writes %llu (back to back %llu, straight after a store %llu), mean %.1f, max %llu cycles; bytes checked %llu, lines not checked %llu;"
+           " DMA writes new %llu, as left %llu; stwcx. failed by a snooped write %llu\n",
+           (unsigned long long)c.sn_n[0], (unsigned long long)c.sn_n[1], (unsigned long long)c.sn_b2b, (unsigned long long)c.sn_eager,
+           (c.sn_n[0] + c.sn_n[1]) ? double(c.sn_lat) / (c.sn_n[0] + c.sn_n[1]) : 0.0, (unsigned long long)c.sn_lat_max,
+           (unsigned long long)c.sn_bytes, (unsigned long long)c.sn_unchk, (unsigned long long)c.sn_dmaw_new,
+           (unsigned long long)c.sn_dmaw_same, (unsigned long long)c.sn_rsv_lost);
   printf("  FP unavailable %llu, FP program precise %llu / after an MSR write %llu, suppressed results %llu\n",
          (unsigned long long)c.vec[8], (unsigned long long)c.fprec, (unsigned long long)c.fpdel, (unsigned long long)c.fpsupp);
   printf("  FP loads %llu, stores %llu, FPR writes and FP quiet points checked %llu\n  FP ops:",
