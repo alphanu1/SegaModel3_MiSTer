@@ -69,7 +69,8 @@ cmat identity() {
 // column 3 of every stack and node matrix is (0, 0, 0, 1)
 constexpr uint16_t COL3 = (1u << 3) | (1u << 7) | (1u << 11) | (1u << 15);
 
-std::vector<cmat> g_stack(256);
+// one stack a thread: the model runs in several threads at once (r3d_tcache_sim, r3d_rast_ref --geo-lod)
+thread_local std::vector<cmat> g_stack(256);
 
 } // namespace
 
@@ -196,6 +197,13 @@ void r3d_geo::draw_viewport(uint32_t address) {
   if (mode == arith::rtl && !setup_cr) u_setup.n.div += 4, u_setup.n.add += 6, u_setup.n.mul += 2;
   }
 
+  if (lod_word) {
+    // C = -cota kz^2 (r3d_geo.sv M_VPW: word 3 into the facing test; with
+    // MAME's frustum kz is a constant and the test forms kz^2 cota once)
+    float const kz = -proj[2][3];
+    float const ncota = -F(3);
+    lod_c = frustum_sm ? ncota : u_face.mul(u_face.mul(kz, kz), ncota);
+  }
   matrix_base = W(22);
   lod_base = W(0x17) & 0xffffff;
   malpha = 1.0f;
@@ -761,6 +769,66 @@ void r3d_geo::draw_model(uint32_t addr) {
     }
     poly_rec(0);
     if (dropped) { st.d19_dropped++; continue; }
+    // Supermodel's back-face test (R3DShaderTriangles.h CalcBackFace, R62):
+    // d = dot(view vertex 0, mat3(modelview) x face normal), facing away when
+    // d > 0. r3d_face.sv's FP32 order, one multiply-add a step:
+    //   V_j = ((x T0j + y T1j) + z T2j) + T3j, N_j = (n0 T0j + n1 T1j) + n2 T2j,
+    //   d = (V0 N0 + V1 N1) + V2 N2,
+    // T the model matrix (top x coordinate matrix, MAME's view space: the y
+    // flip against GL eye space leaves the dot unchanged). The inverted copy
+    // of a double-sided polygon has -d exactly.
+    bool face_gt = false, face_lt = false;
+    float lod_d = 0, lod_b = 0;
+    if (sm_cull) {
+      fp_unit &f = u_face;
+      auto const &T = tr.m;
+      float const vx = vert[0].x, vy = vert[0].y, vz = vert[0].z;
+      float nf[3];
+      for (int k = 0; k < 3; k++) nf[k] = float(int32_t(h[1 + k]) >> 8) * float(1.0 / 4194304.0);
+      float V[3], N[3];
+      for (int j = 0; j < 3; j++) {
+        float a = f.mul(vx, T[0][j]);
+        a = f.add(f.mul(vy, T[1][j]), a);
+        a = f.add(f.mul(vz, T[2][j]), a);
+        V[j] = f.add(f.mul(1.0f, T[3][j]), a);
+        float b = f.mul(nf[0], T[0][j]);
+        b = f.add(f.mul(nf[1], T[1][j]), b);
+        N[j] = f.add(f.mul(nf[2], T[2][j]), b);
+      }
+      float d = f.mul(V[0], N[0]);
+      d = f.add(f.mul(V[1], N[1]), d);
+      d = f.add(f.mul(V[2], N[2]), d);
+      face_gt = d > 0.0f;
+      face_lt = d < 0.0f;
+      if (lod_word) {
+        // r3d_face.sv: Q = NP x C in the polygon's own period, B = d x Q two later
+        float const np = float(h[5] >> 8) * float(1.0 / 4096.0);
+        lod_d = d;
+        lod_b = f.mul(d, f.mul(np, lod_c));
+      }
+      static bool const facedbg = std::getenv("R3D_FACEDBG") != nullptr;
+      if (facedbg) {
+        std::printf("MF %u %d%d d %08X v0 %08X %08X %08X n %08X %08X %08X\n", my_poly, face_gt, face_lt, fbits(d),
+                    fbits(vx), fbits(vy), fbits(vz), fbits(nf[0]), fbits(nf[1]), fbits(nf[2]));
+        std::printf("MV %u %08X %08X %08X N %08X %08X %08X\n", my_poly, fbits(V[0]), fbits(V[1]), fbits(V[2]), fbits(N[0]), fbits(N[1]), fbits(N[2]));
+        std::printf("MT %u", my_poly);
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 3; j++) std::printf(" %08X", fbits(T[i][j]));
+        std::printf("\n");
+      }
+      if (!(h[1] & 0x10)) {
+        // the same test in double, for the record
+        double dv = 0;
+        for (int j = 0; j < 3; j++) {
+          double const vj = double(vx) * T[0][j] + double(vy) * T[1][j] + double(vz) * T[2][j] + T[3][j];
+          double const nj = double(nf[0]) * T[0][j] + double(nf[1]) * T[1][j] + double(nf[2]) * T[2][j];
+          dv += vj * nj;
+        }
+        st.face_single++;
+        st.face_back += face_gt;
+        st.face_vs_double += face_gt != (dv > 0);
+        st.face_zero += !face_gt && !face_lt;
+      }
+    }
     // a double-sided polygon: Supermodel draws a copy with the normals
     // inverted first, then the polygon; the rasteriser culls the one facing
     // away. A fixed or unlit copy keeps the polygon's shade.
@@ -790,10 +858,16 @@ void r3d_geo::draw_model(uint32_t addr) {
       out.w(((h[4] & 0x1f) << 1) | ((h[5] >> 7) & 0x1)); out.w(h[5] & 0x1f);
       out.w((h[3] >> 3) & 0x7); out.w(h[3] & 0x7); out.w((h[6] >> 7) & 0x7);
       out.w(param); out.w(uint32_t(transparency)); out.w(color);
-      if (t_ext()) { out.w(copy == 1 ? 1u : 0u); out.f(sm_lod ? malpha : 1.0f); }
+      // bit 1: this record faces away (the polygon d > 0, its inverted copy d < 0)
+      if (t_ext()) { out.w((copy == 1 ? 1u : 0u) | (((copy == 1) ? face_lt : face_gt) ? 2u : 0u)); out.f(sm_lod ? malpha : 1.0f); }
       if (emit_sf) {
         for (int k : {0, i - 1, i}) out.f(inv ? cv[k].sf[1] : cv[k].sf[0]);
         out.f(sm_d); out.f(sm_a); out.w(floor ? 1u : 0u);
+      }
+      if (lod_word && sm_cull) {
+        // the copy's: -d and -B exactly (a sign flip)
+        uint32_t const sg = copy == 1 ? 0x80000000u : 0u;
+        out.w(fbits(lod_d) ^ sg); out.w(fbits(lod_b) ^ sg);
       }
       out.end();
     }

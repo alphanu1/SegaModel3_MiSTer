@@ -302,6 +302,39 @@ uint32_t fetch_texel(rtri const &t, texram const &tex, uint32_t u, uint32_t v, b
   return bilinear_filter(c00, c01, c10, c11, u & 0xff, v & 0xff);
 }
 
+// Mip levels at Supermodel's sheet bases (r3d_rast_sm.cpp, Real3D.cpp's
+// mipXBase / mipYBase): level L of the page is the 2048 >> L by 1024 >> L
+// region at (MIPX[L], MIPY[L]).
+static constexpr uint32_t MIPX[] = {0, 1024, 1536, 1792, 1920, 1984, 2016, 2032, 2040, 2044, 2046, 2047};
+static constexpr uint32_t MIPY[] = {0, 512, 768, 896, 960, 992, 1008, 1016, 1020, 1022, 1023};
+
+int mip_levels(rtri const &t) {
+  uint32_t const m = std::min(32u << t.tex_w, 32u << t.tex_h);
+  int l = 0;
+  while ((2u << l) <= m) l++;
+  return l - 1;
+}
+
+void texel_addr4(rtri const &t, uint32_t u, uint32_t v, int L, uint32_t a[4]) {
+  uint32_t const pw = std::max(1u, (32u << t.tex_w) >> L), ph = std::max(1u, (32u << t.tex_h) >> L);
+  uint32_t const um = ((t.param & TP_MIRROR_U) ? 2 * pw : pw) - 1, vm = ((t.param & TP_MIRROR_V) ? 2 * ph : ph) - 1;
+  uint32_t const uL = u >> L, vL = v >> L;
+  uint32_t const u1 = (uL >> 8) & um, v1 = (vL >> 8) & vm, u2 = (u1 + 1) & um, v2 = (v1 + 1) & vm;
+  auto mr = [](uint32_t c, uint32_t p) { return c < p ? c : 2 * p - 1 - c; };
+  uint32_t const x0 = MIPX[L] + ((t.tex_x * 32u) >> L), y0 = (t.page & 1) * 1024u + MIPY[L] + ((t.tex_y * 32u) >> L);
+  uint32_t const c1 = x0 + mr(u1, pw), c2 = x0 + mr(u2, pw), r1 = y0 + mr(v1, ph), r2 = y0 + mr(v2, ph);
+  a[0] = ((r1 << 11) + c1) & 0x3fffff; a[1] = ((r1 << 11) + c2) & 0x3fffff;
+  a[2] = ((r2 << 11) + c1) & 0x3fffff; a[3] = ((r2 << 11) + c2) & 0x3fffff;
+}
+
+uint32_t fetch_texel_lv(rtri const &t, texram const &tex, uint32_t u, uint32_t v, int L) {
+  uint32_t a[4];
+  texel_addr4(t, u, v, L, a);
+  int const fm = int(t.fmt & 7);
+  return bilinear_filter(mame_decode(fm, tex.t[a[0]]), mame_decode(fm, tex.t[a[1]]), mame_decode(fm, tex.t[a[2]]),
+                         mame_decode(fm, tex.t[a[3]]), (u >> L) & 0xff, (v >> L) & 0xff);
+}
+
 void draw_tri_rtl(rtri const &t, int32_t idx, rkind kind, texram const &tex, rtl_opts const &o,
                   rimage &img, std::vector<uint32_t> &zb, rstats &st) {
   rtl_tri r;
@@ -511,7 +544,110 @@ int sm_back(rframe const &f, rtri const &t) {
   return d > 0;
 }
 
+// The mip terms of one textured triangle (d25_opts::mip)
+struct mip_tri {
+  bool on = false;
+  rvp const *vp = nullptr;
+  double n[3] = {0, 0, 0}, kz = 2.0, cnp = 0;   // view-space face normal, w = kz x view depth, -cota x NP
+  int levels = 0;
+  int32_t lb8 = INT32_MIN;                       // hardware form: -256 log2(B), B = kz^2 dot(v0, n) (-cota) NP as FP32
+  double dv = 0;                                 // dot(v0, n), the facing dot at vertex 0
+  uint32_t bw = 0;                               // B's FP32 word (0 without a viewport)
+};
+// 256 log2(1 + (i + 1/2) / 64): the 6-bit mantissa table of the hardware form
+struct log2t { uint8_t v[64]; log2t() { for (int i = 0; i < 64; i++) v[i] = uint8_t(std::lround(256.0 * std::log2(1.0 + (i + 0.5) / 64.0))); } };
+log2t const LOG2T_ {};
+uint8_t const *const LOG2T = LOG2T_.v;
+
+mip_tri make_mip(rframe const &f, rtri const &t) {
+  mip_tri m;
+  m.on = true;
+  m.levels = mip_levels(t);
+  if (t.vp < 0) return m;
+  m.vp = &f.vps[size_t(t.vp)];
+  rvp const &vp = *m.vp;
+  m.kz = -double(vp.proj[11]);
+  if (t.model >= 0) {
+    float const nm[3] = {float(int32_t(t.hdr[1]) >> 8) / 4194304.0f, float(int32_t(t.hdr[2]) >> 8) / 4194304.0f,
+                         float(int32_t(t.hdr[3]) >> 8) / 4194304.0f};
+    float const *mm = f.models[size_t(t.model)].top;
+    for (int j = 0; j < 3; j++) m.n[j] = nm[0] * mm[0 * 4 + j] + nm[1] * mm[1 * 4 + j] + nm[2] * mm[2 * 4 + j];
+    m.n[0] *= vp.coord[1]; m.n[1] *= vp.coord[6]; m.n[2] *= -vp.coord[8];
+  }
+  double const cota = double(u2f(vp.node[3])), np = double(t.hdr[5] >> 8) / 4096.0;
+  m.cnp = -cota * np;
+  // the hardware form's per-triangle word: dot(v, n) at vertex 0 (the geometry's facing dot)
+  double const xn = ((t.x[0] - vp.x) / vp.w - 0.5) * 2.0, yn = ((t.y[0] - vp.y) / vp.h - 0.5) * 2.0, w = t.w[0];
+  double const dv = xn * w / double(vp.proj[0]) * m.n[0] + yn * w / double(vp.proj[5]) * m.n[1] - w / m.kz * m.n[2];
+  float const B = float(m.kz * m.kz * dv * m.cnp);
+  m.dv = dv;
+  std::memcpy(&m.bw, &B, 4);
+  m.lb8 = d25_lod_lb8(m.bw);
+  return m;
+}
+
 } // namespace
+
+int32_t d25_lod_lb8(uint32_t bb) {
+  float B; std::memcpy(&B, &bb, 4);
+  if (!(B > 0.0f && std::isfinite(B))) return INT32_MIN;
+  return -((int32_t((bb >> 23) & 255) - 127) * 256 + int32_t(LOG2T[(bb >> 17) & 63]));
+}
+uint8_t d25_log2t(int i) { return LOG2T[i & 63]; }
+bool d25_lod_terms(rframe const &f, rtri const &t, double &dv, uint32_t &bw) {
+  mip_tri const m = make_mip(f, t);
+  dv = m.dv; bw = m.bw;
+  return m.vp != nullptr;
+}
+
+int64_t d25_fog_p(__int128 o2, int eo, float K) { return fog_p(o2, eo, K, 24); }
+
+bool d25_colour(rkind k, uint32_t texel, uint32_t color, uint32_t trans, int32_t shade, uint32_t fogint,
+                int32_t const fc[3], int32_t S, int32_t P, uint32_t &rgb, int &fb, bool &zw) {
+  rtri t{};
+  t.color = color; t.trans = trans;
+  rgb4 col;
+  zw = false;
+  if (!frag(t, k, texel, shade, col, fb, zw)) return false;
+  if (fogint) {
+    fogvp q;
+    q.S = S;
+    for (int c = 0; c < 3; c++) q.fc[c] = fc[c];
+    fog_apply(col, q, P, fogint);
+  }
+  rgb = pk4(col) & 0xffffff;
+  return true;
+}
+
+bool d25_scroll_fog(rframe const &f, d25_sfog &out) {
+  out = d25_sfog{};
+  int best = -1;
+  for (int pri = 0; pri < 4 && best < 0; pri++)
+    for (size_t i = 0; i < f.vps.size(); i++) {
+      auto const &v = f.vps[i];
+      if (int((v.node[0] >> 3) & 3) != pri) continue;
+      uint32_t const sf = v.node[0x20] & 0xff;
+      if (sf > 0 && (best < 0 || (f.vps[size_t(best)].node[0x20] & 0xff) < sf)) best = int(i);
+    }
+  if (best < 0) return false;
+  auto const &v = f.vps[size_t(best)];
+  bool on = false;
+  for (auto const &n : f.vps)
+    if ((n.node[0x22] & 0xffffff) == (v.node[0x22] & 0xffffff)) {
+      float const dens = std::fabs(u2f(n.node[0x23]));
+      if ((dens > 0 && dens < 99999.0f) || int16_t(n.node[0x25] & 0xffff) > 0 || (n.node[0x24] & 0xff)) { on = true; break; }
+    }
+  if (!on) return false;
+  fogvp const q = make_fog(v);
+  out.alpha = v.node[0x20] & 0xff;
+  for (int c = 0; c < 3; c++) {
+    out.col |= uint32_t(q.fc[c]) << (16 - 8 * c);
+    out.shown |= (((uint32_t(q.fc[c]) * out.alpha + 128) >> 8) & 255) << (16 - 8 * c);
+  }
+  out.x0 = std::max(0, int(v.x)); out.x1 = std::min(SCR_W, int(v.x + v.w + 0.5f));
+  out.y0 = std::max(0, int(v.y)); out.y1 = std::min(SCR_H, int(v.y + v.h + 0.5f));
+  return true;
+}
 
 void render_d25(rframe const &f, texram const &tex, rtl_opts const &o, d25_opts const &d, rimage &img, d25_stats &st) {
   img = rimage();
@@ -525,34 +661,12 @@ void render_d25(rframe const &f, texram const &tex, rtl_opts const &o, d25_opts 
 
   // scroll fog: the lowest priority's highest scroll-fog viewport (Supermodel's rule)
   uint32_t sfog = 0;
-  if (d.fog) {
-    int best = -1;
-    for (int pri = 0; pri < 4 && best < 0; pri++)
-      for (size_t i = 0; i < f.vps.size(); i++) {
-        auto const &v = f.vps[i];
-        if (int((v.node[0] >> 3) & 3) != pri) continue;
-        uint32_t const sf = v.node[0x20] & 0xff;
-        if (sf > 0 && (best < 0 || (f.vps[size_t(best)].node[0x20] & 0xff) < sf)) best = int(i);
-      }
-    if (best >= 0) {
-      auto const &v = f.vps[size_t(best)];
-      bool on = false;
-      for (auto const &n : f.vps)
-        if ((n.node[0x22] & 0xffffff) == (v.node[0x22] & 0xffffff)) {
-          float const dens = std::fabs(u2f(n.node[0x23]));
-          if ((dens > 0 && dens < 99999.0f) || int16_t(n.node[0x25] & 0xffff) > 0 || (n.node[0x24] & 0xff)) { on = true; break; }
-        }
-      if (on) {
-        uint32_t const sf = v.node[0x20] & 0xff;
-        fogvp const q = make_fog(v);
-        uint32_t px = 0;   // alpha 0: not drawn; blends read the fog colour itself
-        for (int c = 0; c < 3; c++) px |= uint32_t(q.fc[c]) << (16 - 8 * c);
-        sfog = sf;
-        int const x0 = std::max(0, int(v.x)), x1 = std::min(SCR_W, int(v.x + v.w + 0.5f));
-        int const y0 = std::max(0, int(v.y)), y1 = std::min(SCR_H, int(v.y + v.h + 0.5f));
-        for (int y = y0; y < y1; y++)
-          for (int x = x0; x < x1; x++) img.px[size_t(y) * SCR_W + size_t(x)] = px;
-      }
+  {
+    d25_sfog sg;
+    if (d.fog && d25_scroll_fog(f, sg)) {
+      sfog = sg.alpha;
+      for (int y = sg.y0; y < sg.y1; y++)
+        for (int x = sg.x0; x < sg.x1; x++) img.px[size_t(y) * SCR_W + size_t(x)] = sg.col;   // alpha 0: not drawn; blends read the fog colour itself
     }
   }
 
@@ -586,12 +700,20 @@ void render_d25(rframe const &f, texram const &tex, rtl_opts const &o, d25_opts 
       int const smv = sm_back(f, t);
       if (smv >= 0 && !(t.hdr[1] & 0x10)) st.cull_tab[back][smv]++;
       bool const drop = d.cull == 1 ? back : smv == 1;
-      if (drop && !(t.hdr[1] & 0x10)) { st.culled++; st.setup += 6 + 4; return; }
+      if (drop && !(t.hdr[1] & 0x10)) { st.culled++; st.setup += 6 + 4; if (d.hook) d.hook->tri(idx, layer, r, k, true); return; }
     }
+    if (d.hook) d.hook->tri(idx, layer, r, k, false);
     st.setup += uint64_t(r.tex ? (o.oow ? 54 : 66) : 30) + 4;
     st.store_bytes += uint64_t(r.tex ? (o.oow ? 128 : 144) : 80);
     fogvp const *q = (d.fog && t.vp >= 0) ? &fv[size_t(t.vp)] : nullptr;
     uint32_t const fogint = (t.hdr[6] >> 11) & 31;
+    // mip: Supermodel's LOD = -log2((kz / w)^2 dot(v, n) (-cota) NP); dot(v, n)
+    // is constant on the triangle's plane, so the per-pixel part is -2 log2(1/w)
+    mip_tri mt = (d.mip && r.tex) ? make_mip(f, t) : mip_tri{};
+    if (mt.on && d.lodb && t.poly < d.lodb->size() && (*d.lodb)[t.poly] != 0xffffffffu) {
+      mt.bw = (*d.lodb)[t.poly];
+      mt.lb8 = d25_lod_lb8(mt.bw);
+    }
     if (q && fogint == 0) q = nullptr;
     // cycle model, per band touched
     for (int b = r.y0 / d.band; b <= (r.y1 - 1) / d.band; b++) {
@@ -606,20 +728,62 @@ void render_d25(rframe const &f, texram const &tex, rtl_opts const &o, d25_opts 
           size_t const i = size_t(y) * SCR_W + size_t(x);
           st.ztest++;
           rtl_px const p = r.eval(x, y);
+          d25_px ev;
+          ev.tri = idx; ev.layer = layer; ev.x = x; ev.y = y; ev.k = k; ev.z = p.z; ev.u = p.u; ev.v = p.v; ev.shade = p.shade;
+          struct emit_t { d25_hook *h; d25_px &e; ~emit_t() { if (h) h->px(e); } } emit{d.hook, ev};
           if (stip) {
             uint32_t bb = BAYER[y & 3][x & 3];
             if (t.hdr[6] & 0x20000) bb = 15 - bb;
-            if (!(bb < t.trans / 2)) continue;
+            if (!(bb < t.trans / 2)) { ev.stip_out = true; continue; }
           }
           uint32_t zref = zb[i];
           if (layer) zref = (ztg[i] == gen) ? zt[i] : zb[i];
+          ev.zref = zref;
           if (!nearer(p.z, zref, layer != 0)) continue;
+          ev.zpass = true;
           st.zpass++;
           ps++;
           uint32_t texel = 0;
-          if (r.tex) { bool outside; texel = fetch_texel(t, tex, p.u, p.v, outside); }
+          if (r.tex && !mt.on) { bool outside; texel = fetch_texel(t, tex, p.u, p.v, outside); }
+          else if (r.tex) {
+            int32_t l8;   // LOD x 256, clamped to [0, levels]
+            if (d.lod == 0) {
+              double const ooz = std::ldexp(double(at2(r.pl[1], x, y)), r.pl[1].e - WB - 1);
+              double lod = 0;
+              if (mt.vp && ooz != 0) {
+                double const w = 1.0 / ooz, xn = ((x + 0.5 - mt.vp->x) / mt.vp->w - 0.5) * 2.0, yn = ((y + 0.5 - mt.vp->y) / mt.vp->h - 0.5) * 2.0;
+                double const dv = xn * w / double(mt.vp->proj[0]) * mt.n[0] + yn * w / double(mt.vp->proj[5]) * mt.n[1] - w / mt.kz * mt.n[2];
+                double const fw = mt.kz * ooz, lb = dv * mt.cnp;
+                lod = (lb > 0) ? -std::log2(fw * fw * lb) : 0.0;
+              }
+              if (!(lod > 0)) lod = 0;
+              lod = std::min(lod, double(mt.levels));
+              l8 = int32_t(lod * 256.0);
+              if (d.mip == 1) l8 = int32_t(std::lround(lod)) * 256;
+            } else {
+              uint32_t const zw1 = o.oow ? p.z : z_word(at2(r.pl[1], x, y), r.pl[1].e, 24);
+              int32_t lz = (int32_t(zw1 >> 16) - 127) * 256 + int32_t(LOG2T[(zw1 >> 10) & 63]);   // 256 log2(1/w)
+              l8 = mt.lb8 == INT32_MIN ? 0 : mt.lb8 - 2 * lz;
+              l8 = std::clamp(l8, 0, mt.levels * 256);
+              if (d.mip == 1) l8 = ((l8 + 128) >> 8) << 8;
+            }
+            int const il = l8 >> 8;
+            uint32_t const fr = (il >= mt.levels) ? 0u : uint32_t(l8 & 255);
+            ev.lv0 = il; ev.lodb = mt.bw; ev.lvmax = mt.levels;
+            texel = fetch_texel_lv(t, tex, p.u, p.v, il);
+            if (d.mip == 2 && fr) {
+              ev.lv1 = il + 1; ev.lfr = fr;
+              uint32_t const t1 = fetch_texel_lv(t, tex, p.u, p.v, il + 1);
+              uint32_t m = 0;
+              for (int sh = 0; sh < 32; sh += 8)
+                m |= ((((texel >> sh) & 255) * (256 - fr) + ((t1 >> sh) & 255) * fr) >> 8) << sh;
+              texel = m;
+            }
+          }
+          ev.texel = texel;
           rgb4 col; int fb; bool zw = false;
           if (!frag(t, k, texel, p.shade, col, fb, zw)) continue;
+          ev.ok = true; ev.zw = zw; ev.fb = fb; ev.col_raw = pk4(col);
           if (q) {
             int32_t P;
             if (o.oow) P = int32_t(fog_p(at2(r.pl[0], x, y), r.pl[0].e, q->K, o.recip_bits > 0 ? o.recip_bits : 24));
@@ -627,7 +791,12 @@ void render_d25(rframe const &f, texram const &tex, rtl_opts const &o, d25_opts 
             else P = int32_t(fog_lin(at2(r.pl[0], x, y), r.pl[0].e, q->K));
             fog_apply(col, *q, P, fogint);
             st.fog_px++;
+            ev.fog = true; ev.P = P;
+            ev.K = q->K; ev.S = q->S; ev.fogint = fogint;
+            for (int c = 0; c < 3; c++) ev.fc[c] = q->fc[c];
           }
+          ev.col_fog = pk4(col);
+          ev.dst = img.px[i];
           st.shaded++;
           if (layer) {
             // layer fragment: unblended colour, alpha = transparency (x texel alpha)
@@ -640,6 +809,7 @@ void render_d25(rframe const &f, texram const &tex, rtl_opts const &o, d25_opts 
           }
           if (fb >= 0) bl(col, un4(img.px[i]), uint8_t(fb));
           img.px[i] = 0xff000000u | (pk4(col) & 0xffffff);
+          ev.out = img.px[i];
           if (zw) zb[i] = p.z;
           if (d.trans == 2) { t1[i] = 0; t2[i] = 0; }
           img.kind[i] = k;

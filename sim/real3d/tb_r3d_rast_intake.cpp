@@ -16,6 +16,11 @@
 // fixed-point vertices and planes. Random input gaps and output stalls; then
 // random records of random FP32 values for the converter's whole range.
 //
+// Built with -DINTAKE_MIP (MIP = 1): a fifth header word, the LOD word B
+// (random: positive, negative, zero, infinite, NaN), whose beat must carry
+// lb8 + 65152 (0 for none) and 4 + min(width, height code); the size codes
+// in word 0 random.
+//
 //   Vr3d_rast_intake --tris DIR [--frames N] [--gap PCT] [--stall PCT] [--random N] [--oow]
 
 #include "Vr3d_rast_intake.h"
@@ -63,20 +68,48 @@ int main(int argc, char **argv) {
   std::vector<std::vector<uint32_t>> recs;   // record words
   std::deque<field> expect;
   uint64_t const M40 = (uint64_t(1) << 40) - 1;
-  auto add_tri = [&](rtl_tri const &r, uint32_t w0) {
+  // SETUP4 (the default): a 4-word header; from a frame's set-up the planes are 1/w,
+  // u/w, v/w, shade (rtl_tri's 0, 2, 3, 4: its plane 1 is the same 1/w again) or
+  // 1/w, shade. With -DSETUP5, R62's record: 3 header words, every rtl_tri plane.
+  std::mt19937 gb(11);
+  auto add_tri = [&](rtl_tri const &r, uint32_t w0, bool frame) {
+#ifdef INTAKE_MIP
+    w0 |= (gb() & 7u) << 6 | (gb() & 7u) << 9;
+#endif
+#ifdef SETUP5
     std::vector<uint32_t> w = {w0 | (r.tex ? 0x10u : 0u), 0x12345u, 0xabcdefu};
+    std::vector<int> pls; for (int p = 0; p < r.np; p++) pls.push_back(p);
+#else
+    std::vector<uint32_t> w = {w0 | (r.tex ? 0x10u : 0u), 0x12345u, 0xabcdefu, 0x5au};
+#ifdef INTAKE_MIP
+    uint32_t bw = gb() % 8 == 0 ? (gb() % 2 ? 0x80000000u | (gb() & 0x7fffffff) : (gb() % 3 ? 0x7f800000u | (gb() & 7) : 0u)) : (gb() & 0x7f7fffff);
+    w.push_back(bw);
+#endif
+    std::vector<int> pls;
+    if (frame && r.tex) pls = {0, 2, 3, 4};
+    else for (int p = 0; p < r.np; p++) pls.push_back(p);
+#endif
+    size_t const hw = w.size();
     for (int k = 0; k < 3; k++) { w.push_back(fb(r.fx[k])); w.push_back(fb(r.fy[k])); }
     w.push_back(fb(r.det));
-    for (int p = 0; p < r.np; p++) { w.push_back(fb(r.pdx[p])); w.push_back(fb(r.pdy[p])); w.push_back(fb(r.ps[p])); }
+    for (int p : pls) { w.push_back(fb(r.pdx[p])); w.push_back(fb(r.pdy[p])); w.push_back(fb(r.ps[p])); }
     recs.push_back(w);
-    for (int k = 0; k < 3; k++) expect.push_back({15, w[size_t(k)]});
+    for (size_t k = 0; k < hw; k++) expect.push_back({31, w[k]});
+#ifdef INTAKE_MIP
+    {
+      int32_t const lb = d25_lod_lb8(w[4]);
+      uint32_t const tw = (w0 >> 6) & 7, th = (w0 >> 9) & 7;
+      expect[expect.size() - 1].v = (uint64_t(4 + std::min(tw, th)) << 17) | (lb == INT32_MIN ? 0u : uint32_t(lb + 65152));
+    }
+#endif
     for (int k = 0; k < 3; k++) { expect.push_back({2 * k, uint64_t(uint32_t(int32_t(r.vx[k])))}); expect.push_back({2 * k + 1, uint64_t(uint32_t(int32_t(r.vy[k])))}); }
     expect.push_back({6, fb(r.det)});
-    for (int p = 0; p < r.np; p++) {
-      expect.push_back({8 + 4 * p, uint64_t(int64_t(r.pl[p].e)) & M40});
-      expect.push_back({9 + 4 * p, uint64_t(r.pl[p].c) & M40});
-      expect.push_back({10 + 4 * p, uint64_t(r.pl[p].dx) & M40});
-      expect.push_back({11 + 4 * p, uint64_t(r.pl[p].dy) & M40});
+    for (size_t i = 0; i < pls.size(); i++) {
+      int const p = pls[i], t = 8 + 4 * int(i);
+      expect.push_back({t, uint64_t(int64_t(r.pl[p].e)) & M40});
+      expect.push_back({t + 1, uint64_t(r.pl[p].c) & M40});
+      expect.push_back({t + 2, uint64_t(r.pl[p].dx) & M40});
+      expect.push_back({t + 3, uint64_t(r.pl[p].dy) & M40});
     }
   };
   uint64_t ntri = 0;
@@ -91,7 +124,7 @@ int main(int argc, char **argv) {
       for (auto const &t : f.tris) {
         rtl_tri r;
         if (!r.setup(t, kind_of(t), o)) continue;
-        add_tri(r, 0);
+        add_tri(r, 0, true);
         ntri++;
       }
     }
@@ -101,7 +134,11 @@ int main(int argc, char **argv) {
   std::mt19937 g(7);
   for (int i = 0; i < nrand; i++) {
     rtl_tri r;
+#ifdef SETUP5
     r.tex = g() & 1; r.np = r.tex ? 5 : 2;
+#else
+    r.tex = g() & 1; r.np = r.tex ? 4 : 2;
+#endif
     auto rf = [&](int emin, int emax) {
       uint32_t const E = uint32_t(emin + int(g() % uint32_t(emax - emin + 1)));
       uint32_t u = (g() & 0x80000000u) | (E << 23) | (g() & 0x7fffff);
@@ -125,7 +162,7 @@ int main(int argc, char **argv) {
       auto q = [&](float f) { return std::llround(std::ldexp((long double)f, 40 - r.pl[p].e)); };
       r.pl[p].c = q(r.ps[p]); r.pl[p].dx = q(r.pdx[p]); r.pl[p].dy = q(r.pdy[p]);
     }
-    add_tri(r, 0);
+    add_tri(r, 0, false);
   }
 
   Verilated::commandArgs(argc, argv);
@@ -153,8 +190,8 @@ int main(int argc, char **argv) {
       got++; idle = 0;
       if (expect.empty()) { if (bad++ < 10) std::printf("  extra field tag %d\n", gf.tag); continue; }
       field const e = expect.front(); expect.pop_front();
-      uint64_t const ev = (e.tag <= 6 || e.tag == 15) ? (e.v & 0xffffffffu) : e.v;
-      uint64_t const gv = (e.tag <= 6 || e.tag == 15) ? (gf.v & 0xffffffffu) : gf.v;
+      uint64_t const ev = (e.tag <= 6 || e.tag == 31) ? (e.v & 0xffffffffu) : e.v;
+      uint64_t const gv = (e.tag <= 6 || e.tag == 31) ? (gf.v & 0xffffffffu) : gf.v;
       if (e.tag != gf.tag || ev != gv)
         if (bad++ < 10) std::printf("  field %" PRIu64 ": rtl tag %d %010" PRIx64 ", model tag %d %010" PRIx64 "\n", got, gf.tag, gv, e.tag, ev);
     } else idle++;

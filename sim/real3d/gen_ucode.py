@@ -49,7 +49,8 @@ import os
 import sys
 
 MAC_W = 12         # write cycle after issue
-R3 = '--3r' in sys.argv   # a third lane-register read (port C, r3d_vpu SETUP_3R): c from any register
+R3 = '--3r' in sys.argv   # (set True for the set-up output ROM)
+# a third lane-register read (port C, r3d_vpu SETUP_3R): c from any register
 DIV_W = 15         # lane 0 write cycle after issue; lane k at +k
 
 K = {'zero': 0, 'one': 1, 'half': 2, 'k255': 3, 'k99999': 4, 'mone': 5, 'two': 6, 'wplane': 7}
@@ -86,8 +87,9 @@ BC_K = 16                              # constants, bank 1 entries 16-23 (K orde
 
 class Op:
     def __init__(self, a, b, c=None, negc=False, post=0, dst=None, dstb=None, side=None, div=False,
-                 absr=False, lanes=0xF, dstk=None, tr=False):
+                 absr=False, lanes=0xF, dstk=None, tr=False, sdup=False):
         self.a, self.b, self.c, self.negc, self.post = a, b, c, negc, post
+        self.sdup = sdup   # also write the side memory at dst's address (r3d_vpu writes both)
         self.dst, self.dstb, self.side, self.div, self.absr, self.lanes = dst, dstb, side, div, absr, lanes
         self.dstk = dstk
         self.tr = tr
@@ -221,13 +223,18 @@ def encode(op, end=False, valid=True):
     put('rb', rb); put('bsel', bsel); put('csel', csel); put('negc', 1 if op.negc else 0)
     put('bc0', bc0); put('bc1', bc1); put('post', op.post)
     assert (op.dst is not None) + (op.side is not None) + (op.dstk is not None) <= 1
+    # r3d_vpu applies a post-op only to the lane registers and (post 3, MAME's
+    # shade clamp) the side memories, not to the broadcast file
+    assert not op.post or op.dstb is None
+    assert op.post not in (1, 2) or (op.side is None and not op.sdup)
     d = op.dst if op.dst is not None else op.side if op.side is not None else op.dstk if op.dstk is not None else 0
     put('dst', d)
     put('wrf', 1 if (op.dst is not None or op.dstk is not None) else 0)
     put('dstk', 1 if op.dstk is not None else 0)
     put('wbc', 1 if op.dstb is not None else 0)
     put('dstb', op.dstb if op.dstb is not None else 0)
-    put('wside', 1 if op.side is not None else 0)
+    assert not op.sdup or op.dst is not None
+    put('wside', 1 if (op.side is not None or op.sdup) else 0)
     put('tr', 1 if op.tr else 0)
     return w
 
@@ -312,28 +319,31 @@ def k_tl(rows=TL_NV):
 
 def k_proj(rows=PJ_NV):
     # inputs from the projection queue (x y z w u v shade at 0-6 of a row of
-    # 8), results into the projection output buffer in the same layout
+    # 8), results into the projection output buffer: x y at 0-1, 1/w at 2
+    # (the rasteriser's depth and perspective plane, R62), u/w v/w at 4-5,
+    # shade shade' at 6-7. Window z and w are not sent (R62).
     ops = []
     rb = [PJB + v * PJ_W for v in range(rows)]
     OOW, X, Y, Z, U, V = range(6)
     for v, b in enumerate(rb):
         ops.append(Op(sa(v * 8 + 3), k('one'), None, dst=b + OOW, div=True))       # 1 / w
-    for comp, r in ((0, X), (1, Y), (2, Z)):
+    for comp, r in ((0, X), (1, Y)):
         for v, b in enumerate(rb):
             ops.append(mac(sa(v * 8 + comp), rf(b + OOW), None, dst=b + r))
     for comp in (4, 5):
         for v, b in enumerate(rb):
             ops.append(mac(sa(v * 8 + comp), rf(b + OOW), None, side=v * 8 + comp))
-    for comp in (3, 6, 7):
+    for v, b in enumerate(rb):
+        ops.append(mac(rf(b + OOW), k('one'), None, side=v * 8 + 2))            # 1 / w out
+    for comp in (6, 7):
         for v, b in enumerate(rb):
-            ops.append(mac(sa(v * 8 + comp), k('one'), None, side=v * 8 + comp))  # w, shade, shade' pass through
-    for r in (X, Y, Z):
+            ops.append(mac(sa(v * 8 + comp), k('one'), None, side=v * 8 + comp))  # shade, shade' pass through
+    for r in (X, Y):
         for b in rb:
             ops.append(mac(rf(b + r), k('half'), k('half'), dst=b + r))
     for v, b in enumerate(rb):
         ops.append(mac(rf(b + X), bc(0, BC_VW), bc(0, BC_VX), side=v * 8 + 0))
         ops.append(mac(rf(b + Y), bc(0, BC_VH), bc(0, BC_VY), side=v * 8 + 1))
-        ops.append(mac(rf(b + Z), bc(0, BC_ZS), bc(0, BC_ZO), side=v * 8 + 2))
     return ops
 
 def k_clip():
@@ -479,6 +489,48 @@ def k_setup3(np_):
     assert T0 + 3 * np_ < 98
     return ops
 
+# The set-up as built (r3d_geo SETUP_OUT, m2-notes section 15): one triangle a
+# lane, its inputs in the set-up staging side memory (the projection queue's
+# upper half, written by the set-up port): X_v at v, Y_v at 3 + v, parameter i
+# of sorted vertex v at 6 + 3 i + v (textured 1/w, u/w, v/w, shade; untextured
+# 1/w, shade). Operand a reads them straight from the side memory; X and Y are
+# also needed at ports B and C, so six copies put them in registers, and the
+# same operations write them out (sdup: register and set-up output at one
+# address). Outputs, the set-up output memory, a 32-word slot a lane:
+#   0-5 x1 y1 x2 y2 x3 y3, 6 det, 8 + 4 i + {0, 1, 2} pdx, pdy, ps of
+#   parameter i, 8 + 4 i + 3 parameter i of sorted vertex 1 (ps when flat).
+# Rounding order as k_setup3 (rtl_tri::setup's).
+SO_X, SO_DET = 32, 38   # X_v, Y_v at 32 + 2v, 33 + 2v (output words 0-5), det at 38 (word 6)
+def k_setup_so(np_):
+    ops = []
+    one = k('one')
+    X = [SO_X + 2 * v for v in range(3)]; Y = [SO_X + 2 * v + 1 for v in range(3)]
+    sX = [0, 1, 2]; sY = [3, 4, 5]
+    sP = lambda i, v: 6 + 3 * i + v
+    A = {(r, c): 40 + 3 * r + c for r in range(3) for c in range(3)}
+    U = 49; DET = SO_DET; IDET = 52; T0 = 53
+    for v in range(3):
+        ops.append(mac(sa(sY[v]), one, None, dst=Y[v], sdup=True))
+        ops.append(mac(sa(sX[v]), one, None, dst=X[v], sdup=True))
+    for r, (j, kk) in enumerate(((1, 2), (2, 0), (0, 1))):
+        ops.append(mac(sa(sY[j]), one, rf(Y[kk]), negc=True, dst=A[(r, 0)]))
+        ops.append(mac(sa(sX[kk]), one, rf(X[j]), negc=True, dst=A[(r, 1)]))
+        ops.append(mac(sa(sX[kk]), rf(Y[j]), None, dst=U + r))
+        ops.append(mac(sa(sX[j]), rf(Y[kk]), rf(U + r), negc=True, dst=A[(r, 2)]))
+    ops.append(mac(rf(A[(0, 2)]), one, rf(A[(1, 2)]), dst=DET))
+    ops.append(mac(rf(DET), one, rf(A[(2, 2)]), dst=DET, sdup=True))
+    ops.append(Op(rf(DET), one, None, dst=IDET, div=True))
+    for i in range(np_):
+        ops.append(mac(sa(sP(i, 0)), one, None, side=8 + 4 * i + 3))
+        for c in range(3):
+            acc = T0 + 3 * i + c
+            ops.append(mac(sa(sP(i, 0)), rf(A[(0, c)]), None, dst=acc))
+            ops.append(mac(sa(sP(i, 1)), rf(A[(1, c)]), rf(acc), dst=acc))
+            ops.append(mac(sa(sP(i, 2)), rf(A[(2, c)]), rf(acc), dst=acc))
+            ops.append(mac(rf(acc), rf(IDET), None, side=8 + 4 * i + c))
+    assert T0 + 3 * np_ <= 98 and IDET < T0
+    return ops
+
 def k_face():
     # the per-polygon back-face test, one polygon a lane, four rows: the face
     # normal into view space (n x T, 9 MACs), folded through the projection
@@ -521,14 +573,9 @@ KERNELS = [
     ('SMFR', k_smfr),
 ]
 
-def main():
-    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    setup = '--setup-kernels' in sys.argv
-    if setup:
-        KERNELS.extend([('SETUP5', lambda: k_setup(5)), ('SETUP2', lambda: k_setup(2))])
-        if R3: KERNELS.append(('FACE', k_face))
+def build(kernels):
     words, entries, lengths, nops = [], {}, {}, {}
-    for name, fn in KERNELS:
+    for name, fn in kernels:
         ops = fn()
         t_issue, end = schedule(ops)
         entries[name] = len(words)
@@ -549,16 +596,19 @@ def main():
         lengths[name] = end + 1
         nops[name] = len(ops)
         print('%-8s %4d ops, %4d cycles, %4d words' % (name, len(ops), end + 1, len(prog)), file=sys.stderr)
+    return words, entries, lengths, nops
+
+HDR = ("// SPDX-License-Identifier: GPL-3.0-or-later\n//\n// Sega Model 3 core for MiSTer FPGA\n"
+       "// Copyright (C) 2026 alphanu1\n//\n// Generated by sim/real3d/gen_ucode.py; do not edit.\n\n")
+
+def write_rom(path, module, words, note):
     depth = 1 << (len(words) - 1).bit_length()
-    print('ROM %d words of %d bits (depth %d)' % (len(words), WORD_W, depth), file=sys.stderr)
-    assert len(words) <= (1024 if setup else 512)
-    hdr = ("// SPDX-License-Identifier: GPL-3.0-or-later\n//\n// Sega Model 3 core for MiSTer FPGA\n"
-           "// Copyright (C) 2026 alphanu1\n//\n// Generated by sim/real3d/gen_ucode.py; do not edit.\n\n")
-    with open(os.path.join(root, 'rtl/real3d/r3d_ucode.sv'), 'w') as f:
-        f.write(hdr)
-        f.write("// r3d_vpu micro-code ROM, %d words of %d bits, in block RAM.\n\n" % (len(words), WORD_W))
-        f.write("module r3d_ucode (\n  input  logic        clk,\n  input  logic [9:0]  addr,\n"
-                "  output logic [%d:0] q\n);\n" % (WORD_W - 1))
+    print('%s: %d words of %d bits (depth %d)' % (module, len(words), WORD_W, depth), file=sys.stderr)
+    with open(path, 'w') as f:
+        f.write(HDR)
+        f.write("// r3d_vpu micro-code ROM%s, %d words of %d bits, in block RAM.\n\n" % (note, len(words), WORD_W))
+        f.write("module %s (\n  input  logic        clk,\n  input  logic [9:0]  addr,\n"
+                "  output logic [%d:0] q\n);\n" % (module, WORD_W - 1))
         f.write("  (* romstyle = \"M10K\" *) logic [%d:0] rom [0:%d];\n" % (WORD_W - 1, depth - 1))
         f.write("  initial begin\n")
         for i in range(depth):
@@ -566,6 +616,29 @@ def main():
             f.write("    rom[%d] = %d'h%x;\n" % (i, WORD_W, w))
         f.write("  end\n")
         f.write("  always_ff @(posedge clk) q <= rom[addr[%d:0]];\nendmodule\n" % ((depth - 1).bit_length() - 1))
+
+def main():
+    global R3
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    setup = '--setup-kernels' in sys.argv
+    base = list(KERNELS)
+    if setup:
+        # measurement (R60, R65): textured: 1/w, u/w, v/w, shade; untextured: 1/w, shade (R62: no w plane)
+        KERNELS.extend([('SETUP4', lambda: k_setup(4)), ('SETUP2', lambda: k_setup(2))])
+        if R3: KERNELS.append(('FACE', k_face))
+    words, entries, lengths, nops = build(KERNELS)
+    assert len(words) <= (1024 if setup else 512)
+    write_rom(os.path.join(root, 'rtl/real3d/r3d_ucode.sv'), 'r3d_ucode', words, '')
+    if not setup:
+        # the set-up output ROM (r3d_vpu SU_ROM, r3d_geo SETUP_OUT): every kernel of
+        # the default ROM at the same address, then the set-up kernels with port C
+        R3 = True
+        print('-- set-up output ROM', file=sys.stderr)
+        sw, se, sl, sn = build(base + [('SETUP4', lambda: k_setup_so(4)), ('SETUP2', lambda: k_setup_so(2))])
+        assert sw[:len(words)] == words and len(sw) <= 1024
+        write_rom(os.path.join(root, 'rtl/real3d/r3d_ucode_su.sv'), 'r3d_ucode_su', sw, ' with the set-up kernels (SETUP_OUT)')
+        for n in ('SETUP4', 'SETUP2'):
+            entries[n], lengths[n], nops[n] = se[n], sl[n], sn[n]
     consts = [('MT', MT), ('CO', CO), ('PR', PR), ('TR', TR),
               ('GA', GA), ('GB', GB), ('GC', GC), ('GO', GO), ('CT', CT),
               ('TLB', TLB), ('TL_W', TL_W), ('PJB', PJB), ('PJ_W', PJ_W), ('TL_NV', TL_NV), ('PJ_NV', PJ_NV),
@@ -576,12 +649,11 @@ def main():
               ('BC_VW', BC_VW), ('BC_VX', BC_VX), ('BC_VH', BC_VH), ('BC_VY', BC_VY), ('BC_T', BC_T),
               ('BC_CU', BC_CU), ('BC_CL', BC_CL), ('BC_ZS', BC_ZS), ('BC_ZO', BC_ZO), ('BC_L2N', BC_L2N), ('BC_K', BC_K)]
     with open(os.path.join(root, 'rtl/real3d/r3d_ucode_pkg.sv'), 'w') as f:
-        f.write(hdr)
+        f.write(HDR)
         f.write("package r3d_ucode_pkg;\n")
         for name in entries:
-            f.write("  localparam logic [9:0] K_%s = 10'd%d;  // %d cycles, %d ops\n" % (name, entries[name], lengths[name], nops[name]))
-        if not setup:
-            f.write("  localparam logic [9:0] K_SETUP5 = 10'd0, K_SETUP2 = 10'd0;  // not built (--setup-kernels)\n")
+            note = '  (set-up output ROM, r3d_ucode_su)' if (not setup and name.startswith('SETUP')) else ''
+            f.write("  localparam logic [9:0] K_%s = 10'd%d;  // %d cycles, %d ops%s\n" % (name, entries[name], lengths[name], nops[name], note))
         if 'FACE' not in entries:
             f.write("  localparam logic [9:0] K_FACE = 10'd0;  // not built (--setup-kernels --3r)\n")
         for n, v in consts:
@@ -591,7 +663,7 @@ def main():
             f.write("  localparam int U_%s = %d, UW_%s = %d;\n" % (n.upper(), lo, n.upper(), w))
         f.write("endpackage\n")
     with open(os.path.join(root, 'sim/real3d/r3d_ucode.h'), 'w') as f:
-        f.write(hdr)
+        f.write(HDR)
         f.write("#pragma once\nnamespace r3d_uc {\n")
         for name in entries:
             f.write("constexpr unsigned K_%s = %d, LEN_%s = %d;\n" % (name, entries[name], name, lengths[name]))

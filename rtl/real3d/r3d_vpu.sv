@@ -41,6 +41,9 @@
 // {1, sp_a, ra[1:0]}, a result flagged dstk writes {1, sp_d, dst[1:0]}; both
 // latched at kernel start.
 //
+// A word may write both its lane register and the side memory at the same
+// address (wrf and wside set): the set-up's copies of its inputs.
+//
 // Results: lane register, broadcast entry (lane j writes bank j: a matrix
 // product lands column j in bank j, immediately readable as a broadcast
 // operand), or a side memory (vertex store, projection output) written by the
@@ -72,7 +75,10 @@ module r3d_vpu
   // field's address
   parameter bit SETUP_3R = 1'b0,
   // the broadcast file in block RAM (8 x 32 x 32, read registered either way)
-  parameter bit BC_M10K  = 1'b0
+  parameter bit BC_M10K  = 1'b0,
+  // the ROM with the set-up kernels (r3d_ucode_su: the default ROM's kernels at
+  // the same addresses, then SETUP4 and SETUP2; r3d_geo SETUP_OUT)
+  parameter bit SU_ROM   = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -108,7 +114,14 @@ module r3d_vpu
   logic        running, fetch;
   logic [6:0]  wcnt;
 
-  r3d_ucode u_rom (.clk, .addr(pc), .q(uw));
+  // explicit port connections: with implicit ones (.clk) Quartus 17 wants
+  // r3d_ucode_su declared even when SU_ROM = 0, and the default build's file
+  // lists do not carry it
+  generate if (SU_ROM) begin : g_rom_su
+    r3d_ucode_su u_rom (.clk(clk), .addr(pc), .q(uw));
+  end else begin : g_rom
+    r3d_ucode u_rom (.clk(clk), .addr(pc), .q(uw));
+  end endgenerate
 
   function automatic logic [31:0] fld(input logic [UW-1:0] w, input int lo, input int n);
     fld = 32'((w >> lo) & ((UW'(1) << n) - UW'(1)));
@@ -357,21 +370,27 @@ module r3d_vpu
       .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(c_d[4]), .sub(1'b0),
       .out_valid(sv), .result(sum), .overflow(), .underflow(s_unf), .invalid());
 
-    // post-op at +11
-    logic [31:0] res;
+    // post-op at +11: which constant replaces the sum, pz +0 or pk the clamp
+    // (1.0 Supermodel, 255 MAME). Only the flags are decided at +11; they are
+    // registered beside the raw result and applied on the way into each
+    // memory at +12, the cycle that otherwise only routes the register to the
+    // memory's input (the clamp's compare and its 32-bit select in front of
+    // the write-back register missed 10 ns at -40C, R73's lateack_s3)
+    logic        pz, pk;
     logic        neg, isnan, iszero;
+    localparam logic [31:0] PK = SM_LIGHT ? 32'h3f80_0000 : 32'h437f_0000;
     always_comb begin
       isnan  = (sum[30:23] == 8'hff) && (sum[22:0] != 23'd0);
       iszero = (sum[30:0] == 31'd0);
       neg    = sum[31] && !isnan && !iszero;
-      res = sum;
+      pz = 1'b0; pk = 1'b0;
       if (SM_LIGHT) begin
-        if (wq[11].post == 2'd1 && neg) res = 32'h0000_0000;
+        if (wq[11].post == 2'd1 && neg) pz = 1'b1;
         else if ((wq[11].post == 2'd1 || wq[11].post == 2'd2) && !sum[31] && !isnan && sum[30:0] > 31'h3f80_0000)
-          res = 32'h3f80_0000;
+          pk = 1'b1;
       end else begin
-        if ((wq[11].post == 2'd1 || wq[11].post == 2'd3) && neg) res = 32'h0000_0000;
-        else if (wq[11].post == 2'd3 && !sum[31] && !isnan && sum[30:0] > 31'h437f_0000) res = 32'h437f_0000;
+        if ((wq[11].post == 2'd1 || wq[11].post == 2'd3) && neg) pz = 1'b1;
+        else if (wq[11].post == 2'd3 && !sum[31] && !isnan && sum[30:0] > 31'h437f_0000) pk = 1'b1;
       end
     end
 
@@ -379,7 +398,8 @@ module r3d_vpu
     assign div_wb = dv[11] && d_ov && dl[11] == l && dcur.lanes[l];
 
     // write-back: the result, the divide's or the external port's, chosen at
-    // +11 and registered, so every memory is written from a register (+12)
+    // +11 and registered with its post-op flags; each memory is written at
+    // +12 from the register, the flags' constant put in on the way
     logic        we_n, bwe_n;
     logic [7:0]  wa_n;
     logic [4:0]  bwa_n;
@@ -389,7 +409,7 @@ module r3d_vpu
     logic        mac_l;
     logic [31:0] rr;
     assign mac_l = mac10 && wq[11].lanes[l];
-    assign rr = mac_l ? res : d_res;
+    assign rr = mac_l ? sum : d_res;
     always_comb begin
       we_n = 1'b0; wa_n = ext_waddr; wd_n = ext_wdata[l];
       if (mac_l && wq[11].wrf) begin
@@ -408,12 +428,26 @@ module r3d_vpu
         bwe_n = 1'b1;
       end
     end
+    logic [31:0] wd_r, bwd_r, swd_r;
+    logic        wpz, wpk, spz, spk;
     always_ff @(posedge clk) begin
-      we <= we_n && !rst; wa <= wa_n; wd <= wd_n;
-      bc_we[l] <= bwe_n && !rst; bc_waddr[l] <= bwa_n; bc_wdata[l] <= bwd_n;
+      we <= we_n && !rst; wa <= wa_n; wd_r <= wd_n;
+      wpz <= mac_l && wq[11].wrf && pz; wpk <= mac_l && wq[11].wrf && pk;
+      bc_we[l] <= bwe_n && !rst; bc_waddr[l] <= bwa_n; bwd_r <= bwd_n;
       sw_we[l] <= mac10 && wq[11].wside && wq[11].lanes[l] && !rst;
-      sw_data[l] <= res;
+      swd_r <= sum; spz <= pz; spk <= pk;
     end
+    // the micro-code puts post-op results only in the lane registers, and, with
+    // MAME's rows, the shade clamp (post 3) into a side memory; never into the
+    // broadcast file (gen_ucode.py asserts it), so only those carry the select
+    assign wd = wpz ? 32'd0 : wpk ? PK : wd_r;
+    assign bc_wdata[l] = bwd_r;
+    assign sw_data[l] = SM_LIGHT ? swd_r : spz ? 32'd0 : spk ? PK : swd_r;
+`ifdef VERILATOR
+    always_ff @(posedge clk)
+      if (mac10 && wq[11].lanes[l] && (pz || pk) && (wq[11].wbc || (SM_LIGHT && wq[11].wside)))
+        $error("r3d_vpu: a post-op result into a memory without the post-op select");
+`endif
 
 `ifdef VERILATOR
     // subnormal monitor: operands at +2 (multiplier and divider inputs), the

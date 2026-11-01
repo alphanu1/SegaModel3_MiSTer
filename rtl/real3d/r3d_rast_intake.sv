@@ -15,9 +15,12 @@
 // the rasteriser's fixed point out. Bit for bit r3d_rast_rtl.cpp
 // rtl_tri::setup's to_fix and make_plane.
 //
-// Record: words 0-2 the polygon header (word 0 [4] texture on), 3-8 the
-// y-sorted screen x, y (FP32), 9 det, then per parameter pdx, pdy, ps (FP32):
-// five parameters textured, two untextured.
+// Record (SETUP4 = 1, the default: R65, m2-notes.md section 15): words 0-3
+// the polygon header (word 0 [4] texture on; word 3 fog intensity, layer,
+// facing), 4-9 the y-sorted screen x, y (FP32), 10 det, then per parameter
+// pdx, pdy, ps (FP32): 1/w, u/w, v/w, shade textured (23 words), 1/w, shade
+// untextured (17). SETUP4 = 0 takes R62's record (section 14): a 3-word
+// header and five parameters textured, w first.
 //
 // One FP32-to-fixed converter serves every field (study 8.4: converters
 // time-shared). A vertex is f 2^16 rounded to nearest, ties away from zero,
@@ -33,9 +36,20 @@
 // Out, a field a beat: tag 0-5 vertex x1 y1 x2 y2 x3 y3 (32 bits), tag 6
 // det's raw word, then per parameter p tags 8 + 4p .. 11 + 4p: e (signed 9),
 // c = ps, dx, dy (signed 40). o_last on the record's last field. The record's
-// header words go out first, tag 15 (three beats).
+// header words go out first, tag 31 (four beats; three with SETUP4 = 0). No
+// parameter tag reaches 31 (the last is 27), so every tag names one field.
+//
+// MIP = 1 (study D-33, R67): the header has one more word, the geometry's LOD
+// word B (r3d_geo LOD_WORD), and its tag-31 beat carries the triangle's LOD
+// terms in its place: [16:0] K = 97664 - {E(B), T[B's top six mantissa
+// bits]} (T the 64-entry 256 log2 table; 0 when B is not positive and finite,
+// which gives level 0), [20:17] the highest level 4 + min(width code, height
+// code). r3d_rast_interp's i_lk and i_lvm take them.
 
-module r3d_rast_intake (
+module r3d_rast_intake #(
+  parameter bit SETUP4 = 1'b1,
+  parameter bit MIP = 1'b0
+) (
   input  logic        clk,
   input  logic        rst,
 
@@ -59,6 +73,30 @@ module r3d_rast_intake (
   // vertices saturate above 7). Header words, det and e pass as raw fields.
 
   localparam logic [1:0] K_RAW = 2'd0, K_VTX = 2'd1, K_PLN = 2'd2;
+  localparam logic [4:0] HW = (SETUP4 ? 5'd4 : 5'd3) + (MIP ? 5'd1 : 5'd0);    // header words
+
+  // MIP: 256 log2(1 + (i + 1/2) / 64), rounded (r3d_rast_interp's table)
+  function automatic logic [7:0] log2t(input logic [5:0] i);
+    case (i)
+      6'd0: log2t = 8'd3;    6'd1: log2t = 8'd9;    6'd2: log2t = 8'd14;   6'd3: log2t = 8'd20;
+      6'd4: log2t = 8'd25;   6'd5: log2t = 8'd30;   6'd6: log2t = 8'd36;   6'd7: log2t = 8'd41;
+      6'd8: log2t = 8'd46;   6'd9: log2t = 8'd51;   6'd10: log2t = 8'd56;  6'd11: log2t = 8'd61;
+      6'd12: log2t = 8'd66;  6'd13: log2t = 8'd71;  6'd14: log2t = 8'd75;  6'd15: log2t = 8'd80;
+      6'd16: log2t = 8'd85;  6'd17: log2t = 8'd89;  6'd18: log2t = 8'd94;  6'd19: log2t = 8'd98;
+      6'd20: log2t = 8'd103; 6'd21: log2t = 8'd107; 6'd22: log2t = 8'd111; 6'd23: log2t = 8'd116;
+      6'd24: log2t = 8'd120; 6'd25: log2t = 8'd124; 6'd26: log2t = 8'd128; 6'd27: log2t = 8'd132;
+      6'd28: log2t = 8'd136; 6'd29: log2t = 8'd140; 6'd30: log2t = 8'd144; 6'd31: log2t = 8'd148;
+      6'd32: log2t = 8'd152; 6'd33: log2t = 8'd155; 6'd34: log2t = 8'd159; 6'd35: log2t = 8'd163;
+      6'd36: log2t = 8'd167; 6'd37: log2t = 8'd170; 6'd38: log2t = 8'd174; 6'd39: log2t = 8'd178;
+      6'd40: log2t = 8'd181; 6'd41: log2t = 8'd185; 6'd42: log2t = 8'd188; 6'd43: log2t = 8'd192;
+      6'd44: log2t = 8'd195; 6'd45: log2t = 8'd198; 6'd46: log2t = 8'd202; 6'd47: log2t = 8'd205;
+      6'd48: log2t = 8'd208; 6'd49: log2t = 8'd212; 6'd50: log2t = 8'd215; 6'd51: log2t = 8'd218;
+      6'd52: log2t = 8'd221; 6'd53: log2t = 8'd224; 6'd54: log2t = 8'd228; 6'd55: log2t = 8'd231;
+      6'd56: log2t = 8'd234; 6'd57: log2t = 8'd237; 6'd58: log2t = 8'd240; 6'd59: log2t = 8'd243;
+      6'd60: log2t = 8'd246; 6'd61: log2t = 8'd249; 6'd62: log2t = 8'd252; default: log2t = 8'd255;
+    endcase
+  endfunction
+  logic [3:0] lvm_r;          // MIP: 4 + min(width code, height code), from word 0
 
   wire adv = !o_valid || o_ready;
 
@@ -143,12 +181,18 @@ module r3d_rast_intake (
         f_last <= 1'b0;
         // sh = E - 134, a = 148 - E
         f_a    <= 11'sd148 - $signed({3'b000, i_data[30:23]});
-        if (wc <= 5'd2) begin
-          f_v <= 1'b1; f_tag <= 5'd15; f_kind <= K_RAW;
-          if (wc == 5'd0) np_left <= i_data[4] ? 3'd5 : 3'd2;
-        end else if (wc <= 5'd8) begin
-          f_v <= 1'b1; f_tag <= 5'(wc - 5'd3); f_kind <= K_VTX;
-        end else if (wc == 5'd9) begin
+        if (wc < HW) begin
+          f_v <= 1'b1; f_tag <= 5'd31; f_kind <= K_RAW;
+          if (wc == 5'd0) np_left <= i_data[4] ? (SETUP4 ? 3'd4 : 3'd5) : 3'd2;
+          if (MIP && wc == 5'd0) lvm_r <= 4'd4 + {1'b0, (i_data[8:6] < i_data[11:9]) ? i_data[8:6] : i_data[11:9]};
+          if (MIP && wc == HW - 5'd1) begin
+            logic ok;
+            ok = !i_data[31] && i_data[30:23] != 8'hff && i_data[30:0] != 31'd0;
+            f_raw <= {19'd0, lvm_r, ok ? 17'(17'd97664 - {1'b0, i_data[30:23], log2t(i_data[22:17])}) : 17'd0};
+          end
+        end else if (wc < HW + 5'd6) begin
+          f_v <= 1'b1; f_tag <= 5'(wc - HW); f_kind <= K_VTX;
+        end else if (wc == HW + 5'd6) begin
           f_v <= 1'b1; f_tag <= 5'd6; f_kind <= K_RAW;
           pk <= 2'd0; pnum <= 3'd0; emx <= 9'd0;
         end else begin

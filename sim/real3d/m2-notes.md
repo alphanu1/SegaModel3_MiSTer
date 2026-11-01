@@ -727,6 +727,9 @@ The triangle a beat (672 vertex flip-flops and about 1,100 output wires) is gone
 | 2 | colour: h4 >> 8 or the colour-table word, R in [23:16] |
 | 3 + 7k .. 9 + 7k | vertex k: screen x, screen y, z (GL window depth, larger nearer), w (depth), 256 u / w, 256 v / w, shade (FP32, 255 x intensity; may be negative, never above 255) |
 
+(Replaced in section 15: a fourth header word, six words a vertex with 1/w for z
+and w, a viewport record, and the facing test in the geometry.)
+
 The polygon is the fan (v0, v[i-1], v[i]), i = 2..n-1, in MAME's order. A
 double-sided polygon comes as two records, the inverted copy first; the
 rasteriser culls whichever faces away (the copy with the face normal negated).
@@ -1210,6 +1213,9 @@ the input port and its facing test an estimated 250-450 ALM and 1-2 DSP, against
 
 ### The set-up's output, for the rasteriser
 
+(Section 15 replaces this: no w plane, 1/w for every triangle, a 4-word header,
+one record per double-sided polygon from the normal test.)
+
 With the set-up on the pool, the geometry would hand the rasteriser triangles, not
 fans, as word-stream records (the record header of section 11 unchanged, its
 vertex count field 3):
@@ -1325,3 +1331,1047 @@ targeted is gone), and 14 new ones for what this pass restructured.
   port; that port is not built, and Daytona 2 has to be measured before the
   rasteriser drops its own set-up unit.
 - N4, N6, G5 and G8 need directed benches; N2 stays masked by D11's guard.
+
+## 15. The facing test beside the pool, the R62 record, Step 2.1 (fifth build)
+
+Study R62 found that the screen winding agrees with Supermodel's view-space
+back-face test on only 58-69% of single-sided triangles, and that culling by the
+winding damages the image. Section 14's 83.6% / 79.6% used the model's verdict
+loaded into the RTL (simulation only), while its "hardware form" was a 2D cross
+product. This build makes the normal test real hardware beside the pool, adds what
+the rasteriser asked for in R62, and runs Daytona 2 (Step 2.1) through the model
+and the RTL.
+
+### The facing test
+
+Supermodel's test (`R3DShaderTriangles.h`, `CalcBackFace`) is d = dot(view vertex,
+mat3(modelview) x face normal), the polygon facing away when d > 0. The model takes
+vertex 0. MAME's view space is GL eye space with y negated, which leaves the dot
+unchanged. I first measured in the model what precision the test needs. Disagreements
+with the same test in double, single-sided polygons of 400 + 400 frames (VF3
+2,930,614, Bass Fishing 1,134,655):
+
+| Form | VF3 | Bass Fishing |
+|---|---|---|
+| FP32, V = ((x T0 + y T1) + z T2) + T3, N = (n0 T0 + n1 T1) + n2 T2, d = (V0 N0 + V1 N1) + V2 N2 | 0 | 0 |
+| the same at a 20-bit mantissa | 0 | 0 |
+| 18 / 16 / 14 / 12 bits | 13 / 18 / 49 / 128 | 2 / 3 / 11 / 44 |
+| block fixed point: the matrix at one exponent, V and N exact, then 27 bits each, d exact | 0 | 0 |
+| the same at 20 / 18 / 16 bits | 1 / 10 / 44 | 1 / 7 / 27 |
+| model space with the eye position, matrix taken as a similarity | 31 | 0 |
+| model space with the eye from the true inverse | 840 | 1 |
+| Q = M M^T and r = M t in FP32 per model, then d = v0 Q n + r.n exactly | 28,715-805,427 | 7,707-204,685 |
+
+The last row fails by cancellation: for a large model whose origin is far from the
+camera, t.N and (v0 M).N are both large and d is their difference, so Q and r would
+need far more than FP32. The model-space forms differ from Supermodel's where the
+model matrix is not a similarity (0.54% of VF3's polygons have a deviation over 0.1;
+Supermodel uses mat3(modelview), not its inverse transpose). The test is cheap only in
+its inputs: vertex 0 and the face normal are integers, but the matrix is FP32 and V
+has to be formed before the dot. So the model's test is now the FP32 form of the first
+row, in that order (`r3d_geo.cpp`, `sm_cull`), and the hardware computes exactly that.
+Over all 800 frames it equals the double test on every polygon; on Daytona 2 it
+differs on 14 of 2,136,440 (20 more have d exactly 0).
+
+`r3d_face.sv` is one FP32 multiply-add beside the pool: the pool's own `r3d_fp_mul`
+and `r3d_fp_add` (flush to zero, the adder's align stage split as in the lanes), a
+32-word MLAB for four polygons' inputs (vertex 0 and the face normal as raw 24-bit
+words, converted to FP32 on the way to the multiplier; then V0..V2 over the
+position), and a 32-word MLAB for the
+model matrix of two models and N0..N2 of two polygons. A period is four rounds of
+seven slots: the V and N chains of the polygon in hand in slots 0-5, the d chain of the
+polygon before it in slot 6. A chain's steps are seven cycles apart, so each step takes
+its predecessor's sum straight from the adder's output, two cycles later: no
+accumulators. 28 cycles a polygon; its random bench (`make test_real3d_face`, three
+seeds of 300,000 polygons with gaps on both ports) has no verdict wrong.
+
+Where its inputs come from:
+- **The model matrix**: main reads the TR rows out of the pool after the model's
+  set-up kernel, through the external read port, a word a cycle (17 cycles a model,
+  the engine idle and held). Two buffers alternate by model; main clears a buffer
+  before the decoder can commit a polygon of the new model, and waits if the model
+  two back still has a polygon in the test.
+- **Vertex 0 and the face normal**: the decoder writes the header's words 1-3 as they
+  stream in, and vertex 0's x y z either as they stream in (a new vertex 0) or from
+  its slot entry's raw words during the header (a reused one; the slot memory's read
+  port is idle there). No decoder cycle is added unless all four slots are full.
+- **The verdict** goes into a 32-entry ring by polygon number. The polygon machine
+  waits for it, and with `FACE_DROP` (the default) skips a single-sided back face
+  before its assembly and clip, so back faces cost no CLIP or projection kernel.
+
+Back faces are 42% of the single-sided polygons in every game (VF3 1,227,146 of
+2,930,333; Bass Fishing 478,963 of 1,133,455; Daytona 2 908,093 of 2,136,440), and
+46-49% of the triangles: VF3 1,959,033 of 4,272,181, Bass Fishing 1,328,382 of
+2,718,227.
+
+### The record (R62)
+
+Polygon record, 4 + 6 n words (a triangle 22, a quad 28; section 11 was 3 + 7 n):
+
+| Word | Bits |
+|---|---|
+| 0 | [1:0] priority pass, [2] alpha buffer, [3] inverted copy of a double-sided polygon, [4] texture on, [5] texture page, [8:6] texture width code, [11:9] height code, [14:12] texel format, [20:15] MAME's TRI_PARAM bits, [26:21] transparency (32 = opaque), [31:27] vertex count n (3..16) |
+| 1 | [19:0] polygon number, [25:20] texture x / 32, [30:26] texture y / 32 |
+| 2 | colour: h4 >> 8 or the colour-table word |
+| 3 | [4:0] fog intensity (header[6] bits 11-15), [5] translucency layer select (header[6] bit 17), [6] faces away (the normal test) |
+| 4 + 6k .. 9 + 6k | vertex k: screen x, screen y, 1/w, 256 u / w, 256 v / w, shade (FP32) |
+
+1/w is every triangle's, textured or not: the projection kernel's own reciprocal
+(its OOW register) goes to the output buffer where z was. Window z and w are no
+longer computed or sent, which took the projection kernel from 60 to 48 operations
+and 86 to 74 cycles (PROJ3 69 to 68, PROJ1 61 to 60). The bench checks 1/w as the
+model's reciprocal of its w.
+
+Viewport record, 6 words, sent before the viewport's polygons (vertex count 0 marks
+it): {0, pass 2}; node word 0x20 (scroll fog); 0x22 (fog colour); 0x23 (fog density,
+FP32); 0x25 (fog ambient [23:16], fog start [15:0]); kz (FP32, the depth scale the
+rasteriser's fog divides by: 1.0 with Supermodel's frustum, 2fn / (f - n) with
+MAME's). Main reads words 0x20-0x25 at the end of the viewport's set-up.
+
+A double-sided polygon's inverted copy has -d exactly. With `FACE_DROP` the geometry
+sends only the record facing the viewer (the copy when d > 0, the polygon when d < 0,
+both when d is exactly 0) and no single-sided back face, so word 3 bit 6 is always 0.
+`FACE_DROP = 0` sends every record (both copies, every back face) with bit 6 set on
+those facing away.
+
+The set-up's output (section 14), with these changes: the same 4-word header with
+n = 3; the three vertices' screen x, y sorted by y (6 words); det (1); then pdx, pdy,
+ps for p = 1/w, u/w, v/w, shade (textured, 12 words, a 23-word record) or p = 1/w,
+shade (untextured, 6 words, 17). There is no w plane. A double-sided polygon is set up
+once with the facing copy's shade (twice when d = 0), and back faces get no set-up
+and are not sent. The textured kernel is now SETUP4: 63 operations and 97 cycles
+(SETUP5 was 75 and 100), with an 18-word port load (21 before).
+
+### Step 2.1 and Daytona 2
+
+MAME changes two things with the step (`model3_v.cpp`): positions are 13.11 from Step
+1.5, and nodes have words 1 and 2 (offset 2). The model already had both (`--step`).
+The RTL has a `step15` input: the walker reads word 0, then words 3-9 into the same
+buffer places, and the decoder and the facing test take 2^-11 for positions.
+
+I made a new Daytona 2 set as `tools/mame-census/README.md` describes: Supermodel
+`036af1c` with the dump patch, the link at Single in its NVRAM (identical to
+`sm3-builds/daytona2.nv.bak`), every 30th frame from 1800 to 13770,
+`xvfb-run -n 212` (`sm3-builds/census/dumps_daytona2_r62`). A first short run had shown
+that Supermodel does not reproduce Daytona 2's dumps byte for byte (all five checked
+frames differ from the 2026-10-30 set), unlike VF3 and Bass Fishing, so the old set is
+kept beside it. MAME's replay of each set gives its triangle lists and the VROM image.
+
+The model, MAME's rows and correctly rounded frustum, `--step 21`, against MAME's
+lists: **every field bit-exact on all 400 frames of both sets** (4,173,093 triangles in
+the new one). Step 2.1's formats need nothing more in the model.
+
+Per frame at p99 (new set): 21,270 polygons, 66,880 new vertices, 2,582 models and 3,927
+nodes, against VF3's 16,612, 46,278, 1,096 and 1,831.
+
+The RTL with `step15`, Supermodel's frustum, culling and every row against the model
+(`--step 21`): **every field on all 400 frames** (2,868,892 triangles), in the default
+build and with the set-up load.
+
+### Cycles (bench, 12-20 cycle latency, 20% output stall; 100 MHz frame 1,738,530 cycles)
+
+p99 share of a frame, 400 frames each:
+
+| Build | VF3 | Bass Fishing | Daytona 2 |
+|---|---|---|---|
+| Section 14 (R60), no set-up | 63.5% | 63.8% | not run (Step 1.0 only) |
+| This build without the facing test (`SM_CULL = 0`, every record sent) | 62.5% | 62.1% | 96.9% |
+| This build, `FACE_DROP = 0` (the test runs, nothing dropped) | 64.9% | 64.1% | |
+| **This build, no set-up** | **61.3%** (1,066,378) | **56.9%** (989,111) | **93.9%** (1,632,908) |
+| Section 14, set-up with port C, facing beside the pool (the model's verdict), port load | 83.6% | 79.6% | |
+| **This build, set-up with port C, the facing test in hardware, port load** | **78.7%** (1,367,371) | **73.2%** (1,273,022) | **120.7%** (2,098,550) |
+
+Against section 14, the shorter projection kernel and record take 1.0 (VF3) and 1.7
+(Bass Fishing) points off; the facing test's own cost, its stalls and the 17-cycle
+matrix copy a model, adds 2.4 and 2.0; dropping back faces before their clip and
+projection takes 3.6 and 7.2 off again, a net 1.2, 5.2 and (Daytona 2) 3.0 points. The set-up
+on the pool fits under 85% on VF3 and Bass Fishing with 6 and 12 points to spare, but
+**Daytona 2 does not fit even without it**. Its heaviest frames hold the engine 76% of
+the time: transform and light 27.6% of the frame (TL and TL3), node culling 15.7% (CULLU
+53 cycles and CULLT 40 a node, latency bound), the node matrix product 9.4%, model set-up
+9.4%, projection 8.0%. That is 2,582 models and 3,927 nodes a frame against VF3's 1,096
+and 1,831: per-node and per-model work, which the vertex count R20 scaled by does not
+see.
+
+### Checks
+
+| What | Result |
+|---|---|
+| `r3d_face` against the model's FP32 test (`make test_real3d_face`): random matrices (exponents over 64 octaves, zeros), positions and normals, gaps on both ports, its holds honoured | 900,000 polygons on three seeds, 0 verdicts wrong, 0 subnormals; the other alignment of the adder's zero select (one cycle off) gets 47% wrong |
+| r3d_geo against the model, 400 VF3 + 400 Bass Fishing frames, every field of every triangle and every viewport record | every frame in ten builds: Supermodel's frustum with and without culling; MAME's correctly rounded frustum with and without; MAME's algebraic one; the default with MAME's rows; MAME throughout; `FACE_DROP = 0`; `OUT_M10K`; the set-up load |
+| The same, Daytona 2 (new set, `--step 21`) | every frame, default build and with the set-up load |
+| Subnormal or flushed value at the pool's units or the facing test's (monitors) | 0 in every build |
+| The model's FP32 facing test against the same test in double | VF3 0 of 2,930,333, Bass Fishing 0 of 1,133,455, Daytona 2 14 of 2,136,440 |
+| The model against MAME's lists, MAME's rows, `--step 21`, Daytona 2 | every field, 400 + 400 frames (two sets) |
+| `quartus_map --analyze_file` (the micro-code, `r3d_face`, `r3d_walker`, `r3d_geo`), then analysis and elaboration | pass |
+
+### Area and timing (Quartus 17.0, 5CSEBA6U23I7, standalone, 10 ns, `sm3-builds/r3d/r62/fit.sh`)
+
+| Build | Seed | ALM (with the 117 pin ALMs) | Registers | M10K | DSP | Fmax slow 100C |
+|---|---|---|---|---|---|---|
+| This build, default (`fits/face3`) | 1 | 8,197 | 8,878 | 12 | 11 | 106.15 MHz |
+| | 2 | 8,194 | 8,878 | 12 | 11 | 105.56 MHz |
+| | 3 | 8,201 | 8,895 | 12 | 11 | 112.55 MHz |
+| Section 14 (R60, `fits/e7`) | 1-3 | 7,276-7,293 | 8,101-8,145 | 12 | 10 | 104.1-111.5 MHz |
+
+All three seeds close 10 ns. Without the pins the geometry is **8,077-8,084 ALM: about
+910 above section 14, within D-27's 8,550 but about 480 above the 7,600 that the
+set-up port was to fit under**, before the port itself.
+
+By unit (seeds 1 / 2 / 3; section 14's seed 1 in brackets):
+
+| Unit | ALM | Registers | M10K | DSP | Fmax (worst path ending there) |
+|---|---|---|---|---|---|
+| Facing test (`r3d_face`) | 792 / 766 / 780 | 698-708 | 0 (40 ALM of MLAB) | 1 | 111.6 / 105.6 / 114.6 MHz |
+| - its adder | 332-336 | 284 | 0 | 0 | |
+| - its multiplier | 92-93 | 146 | 0 | 1 | |
+| Engine | 2,934 / 2,949 / 2,942 (2,938) | 4,628-4,656 | 11 | 10 | 117.1 / 113.5 / 118.1 MHz |
+| Walker | 583 / 577 / 586 (564) | 656 | 0 | 0 | 124.2 / 124.1 / 127.9 MHz |
+| Stream | 144 / 135 / 143 (127) | 162 | 0 | 0 | |
+| Controller, its memories and the pins | 3,744 / 3,767 / 3,749 (3,647) | | 1 | 0 | 106.1 / 109.9 / 112.5 MHz |
+
+The controller's +97 is the record (the fourth header word, the fog and layer bits in
+the emission ring, the six-word vertex), the viewport record, the decoder's feed, the
+verdict ring and main's matrix copy.
+
+**The facing test is the cost: about 780 ALM and 1 DSP**, of which the FP32 adder is
+a third. R60 had estimated 250-450 ALM for the input port and the facing test
+together, because the test was then a 2D cross product. With the normal it is a
+dot product of two vectors that are each formed from the FP32 matrix: 21 products and
+17 sums a polygon, and no integer form short of 20 bits (table above) avoids an
+adder's alignment and normalisation. The trades that would pay for it are those of
+section 14: `OUT_M10K` (-228 ALM, +4 M10K), `BC_M10K` (-140, +8), `SIDE_M10K` (-336,
++16), all a study decision.
+
+### Planted faults (`make test_real3d_faults4`; default build; frames 190-209 unless stated)
+
+Section 14's 50 re-run on this RTL (D2 now in the `FACE_DROP = 0` build, D11 at 90%
+output stall, F5, D5 and D9 over all 400 frames as before), and 15 new FA faults for the
+facing test, the record and Step 2.1 (FA11 and FA12 add 20 Daytona 2 frames). A fault
+that hangs the RTL stops at 20 M cycles a frame.
+
+| Fault | VF3 frames differing | Bass Fishing | Daytona 2 |
+|---|---|---|---|
+| F1_stack_pop | 20 / 20 | 3 / 20 |  |
+| F2_vertex_reuse | 20 / 20 | 3 / 20 |  |
+| F3_clip_order | 20 / 20 | 3 / 20 |  |
+| F4_recip_round | 20 / 20 | 3 / 20 |  |
+| F5_viewport_xy | 0 / 20 | 66 / 400 |  |
+| F6_pass_label | 20 / 20 | 4 / 20 |  |
+| F7_colour_table | 3 / 20 | 0 / 20 |  |
+| F8_shading_lit | 20 / 20 | 0 / 20 |  |
+| F9_intensity_limit | 20 / 20 | 0 / 20 |  |
+| F10_tex_x | 20 / 20 | 3 / 20 |  |
+| F11_viewport_wh | 20 / 20 | 3 / 20 |  |
+| F12_tls_bank | 20 / 20 | 3 / 20 |  |
+| F13_cordic_round | 20 / 20 | 3 / 20 |  |
+| N1_chunk_order | 20 / 20 | 19 / 20 |  |
+| N2_buffer_hazard | 0 / 20 | 0 / 20 |  | not caught
+| N3_pbuf_tag | 20 / 20 | 3 / 20 |  |
+| N4_ftz_sign | 0 / 20 | 0 / 20 |  | not caught
+| N5_vs_window | 3 / 20 | 0 / 20 |  |
+| N6_reuse_window | 0 / 20 | 0 / 20 |  | not caught
+| N8_sm_frustum | 20 / 20 | 3 / 20 |  |
+| N9_cull_verdict | 16 / 20 | 0 / 20 |  |
+| D1_normal_conv | 20 / 20 | 0 / 20 |  |
+| D2_double_second | 20 / 20 | 3 / 20 |  |
+| D3_sun_clamp | 20 / 20 | 0 / 20 |  |
+| D4_colour_base | 3 / 20 | 0 / 20 |  |
+| D5_fixed_sign | 29 / 400 | 0 / 400 |  |
+| D6_trans_drop | 0 / 20 | 20 / 20 |  |
+| D7_light_z | 20 / 20 | 0 / 20 |  |
+| D8_normal_matrix | 20 / 20 | 0 / 20 |  |
+| D9_reuse_key | 7 / 400 | 0 / 400 |  |
+| D10_copy_shade | 20 / 20 | 0 / 20 |  |
+| D11_list_hazard | 20 / 20 | 3 / 20 |  |
+| D12_trans_latch | 20 / 20 | 3 / 20 |  |
+| D13_const_load | 20 / 20 | 3 / 20 |  |
+| D14_div_ring | 20 / 20 | 3 / 20 |  |
+| G1_slot_alloc | 20 / 20 | 3 / 20 |  |
+| G2_slot_reuse | 20 / 20 | 3 / 20 |  |
+| G3_smfr_const | 20 / 20 | 3 / 20 |  |
+| G4_conv_ebase | 20 / 20 | 3 / 20 |  |
+| G5_outcode_eq | 0 / 20 | 0 / 20 |  | not caught
+| G6_amb_byte | 20 / 20 | 0 / 20 |  |
+| G7_div_rem | 20 / 20 | 3 / 20 |  |
+| G8_region_end | 0 / 20 | 0 / 20 |  | not caught
+| G9_record_bits | 20 / 20 | 0 / 20 |  |
+| G10_matrix_bank | 20 / 20 | 3 / 20 |  |
+| G11_addr_adder | 0 / 20 | 0 / 20 |  | not caught
+| G5b_outcode_sign | 5 / 20 | 0 / 20 |  |
+| G11b_addr_adder | 20 / 20 | 3 / 20 |  |
+| G12_result_mux | 20 / 20 | 0 / 20 |  |
+| FA1_facing_sign | 20 / 20 | 3 / 20 |  |
+| FA2_normal_matrix | 20 / 20 | 0 / 20 |  |
+| FA3_copy_choice | 20 / 20 | 3 / 20 |  |
+| FA3b_cull_flag | 20 / 20 | 3 / 20 |  |
+| FA4_fog_bits | 20 / 20 | 3 / 20 |  |
+| FA5_layer_bit | 20 / 20 | 3 / 20 |  |
+| FA6_vp_words | 0 / 20 | 20 / 20 |  |
+| FA7_vp_kz | 20 / 20 | 20 / 20 |  |
+| FA8_oow_word | 20 / 20 | 3 / 20 |  |
+| FA9_matrix_wait | 20 / 20 | 0 / 20 |  |
+| FA10_slot_gate | 20 / 20 | 0 / 20 |  |
+| FA11_step15_scale | 0 / 20 | 0 / 20 | 19 / 20 |
+| FA12_step15_node | 0 / 20 | 0 / 20 | 19 / 20 |
+| FA13_back_skip | 20 / 20 | 2 / 20 |  |
+| FA14_reused_v0 | 20 / 20 | 0 / 20 |  |
+| N7_div_lane | 0 / 20 | 3 / 20 |  |
+
+59 of 65 caught.
+
+### Wrong turns and findings
+
+- **The decoder wrote a polygon's face normal into a slot still in use.** Its writes
+  stalled the stream while the facing test's four slots were full, but the write
+  enable did not wait. The polygon that is first of its model waits for its matrix,
+  the slots fill behind it, and the next polygon's normal overwrote its own: 112
+  verdicts wrong in VF3 frame 190, every one the first polygon of a model (19% of the
+  models). The write is now gated by the slot's state; FA10 plants the old form.
+- **The model-space shortcuts do not hold.** Q = M M^T and r = M t per model on the
+  pool, then an exact integer d, fails by cancellation (28K-806K polygons wrong on
+  VF3); the eye position in model space assumes a similarity and misses 31 VF3
+  polygons (840 with the true inverse). Only forming V first works.
+- **Converting the inputs as they are written broke timing.** It took 60 ALM off the
+  unit but put the decoder's slot read, a mux and the int24 converter in front of the
+  MLAB's write: 72-75 MHz on three seeds (the fitter then gave up on timing elsewhere
+  too, so the build looked 260 ALM smaller). The conversion is back on the read side;
+  the split-align adder and the shorter sum delay stayed (20-45 ALM).
+- **My count of the multiply-add's latency was one cycle off** for the adder's zero
+  select and forwarding delay; the random bench caught the other alignment (47% of
+  verdicts wrong).
+- **Supermodel does not reproduce Daytona 2's dumps** byte for byte, unlike VF3 and
+  Bass Fishing. Both sets are bit-exact between the model and MAME.
+- **The facing test's 780 ALM is about twice what I estimated** before building it,
+  and three times R60's estimate, which was for the 2D cross product. Using the pool's
+  idle issue slots instead (a fifth operand source into a lane) would save the adder
+  and multiplier, but Daytona 2's heaviest frames leave the engine idle only 24% of the
+  time, so one lane would give the test 100 cycles a polygon. I did not build it.
+- **D2 and D11 need other conditions now.** With FACE_DROP a double-sided polygon is one
+  record unless d is exactly 0 (never in the default build's frames), so D2 runs the
+  `FACE_DROP = 0` build; the emitter's six-word vertices and the dropped back faces
+  drain the output fast enough that D11's list hazard needs a 90% output stall.
+- **Daytona 2 is per-node and per-model bound** (above). R20 scaled the geometry from
+  the new vertex count alone and put it at 72% of a 50 MHz frame on four multipliers.
+
+### Open after the fifth build
+
+- **The set-up on the pool** fits VF3 (78.7%) and Bass Fishing (73.2%) at p99 but not
+  Daytona 2 (120.7%); the geometry alone is 93.9% there. Whether the rasteriser keeps
+  its own set-up unit, or Daytona 2 runs at the reduced frame rate D-10 allows, is a
+  study decision.
+- **Area**: 8,077-8,084 ALM without pins, 910 above section 14, all but 97 of it the
+  facing test. The set-up port is not built (an estimated 150-300 ALM more). The
+  MLAB-to-M10K trades of section 14 would pay part of it.
+- **Daytona 2's node culling** (CULLU and CULLT, 93 latency-bound cycles a node, 15.7%
+  of its heaviest frames) is the largest lever found there.
+- N2, N4, N6, G5, G8 and G11 still need directed benches (G11b catches the address
+  adder itself).
+
+### D-32: the output buffer and the side memories in M10K by default
+
+Study D-32 takes two of section 14's trades: `OUT_M10K` and `SIDE_M10K` now default to 1
+in `r3d_geo.sv`; `BC_M10K` stays 0. Nothing else had to change with them:
+- **The output buffer** was already built to be read a cycle ahead (section 14). The
+  emitter reads the first vertex word during the header, the next word on each beat
+  it sends, and the same word in a stall. The R62 record's six-word vertex and its
+  shade word (7 for an inverted copy) were already in that read-ahead: `OUT_M10K` was
+  one of the ten builds in section 15's checks.
+- **The side memories** (T&L staging and the projection queue, 16 of 32 x 32) are read
+  registered either way, so their timing does not change. `sa_hi` is registered to line
+  up with the data either way.
+- **No interaction between the two.** The emitter reads the output buffer; the engine
+  reads the side memories through its own port. They share no read path.
+- **Read during write.** It differs between the forms: the registered-address MLAB gives
+  the new word, the M10K the old one. Every frame is exact in both, so no caller reads a
+  word in the cycle it is written, as `r3d_ram` says.
+
+The M2.5 viewer instantiates `r3d_geo` with defaults, so it takes this at its next build.
+
+**Checks.** Each build is the same Verilator bench with the same parameters and bench
+arguments as `test_real3d_geo4_all` and `test_real3d_setup4`. The runs are split into
+8 slices a game, 16 for Daytona 2 (`sm3-builds/r3d/d32/verify.sh`, `bench.sh`).
+
+| Build | VF3 | Bass Fishing | Daytona 2 |
+|---|---|---|---|
+| Default | 400 / 400 | 400 / 400 | 400 / 400 |
+| Set-up load (`SETUP_LOAD`, `SETUP_3R`, `SETUP_PORT`, the set-up ROM) | 400 / 400 | 400 / 400 | 400 / 400 |
+| Supermodel frustum without culling; MAME's correctly rounded frustum with and without; MAME's algebraic one | 400 / 400 each | 400 / 400 each | |
+| The default with MAME's rows; MAME throughout | 400 / 400 each | 400 / 400 each | |
+| `FACE_DROP = 0` | 400 / 400 | 400 / 400 | |
+
+Every field of every triangle and viewport record matches the model. There are no
+subnormals at the pool's units or at the facing test's. The Makefile targets
+themselves, run whole and not sliced, give the same result. These are
+`test_real3d_geo4` on Daytona 2 and the first three builds of `test_real3d_geo4_all` on
+VF3; I stopped the rest, which take about 6.5 minutes a run.
+
+**Cycles.** I ran each build again with `-GOUT_M10K=0 -GSIDE_M10K=0`. In every one of the
+ten, the per-frame cycles p50, p99 and maximum are identical to the new default
+(Daytona 2's default at 16 slices included). p99, share of a 100 MHz frame:
+
+| Build | VF3 | Bass Fishing | Daytona 2 |
+|---|---|---|---|
+| Default, no set-up (section 15) | 61.3% | 56.9% | 93.9% |
+| Default, D-32 | **61.3%** (1,066,378) | **56.9%** (989,111) | **93.9%** (1,632,908) |
+| Set-up on the pool (section 15) | 78.7% | 73.2% | 120.7% |
+| Set-up on the pool, D-32 | **78.7%** (1,367,371) | **73.2%** (1,273,022) | **120.7%** (2,098,901 at 8 slices) |
+
+**Planted faults** (`sim/real3d/faults.py`, 20 M cycles a frame cap, in
+`sm3-builds/r3d/d32/faults`): 64 of 70 caught. The 65 faults of section 15 give exactly
+section 15's table, and the six misses are the same six. No fault hung. I added five
+faults on the new read timing, and all five are caught:
+
+| Fault | What it plants | VF3 | Bass Fishing |
+|---|---|---|---|
+| FO1_out_noahead | output buffer read on the beat's own address, with no read-ahead: each word one late | 20 / 20 | 3 / 20 |
+| FO2_out_stall | the read-ahead advances in an output stall | 20 / 20 | 3 / 20 |
+| FO3_out_vertex | at a vertex's last word, the read-ahead keeps the vertex instead of taking the next | 20 / 20 | 3 / 20 |
+| FS1_side_early | side-memory half select (`sa_hi`) taken from the address, a cycle ahead of the data | 20 / 20 | 3 / 20 |
+| FS2_side_late | the same select registered twice, a cycle behind the data | 20 / 20 | 3 / 20 |
+
+FO2 shows only when the output stalls: with `out_ready` always high, `out_go` is
+always 1 in E_OUT. The bench stalls 20% of output words.
+
+**Area and timing** (Quartus 17.0, 5CSEBA6U23I7, standalone, 10 ns,
+`sm3-builds/r3d/r62/fit.sh`, `fits/d32_s1..3`):
+
+| Seed | ALM (with the 117 pin ALMs) | Without pins | Registers | M10K | DSP | Fmax slow 100C |
+|---|---|---|---|---|---|---|
+| 1 | 7,649 | 7,532 | 8,813 | 32 | 11 | 103.14 MHz |
+| 2 | 7,685 | 7,568 | 8,803 | 32 | 11 | 103.99 MHz |
+| 3 | 7,677 | 7,560 | 8,784 | 32 | 11 | 106.30 MHz |
+| Section 15 (`fits/face3`) | 8,194-8,201 | 8,077-8,084 | 8,878-8,895 | 12 | 11 | 105.56-112.55 MHz |
+
+All three seeds close 10 ns. The saving is **-509 to -548 ALM (-527 on average) for
++20 M10K**, against the -564 that the two trades measured one at a time.
+
+By unit (seeds 1 / 2 / 3; section 15's in brackets):
+
+| Unit | ALM | M10K |
+|---|---|---|
+| Facing test | 789 / 787 / 799 (792 / 766 / 780) | 0 |
+| Engine | 2,931 / 2,948 / 2,940 (2,934 / 2,949 / 2,942) | 11 |
+| Walker | 575 / 581 / 588 (583 / 577 / 586) | 0 |
+| Stream | 133 / 133 / 138 (144 / 135 / 143) | 0 |
+| Controller memories | 524 / 523 / 524 (1,090 / 1,090 / 1,088) | 21 (1) |
+| Controller logic, with the pins | 2,697 / 2,712 / 2,688 (2,655 / 2,678 / 2,662) | 0 |
+
+- **The memories saved what was measured:** -566 ALM against -228 - 336 = -564. The two
+  trades add, with no interaction.
+- **Most of the shortfall is in the controller's logic,** about +35 ALM on average; the
+  seed spread there is about 25. Registers fell by 65-111, mostly the MLABs' registered
+  read addresses, which the M10K holds inside the block.
+- **M10K is exactly +20** (12 -> 32). Quartus packs each pqa/pqb pair, which share an
+  address, as one 64-bit memory of 2 blocks, so the count is unchanged.
+- **Fmax fell 2.4-6.3 MHz.** The worst path is now the decoder's k255 conversion
+  (`vq_r` -> `tc_k`), with 0.30-0.59 ns of slack; before it was `cq_cnt` -> `pst` or the
+  facing test's MLAB. That path did not change, so the fitter placed it worse once the
+  MLABs went to M10K columns. 100 MHz still closes with 0.3 ns to spare on the worst
+  seed.
+
+The geometry is now about 7,530-7,570 ALM without pins, close to the 7,520 aimed for and
+30-70 under the 7,600 target, before the set-up port (an estimated 150-300).
+
+### Wrong turns and findings (D-32)
+
+- **An R65 fault group was still running** (`r62/faults_g0.log`, started 20:28) in the
+  shared `sm3-builds/r3d/faults2/` when I started. Each fault copies `rtl/real3d` when
+  it starts, so that log's last eight lines (D1, D5, D9, D13, G3, G7, G11, N7, from about
+  21:45) ran on the D-32 RTL, not R65's. Their verdicts are the same as section 15's.
+  So that two runs cannot clear each other's copies, `faults.py` takes `R3D_FAULTDIR`
+  (default unchanged), and mine ran in `sm3-builds/r3d/d32/faults`.
+- **R65's first verify pass** (`r62/verify.log`: sm0, cr1, cr0, alg0) differs from mine
+  by a few hundred cycles at p99, e.g. sm0 on VF3 1,116,352 against 1,116,751. That is
+  not D-32: the same builds with the old defaults give my numbers to the cycle. R65's
+  later passes (def2, def3, su3, keep3, sm1m, cr0m) also match mine to the cycle, so the
+  first pass ran on an earlier state of the RTL or the bench.
+- **The sum of the one-at-a-time trades overstates the joint saving** by about 40 ALM in
+  this fit. The memories gave exactly the sum; the controller logic around them did not.
+
+### The LOD word (`LOD_WORD`, study D-33, R67)
+
+Study R67 left the hardware LOD needing one FP32 word a polygon from the geometry,
+B = d NP (-cota) kz^2, and one thing unchecked: whether `r3d_face`'s d has the scale of
+the dot render_d25 uses. A factor of 2 is a whole level, so I checked that first.
+
+**d's scale** (`sim/real3d/r3d_lod_cmp.cpp`). The geometry model, run on each dump
+with MAME's correctly rounded frustum and every node walked (so its polygon numbers
+are MAME's), against render_d25's dot(v0, n) from MAME's list, polygon by polygon:
+
+| | VF3 | Bass Fishing |
+|---|---|---|
+| polygons matched | 2,313,039 | 1,060,013 |
+| same sign / opposite / either zero | 2,294,819 / 196 / 18,024 | 1,059,986 / 18 / 9 |
+| \|d / dv - 1\| p50 / p99 / p99.9 | 5.6e-8 / 3.4e-5 / 0.030 | 5.8e-8 / 8.6e-6 / 0.0015 |
+| off by 1/32 level or more: vertex 0 clipped / not clipped | 2,776 / 1 | 62 / 0 |
+| textured, lb8 equal (1/256 level) / within 4 / apart by half a level or more | 1,090,734 / 1,091,838 / 37 of 1,093,039 | 435,700 / 435,911 / 2 of 436,003 |
+
+So d has the model's scale: the ratio is 1 to FP32 rounding on 99% of polygons, and no
+bin sits at a factor of 2. Every polygon that is off but one has its vertex 0 clipped:
+the geometry takes the polygon's own vertex 0, the list's triangles a clipped one, and
+the header normal is not the face's normal, so the dot moves. The geometry's value is
+the polygon's, the same for every triangle of it.
+
+**The geometry side.** With `LOD_WORD = 1` the polygon record is 5 + 6 n words, B in
+header word 4 (the viewport record stays 6 words); 0 keeps R62's 4 + 6 n.
+- **NP** (header word 5 bits 8-31) goes into the facing test's fill slot as word 7, as
+  the decoder streams the header; it goes through the test's one converter, unsigned
+  at 2^-12. The three converters of the test (position, normal and now NP) became one
+  with a muxed exponent.
+- **C = -cota kz^2 once a viewport.** Main reads viewport word 3 with the viewport (a
+  one-word culling read, `M_VP8`) and loads -cota into the test at `M_VPW`, after the
+  last viewport's polygons have all had their verdict. With Supermodel's frustum kz = 1
+  and C = -cota needs no product. With MAME's frustum kz is the constant -F_P23, so kz^2
+  is a constant (0x408000A8) and the test forms C = kz^2 x (-cota) itself, idle, before
+  the viewport's first polygon starts.
+- **The two products go in round 3's idle slots** (the period is 28 cycles; slots 3-6 of
+  round 3 were idle): slot 3 forms Q = NP x C for the polygon in hand into B memory
+  {its N buffer, 3, 3}, which was free; d is kept in a register as it leaves the adder;
+  slot 4 of the period after that forms B = d x Q for the polygon two back. B leaves in
+  polygon order into a 32-entry ring by polygon number (one MLAB), and the emitter waits
+  for it before a record. The inverted copy of a double-sided polygon carries -B.
+- **The model** (`r3d_geo.cpp lod_word`) ends each 'T' record with d and B in that
+  order, B = fl(d x fl(NP x C)) with flush to zero.
+
+**Checks.**
+- `make test_real3d_face_lod`: 1.8 M random polygons on three seeds with kz^2 = 1 and
+  MAME's, C changed while idle (91 K times): 0 verdicts and 0 B words wrong.
+- The geometry against the model with `LOD_WORD = 1`, every field and B: 400 VF3, 400 Bass
+  Fishing and 400 Daytona 2 frames in the default build, and VF3 and Bass Fishing in
+  MAME's correctly rounded frustum with and without culling, the algebraic frustum,
+  `FACE_DROP = 0` and MAME's rows (no facing test, B = 0): every frame, no subnormal.
+- With `LOD_WORD = 0` the default build is bit-exact on all 1,200 frames and its
+  cycles are R68's to the cycle (VF3 1,066,378, Bass Fishing 989,111, Daytona 2
+  1,632,908 at p99).
+
+**Cycles at p99, 400 frames, 100 MHz frame:**
+
+| Game | `LOD_WORD = 0` | `LOD_WORD = 1` | Change |
+|---|---|---|---|
+| VF3 | 1,066,378 (61.3%) | 1,067,801 (61.4%) | +1,423 (+0.13%) |
+| Bass Fishing | 989,111 (56.9%) | 990,422 (57.0%) | +1,311 (+0.13%) |
+| Daytona 2 | 1,632,908 (93.9%) | 1,632,908 (93.9%) | 0 (p50 +367) |
+
+The cost is the record's fifth header word (one emitter beat a record), the NP word's
+write into the test, and the extra period a burst of polygons ends with.
+
+**Area and timing** (Quartus 17.0, 10 ns, `sm3-builds/r3d/r62/fit.sh`, ALM without the
+117 pin ALMs):
+
+| Build | Seed | ALM | Registers | M10K | DSP | Fmax slow 100C | Facing test (entity) |
+|---|---|---|---|---|---|---|---|
+| R68 (D-32 default) | 1 / 2 / 3 | 7,532 / 7,568 / 7,560 | 8,784-8,813 | 32 | 11 | 103.1 / 104.0 / 106.3 MHz | 789 / 787 / 799 |
+| This default (`LOD_WORD = 0`) | 1 / 2 / 3 | 7,582 / 7,565 / 7,571 | 8,781-8,797 | 32 | 11 | 107.6 / 107.0 / 101.2 MHz | 774 / 771 / 778 |
+| `LOD_WORD = 1` | 1 / 2 / 3 | 7,616 / 7,598 / 7,597 | 8,939-8,970 | 32 | 11 | 108.7 / 111.6 / 109.6 MHz | 803 / 810 / 813 |
+
+- The LOD word costs about +31 ALM over this default (+26 to +34 seed by seed), 0 M10K and 0
+  DSP: the facing test +29 to +39 (two registers, d and C, the b-side mux, two operand
+  kinds and the write-back kinds), the B ring 21 (one MLAB), and the rest about none.
+  Registers +160 to +175.
+- The default moved 3 to 50 ALM against R68, within the seeds' spread: the facing test's
+  converters shared into one gave back about 15 inside the unit (771-778 against
+  787-799). The converter's operand path (A's word through the exponent mux) is now the
+  test's worst path (102.8-110.9 MHz) but closes. The geometry's worst seed (101.2 MHz,
+  default seed 3) is the pool's adder, which did not change.
+- With `LOD_WORD = 1` the geometry is 7,597-7,616 ALM, at the 7,600 target and up to 16
+  over it, before the set-up port.
+- The trees are not quite the same: the `LOD_WORD = 1` fits copied the RTL at 00:42-01:28,
+  the default fits at 02:45-03:37, after R70's model-stream change (`ready_start` and
+  `M_END` also wait for the stream's last request), which is in the default fits only. It
+  is a few gates; the +31 is within a few ALM of the LOD word alone.
+
+**Planted faults** (`faults.py` L1-L10, the LOD build, 20 + 20 frames): 9 of 10 caught.
+- Caught: the copy's sign; NP's scale (x 2); C's sign; kz^2 left out (MAME's frustum);
+  NP converted as signed (19 of 20 VF3 frames: NP reaches 2048, bit 23); Q in the other
+  N buffer; the zero-select alignment below; viewport word 2 for 3; header word 4 for 5.
+- Not caught: the emitter not waiting for B (L8). B is always ready long before the
+  polygon's record leaves (it follows the verdict by about two periods, and the polygon
+  still has its clip and projection to go), so the wait never holds in these frames. It
+  stays as an interlock.
+
+### Wrong turns and findings (LOD word)
+
+- **The adder's zero select belongs to the operation one slot earlier.** `c0_d[5]` meets
+  the product of the operation issued one cycle before the one that set it, because the
+  multiplier's latency is 4 and the line is 5. The R62 schedule worked because its
+  `op_c0 = (r == 0)` is the same for neighbouring slots, except at the d chain's first
+  step (round 0 slot 6), which took round 1's 0 and so added the idle round-3-slot-6
+  product from the period before. That product is a raw normal word read as FP32 times
+  B memory's {par, 3, 3}, which nothing wrote: zero in an MLAB that powers up clear. My
+  first build put Q there and set `op_c0` on round 3 slot 3 itself: 9,676 verdicts of
+  300,000 went wrong (V2's last step lost its addend) and 289 K of 300 K B words. The fix
+  starts each chain from the slot before (round 0, round 1 slot 0 for the d chain, round
+  3 slots 4 and 5 for the two products). It goes into the default build too, so the d
+  chain no longer depends on that word being zero; the default is bit-exact on every
+  frame with it. Planted as L7.
+- **I typed the 64-entry log2 table by hand first** for the rasteriser's copy; about a
+  third of the entries were off by one to six. I generated it from the formula before
+  any bench ran.
+
+### The model stream and a late acknowledge (M2.5 viewer, frame 1800)
+
+**Symptom.** The viewer's bench (`sim/viewer/tb_m3v.cpp`) lost triangles from VF3 frame
+1800 when polygon RAM reads waited at the DDR3 bridge. In my copy of the viewer, BUSY 30%
+and latency 30-120 cycles:
+
+| Reads the bridge holds | Seed 1 | Seed 2 | Seed 3 |
+|---|---|---|---|
+| 1 | geometry hangs (frame timeout) | geometry hangs | 7,361 of 7,621 |
+| 4 | 7,621 | 7,613 | 7,621 |
+| 8 | 7,621 | 7,621 | 7,621 |
+
+The case as it was handed to me (8 reads, seed 3) was exact in my copy: the viewer had
+moved on since, so the same seed no longer lands on the same cycle. The 4-read seed-2
+case gives the same 7,613.
+
+**Reproduced alone.** The viewer bench now writes the geometry's port inputs a byte a
+cycle (`M3V_GTRACE`: the three ports' acknowledge and valid, `out_ready`, `start`), and
+`tb_r3d_geo --replay` drives `r3d_geo` from it with the words from the files. The replay
+gives the viewer's result exactly, so the loss is inside `r3d_geo`, from port timing
+alone. The facing test's inputs then showed 16 committed polygons missing after commit
+7,213: one model's polygons were never decoded. The record order shifted after it, so
+the triangles lost are not a fixed set of 8; the count happens to come out 8 short.
+
+**Root cause** (`r3d_mstream.sv`). A model ends with `stop` while the stream is still
+prefetching. The stream counts only acknowledged bursts (`outst`); a burst it has asked
+for and that is not yet acknowledged is in `pram_req` / `vrom_req`, and the request must
+hold until its ack. `stop` drained the acknowledged bursts and then raised `ready_start`
+with that request still waiting. When the memory took it late, after the last
+acknowledged burst had drained, three things could happen:
+- acknowledged in the cycle the decoder saw `ready_start`: `outst` went to 1, the start
+  pulse a cycle later was ignored, and the decoder waited for words forever (the hangs);
+- acknowledged in the start cycle (frame 1800): the start's `next <= addr` lost to the
+  ack's `next <= next + 8`, so the new model streamed from the old model's next address;
+- acknowledged after the start: the old burst's 8 words went to the head of the new
+  model's FIFO and `next` stepped past the new model's first 8 words.
+
+In the frame 1800 trace the old model's last acknowledged burst took 380 cycles to drain
+and the waiting one was acknowledged at once after it, in the cycle the new model
+started. The bench's memory had always acknowledged in 1-3 cycles, so the window never
+opened there: the `MS_MON` counters show the decoder never waited on the stream in it.
+What opens it is a late acknowledge, as a bridge whose queue is full of other masters'
+reads gives; long latency alone does not (latency 150-400 with one read held: 0 bad
+starts in the frames run).
+
+**Fix.** `ready_start` also waits for `!pram_req && !vrom_req`. A late burst is then taken
+while the stream is idle, and its words are dropped as a drained burst's are. One AND
+term. While the stream is idle nothing else raises a request, so `ready_start` cannot fall
+between the decoder's test and its start pulse.
+
+**Bench** (`tb_r3d_geo --hostile MASK`): the masked ports get their own random stream; a
+request is acknowledged `--ack LO..HI` cycles after it is raised, held a further cycle
+with chance `--busy`, and with `--maxrd K` held while K reads are acknowledged and not all
+back; words come in order `--lat` cycles after the ack, each held back with chance
+`--gap`. `--stall` is the output stall as before. The default bench is unchanged (its
+random stream is not touched). `make test_real3d_geo_timing` runs six profiles on 20
+frames of each game.
+
+**Which port.** Late acknowledges (100-400 cycles, latency 2-10) on the old RTL:
+- polygon RAM alone, frame 1800: 2 starts with a request waiting, frame wrong;
+- polygon RAM and VROM, frame 1800: 3, frame wrong;
+- VROM alone, frames 190-193: 7, all 4 frames wrong, and the geometry hung in 4 frames
+  (decoder in its header state, stream idle with 5 words: the ignored start);
+- culling alone, frames 190-199: exact. The walker and the viewport reads hold their
+  request until the ack and then wait for their own words; nothing is abandoned there.
+
+**A second fault, found by the new bench after the first fix.** The first full sweep of
+the late-acknowledge profile hung in 3 to 19 of each 25 VF3 frames: one frame stopped with
+a single viewport record out, and every frame after it put out nothing. Each frame alone
+was exact on 12 seeds, so it needed the frame before. `busy` falls in `M_END`, which waits
+for the decoder, rings, emitter, walker and facing test but not for the model stream; the
+stream's last prefetch of the frame (a VROM request in every case I printed) was still
+waiting when `busy` fell. The bench starts each frame with empty ports, as any owner that
+hands the port on at `!busy` would, so that request was never answered and the next
+frame's first model waited for it for ever. The viewer keeps its ports across frames, so
+it does not see this. `M_END` now also waits for `ms_ready`, so `busy` low leaves no read
+open at any port, and the bench fails a frame whose `busy` falls with a request waiting or
+a word still due. The default bench never ended a frame with a port open (1,200 frames,
+old and new RTL), and cycles are identical on all 1,200.
+
+
+**Checks after both fixes:**
+- **Viewer** (my copy of `rtl/viewer` and its bench, the live `rtl/real3d`), VF3 frame
+  1800, BUSY 30%, latency 30-120: exact (7,621 triangles, every set-up record, every
+  layer pixel) with 1 read held, seeds 1-4; 2 reads, seed 6; 4 reads, seeds 2 and 5; 8 reads,
+  seed 3. Five frames (1800, 7800, 7860, 7920, 13770) at BUSY 40%, latency 30-160, one read,
+  seed 7: exact, 37,245 triangles. The geometry phase of the 4-read seed-2 case is
+  5,527,325 cycles with the first fix and with both.
+- **Default bench**, 400 frames each of VF3, Bass Fishing and Daytona 2: exact, and the
+  cycle count of every one of the 1,200 frames identical to the old RTL.
+- **Timing sweep**, every one of the 1,200 frames under each profile, 25-frame runs:
+
+| Profile | Ports | Ack (cycles) | Latency | BUSY | Gap | Reads held | Stall | Seed | Frames exact | Longest frame |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | all | 50-400 | 2-20 | 0 | 0 | 1 | 0 | 1 | 1,200 / 1,200 | 10.4 M |
+| 2 | all | 1-200 | 1-200 | 60% | 30% | 2 | 90% | 2 | 1,200 / 1,200 | 12.0 M |
+| 3 | all | 1-20 | 30-200 | 60% | 50% | 1 | 50% | 3 | 1,200 / 1,200 | 6.9 M |
+| 4 | polygon RAM | 1-400 | 1-120 | 30% | 0 | any | 20% | 4 | 1,200 / 1,200 | 5.5 M |
+| 5 | culling, VROM | 1-300 | 1-200 | 40% | 20% | 1 | 70% | 5 | 1,200 / 1,200 | 14.4 M |
+| 6 | all | 1-2 | 1-2 | 0 | 0 | any | 90% | 6 | 1,200 / 1,200 | 2.6 M |
+
+  6,571,885 triangles a profile; no frame reached the 20 M-cycle cap, none ended with a
+  port open. (Profile 4's other ports and profile 5's polygon RAM keep the default model.)
+
+**Wrong turns:**
+- My first hostile profiles (acknowledge in 1-3 cycles, or after the port's own read
+  drained, latency up to 400) never opened the window: 0 bad starts in 20 frames each. I
+  had modelled the bridge's limit per port, but in the viewer the bridge is full of the
+  scan-out's and the store's reads, so the geometry's request waits there regardless of
+  its own traffic. The acknowledge delay is the parameter that matters.
+- I declared the fix done after the viewer cases passed and launched the sweep and the
+  fits. The sweep's first profile then hung on the second fault, and I stopped both. A
+  fix confirmed in the bench that found the bug is not confirmed in a harsher one.
+- Replaying the trace on the fixed RTL cannot pass: once the RTL behaves differently the
+  trace's acknowledges no longer meet requests (984 and 11,240 events off the trace). The
+  replay is for reproducing; the check is the closed-loop bench.
+- Four planted faults' patterns no longer matched the RTL, so `faults.py` stopped at the
+  first of them (FA2) with an assertion: the LOD work had changed those lines (FA2: the
+  converter select is now `A_NRM`; FA3b: the cull flag is beat `3'd3`'s; FA9 and FA11: the
+  start test and the exponent select gained LOD terms). I moved the four patterns to the
+  current lines; the faults are the same.
+
+### The set-up on the pool (`SETUP_OUT`, study D-28 option (a), R60, R65)
+
+With `SETUP_OUT = 1` the geometry sends set-up records instead of polygon records. The
+format is section 15's SETUP4, which `r3d_rast_intake` takes with `SETUP4 = 1`: the
+polygon header with n = 3 (and the LOD word with `LOD_WORD`), x1 y1 x2 y2 x3 y3 sorted
+by y, det, then pdx, pdy, ps of 1/w, u/w, v/w and shade. That is 23 words textured and
+17 untextured. The parameter defaults to 0, so the viewer's input does not change. With
+it on, the geometry does on the pool what the viewer's temporary `m3v_setup` does (the
+RTL form of `rtl_tri::setup`), and it drops a triangle with a non-finite x, y or 1/w as
+`m3v_setup` does.
+
+**How it is built.** It follows R65's model: one triangle a lane, four triangles a
+kernel, results out through the side port. Three things differ from the model, and
+each one made it cheaper:
+
+- **No load through the external port.** R65's `SETUP_PORT` held the engine idle for
+  18 cycles (12 untextured) before each kernel. Instead a set-up port gathers each
+  triangle's sorted inputs into a staging memory while the engine runs other kernels.
+  The kernel reads them as operand a through the side port, as T&L and PROJ read
+  theirs. X and Y are also needed at ports B and C, so the kernel copies those six into
+  registers. Each copy writes the register and the output memory at one address (a new
+  `sdup` micro-word, wrf and wside together, which `r3d_vpu` already allowed). The
+  copies are therefore also the record's x1 .. y3, and det's last add writes both places
+  too.
+  - SETUP4: 73 operations, 110 cycles. The model was 18 + 97 = 115.
+  - SETUP2: 47 operations, 104 cycles. The model was 12 + 91 = 103.
+- **The staging is the projection queue's upper half.** Each `pqa`/`pqb` pair is two
+  M10K a lane holding 32 of 256 words (D-32). With `SETUP_OUT` the address gains a bit,
+  so {1, half, row, comp} is the staging. It has two halves: the port fills one while
+  the kernel reads the other. The port writes one memory of the pair at a time
+  (`pq_wea`/`pq_web`), and only when the polygon machine cannot write the next cycle
+  (`s_blk`: in P_Q1, or in P_Q0 about to enter it). No memory is added for the inputs.
+- **The set-up runs beside the polygon machine, not inside it.** In R65's model the
+  polygon machine ran the kernels after each PROJ and kept the engine through all of
+  them. Here the port is a third owner in the engine's turn (main, polygon, set-up).
+  Without `SETUP_OUT` the turn is the old two-way one, cycle for cycle.
+
+The port takes each projected batch in the emitter's place. For each polygon record it
+takes each fan triangle (v0, v[i-1], v[i]), with the inverted copy first as in E_P1:
+- It reads the three y words, registers them, and does MAME's sort with three
+  comparators.
+- It reads the sorted vertices' x, y, 1/w, u/w, v/w and shade (shade' for an inverted
+  copy unless fixed) into staging word 3 j + v, one word a cycle. That is about 25 cycles
+  a textured triangle and 19 untextured, when the queue write is not blocked.
+- Untextured triangles put shade where u/w goes, so one layout serves both kernels.
+- A group of four, or the batch's last, runs SETUP4 if any of it is textured, else
+  SETUP2.
+- The emitter takes its triangles from a 16-entry queue, in order.
+
+Set-up output memory, two halves of 32 words a lane (`SO_M10K`, M10K by default):
+
+| Word | Content |
+|---|---|
+| 0-5 | x1 y1 x2 y2 x3 y3 (the copies) |
+| 6 | det |
+| 8 + 4 p + {0, 1, 2} | pdx, pdy, ps of parameter p |
+| 8 + 4 p + 3 | parameter p of the first sorted vertex (a flat triangle's ps) |
+
+A flat triangle (|det| < 0.00001) is sent with pdx = pdy = +0, and ps taken from word
+8 + 4 p + 3. The emitter registers the flat flag on det's beat. ps is read ahead two
+beats later, so no compare sits in front of the memory's address. The header and
+viewport words are now one shared `e_hw`/`e_vw` for both emitter paths.
+
+The generator writes two ROMs:
+- `r3d_ucode` is unchanged, byte for byte.
+- `r3d_ucode_su` holds the same kernels at the same addresses, then SETUP4 and SETUP2
+  (625 of 1,024 words). `r3d_vpu`'s `SU_ROM` selects it.
+- `--setup-kernels` builds R65's measurement ROM as before.
+
+**Checks.** `make test_real3d_setup_out` and `make test_real3d_geo_timing_su`. With
+`--setup-out` the bench cuts each set-up record and checks every word against
+`rtl_tri::setup` on the model's triangle (depth on 1/w, flush to zero), and every
+header field as before. The model's set-up is linked only with `-DGEO_SETUP_OUT`, so
+the existing targets build as they did.
+
+| | VF3 | Bass Fishing | Daytona 2 |
+|---|---|---|---|
+| Frames exact, every word of every record | 400 / 400 | 400 / 400 | 400 / 400 |
+| Set-up records | 2,313,148 | 1,389,845 | 2,868,892 |
+| of which textured / flat | 1,834,256 / 72,162 | 1,124,135 / 17,396 | 2,617,302 / 41,861 |
+| Left out (x, y or 1/w not finite) | 0 | 0 | 0 |
+| Subnormal or flushed values at the pool's units | 0 | 0 | 0 |
+
+- **Hostile timing.** The six profiles of `test_real3d_geo_timing`, 20 frames of each
+  game, on the `SETUP_OUT` build: 18 / 18 runs exact, no port open at the end. Two
+  profiles also ran on all 1,200 frames: profile 6 (90% output stall), 1,200 exact;
+  profile 1 (acknowledges 50-400 cycles late), 1,200 exact. No frame ended with a port open.
+- **Default build** (`SETUP_OUT = 0`): exact on all 1,200 frames, and every frame's
+  cycle count is identical to the RTL before this work. `LOD_WORD = 1`: 1,200 / 1,200.
+  MAME's rows (`SM_LIGHT = 0`, the 255 clamp): 800 / 800.
+- **The facing test** (`test_real3d_face`, `test_real3d_face_lod`): 900,000 and 1.8 M
+  random polygons, 0 wrong.
+- **Quartus.** `quartus_map --analyze_file` passes on every changed file. The default
+  build elaborates without `r3d_ucode_su.sv` in its file list. Quartus 17's
+  constant-folding of the new size-cast and concatenation idioms gives the expected
+  values for all eight.
+
+**Frame load, p99 of a 100 MHz frame over 400 frames:**
+
+| Build | VF3 | Bass Fishing | Daytona 2 |
+|---|---|---|---|
+| Default, no set-up (R68) | 61.3% (1,066,378) | 56.9% (989,111) | 93.9% (1,632,908) |
+| R65's model: set-up load, port C, port load | 78.7% (1,367,371) | 73.2% (1,273,022) | 120.7% |
+| **`SETUP_OUT`, built** | **76.9%** (1,337,476) | **71.3%** (1,239,863) | **117.6%** (2,043,682) |
+
+The built form is 1.8, 1.9 and 3.1 points under the model, and Daytona 2 still does not
+fit (D-10's reduced rate, or the rasteriser keeps a set-up unit; a study decision).
+
+**Area and timing** (Quartus 17.0, 5CSEBA6U23I7, standalone, 10 ns,
+`sm3-builds/r3d/su/fit.sh`: R62's `fit.sh` plus `r3d_ucode_su` and both slow corners):
+
+| Build | Seed | ALM without pins | Registers | M10K | DSP | Fmax 100C | Fmax −40C |
+|---|---|---|---|---|---|---|---|
+| `SETUP_OUT = 1` | 1 | 7,864 | 9,050 | 43 | 11 | 109.82 MHz | 104.94 MHz |
+| | 2 | 7,868 | 9,060 | 43 | 11 | 111.83 MHz | 110.55 MHz |
+| | 3 | 7,860 | 9,117 | 43 | 11 | 109.65 MHz | 106.61 MHz |
+| Default | 1 | 7,517 | 8,875 | 32 | 11 | 112.87 MHz | 109.22 MHz |
+| | 2 | 7,505 | 8,882 | 32 | 11 | 116.86 MHz | 111.17 MHz |
+| | 3 | 7,526 | 8,843 | 32 | 11 | 108.04 MHz | 105.15 MHz |
+| R68 (D-32) | 1-3 | 7,532-7,568 | 8,784-8,813 | 32 | 11 | 103.1-106.3 MHz | 96.5-99.7 MHz |
+
+Every seed of both builds now meets 10 ns at both slow corners. The default build is
+7,505-7,526 ALM, 7-63 below R68.
+
+By unit, the `SETUP_OUT` build, seeds 1 / 2 / 3 (worst path ending there; MHz at 100C,
+then at −40C):
+
+| Unit | 100C | −40C |
+|---|---|---|
+| Controller (with the set-up port) | 109.8 / 111.8 / 109.6 | 104.9 / 110.9 / 106.6 |
+| Engine | 116.8 / 116.0 / 120.9 | 113.2 / 110.5 / 116.8 |
+| Divide | 116.8 / 121.4 / 123.5 | 117.0 / 118.5 / 119.6 |
+| Facing test | 123.7 / 118.1 / 115.0 | 119.5 / 115.3 / 109.6 |
+| Walker | 126.7 / 128.6 / 126.3 | 122.4 / 126.1 / 125.3 |
+| Model stream | 129.2 / 136.6 / 132.7 | 134.1 / 138.5 / 132.0 |
+
+The worst paths are now the decoder's vertex reuse (`h0` -> `nref`, `nref_chunk`), and
+one adder's internal path in seed 2.
+
+The set-up against the default at the same seed (seed 1): **+347.5 ALM, +175 registers,
++11 M10K, +0 DSP.** That is 50 ALM above R60's 150-300 estimate, and inside the
+7,600 + 300 the geometry was given.
+
+| §8.4 technique | Where | ALM | M10K |
+|---|---|---|---|
+| One shared pool | the set-up's 73 / 47 FP operations on the pool's 4 multipliers, 4 adders and divide; no FP unit added. The rasteriser's own unit was 1,300-1,600 ALM and 4 DSP (R60); `m3v_setup` is 1,780 ALM and 7 DSP in the viewer | 0 | 0 |
+| MLAB and M10K traded as whichever binds | the staging in the projection queue's unused M10K depth (still two blocks a lane), not a 32 × 32 memory a lane (80 ALM in MLAB, or 4 M10K) | 0 | 0 |
+| | the set-up output, 2 × 32 × 32 a lane in M10K; about 160 ALM in MLAB (`SO_M10K = 0`) | 0 | +4 |
+| Small storage out of flip-flops | the triangle queue (16 × 9) in one MLAB; the polygon's three flags in the `SETUP_LOAD` flag MLAB, into the batch list's spare width (17 → 20 bits, the same MLAB) | +22 | 0 |
+| Duplicated arithmetic built once | the X/Y register copies are also the record's x/y words, and det's last add writes both (`sdup`): 7 operations fewer, no copy logic | 0 | 0 |
+| Converters time-shared | the inputs read straight off the side port, so no new source on the external write port's 4 × 32-bit data and no 18-cycle hold | 0 (est. 64-128 ALUT saved) | 0 |
+| | one 4:1 lane select of the projection output for every gathered word; one for the output memory | in the +325 | |
+| Per-game parameters | `SETUP_OUT`, `SO_M10K` | | |
+| Port C and the ROM (R65) | a third register copy a lane; ROM 512 → 1,024 words | +12 | +7 |
+| The port's controller | gather, sort, groups, kernel turn, emitter path, queue-write guard | +325 | 0 |
+
+### The cold corner: three paths, none of them an M10K
+
+All three D-32 fits miss 10 ns at slow −40C (97.2 / 96.5 / 99.7 MHz), and so does one of
+the three late-acknowledge fits (lateack_s3, 97.9). R65's fits, before D-32, met −40C
+at 103.4-109.5 MHz. R68 reported only the 100C corner. I refitted lateack_s3: same RTL
+and seed, so the same placement, 101.15 / 97.87 MHz. This time I kept the database for
+both corners. Its failing paths at −40C:
+
+| Path | −40C slack | 100C slack | Data delay |
+|---|---|---|---|
+| decoder `vq_r` → `tc_k` (the byte select, the 9-bit negate of 2b + 1, k255a's 24-bit sum) | −0.218 ns | +0.408 | 9.54 ns |
+| pool lane 0, adder result → post-op clamp → write-back register `wd` | −0.193 | +0.114 | 9.52 ns |
+| facing test, MLAB word → `itof` (24-bit negate, leading one, shift) → `opa` | +0.060 | +0.275 | 9.54 ns |
+
+None of them starts or ends at an M10K. They are long logic paths that lose about 3%
+cold. They were placed worse once the memories moved to the M10K columns. Each fix leaves
+every cycle and every result as it was:
+
+- **k255.** 2b + 1 is odd, so −(2b + 1) is {~b, 1} in nine bits. Its magnitude byte is
+  {~b[6:0], 1}: an XOR, not a subtract (checked for all 256 bytes). That alone was not
+  enough. In the next fit the worst path started at the ambient byte, `vq_r[8]`, so the
+  ambient byte now has its own register `amb_b`, loaded beside `amb_ld` from the same
+  word. `vq_r` is the main machine's widely used register.
+- **Post-op.** The clamp only ever puts +0 or the clamp constant (1.0, or 255 for MAME's
+  rows) in place of the sum. The flags are decided at +11 and registered beside the raw
+  result, and the constant goes in at +12 on the way into the memory. Until now that
+  cycle only routed the register to the memory's input register, so the write still
+  lands at +12. Only the lane registers (and, with MAME's rows, the side memories) get
+  the select. The micro-code never puts a post-op result in the broadcast file:
+  `gen_ucode.py` asserts it, and the bench's `$error` catches it.
+- **Facing test.** The sign and the 24-bit magnitude are formed in the read cycle. The
+  converter's cycle keeps only the leading-one search, the shift and the exponent. Its
+  unit fell from about 789 to 735-738 ALM.
+
+The default build's seed 1 went from R68's 103.14 / ~97 MHz to 112.87 / 109.22 MHz,
+and from 7,532 to 7,517 ALM.
+
+### Planted faults (`sim/real3d/faults.py`; the SU faults run the `SETUP_OUT` build with `--setup-out`)
+
+Every existing fault re-run on this RTL, plus 15 SU faults for the set-up port. A fault that hangs
+the RTL stops at 20 M cycles a frame. The 82 faults that were there before give the same verdicts as
+before (R68 and the LOD word): the misses are R60's six and L8. SU11 runs at 90% output stall.
+
+| Fault | VF3 frames differing | Bass Fishing | Daytona 2 |
+|---|---|---|---|
+| F1_stack_pop | 20 / 20 | 3 / 20 |  |
+| F2_vertex_reuse | 20 / 20 | 3 / 20 |  |
+| F3_clip_order | 20 / 20 | 3 / 20 |  |
+| F4_recip_round | 20 / 20 | 3 / 20 |  |
+| F5_viewport_xy | 0 / 20 | 66 / 400 |  |
+| F6_pass_label | 20 / 20 | 4 / 20 |  |
+| F7_colour_table | 3 / 20 | 0 / 20 |  |
+| F8_shading_lit | 20 / 20 | 0 / 20 |  |
+| F9_intensity_limit | 20 / 20 | 0 / 20 |  |
+| F10_tex_x | 20 / 20 | 3 / 20 |  |
+| F11_viewport_wh | 20 / 20 | 3 / 20 |  |
+| F12_tls_bank | 20 / 20 | 3 / 20 |  |
+| F13_cordic_round | 20 / 20 | 3 / 20 |  |
+| N1_chunk_order | 20 / 20 | 19 / 20 |  |
+| N2_buffer_hazard | 0 / 20 | 0 / 20 |  | not caught
+| N3_pbuf_tag | 20 / 20 | 3 / 20 |  |
+| N4_ftz_sign | 0 / 20 | 0 / 20 |  | not caught
+| N5_vs_window | 3 / 20 | 0 / 20 |  |
+| N6_reuse_window | 0 / 20 | 0 / 20 |  | not caught
+| N8_sm_frustum | 20 / 20 | 3 / 20 |  |
+| N9_cull_verdict | 16 / 20 | 0 / 20 |  |
+| D1_normal_conv | 20 / 20 | 0 / 20 |  |
+| D2_double_second | 20 / 20 | 3 / 20 |  |
+| D3_sun_clamp | 20 / 20 | 0 / 20 |  |
+| D4_colour_base | 3 / 20 | 0 / 20 |  |
+| D5_fixed_sign | 29 / 400 | 0 / 400 |  |
+| D6_trans_drop | 0 / 20 | 20 / 20 |  |
+| D7_light_z | 20 / 20 | 0 / 20 |  |
+| D8_normal_matrix | 20 / 20 | 0 / 20 |  |
+| D9_reuse_key | 7 / 400 | 0 / 400 |  |
+| D10_copy_shade | 20 / 20 | 0 / 20 |  |
+| D11_list_hazard | 20 / 20 | 3 / 20 |  |
+| D12_trans_latch | 20 / 20 | 3 / 20 |  |
+| D13_const_load | 20 / 20 | 3 / 20 |  |
+| D14_div_ring | 20 / 20 | 3 / 20 |  |
+| G1_slot_alloc | 20 / 20 | 3 / 20 |  |
+| G2_slot_reuse | 20 / 20 | 3 / 20 |  |
+| G3_smfr_const | 20 / 20 | 3 / 20 |  |
+| G4_conv_ebase | 20 / 20 | 3 / 20 |  |
+| G5_outcode_eq | 0 / 20 | 0 / 20 |  | not caught
+| G6_amb_byte | 20 / 20 | 0 / 20 |  |
+| G7_div_rem | 20 / 20 | 3 / 20 |  |
+| G8_region_end | 0 / 20 | 0 / 20 |  | not caught
+| G9_record_bits | 20 / 20 | 0 / 20 |  |
+| G10_matrix_bank | 20 / 20 | 3 / 20 |  |
+| G11_addr_adder | 0 / 20 | 0 / 20 |  | not caught
+| G5b_outcode_sign | 5 / 20 | 0 / 20 |  |
+| G11b_addr_adder | 20 / 20 | 3 / 20 |  |
+| G12_result_mux | 20 / 20 | 0 / 20 |  |
+| FA1_facing_sign | 20 / 20 | 3 / 20 |  |
+| FA2_normal_matrix | 20 / 20 | 0 / 20 |  |
+| FA3_copy_choice | 20 / 20 | 3 / 20 |  |
+| FA3b_cull_flag | 20 / 20 | 3 / 20 |  |
+| FA4_fog_bits | 20 / 20 | 3 / 20 |  |
+| FA5_layer_bit | 20 / 20 | 3 / 20 |  |
+| FA6_vp_words | 0 / 20 | 20 / 20 |  |
+| FA7_vp_kz | 20 / 20 | 20 / 20 |  |
+| FA8_oow_word | 20 / 20 | 3 / 20 |  |
+| FA9_matrix_wait | 20 / 20 | 0 / 20 |  |
+| FA10_slot_gate | 20 / 20 | 0 / 20 |  |
+| FA11_step15_scale | 0 / 20 | 0 / 20 | 19 / 20 |
+| FA12_step15_node | 0 / 20 | 0 / 20 | 19 / 20 |
+| FA13_back_skip | 20 / 20 | 2 / 20 |  |
+| FA14_reused_v0 | 20 / 20 | 0 / 20 |  |
+| N7_div_lane | 0 / 20 | 3 / 20 |  |
+| FO1_out_noahead | 20 / 20 | 3 / 20 |  |
+| FO2_out_stall | 20 / 20 | 3 / 20 |  |
+| FO3_out_vertex | 20 / 20 | 3 / 20 |  |
+| FS1_side_early | 20 / 20 | 3 / 20 |  |
+| L1_copy_sign | 20 / 20 | 2 / 20 |  |
+| L2_np_scale | 20 / 20 | 3 / 20 |  |
+| L3_c_sign | 20 / 20 | 3 / 20 |  |
+| L4_kz2 | 20 / 20 | 3 / 20 |  |
+| L5_np_signed | 19 / 20 | 0 / 20 |  |
+| L6_q_par | 20 / 20 | 3 / 20 |  |
+| L7_c0_align | 20 / 20 | 2 / 20 |  |
+| L8_b_nowait | 0 / 20 | 0 / 20 |  | not caught
+| L9_cota_word | 20 / 20 | 3 / 20 |  |
+| L10_np_word | 20 / 20 | 3 / 20 |  |
+| T1_stream_late_ack | 20 / 20 | 14 / 20 |  |
+| T2_end_open | 14 / 20 | 10 / 20 |  |
+| SU1_sort_c3 | 20 / 20 | 3 / 20 |  |
+| SU2_sort_c1 | 20 / 20 | 3 / 20 |  |
+| SU3_copy_shade | 20 / 20 | 0 / 20 |  |
+| SU4_flat_ps | 17 / 20 | 2 / 20 |  |
+| SU5_flat_never | 17 / 20 | 2 / 20 |  |
+| SU6_nonfin_drop | 0 / 20 | 0 / 20 |  | not caught
+| SU7_queue_guard | 20 / 20 | 3 / 20 |  |
+| SU8_stage_half | 20 / 20 | 3 / 20 |  |
+| SU9_out_wait | 20 / 20 | 4 / 20 |  |
+| SU10_kernel_kind | 20 / 20 | 3 / 20 |  |
+| SU11_half_free | 20 / 20 | 4 / 20 |  |
+| SU12_word_lane | 20 / 20 | 3 / 20 |  |
+| SU13_group_size | 20 / 20 | 4 / 20 |  |
+| SU14_two_records | 0 / 20 | 0 / 20 |  | not caught
+| SU15_stage_wait | 20 / 20 | 4 / 20 |  |
+| FS2_side_late | 20 / 20 | 3 / 20 |  |
+
+88 of 97 caught. Not caught: N2_buffer_hazard, N4_ftz_sign, N6_reuse_window, G5_outcode_eq, G8_region_end, G11_addr_adder, L8_b_nowait, SU6_nonfin_drop, SU14_two_records. SU6 needs a non-finite triangle and SU14 a polygon with d exactly 0; neither occurs in these frames.
+
+### Wrong turns and findings (the set-up on the pool)
+
+- **My first corner script named the cold corner `7_slow_1100mv_n40c`.** Quartus 17
+  calls it `7_slow_1100mv_-40c`, so the TimeQuest script failed after the 100C half, and
+  the fit script deleted the database before I saw the cold paths. Refitting lateack_s3
+  cost a slot. `fit.sh` now keeps the database unless the −40C section is written.
+- **The first set-up fit failed both corners on my own sort**: it compared the third y
+  word straight off the projection output's M10K (−0.374 ns at −40C, −0.308 at 100C).
+  The three y words are now registered before any compare, which costs one cycle a
+  triangle and no frame-level cycles (VF3 p99 77.0% → 76.9%).
+- **My first post-op fix put a 32-bit select on each of the three write-back paths per
+  lane**, about +120 ALM in that fit (7,997 without pins), where the old code had one
+  shared select. Post-op results only go to the lane registers (and MAME's shade to the
+  side memories), so only those carry the select now.
+- **The XOR alone did not clear k255.** The next fit's worst path came from the
+  ambient byte through `vq_r`, a register shared across the main machine, not from the
+  negation.
+- **Quartus 17 would not elaborate the default build without `r3d_ucode_su.sv`.** The
+  inactive generate branch's instance used implicit port connections (`.clk`), and
+  Quartus wants the module declared to resolve them. Verilator accepted it. Explicit
+  connections fixed it, and the viewer's and core's file lists need no change for the
+  default build.
+- **Duplicating the emitter's header and viewport code made FA7's and L1's patterns
+  match twice**, and `faults.py` stops at an ambiguous pattern. The code is now shared
+  (`e_hw`, `e_vw`). FA3b, FA7, L1, D1, D3, G6, G12 and L5 moved to the current lines,
+  and the faults are the same. G12 now plants "the post-op's select left out of the
+  lane-register write", the old "result mux" in its new place.
+- **R65's measurement kernels were never checked for their results**, because the
+  results were unused. Built, SETUP4 and SETUP2 give `rtl_tri::setup`'s words on 6.57 M
+  records with no change to the rounding order.
+- **The built form beats the model** by 1.8-3.1 points: there is no 18-cycle hold, the
+  kernel is 5 cycles shorter, and the port overlaps the polygon machine.
+- **72,162 flat triangles in VF3's 400 frames** (3.1% of records) take the flat path,
+  so its substitution is not a corner case.
+
+### Open after the set-up
+
+- Daytona 2 is 117.6% at p99 with the set-up (93.9% without).
+- The port is about 50 ALM over R60's estimate. Staging in `pqa` alone (with the
+  address's spare bit) would take the shared write data's second source away, an
+  estimated 20-40 ALM.
+- SU6 (the non-finite drop) and SU14 (the second record of a polygon with d exactly 0)
+  are not reached by these frames: no non-finite triangle, and no d of exactly 0.

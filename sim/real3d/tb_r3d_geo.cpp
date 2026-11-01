@@ -11,16 +11,36 @@
 // ---------------------------------------------------------------------------
 //
 // r3d_geo against the reference model, triangle by triangle, every field. The
-// RTL's word stream (polygon records, r3d_geo.sv's emitter) is cut into the
-// fan's triangles here, with MAME's buffer index counted per alpha buffer.
+// RTL's word stream (polygon and viewport records, r3d_geo.sv's emitter,
+// m2-notes section 15) is cut into the fan's triangles here, with MAME's buffer
+// index counted per alpha buffer. The model's triangles that face away (its
+// back-face test, R62) are left out unless --face-keep (FACE_DROP = 0); 1/w is
+// the model's reciprocal of its w; the viewport records' words are read from
+// the dump at each 'V' record's address.
 //
 //   Vr3d_geo --dumps DIR --vrom FILE [--frames N] [--first N] [--lat LO HI]
 //            [--stall P] [--seed S] [--setup sm|cr|alg] [--cull] [--rows sm|mame|LIST]
+//            [--step HEX] [--face-keep] [--lod]
+//            [--hostile MASK] [--ack LO HI] [--busy PCT] [--gap PCT] [--maxrd K]
+//            [--replay TRACE]
+//
+// --lod: the build has LOD_WORD = 1; each polygon record is 5 + 6 n words and
+// its header word 4, the LOD word B, is checked against the model's.
+//
+// --setup-out: the build has SETUP_OUT = 1 (the set-up on the pool, m2-notes
+// section 15): the RTL sends one set-up record a triangle, the polygon header
+// with n = 3 (and the LOD word with --lod), then x1 y1 x2 y2 x3 y3, det and
+// pdx, pdy, ps of 1/w, u/w, v/w, shade (textured, 23 words) or 1/w, shade (17).
+// Each is checked word by word against rtl_tri::setup (r3d_rast_rtl.cpp, depth
+// on 1/w, flush to zero) on the model's triangle, the header fields as above.
+// A triangle whose x, y or 1/w is not finite is left out of the model's list,
+// as the set-up port (and m3v_setup) drops it.
 //
 // --rows gives the model's D-19 rows (m2-notes section 3) and must match the
 // RTL build's SM_* parameters: sm (default, every row), mame, or a list of
-// flat, fixed, double, light, trans, ctab (flat: row 18 as built, the (2b + 1) / 255
-// normals; face adds the face normals of flat polygons, a model switch only).
+// flat, fixed, double, light, trans, ctab, cull (flat: row 18 as built, the (2b + 1) / 255
+// normals; face adds the face normals of flat polygons, a model switch only;
+// cull the back-face test, SM_CULL).
 //
 // Each memory port answers a request after 1-3 cycles and returns its words
 // LO..HI cycles later (random per request, in order, one word a cycle); up to
@@ -28,12 +48,30 @@
 // chance, in percent, that the triangle consumer is not ready. Reports frames
 // that match exactly, mismatches per field, cycles per frame, and words and
 // requests per port.
+//
+// --hostile MASK (1 culling, 2 polygon RAM, 4 VROM) gives those ports a slow,
+// irregular memory instead, with its own random stream (study R70): a request
+// is acknowledged ACK LO..HI cycles after it is raised (default 1-3), and on
+// any cycle of that wait with chance BUSY (percent) it is held one cycle
+// more; with --maxrd at most K requests are held at once (acknowledged and not
+// all returned), so a new one waits for the oldest to drain, as the viewer's
+// one-request DDR3 reader does. Words come back in order LO..HI cycles after
+// the acknowledge, and each cycle a due word is held back with chance GAP.
+// The other ports keep the default model.
+//
+// --replay TRACE drives every port's acknowledge and valid, out_ready and
+// start from a trace of one frame, a byte a cycle (sim/viewer/tb_m3v.cpp,
+// M3V_GTRACE), so a timing seen in a whole-core bench runs here alone. Use it
+// with --frames 1 and --first for that frame.
 
 #include "Vr3d_geo.h"
 #include "Vr3d_geo___024root.h"
 #include "verilated.h"
 #include "r3d_geo.h"
 #include "r3d_ucode.h"
+#ifdef GEO_SETUP_OUT
+#include "r3d_rast.h"   // rtl_tri::setup, the set-up records' reference
+#endif
 #include <zlib.h>
 #include <algorithm>
 #include <cinttypes>
@@ -61,14 +99,20 @@ static bool load_dump(std::string const &fn, r3d_mem &m) {
 }
 
 struct port {
-  struct beatq { uint64_t at; uint32_t d; };
+  struct beatq { uint64_t at; uint32_t d; bool last; };
   std::deque<beatq> q;
   int ack_wait = -1;
   uint64_t last_at = 0;
   uint64_t reqs = 0, words = 0;
+  unsigned held = 0;    // --hostile: requests acknowledged and not all returned
 };
 
+#ifdef MS_MON
+static uint64_t n_ready_pend = 0, n_ready_pend_w = 0, n_wait = 0;
+#endif
 static float bf(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+// a 'T' record of the model with the LOD words (d, B) after its other words
+static bool geo_lod_ok(record const &r) { return r.w.size() >= 39; }
 
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
@@ -76,8 +120,13 @@ int main(int argc, char **argv) {
   long max_frames = -1, first = 0;
   int lat_lo = 12, lat_hi = 20, stall = 20;
   unsigned seed = 1;
-  bool setup_cr = false, cull = false, frustum_sm = false;
+  bool setup_cr = false, cull = false, frustum_sm = false, face_keep = false, lod = false, setup_out = false;
+  uint32_t step = 0x10;
   std::string rows = "sm";
+  unsigned hostile = 0, h_maxrd = 0;
+  std::vector<uint8_t> replay;
+  bool replaying = false;
+  int h_ack_lo = 1, h_ack_hi = 3, h_busy = 0, h_gap = 0;
   for (int i = 1; i < argc; i++) {
     std::string const a = argv[i];
     auto nx = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -91,7 +140,29 @@ int main(int argc, char **argv) {
     else if (a == "--setup") { std::string const v = nx(); setup_cr = v == "cr"; frustum_sm = v == "sm"; }
     else if (a == "--cull") cull = true;
     else if (a == "--rows") rows = nx();
+    else if (a == "--step") step = uint32_t(std::strtoul(nx().c_str(), nullptr, 16));
+    else if (a == "--face-keep") face_keep = true;
+    else if (a == "--lod") lod = true;
+    else if (a == "--setup-out") {
+#ifdef GEO_SETUP_OUT
+      setup_out = true;
+#else
+      std::fprintf(stderr, "--setup-out needs the bench built with -DGEO_SETUP_OUT (r3d_rast.cpp, r3d_rast_rtl.cpp)\n"); return 2;
+#endif
+    }
+    else if (a == "--hostile") hostile = unsigned(std::strtoul(nx().c_str(), nullptr, 0));
+    else if (a == "--ack") { h_ack_lo = std::max(1, std::atoi(nx().c_str())); h_ack_hi = std::max(h_ack_lo, std::atoi(nx().c_str())); }
+    else if (a == "--busy") h_busy = std::atoi(nx().c_str());
+    else if (a == "--gap") h_gap = std::atoi(nx().c_str());
+    else if (a == "--maxrd") h_maxrd = unsigned(std::atoi(nx().c_str()));
+    else if (a == "--replay") {
+      std::FILE *f = std::fopen(nx().c_str(), "rb");
+      if (!f) { std::fprintf(stderr, "no trace\n"); return 2; }
+      int c; while ((c = std::fgetc(f)) != EOF) replay.push_back(uint8_t(c));
+      std::fclose(f); replaying = true;
+    }
   }
+
   r3d_mem mem;
   {
     std::FILE *f = std::fopen(vrom.c_str(), "rb");
@@ -105,17 +176,23 @@ int main(int argc, char **argv) {
   if (max_frames >= 0 && size_t(max_frames) < files.size()) files.resize(size_t(max_frames));
 
   std::mt19937 rng(seed);
+  std::mt19937 hrng(seed * 2654435761u + 12345u);   // the hostile ports' own stream
   Vr3d_geo *t = new Vr3d_geo;
   auto tick = [&]() { t->clk = 0; t->eval(); t->clk = 1; t->eval(); };
-  t->rst = 1; t->start = 0; t->cull_ack = 0; t->pram_ack = 0; t->vrom_ack = 0;
+  t->rst = 1; t->start = 0; t->cull_ack = 0; t->pram_ack = 0; t->vrom_ack = 0; t->step15 = step >= 0x15;
   t->cull_rvalid = 0; t->pram_rvalid = 0; t->vrom_rvalid = 0; t->out_ready = 0;
   tick(); tick(); t->rst = 0;
 
-  static char const *fname[] = {"pass", "alpha", "index", "poly", "x", "y", "z", "w", "u/w", "v/w", "shade",
+  static char const *fname[] = {"pass", "alpha", "index", "poly", "x", "y", "1/w", "u/w", "v/w", "shade",
                                 "tex_en", "page", "tex_x", "tex_y", "tex_w", "tex_h", "tex_fmt", "param", "transparency", "colour",
-                                "flags", "model alpha"};
+                                "inverted copy", "faces away", "fog", "translucency layer", "viewport record", "LOD word",
+                                "set-up x", "set-up y", "det", "pdx", "pdy", "ps", "set-up record length"};
+  uint64_t su_tris = 0, su_tex = 0, su_flat = 0, su_nonfin = 0, su_nonfin_w = 0, su_rows0 = 0;
+  uint64_t face_single = 0, face_back = 0, face_dbl = 0, face_zero = 0, vrecs = 0, vrec_bad = 0, tris_culled = 0;
+  uint32_t fsubn_last = 0; uint64_t fsubn_total = 0;
   std::map<std::string, uint64_t> fbad;
   uint64_t frames_ok = 0, tris_total = 0, count_bad = 0;
+  uint64_t port_open = 0, port_open_f = 0;   // frames whose busy fell with a port open
   std::vector<uint64_t> cycles;
   std::vector<uint64_t> pw[3], pr[3];
   int shown = 0;
@@ -140,22 +217,91 @@ int main(int argc, char **argv) {
       if (rows != "sm" && rows != "mame") {
         auto has = [&](char const *k) { return rows.find(k) != std::string::npos; };
         geo.sm_n255 = has("flat"); geo.sm_flat = has("face"); geo.sm_fixed = has("fixed"); geo.sm_double = has("double");
-        geo.sm_light = has("light"); geo.sm_trans = has("trans"); geo.sm_ctab = has("ctab");
+        geo.sm_light = has("light"); geo.sm_trans = has("trans"); geo.sm_ctab = has("ctab"); geo.sm_cull = has("cull");
       }
-#ifdef SETUP_FACE
-      std::vector<uint8_t> bfv;
-      geo.backface = &bfv;
-#endif
+      geo.step = step;
+      geo.lod_word = lod;
       geo.frame(uint32_t(fi));
       geo.out.records(ref_all);
-#ifdef SETUP_FACE
-      // the model's back-face verdicts for the RTL's set-up measurement (SETUP_FACE)
-      for (size_t i = 0; i < 32768; i++) t->rootp->r3d_geo__DOT__face_mem[i] = i < bfv.size() ? bfv[i] : 0;
-      { static uint64_t nb = 0, np = 0; for (uint8_t b : bfv) nb += b; np += bfv.size();
-        if (fi + 1 == files.size()) std::printf("back faces (model, Supermodel's test): %" PRIu64 " of %" PRIu64 " polygons\n", nb, np); }
-#endif
+      face_single += geo.st.face_single; face_back += geo.st.face_back; face_dbl += geo.st.face_vs_double; face_zero += geo.st.face_zero;
     }
-    for (auto &r : ref_all) if (r.tag == 'T') ref.push_back(r);
+    // the model's triangles as the RTL sends them: without those facing away
+    // (FACE_DROP), 1/w for z and w, the header's fog and layer bits
+    std::vector<record> precs;
+    for (auto &r : ref_all) if (r.tag == 'P') precs.push_back(r);
+    {
+      fp_unit rq;
+      uint32_t ro = 0, ra = 0;
+      for (auto &r : ref_all) if (r.tag == 'T') {
+        bool const culled = r.w.size() >= 37 && (r.w[35] & 2);
+        if (culled && !face_keep) { tris_culled++; continue; }
+        record e; e.tag = 'T';
+        e.w.assign(40, 0);   // 37-39: the model's w (the set-up's reference, --setup-out)
+        e.w[0] = r.w[0]; e.w[1] = r.w[1]; e.w[2] = r.w[1] ? ra++ : ro++; e.w[3] = r.w[3];
+        for (int v = 0; v < 3; v++) {
+          uint32_t const *q = &r.w[size_t(4 + 7 * v)];
+          uint32_t *o = &e.w[size_t(4 + 6 * v)];
+          o[0] = q[0]; o[1] = q[1]; o[2] = fbits(rq.recip(bitsf(q[3]))); o[3] = q[4]; o[4] = q[5]; o[5] = q[6];
+          e.w[size_t(37 + v)] = q[3];
+        }
+        for (int k = 0; k < 10; k++) e.w[size_t(22 + k)] = r.w[size_t(25 + k)];
+        e.w[32] = r.w.size() >= 37 ? (r.w[35] & 1) : 0;
+        e.w[33] = r.w.size() >= 37 ? ((r.w[35] >> 1) & 1) : 0;
+        uint32_t const h6 = r.w[3] < precs.size() ? precs[r.w[3]].w[9] : 0;
+        e.w[34] = (h6 >> 11) & 31; e.w[35] = (h6 >> 17) & 1;
+        e.w[36] = (lod && geo_lod_ok(r)) ? r.w.back() : 0;
+        ref.push_back(e);
+      }
+    }
+    // SETUP_OUT: the set-up records the RTL sends, from rtl_tri::setup on each
+    // triangle; a triangle with a non-finite x, y or 1/w word is not sent
+    std::vector<std::vector<uint32_t>> sref, sgot;
+#ifdef GEO_SETUP_OUT
+    if (setup_out) {
+      std::vector<record> keep;
+      uint32_t ro = 0, ra = 0;
+      rtl_opts o; o.oow = true; o.ftz = true;
+      for (auto &e : ref) {
+        bool nf = false;
+        for (int v = 0; v < 3; v++) for (int k = 0; k < 3; k++) if (((e.w[size_t(4 + 6 * v + k)] >> 23) & 0xff) == 0xff) nf = true;
+        if (nf) { su_nonfin++; continue; }
+        e.w[2] = e.w[1] ? ra++ : ro++;
+        rtri t{};
+        for (int v = 0; v < 3; v++) {
+          uint32_t const *q = &e.w[size_t(4 + 6 * v)];
+          // the model's w: rtl_tri::setup forms 1/w as 1.0f / w
+          t.x[v] = bf(q[0]); t.y[v] = bf(q[1]); t.w[v] = bf(e.w[size_t(37 + v)]);
+          { float const iw = 1.0f / t.w[v]; uint32_t u; std::memcpy(&u, &iw, 4); if (u != q[2]) su_nonfin_w++; }
+          t.p0[v] = bf(q[3]); t.p1[v] = bf(q[4]); t.p2[v] = bf(q[5]);
+        }
+        t.param = e.w[29]; t.alpha = e.w[1];
+        rtl_tri r;
+        bool const rows = r.setup(t, kind_of(t), o);
+        if (!rows) su_rows0++;
+        std::vector<uint32_t> w;
+        auto fb = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        for (int v = 0; v < 3; v++) { w.push_back(fb(r.fx[v])); w.push_back(fb(r.fy[v])); }
+        w.push_back(fb(r.det));
+        std::vector<int> pls = r.tex ? std::vector<int>{0, 2, 3, 4} : std::vector<int>{0, 1};
+        for (int pp : pls) { w.push_back(fb(r.pdx[pp])); w.push_back(fb(r.pdy[pp])); w.push_back(fb(r.ps[pp])); }
+        su_tris++; if (r.tex) su_tex++; if (r.flat) su_flat++;
+        sref.push_back(w);
+        keep.push_back(e);
+      }
+      ref.swap(keep);
+    }
+#endif
+    // the viewport records the RTL sends: one a 'V' record, words from the dump
+    std::vector<std::array<uint32_t, 6>> vref, vgot;
+    for (auto &r : ref_all) if (r.tag == 'V') {
+      uint32_t const a = r.w[1];
+      auto W = [&](uint32_t k) -> uint32_t {
+        uint32_t const x = a + k;
+        if (x & 0x800000) { uint32_t o = x - 0x800000; return (x < 0x840000 && o < 0x40000) ? mem.cull_hi[o] : 0; }
+        return x < 0x100000 ? mem.cull_lo[x] : 0;
+      };
+      vref.push_back({r.w[0] & 3, W(0x20), W(0x22), W(0x23), W(0x25), fbits(-bitsf(r.w[9 + 11]))});
+    }
 
     port P[3];  // cull, pram, vrom
     auto mem_word = [&](int pi, uint32_t a) -> uint32_t {
@@ -163,7 +309,7 @@ int main(int argc, char **argv) {
         if (a & 0x800000) { uint32_t o = a - 0x800000; return o < 0x40000 ? mem.cull_hi[o] : 0xDEADBEEFu; }
         return a < 0x100000 ? mem.cull_lo[a] : 0xDEADBEEFu;
       }
-      if (pi == 1) return a < 0x100000 ? mem.poly[a] : 0xDEADBEEFu;
+      if (pi == 1) return a < 0x100000 ? mem.poly[a] : replaying ? 0u : 0xDEADBEEFu;
       return a < 0x1000000 ? mem.vrom[a] : 0xDEADBEEFu;
     };
     std::vector<std::array<uint32_t, 37>> got;
@@ -174,37 +320,103 @@ int main(int argc, char **argv) {
     auto take = [&]() {
       uint32_t const w0 = rec.size() > 0 ? rec[0] : 0, w1 = rec.size() > 1 ? rec[1] : 0;
       uint32_t const nv = w0 >> 27;
-      if (rec.size() != 3 + 7 * size_t(nv) || nv < 3) { rec_bad++; rec.clear(); return; }
+      if (nv == 0) {   // a viewport record
+        if (rec.size() != 6) { rec_bad++; rec.clear(); return; }
+        vgot.push_back({rec[0], rec[1], rec[2], rec[3], rec[4], rec[5]});
+        rec.clear(); return;
+      }
+      size_t const hw = lod ? 5 : 4;
+      if (setup_out) {
+        // one set-up record: the header, then 19 (textured) or 13 words
+        size_t const nw = ((w0 >> 4) & 1) ? 19 : 13;
+        if (nv != 3 || rec.size() != hw + nw) {
+          rec_bad++; fbad[fname[32]]++;
+          if (shown < 12) { shown++; std::printf("set-up record: n %u, %zu words\n", nv, rec.size()); }
+          rec.clear(); return;
+        }
+        std::array<uint32_t, 37> r{};
+        uint32_t const w3 = rec[3];
+        uint32_t const alpha = (w0 >> 2) & 1;
+        r[0] = w0 & 3; r[1] = alpha; r[2] = alpha ? cnt_a++ : cnt_o++; r[3] = w1 & 0xfffff;
+        r[22] = (w0 >> 4) & 1; r[23] = (w0 >> 5) & 1; r[24] = (w1 >> 20) & 0x3f; r[25] = (w1 >> 26) & 0x1f;
+        r[26] = (w0 >> 6) & 7; r[27] = (w0 >> 9) & 7; r[28] = (w0 >> 12) & 7; r[29] = (w0 >> 15) & 0x3f;
+        r[30] = (w0 >> 21) & 0x3f; r[31] = rec[2]; r[32] = (w0 >> 3) & 1; r[33] = (w3 >> 6) & 1;
+        r[34] = w3 & 31; r[35] = (w3 >> 5) & 1;
+        r[36] = lod ? rec[4] : 0;
+        if (w3 >> 7) rec_bad++;
+        got.push_back(r);
+        sgot.push_back(std::vector<uint32_t>(rec.begin() + long(hw), rec.end()));
+        rec.clear(); return;
+      }
+      if (rec.size() != hw + 6 * size_t(nv) || nv < 3) { rec_bad++; rec.clear(); return; }
+      uint32_t const w3 = rec[3];
       for (uint32_t i = 2; i < nv; i++) {
         std::array<uint32_t, 37> r{};
         uint32_t const alpha = (w0 >> 2) & 1;
         r[0] = w0 & 3; r[1] = alpha; r[2] = alpha ? cnt_a++ : cnt_o++; r[3] = w1 & 0xfffff;
         uint32_t const vs[3] = {0, i - 1, i};
-        for (int v = 0; v < 3; v++) for (int k = 0; k < 7; k++) r[size_t(4 + 7 * v + k)] = rec[3 + 7 * vs[v] + size_t(k)];
-        r[25] = (w0 >> 4) & 1; r[26] = (w0 >> 5) & 1; r[27] = (w1 >> 20) & 0x3f; r[28] = (w1 >> 26) & 0x1f;
-        r[29] = (w0 >> 6) & 7; r[30] = (w0 >> 9) & 7; r[31] = (w0 >> 12) & 7; r[32] = (w0 >> 15) & 0x3f;
-        r[33] = (w0 >> 21) & 0x3f; r[34] = rec[2]; r[35] = (w0 >> 3) & 1; r[36] = 0x3f800000u;   // model alpha 1.0 (row 6 not built)
+        for (int v = 0; v < 3; v++) for (int k = 0; k < 6; k++) r[size_t(4 + 6 * v + k)] = rec[hw + 6 * vs[v] + size_t(k)];
+        r[22] = (w0 >> 4) & 1; r[23] = (w0 >> 5) & 1; r[24] = (w1 >> 20) & 0x3f; r[25] = (w1 >> 26) & 0x1f;
+        r[26] = (w0 >> 6) & 7; r[27] = (w0 >> 9) & 7; r[28] = (w0 >> 12) & 7; r[29] = (w0 >> 15) & 0x3f;
+        r[30] = (w0 >> 21) & 0x3f; r[31] = rec[2]; r[32] = (w0 >> 3) & 1; r[33] = (w3 >> 6) & 1;
+        r[34] = w3 & 31; r[35] = (w3 >> 5) & 1;
+        r[36] = lod ? rec[4] : 0;
+        if (w3 >> 7) rec_bad++;
         got.push_back(r);
       }
       rec.clear();
     };
     uint64_t cyc = 0;
-    t->start = 1; tick(); t->start = 0;
-    while ((t->busy || cyc < 4) && cyc < 200000000ull) {
+    uint64_t replay_bad = 0;
+    if (!replaying) { t->start = 1; tick(); t->start = 0; }
+    static uint64_t const maxcyc = std::getenv("R3D_MAXCYC") ? std::strtoull(std::getenv("R3D_MAXCYC"), nullptr, 10) : 200000000ull;
+    while ((t->busy || cyc < 4 || (replaying && cyc < replay.size())) && cyc < maxcyc) {
       // drive memory
       uint8_t req[3] = {t->cull_req, t->pram_req, t->vrom_req};
       uint32_t addr[3] = {t->cull_addr, t->pram_addr, t->vrom_addr};
       uint32_t len[3] = {t->cull_len, t->pram_len, t->vrom_len};
       uint8_t ack[3] = {0, 0, 0}, rv[3] = {0, 0, 0};
       uint32_t rd[3] = {0, 0, 0};
+      if (replaying) t->start = cyc < replay.size() ? (replay[cyc] >> 7) & 1 : 0;
       for (int pi = 0; pi < 3; pi++) {
         port &p = P[pi];
+        if (replaying) {
+          uint8_t const b = cyc < replay.size() ? replay[cyc] : 0;
+          if ((b >> (2 * pi)) & 1) {
+            if (!req[pi] && replay_bad++ < 10) std::printf("replay: port %d acknowledged at %" PRIu64 " with no request\n", pi, cyc);
+            ack[pi] = 1; p.reqs++;
+            for (uint32_t k = 0; k <= len[pi]; k++) { p.q.push_back({0, mem_word(pi, addr[pi] + k), k == len[pi]}); p.words++; }
+          }
+          if ((b >> (2 * pi + 1)) & 1) {
+            if (p.q.empty()) { if (replay_bad++ < 10) std::printf("replay: port %d word at %" PRIu64 " with none due\n", pi, cyc); }
+            else { rv[pi] = 1; rd[pi] = p.q.front().d; p.q.pop_front(); }
+          }
+          continue;
+        }
+        if ((hostile >> pi) & 1) {
+          if (req[pi]) {
+            if (p.ack_wait < 0) p.ack_wait = h_ack_lo + int(hrng() % unsigned(h_ack_hi - h_ack_lo + 1));
+            bool const hold = (int(hrng() % 100) < h_busy) || (h_maxrd && p.held >= h_maxrd);
+            if (!hold && --p.ack_wait == 0) {
+              ack[pi] = 1; p.ack_wait = -1; p.reqs++; p.held++;
+              uint64_t start_at = std::max<uint64_t>(cyc + uint64_t(lat_lo + int(hrng() % unsigned(lat_hi - lat_lo + 1))), p.last_at + 1);
+              for (uint32_t k = 0; k <= len[pi]; k++) { p.q.push_back({start_at + k, mem_word(pi, addr[pi] + k), k == len[pi]}); p.words++; }
+              p.last_at = start_at + len[pi];
+            }
+          }
+          if (!p.q.empty() && p.q.front().at <= cyc && int(hrng() % 100) >= h_gap) {
+            rv[pi] = 1; rd[pi] = p.q.front().d;
+            if (p.q.front().last) p.held--;
+            p.q.pop_front();
+          }
+          continue;
+        }
         if (req[pi]) {
           if (p.ack_wait < 0) p.ack_wait = int(rng() % 3) + 1;
           if (--p.ack_wait == 0) {
             ack[pi] = 1; p.ack_wait = -1; p.reqs++;
             uint64_t start_at = std::max<uint64_t>(cyc + uint64_t(lat_lo + int(rng() % unsigned(lat_hi - lat_lo + 1))), p.last_at + 1);
-            for (uint32_t k = 0; k <= len[pi]; k++) { p.q.push_back({start_at + k, mem_word(pi, addr[pi] + k)}); p.words++; }
+            for (uint32_t k = 0; k <= len[pi]; k++) { p.q.push_back({start_at + k, mem_word(pi, addr[pi] + k), k == len[pi]}); p.words++; }
             p.last_at = start_at + len[pi];
           }
         }
@@ -214,13 +426,67 @@ int main(int argc, char **argv) {
       t->cull_rvalid = rv[0]; t->cull_rdata = rd[0];
       t->pram_rvalid = rv[1]; t->pram_rdata = rd[1];
       t->vrom_rvalid = rv[2]; t->vrom_rdata = rd[2];
-      t->out_ready = (int(rng() % 100) >= stall) ? 1 : 0;
+      t->out_ready = replaying ? ((cyc < replay.size() ? replay[cyc] >> 6 : 1) & 1) : (int(rng() % 100) >= stall) ? 1 : 0;
       t->eval();
       if (t->out_valid && t->out_ready) {
         rec.push_back(t->out_data);
         if (t->out_last) take();
       }
-      if (std::getenv("R3D_DUMPVP")) {
+#ifdef FACE_MON
+      // debug (R3D_FACEDBG): the facing test's inputs, matrix writes, starts and results
+      static bool const facedbg = std::getenv("R3D_FACEDBG") != nullptr;
+      if (facedbg) {
+        static uint64_t nv = 0;
+        if (t->rootp->r3d_geo__DOT__f_vv) std::printf("RF %lu %d%d\n", (unsigned long)nv++, t->rootp->r3d_geo__DOT__f_gt, t->rootp->r3d_geo__DOT__f_lt);
+        static uint32_t fw[6]; static uint64_t nc = 0;
+        if (t->rootp->r3d_geo__DOT__f_twe && !t->rootp->r3d_geo__DOT__f_thold)
+          std::printf("RT %d %d %d %08X\n", t->rootp->r3d_geo__DOT__tbuf_m, t->rootp->r3d_geo__DOT__ft_row, t->rootp->r3d_geo__DOT__ft_col,
+                      t->rootp->r3d_geo__DOT__x_rdata[t->rootp->r3d_geo__DOT__ft_col]);
+        if (t->rootp->r3d_geo__DOT__f_commit) std::printf("RC mb %d\n", t->rootp->r3d_geo__DOT__tbuf_d);
+        {
+          auto *rp = t->rootp;
+          bool const bnd = !rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__run || (rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__r == 3 && rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__s == 6);
+          int const cpp = rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__cp;
+          if (bnd && rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__pend && ((rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__tv >> ((rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__mbs >> cpp) & 1)) & 1))
+            std::printf("RS slot %d mb %d tv %d\n", cpp, (rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__mbs >> cpp) & 1, rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__tv);
+          auto *fu = rp;
+          if (fu->r3d_geo__DOT__g_face__DOT__u_face__DOT__wv || fu->r3d_geo__DOT__g_face__DOT__u_face__DOT__wn || fu->r3d_geo__DOT__g_face__DOT__u_face__DOT__wd)
+            std::printf("RW %c sum %08X\n", fu->r3d_geo__DOT__g_face__DOT__u_face__DOT__wv ? 'V' : fu->r3d_geo__DOT__g_face__DOT__u_face__DOT__wn ? 'N' : 'D',
+                        fu->r3d_geo__DOT__g_face__DOT__u_face__DOT__sum);
+          static int ltv = 0;
+          if (rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__tv != ltv) { ltv = rp->r3d_geo__DOT__g_face__DOT__u_face__DOT__tv; std::printf("RV tv %d\n", ltv); }
+        }
+        if (t->rootp->r3d_geo__DOT__f_we && !t->rootp->r3d_geo__DOT__f_hold) {
+          fw[t->rootp->r3d_geo__DOT__f_word % 6] = t->rootp->r3d_geo__DOT__f_d;
+          std::printf("RA slot %d word %d %06X full %X dst %d\n", t->rootp->r3d_geo__DOT__g_face__DOT__u_face__DOT__fp, t->rootp->r3d_geo__DOT__f_word,
+                      t->rootp->r3d_geo__DOT__f_d, t->rootp->r3d_geo__DOT__g_face__DOT__u_face__DOT__full, int(t->rootp->r3d_geo__DOT__dst));
+        }
+        if (t->rootp->r3d_geo__DOT__f_commit) std::printf("RI %lu %06X %06X %06X n %06X %06X %06X\n", (unsigned long)nc++, fw[0], fw[1], fw[2], fw[3], fw[4], fw[5]);
+      }
+#endif
+#ifdef MS_MON
+      {
+        // debug: the model stream started with a request of the last model still waiting
+        auto *rp = t->rootp;
+        static uint64_t n_ss = 0, n_sd = 0;
+        if (rp->r3d_geo__DOT__ms_start && rp->r3d_geo__DOT__ms_ready && (t->pram_req || t->vrom_req) && n_ss++ < 20)
+          std::printf("MS start at %" PRIu64 " with a request waiting (pram %d vrom %d)\n", cyc, t->pram_req, t->vrom_req);
+        if (rp->r3d_geo__DOT__ms_stop && (t->pram_req || t->vrom_req) && n_sd++ < 20)
+          std::printf("MS stop at %" PRIu64 " with a request waiting, outst %d\n", cyc, rp->r3d_geo__DOT__u_ms__DOT__outst);
+        bool const rdy = rp->r3d_geo__DOT__ms_ready, pend = (t->pram_req && !rp->r3d_geo__DOT__u_ms__DOT__c_issued) || t->vrom_req;
+        bool const dwait = rp->r3d_geo__DOT__dst == 0 && rp->r3d_geo__DOT__d_req != rp->r3d_geo__DOT__d_ack;
+        if (rdy && pend) { n_ready_pend++; if (dwait) n_ready_pend_w++; }
+        if (dwait && !rdy) n_wait++;
+        static long const w0 = std::getenv("R3D_MSWIN") ? std::atol(std::getenv("R3D_MSWIN")) : -1;
+        if (w0 >= 0 && cyc + 3000 >= uint64_t(w0) && cyc <= uint64_t(w0) + 60)
+          std::printf("  %" PRIu64 ": req %d addr %06X ack %d rv %d | start %d stop %d active %d draining %d outst %d count %d next %06X dst %d dwait %d mst %d\n", cyc,
+                      t->pram_req, t->pram_addr, t->pram_ack, t->pram_rvalid, rp->r3d_geo__DOT__ms_start, rp->r3d_geo__DOT__ms_stop,
+                      rp->r3d_geo__DOT__u_ms__DOT__active, rp->r3d_geo__DOT__u_ms__DOT__draining, rp->r3d_geo__DOT__u_ms__DOT__outst,
+                      rp->r3d_geo__DOT__u_ms__DOT__count, rp->r3d_geo__DOT__u_ms__DOT__next, int(rp->r3d_geo__DOT__dst), int(dwait), int(rp->r3d_geo__DOT__mst));
+      }
+#endif
+      static bool const dumpvp = std::getenv("R3D_DUMPVP") != nullptr;
+      if (dumpvp) {
         // debug: the first model set-up's broadcast matrices and lane registers
         static int st_ = 0;
         auto *rp = t->rootp;
@@ -263,6 +529,26 @@ int main(int argc, char **argv) {
       tick();
       cyc++;
     }
+    {
+      // busy low must leave every port quiet (no request waiting, no word due): the
+      // next frame's ports start empty here, as an owner may hand them on
+      unsigned due = 0; for (int pi = 0; pi < 3; pi++) due += unsigned(P[pi].q.size());
+      if (!replaying && (t->cull_req || t->pram_req || t->vrom_req || due)) {
+        port_open++;
+        if (port_open <= 10) std::printf("%s: busy fell with requests %d%d%d waiting and %u words due\n", fs::path(files[fi]).filename().c_str(),
+                                         t->cull_req, t->pram_req, t->vrom_req, due);
+      }
+    }
+    if (cyc >= maxcyc) {
+      // the frame did not finish: where each machine stands
+      auto *rp = t->rootp;
+      std::printf("%s: no end after %" PRIu64 " cycles: main %d decoder %d polygon %d emitter %d walker %d; culling owner %d acked %d, "
+                  "requests %d%d%d; stream active %d draining %d outst %d count %d; chunks %d %d\n", fs::path(files[fi]).filename().c_str(), cyc,
+                  int(rp->r3d_geo__DOT__mst), int(rp->r3d_geo__DOT__dst), int(rp->r3d_geo__DOT__pst), int(rp->r3d_geo__DOT__est),
+                  int(rp->r3d_geo__DOT__u_walker__DOT__st), int(rp->r3d_geo__DOT__own), int(rp->r3d_geo__DOT__own_acked),
+                  t->cull_req, t->pram_req, t->vrom_req, rp->r3d_geo__DOT__u_ms__DOT__active, rp->r3d_geo__DOT__u_ms__DOT__draining,
+                  rp->r3d_geo__DOT__u_ms__DOT__outst, rp->r3d_geo__DOT__u_ms__DOT__count, int(rp->r3d_geo__DOT__dq_cnt), int(rp->r3d_geo__DOT__cq_cnt));
+    }
     cycles.push_back(cyc);
     {
       uint32_t const is = t->rootp->r3d_geo__DOT__u_vpu__DOT__iss_cnt, lo = t->rootp->r3d_geo__DOT__u_vpu__DOT__lop_cnt;
@@ -275,45 +561,86 @@ int main(int argc, char **argv) {
       uint32_t const sn = t->rootp->r3d_geo__DOT__u_vpu__DOT__subn_cnt;
       if (sn != subn_last) { subn_frames++; subn_total += sn - subn_last; }
       subn_last = sn;
+#ifdef FACE_MON
+      uint32_t const fsn = t->rootp->r3d_geo__DOT__g_face__DOT__u_face__DOT__subn_cnt;
+      fsubn_total += fsn - fsubn_last; fsubn_last = fsn;
+#endif
     }
     for (int pi = 0; pi < 3; pi++) { pw[pi].push_back(P[pi].words); pr[pi].push_back(P[pi].reqs); }
     // compare
+    if (replay_bad) std::printf("replay: %" PRIu64 " port events off the trace\n", replay_bad);
     if (!rec.empty() || rec_bad) { std::printf("%s: %zu words left over, %" PRIu64 " malformed records\n", fs::path(files[fi]).filename().c_str(), rec.size(), rec_bad); }
-    bool ok = got.size() == ref.size() && !t->err && rec.empty() && !rec_bad;
+    bool ok = got.size() == ref.size() && !t->err && rec.empty() && !rec_bad && port_open == port_open_f;
+    port_open_f = port_open;
     if (got.size() != ref.size()) count_bad++;
     size_t n = std::min(got.size(), ref.size());
     for (size_t i = 0; i < n; i++) {
       auto const &a = ref[i].w;
       auto const &b = got[i];
-      int const nw = a.size() >= 37 ? 37 : 35;   // flags and model alpha when the model writes them
-      for (int k = 0; k < nw; k++) {
-        bool same = a[k] == b[k] || (k >= 4 && k < 25 && std::isnan(bf(a[k])) && std::isnan(bf(b[k])));
+      for (int k = 0; k < 37; k++) {
+        if (setup_out && k >= 4 && k < 22) continue;   // the vertex words: the set-up words below
+        bool same = a[k] == b[k] || ((k >= 4 && k < 22) || k == 36) && std::isnan(bf(a[k])) && std::isnan(bf(b[k]));
         if (!same) {
           ok = false;
-          int fk = k < 4 ? k : k < 25 ? 4 + (k - 4) % 7 : 11 + (k - 25);
+          int fk = k < 4 ? k : k < 22 ? 4 + (k - 4) % 6 : k == 36 ? 25 : 10 + (k - 22);
           fbad[fname[fk]]++;
           if (shown < 12) { shown++; std::printf("%s tri %zu field %s (word %d): model %08X rtl %08X\n", fs::path(files[fi]).filename().c_str(), i, fname[fk], k, a[k], b[k]); }
         }
       }
     }
+    if (setup_out) {
+      for (size_t i = 0; i < n; i++) {
+        auto const &a = sref[i];
+        auto const &b = sgot[i];
+        if (a.size() != b.size()) { ok = false; fbad[fname[32]]++; continue; }
+        for (size_t k = 0; k < a.size(); k++) {
+          bool const same = a[k] == b[k] || (std::isnan(bf(a[k])) && std::isnan(bf(b[k])));
+          if (same) continue;
+          ok = false;
+          int const fk = k < 6 ? 26 + int(k & 1) : k == 6 ? 28 : 29 + int((k - 7) % 3);
+          fbad[fname[fk]]++;
+          if (shown < 12) { shown++; std::printf("%s tri %zu set-up word %zu (%s): model %08X rtl %08X\n", fs::path(files[fi]).filename().c_str(), i, k, fname[fk], a[k], b[k]); }
+        }
+      }
+    }
+    vrecs += vref.size();
+    if (vref.size() != vgot.size() || vref != vgot) {
+      ok = false; vrec_bad++; fbad[fname[24]]++;
+      if (shown < 12) { shown++; std::printf("%s: viewport records model %zu rtl %zu differ\n", fs::path(files[fi]).filename().c_str(), vref.size(), vgot.size()); }
+    }
     if (char const *sq = std::getenv("R3D_SEQ")) {
       // debug: the triangle sequence (poly, flags) of both, from index sq
       size_t const k0 = size_t(std::atol(sq));
       for (size_t k = k0; k < k0 + 40 && k < std::max(ref.size(), got.size()); k++)
-        std::printf("seq %zu model %08X/%u rtl %08X/%u\n", k, k < ref.size() ? ref[k].w[3] : 0, k < ref.size() && ref[k].w.size() > 35 ? ref[k].w[35] : 9,
-                    k < got.size() ? got[k][3] : 0, k < got.size() ? got[k][35] : 9);
+        std::printf("seq %zu model %08X/%u rtl %08X/%u\n", k, k < ref.size() ? ref[k].w[3] : 0, k < ref.size() ? ref[k].w[32] : 9,
+                    k < got.size() ? got[k][3] : 0, k < got.size() ? got[k][32] : 9);
     }
     tris_total += ref.size();
     if (ok) frames_ok++;
-    else if (got.size() != ref.size() && shown < 12) { shown++; std::printf("%s: model %zu triangles, rtl %zu, err %02X\n", fs::path(files[fi]).filename().c_str(), ref.size(), got.size(), t->err); }
+    else if (got.size() != ref.size() && shown < 12) {
+      shown++;
+      size_t k = 0;
+      while (k < n && got[k][3] == ref[k].w[3]) k++;
+      std::printf("%s: model %zu triangles, rtl %zu, err %02X; first different triangle %zu (model polygon %u, rtl %u)\n", fs::path(files[fi]).filename().c_str(),
+                  ref.size(), got.size(), t->err, k, k < ref.size() ? ref[k].w[3] : 0u, k < got.size() ? got[k][3] : 0u);
+    }
   }
   auto pct = [](std::vector<uint64_t> v, double p) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return double(v[std::min(v.size() - 1, size_t(p * (v.size() - 1) + 0.5))]); };
   std::printf("r3d_geo: %zu frames, %" PRIu64 " match the model on every triangle field (%" PRIu64 " triangles), %" PRIu64 " with a different count; latency %d-%d, stall %d%%\n",
               files.size(), frames_ok, tris_total, count_bad, lat_lo, lat_hi, stall);
   for (auto const &kv : fbad) std::printf("  field %-12s %" PRIu64 " mismatches\n", kv.first.c_str(), kv.second);
+  if (port_open) std::printf("  %" PRIu64 " frames ended with a port still open\n", port_open);
+  if (setup_out)
+    std::printf("set-up records (model): %" PRIu64 " triangles, %" PRIu64 " textured, %" PRIu64 " flat; %" PRIu64 " left out (x, y or 1/w not finite), "
+                "%" PRIu64 " vertices whose 1/w word is not 1.0f / w, %" PRIu64 " with no row on screen (sent)\n",
+                su_tris, su_tex, su_flat, su_nonfin, su_nonfin_w, su_rows0);
   std::printf("cycles per frame p50 %.0f p99 %.0f max %.0f (p99 = %.1f%% of a 50 MHz frame, %.1f%% at 100 MHz)\n",
               pct(cycles, .5), pct(cycles, .99), pct(cycles, 1), 100.0 * pct(cycles, .99) / 869265, 100.0 * pct(cycles, .99) / 1738530);
-  std::printf("subnormal or flushed values at an FP unit input or output: %" PRIu64 " (in %" PRIu64 " frames)\n", subn_total, subn_frames);
+  std::printf("subnormal or flushed values at an FP unit input or output: %" PRIu64 " (in %" PRIu64 " frames); at the facing test's units %" PRIu64 "%s\n",
+              subn_total, subn_frames, fsubn_total, std::getenv("R3D_NOFACEMON") ? "" : "");
+  std::printf("facing test (model): %" PRIu64 " single-sided polygons, %" PRIu64 " facing away, %" PRIu64 " with d exactly 0, %" PRIu64
+              " where FP32 and double differ; %" PRIu64 " triangles left out; %" PRIu64 " viewport records, %" PRIu64 " frames with one wrong\n",
+              face_single, face_back, face_zero, face_dbl, tris_culled, vrecs, vrec_bad);
   {
     // occupancy of the p99 frame: issue slots used, and lane operations of four a cycle
     std::vector<size_t> ix(cycles.size());
@@ -338,6 +665,9 @@ int main(int argc, char **argv) {
       std::printf("  %s %3d: %5.1f%%\n", v[i].second >= 4000 ? "decoder" : v[i].second >= 3000 ? "engine idle" : v[i].second >= 2000 ? "kernel" : v[i].second >= 1000 ? "poly state" : "main state",
                   v[i].second % 1000, 100.0 * v[i].first / fr);
   }
+#ifdef MS_MON
+  std::printf("MS ready with a request waiting %" PRIu64 " cycles, %" PRIu64 " with the decoder waiting; decoder waiting for the stream %" PRIu64 " cycles\n", n_ready_pend, n_ready_pend_w, n_wait);
+#endif
   delete t;
-  return (frames_ok == files.size() && subn_total == 0) ? 0 : 1;
+  return (frames_ok == files.size() && subn_total == 0 && fsubn_total == 0) ? 0 : 1;
 }

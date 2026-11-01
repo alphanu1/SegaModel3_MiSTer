@@ -85,6 +85,9 @@ struct stage_counts {
   // row 6: nodes tested, culled by distance, LOD lists by entry chosen, blends,
   // entries walked as nodes, models drawn with alpha < 1 / alpha 0
   uint64_t lod_tests = 0, lod_far = 0, lod_pick[4] = {}, lod_blend = 0, lod_node_entries = 0, lod_alpha_models = 0, lod_alpha0 = 0;
+  // the facing test: single-sided polygons tested, facing away, and where the
+  // FP32 form differs from the same test in double
+  uint64_t face_single = 0, face_back = 0, face_vs_double = 0, face_zero = 0;
   // operations the RTL does not repeat: shared vertices keep their transform
   // and light, and their projection while the polygon is not clipped
   fp_counts cached;
@@ -116,14 +119,26 @@ public:
   bool sm_trans = true;   // 17: 6-bit transparency; transparency-0 polygons dropped
   bool sm_ctab = true;    // 12: colour-table base from node words 3, 7, 8 (node[0] & 4), 12-bit index
   bool sm_lod = false;    // 6: LOD by distance and blend radius from viewport word 0x17's table, model alpha (model only)
+  // R62: Supermodel's back-face test, dot(view vertex 0, view face normal) > 0,
+  // in the FP32 order r3d_face.sv computes it (study R62, m2-notes section 15)
+  bool sm_cull = true;
   bool sun_clamp = true;  // Mars mode word bit 18 clear: sunFactor floored at 0 (VF3 and Bass Fishing write 0)
   bool emit_sf = false;   // measurement only: unclamped sunFactor per vertex, d, a, floor after the 'T' words
-  void rows(bool sm, bool lod = false) { sm_n255 = sm_fixed = sm_double = sm_light = sm_trans = sm_ctab = sm; sm_flat = false; sm_lod = sm && lod; }
+  // The per-polygon LOD word (study D-33, R67; r3d_geo.sv LOD_WORD): with
+  // sm_cull, each 'T' record ends with two more words, the facing dot d and
+  // B = d x (NP x C) in FP32 with flush to zero (r3d_face.sv's order), NP =
+  // header[5] bits 8-31 / 4096, C = -cota kz^2 a viewport (cota viewport word
+  // 3; kz^2 = 1 with Supermodel's frustum, else the product kz kz). The
+  // inverted copy of a double-sided polygon carries -d and -B.
+  bool lod_word = false;
+  void rows(bool sm, bool lod = false) { sm_n255 = sm_fixed = sm_double = sm_light = sm_trans = sm_ctab = sm_cull = sm; sm_flat = false; sm_lod = sm && lod; }
   // 'T' carries words 35 (flags: bit 0 the inverted copy of a double-sided
-  // polygon) and 36 (model alpha) when any row that sets them is on
-  bool t_ext() const { return sm_double || sm_lod || emit_sf; }
+  // polygon, bit 1 the record faces away by the face normal) and 36 (model
+  // alpha) when any row that sets them is on
+  bool t_ext() const { return sm_double || sm_lod || emit_sf || sm_cull; }
   r3d_geo(r3d_mem const &m, arith a, bool ftz) : mem(m), mode(a) {
     for (fp_unit *u : {&u_setup, &u_stack, &u_model, &u_vertex, &u_clip, &u_project}) u->ftz = ftz;
+    u_face.ftz = true;   // r3d_face's units flush (no subnormal reaches them, monitored)
   }
 
   // walker events, as rtl/real3d/r3d_walker.sv emits them: {type, a, b, c}
@@ -157,7 +172,7 @@ private:
 
   r3d_mem const &mem;
   arith mode;
-  fp_unit u_setup, u_stack, u_model, u_vertex, u_clip, u_project;
+  fp_unit u_setup, u_stack, u_model, u_vertex, u_clip, u_project, u_face;
 
   int sp = 0;
   int list_depth = 0, call_depth = 0;
@@ -171,6 +186,7 @@ private:
   float sm_d = 0, sm_a = 0;      // Supermodel's diffuse clamp(n7, 0, 1) and ambient byte * (1 / 255)
   uint32_t matrix_base = 0;
   float vpl[8] = {};             // viewport words 12..19 (plane terms)
+  float lod_c = 0;               // lod_word: the viewport's C = -cota kz^2
 
   uint32_t rd(ptr p, uint32_t k, int cat);
   uint32_t pk(ptr p, uint32_t k) const;   // a word the walker already holds (not counted)

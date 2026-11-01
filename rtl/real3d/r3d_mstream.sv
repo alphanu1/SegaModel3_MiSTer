@@ -16,7 +16,12 @@
 // flight, into a 32-word FIFO, so memory latency (12-20 cycles) overlaps the
 // decode. Words past the end of the region read as zero, as the reference
 // model does. "stop" abandons a model: bursts in flight are drained and
-// discarded before the next start.
+// discarded before the next start, and so is a burst asked for and not yet
+// acknowledged, which stop cannot withdraw (a request holds until its ack).
+// ready_start waits for it: a slow memory can acknowledge it after the last
+// acknowledged burst has drained, and taken by a new model it would put the
+// old model's words at the head of the FIFO and step next past the new
+// model's first eight (m2-notes section 15).
 //
 // The colour table (polygon RAM 0x400 + index) shares the polygon RAM port:
 // a colour read waits until no stream burst is in flight there.
@@ -78,7 +83,7 @@ module r3d_mstream (
   assign rv = in_vrom ? vrom_rvalid : pram_rvalid;
   assign rd = in_vrom ? vrom_rdata : pram_rdata;
 
-  assign ready_start = !active && !draining && outst == 3'd0;
+  assign ready_start = !active && !draining && outst == 3'd0 && !pram_req && !vrom_req;
   assign w_valid = active && count != 7'd0;
   assign w_data = fifo[rp];
 

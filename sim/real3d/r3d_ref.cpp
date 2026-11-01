@@ -230,7 +230,7 @@ int main(int argc, char **argv) {
     else if (a == "--ftz") ftz = true;
     else if (a == "--setup") { std::string const v = nx(); setup_cr = v == "cr"; frustum_sm = v == "sm"; }
     else if (a == "--cull") cull = true;
-    else if (a == "--rows") rows = nx();          // mame | sm | a list: flat,fixed,double,light,trans,ctab
+    else if (a == "--rows") rows = nx();          // mame | sm | a list: flat,fixed,double,light,trans,ctab,cull
     else if (a == "--no-sun-clamp") no_sun_clamp = true;
     else if (a == "--emit-sf") emit_sf = true;
     else if (a == "--lod") lod = true;
@@ -269,7 +269,7 @@ int main(int argc, char **argv) {
   if (rows != "sm" && rows != "mame") {
     auto has = [&](char const *k) { return rows.find(k) != std::string::npos; };
     geo.sm_n255 = has("flat"); geo.sm_flat = has("face"); geo.sm_fixed = has("fixed"); geo.sm_double = has("double");
-    geo.sm_light = has("light"); geo.sm_trans = has("trans"); geo.sm_ctab = has("ctab");
+    geo.sm_light = has("light"); geo.sm_trans = has("trans"); geo.sm_ctab = has("ctab"); geo.sm_cull = has("cull");
   }
   geo.sun_clamp = !no_sun_clamp;
   geo.emit_sf = emit_sf;

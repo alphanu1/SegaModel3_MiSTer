@@ -1,0 +1,393 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Sega Model 3 core for MiSTer FPGA
+// Copyright (C) 2026 alphanu1
+//
+// This program is free software: you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option)
+// any later version. See LICENSE for the full text.
+//
+// ---------------------------------------------------------------------------
+//
+// Real3D rasteriser: the texture cache, four texels a clock (D-28), in front
+// of r3d_rast_texel's four banks. A pixel brings each bank's word address
+// (bank b = {A[11], A[0]}, word {A[21:12], A[10:1]}) and gets the four words
+// back in order, exactly the texture RAM's. The addresses are whatever the
+// texel path computes, so a mip level's address (a level base and u, v >> L)
+// needs nothing here.
+//
+// Lines are 4 x 4 texels (32 B), {y tile, x tile}, 18 bits; the texture RAM
+// holds them tiled, a line one 4-beat burst of 64 bits (beat k = row k). A
+// bank keeps a line's 2 x 2 texels of its parity in one 64-bit word, written
+// as two 32-bit lanes (one per beat pair). SETS x WAYS lines, set from the low
+// tile bits of x and y interleaved.
+//
+// Non-blocking, in order (Model 2's m2_texel_bl in shape: misses in flight,
+// answers in request order):
+//   L0  the pixel's line per bank; the four tag copies are read at its sets.
+//   C   compare. The tag rows are read again every cycle the pixel waits, and
+//       the two tag writes the read cannot see are forwarded into them: the
+//       one on the read's own edge (Wq) and the one in flight (W). Hits and
+//       ways are registered.
+//   A   allocate: each distinct missing line takes a cycle: a victim (a
+//       global round-robin way, never one this pixel uses), a fill queued
+//       with the pixel's sequence number; the row with the new tag goes to W
+//       and is written to all four copies the next cycle. The pixel goes into
+//       the FIFO needing every fill allocated so far.
+//   R   the FIFO's head reads when that many fills are written; the words
+//       leave the cycle after.
+// A pixel leaves A only on a cycle with no allocation, so the hits it brings
+// from C already hold every earlier allocation: none of its own can take a
+// way it uses, and its own lines are marked as they are allocated. Nothing is
+// forwarded into A. This is R66's single lookup cycle cut in two (17.5 ns
+// from the tag word to the tag write).
+//
+// A fill's data waits in a buffer until every pixel before its own has read
+// (they may still want the victim's old line), then writes in four cycles.
+// Fills complete in order, so "fills allocated so far" is exact for an
+// in-order reader. inval (texture RAM written) re-sweeps the tags; C and A
+// hold for the sweep and one cycle after it.
+
+/* verilator lint_off UNUSEDSIGNAL */
+module r3d_rast_tcache #(
+  parameter int SB   = 8,    // log2 sets: 8 = 32 KiB, 9 = 64 KiB at four ways
+  parameter int WAYS = 4,
+  parameter int DB   = 6,    // log2 pixels ahead
+  parameter int FB   = 3,    // log2 fills in flight
+  parameter int PW   = 32
+) (
+  input  logic          clk,
+  input  logic          rst,
+  input  logic          inval,
+
+  input  logic          i_valid,
+  output logic          i_ready,
+  input  logic [19:0]   i_a0, i_a1, i_a2, i_a3,
+  input  logic [3:0]    i_use,
+  input  logic [PW-1:0] i_pay,
+
+  output logic          o_valid,
+  input  logic          o_ready,
+  output logic [15:0]   o_q0, o_q1, o_q2, o_q3,
+  output logic [PW-1:0] o_pay,
+
+  output logic          f_req,
+  output logic [17:0]   f_addr,
+  input  logic          f_ack,
+  input  logic          f_rvalid,
+  input  logic [63:0]   f_rdata
+);
+
+  localparam int SETS = 1 << SB;
+  localparam int WB   = $clog2(WAYS);
+  localparam int LB   = SB + WB;          // slot bits
+  localparam int TB   = 18 - SB;          // tag bits
+  localparam int EB   = TB + 1;           // tag entry: {valid, tag}
+  localparam int RW   = WAYS * EB;        // a set's row
+  localparam int D    = 1 << DB;
+  localparam int F    = 1 << FB;
+  localparam int XB   = (SB + 1) / 2, YB = SB / 2;
+
+  function automatic logic [17:0] line_of(input logic [19:0] a);
+    line_of = {a[19:11], a[9:1]};
+  endfunction
+  function automatic logic [SB-1:0] set_of(input logic [17:0] l);
+    set_of = {l[9 +: YB], l[0 +: XB]};
+  endfunction
+  function automatic logic [TB-1:0] tag_of(input logic [17:0] l);
+    tag_of = {l[17 : 9 + YB], l[8 : XB]};
+  endfunction
+  // a row with way w's entry set to {valid, t}: constant indices, a mux a way
+  function automatic logic [RW-1:0] put(input logic [RW-1:0] r, input logic [WB-1:0] w, input logic [TB-1:0] t);
+    put = r;
+    for (int k = 0; k < WAYS; k++) if (w == WB'(k)) put[k * EB +: EB] = {1'b1, t};
+  endfunction
+
+  // ---- tags: four copies, a set's row a word ----------------------------------------------
+  (* ramstyle = "M10K, no_rw_check" *) logic [RW-1:0] tg0 [SETS];
+  (* ramstyle = "M10K, no_rw_check" *) logic [RW-1:0] tg1 [SETS];
+  (* ramstyle = "M10K, no_rw_check" *) logic [RW-1:0] tg2 [SETS];
+  (* ramstyle = "M10K, no_rw_check" *) logic [RW-1:0] tg3 [SETS];
+  logic          twe;
+  logic [SB-1:0] tra [4];
+  logic [SB-1:0] twa;
+  logic [RW-1:0] twd;
+  logic [RW-1:0] trq [4];
+  always_ff @(posedge clk) begin
+    if (twe) begin tg0[twa] <= twd; tg1[twa] <= twd; tg2[twa] <= twd; tg3[twa] <= twd; end
+    trq[0] <= tg0[tra[0]]; trq[1] <= tg1[tra[1]]; trq[2] <= tg2[tra[2]]; trq[3] <= tg3[tra[3]];
+  end
+
+  // ---- data: four banks, two 32-bit lanes each ---------------------------------------------
+  (* ramstyle = "M10K, no_rw_check" *) logic [31:0] dl0 [1 << LB];
+  (* ramstyle = "M10K, no_rw_check" *) logic [31:0] dh0 [1 << LB];
+  (* ramstyle = "M10K, no_rw_check" *) logic [31:0] dl1 [1 << LB];
+  (* ramstyle = "M10K, no_rw_check" *) logic [31:0] dh1 [1 << LB];
+  (* ramstyle = "M10K, no_rw_check" *) logic [31:0] dl2 [1 << LB];
+  (* ramstyle = "M10K, no_rw_check" *) logic [31:0] dh2 [1 << LB];
+  (* ramstyle = "M10K, no_rw_check" *) logic [31:0] dl3 [1 << LB];
+  (* ramstyle = "M10K, no_rw_check" *) logic [31:0] dh3 [1 << LB];
+  logic          dre;
+  logic [LB-1:0] dra [4];
+  logic [63:0]   drq [4];
+  logic          dwe;          // a beat: banks {k[0], 0} and {k[0], 1}, lane k[1]
+  logic [1:0]    dwk;
+  logic [LB-1:0] dwa;
+  logic [31:0]   dwd0, dwd1;   // x even, x odd
+  always_ff @(posedge clk) begin
+    if (dwe && !dwk[0] && !dwk[1]) begin dl0[dwa] <= dwd0; dl1[dwa] <= dwd1; end
+    if (dwe && !dwk[0] &&  dwk[1]) begin dh0[dwa] <= dwd0; dh1[dwa] <= dwd1; end
+    if (dwe &&  dwk[0] && !dwk[1]) begin dl2[dwa] <= dwd0; dl3[dwa] <= dwd1; end
+    if (dwe &&  dwk[0] &&  dwk[1]) begin dh2[dwa] <= dwd0; dh3[dwa] <= dwd1; end
+    if (dre) begin
+      drq[0] <= {dh0[dra[0]], dl0[dra[0]]}; drq[1] <= {dh1[dra[1]], dl1[dra[1]]};
+      drq[2] <= {dh2[dra[2]], dl2[dra[2]]}; drq[3] <= {dh3[dra[3]], dl3[dra[3]]};
+    end
+  end
+
+  // ---- sequence counters -------------------------------------------------------------------
+  logic [FB+1:0] alloc_n, iss_n, done_n;   // fills allocated, issued, written (mod 4F)
+  logic [DB:0]   pix_n, rd_n;              // pixels into the FIFO, pixels read
+  logic [SB:0]   sw_n;                     // tag sweep: sets left
+  logic          sw_q;                     // the cycle after the sweep: C's rows were read under it
+  wire           sweeping = sw_n != '0;
+  wire           hold = sweeping || sw_q;
+
+  // ---- W: the tag write of the last allocation, and Wq the one before -------------------------
+  logic          w_v, wq_v;
+  logic [SB-1:0] w_set, wq_set;
+  logic [WB-1:0] w_way, wq_way;
+  logic [TB-1:0] w_tg, wq_tg;
+  logic [RW-1:0] w_base;                   // the set's row before W's entry
+  always_comb begin
+    twe = w_v; twa = w_set; twd = put(w_base, w_way, w_tg);
+    if (sweeping) begin twe = 1'b1; twa = SB'(sw_n - 1'b1); twd = '0; end
+  end
+
+  // ---- L0 -----------------------------------------------------------------------------------
+  logic          l0_v;
+  logic [19:0]   l0_a [4];
+  logic [3:0]    l0_use;
+  logic [PW-1:0] l0_pay;
+  logic          c_go;
+  assign i_ready = (!l0_v || c_go) && !sweeping;
+  logic [17:0]   l0_ln [4];
+  always_comb for (int b = 0; b < 4; b++) l0_ln[b] = line_of(l0_a[b]);
+
+  // ---- C: compare -----------------------------------------------------------------------------
+  logic          c_v;
+  logic [17:0]   c_ln [4];
+  logic [3:0]    c_use;
+  logic [PW-1:0] c_pay;
+  logic [1:0]    c_j [4];
+  logic [3:0]    c_eq [4], c_ss [4];       // the pixel's banks: same line, same set
+  // the rows as they stand: the read, Wq and W applied
+  logic [RW-1:0] crow [4];
+  logic [3:0]    c_hit;
+  logic [WB-1:0] c_hway [4];
+  always_comb begin
+    for (int b = 0; b < 4; b++) begin
+      crow[b] = trq[b];
+      if (wq_v && set_of(c_ln[b]) == wq_set) crow[b] = put(crow[b], wq_way, wq_tg);
+      if (w_v  && set_of(c_ln[b]) == w_set)  crow[b] = put(crow[b], w_way, w_tg);
+      c_hit[b] = 1'b0; c_hway[b] = '0;
+      for (int w = 0; w < WAYS; w++) begin
+        logic [EB-1:0] e;
+        e = crow[b][w * EB +: EB];
+        if (e[EB-1] && e[TB-1:0] == tag_of(c_ln[b])) begin c_hit[b] = 1'b1; c_hway[b] = WB'(w); end
+      end
+    end
+    // the read: the next pixel's sets when C moves on, else C's own again
+    for (int b = 0; b < 4; b++) tra[b] = c_go ? set_of(l0_ln[b]) : set_of(c_ln[b]);
+  end
+
+  // ---- A: allocate ----------------------------------------------------------------------------
+  logic          a_v;
+  logic [17:0]   a_ln [4];
+  logic [3:0]    a_use, a_ok, a_hit;
+  logic [WB-1:0] a_way [4], a_hway [4];
+  logic [3:0]    a_eq [4], a_ss [4];
+  logic [PW-1:0] a_pay;
+  logic [1:0]    a_j [4];
+  logic [RW-1:0] a_row [4];
+
+  // the first missing bank, one-hot
+  logic [3:0]    miss, mbh;
+  logic [1:0]    mb;
+  always_comb begin
+    for (int b = 0; b < 4; b++) miss[b] = a_use[b] && !a_ok[b] && !a_hit[b];
+    mbh = miss & (~miss + 4'd1);
+    mb = mbh[0] ? 2'd0 : mbh[1] ? 2'd1 : mbh[2] ? 2'd2 : 2'd3;
+  end
+  wire mneed = miss != 4'd0;
+  logic [WB-1:0] way_e [4];
+  always_comb for (int b = 0; b < 4; b++) way_e[b] = a_ok[b] ? a_way[b] : a_hway[b];
+  logic [WB-1:0] rr, vic;
+  logic [3:0]    dup;                      // bank on mb's line
+  logic [WB-1:0] vic_c [4];                // the victim were bank c the one missing
+  always_comb begin
+    for (int b = 0; b < 4; b++) dup[b] = |(a_eq[b] & mbh);
+    // the ways each candidate's set holds for this pixel, in parallel with the choice of mb
+    for (int c = 0; c < 4; c++) begin
+      logic [WAYS-1:0] busy;
+      busy = '0;
+      for (int b = 0; b < 4; b++)
+        for (int w = 0; w < WAYS; w++)
+          if (a_use[b] && (a_ok[b] || a_hit[b]) && a_ss[b][c] && way_e[b] == WB'(w)) busy[w] = 1'b1;
+      vic_c[c] = rr;
+      for (int k = WAYS - 1; k >= 0; k--) if (!busy[WB'(rr + WB'(k))]) vic_c[c] = WB'(rr + WB'(k));
+    end
+    vic = '0;
+    for (int c = 0; c < 4; c++) if (mbh[c]) vic = vic_c[c];
+  end
+
+  // fill queue {line, slot, allocating pixel}, indexed by the counters
+  localparam int QW = 18 + LB + DB + 1;
+  (* ramstyle = "MLAB, no_rw_check" *) logic [QW-1:0] fq [F];
+  wire fq_full = (alloc_n - done_n) == (FB+2)'(F);
+
+  // pixel FIFO {need, payload, j x4, slot x4}
+  localparam int PFW = (FB + 2) + PW + 8 + 4 * LB;
+  (* ramstyle = "M10K, no_rw_check" *) logic [PFW-1:0] pf [D];
+  wire  [DB:0] pf_cnt  = pix_n - rd_n;
+  wire         pf_full = pf_cnt >= (DB+1)'(D - 1);
+
+  wire alloc  = a_v && mneed && !fq_full && !hold;
+  wire a_done = a_v && !mneed && !pf_full && !hold;
+  wire a_go   = (!a_v || a_done) && !hold;
+  assign c_go = (!c_v || a_go) && !hold;
+
+  // A's rows with W applied: W is this pixel's own last allocation (a pixel arrives
+  // only after a cycle without one, so W never holds an older pixel's)
+  logic [RW-1:0] a_rowe [4];
+  always_comb for (int b = 0; b < 4; b++)
+    a_rowe[b] = (w_v && set_of(a_ln[b]) == w_set) ? put(a_row[b], w_way, w_tg) : a_row[b];
+  logic [SB-1:0] a_set_mb;
+  logic [TB-1:0] a_tag_mb;
+  always_comb begin a_set_mb = set_of(a_ln[mb]); a_tag_mb = tag_of(a_ln[mb]); end
+
+  logic [LB-1:0] slot [4];
+  always_comb for (int b = 0; b < 4; b++) slot[b] = {set_of(a_ln[b]), way_e[b]};
+
+  always_ff @(posedge clk) begin
+    if (a_done) pf[pix_n[DB-1:0]] <= {alloc_n, a_pay, a_j[3], a_j[2], a_j[1], a_j[0], slot[3], slot[2], slot[1], slot[0]};
+    if (alloc) fq[alloc_n[FB-1:0]] <= {a_ln[mb], a_set_mb, vic, pix_n};
+  end
+
+  // ---- the fill path -------------------------------------------------------------------------
+  (* ramstyle = "MLAB, no_rw_check" *) logic [63:0] bb [4 * F];
+  logic [FB+2:0] bb_wp, bb_rp;             // beats in, beats written (mod 8F: the buffer can be full)
+  logic [1:0]    wk;
+  wire  [QW-1:0] fq_i = fq[iss_n[FB-1:0]];
+  wire  [QW-1:0] fq_r = fq[done_n[FB-1:0]];
+  assign f_req  = alloc_n != iss_n;
+  assign f_addr = fq_i[QW-1 -: 18];
+  always_ff @(posedge clk) if (f_rvalid) bb[bb_wp[FB+1:0]] <= f_rdata;
+  wire         beats4 = (bb_wp - bb_rp) >= (FB+3)'(4);
+  wire         gate_ok = rd_n == fq_r[DB:0];   // every pixel before the allocator has read
+  wire         wr_go = (alloc_n != done_n) && (wk != 2'd0 || (beats4 && gate_ok));
+  wire  [63:0] bq = bb[bb_rp[FB+1:0]];
+  always_comb begin
+    dwe = wr_go; dwk = wk; dwa = fq_r[DB+1 +: LB];
+    dwd0 = {bq[47:32], bq[15:0]};          // x = 2, x = 0
+    dwd1 = {bq[63:48], bq[31:16]};         // x = 3, x = 1
+  end
+
+  // ---- R: the head, read a cycle ahead into ph --------------------------------------------------
+  logic [PFW-1:0] ph;
+  logic           ph_v;
+  wire  [FB+1:0]  ph_need = ph[PFW-1 -: FB+2];
+  wire            out_free = !o_valid || o_ready;
+  wire            r_go = ph_v && ($signed(done_n - ph_need) >= 0) && out_free;
+  logic           r_v;
+  logic [PW-1:0]  r_pay;
+  logic [1:0]     r_j [4];
+  always_comb begin
+    dre = r_go;
+    for (int b = 0; b < 4; b++) dra[b] = ph[b * LB +: LB];
+  end
+  wire [DB:0] ra = rd_n + (r_go ? (DB+1)'(1) : '0);
+  always_ff @(posedge clk) ph <= pf[ra[DB-1:0]];
+
+  function automatic logic [15:0] pick(input logic [63:0] w, input logic [1:0] j);
+    pick = w[16 * j +: 16];
+  endfunction
+
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      l0_v <= 1'b0; c_v <= 1'b0; a_v <= 1'b0; o_valid <= 1'b0; r_v <= 1'b0; ph_v <= 1'b0;
+      w_v <= 1'b0; wq_v <= 1'b0; sw_q <= 1'b0;
+      alloc_n <= '0; iss_n <= '0; done_n <= '0; pix_n <= '0; rd_n <= '0;
+      sw_n <= (SB+1)'(SETS); rr <= '0; bb_wp <= '0; bb_rp <= '0; wk <= 2'd0;
+    end else begin
+      if (inval && !sweeping) sw_n <= (SB+1)'(SETS);
+      else if (sweeping) sw_n <= sw_n - 1'b1;
+      sw_q <= sweeping;
+      // L0
+      if (i_valid && i_ready) begin
+        l0_v <= 1'b1;
+        l0_a[0] <= i_a0; l0_a[1] <= i_a1; l0_a[2] <= i_a2; l0_a[3] <= i_a3;
+        l0_use <= i_use; l0_pay <= i_pay;
+      end else if (c_go) l0_v <= 1'b0;
+      // C
+      if (c_go) begin
+        c_v <= l0_v;
+        for (int b = 0; b < 4; b++) begin
+          c_ln[b] <= l0_ln[b]; c_j[b] <= {l0_a[b][10], l0_a[b][0]};
+          for (int k = 0; k < 4; k++) begin
+            c_eq[b][k] <= l0_ln[b] == l0_ln[k];
+            c_ss[b][k] <= set_of(l0_ln[b]) == set_of(l0_ln[k]);
+          end
+        end
+        c_use <= l0_use; c_pay <= l0_pay;
+      end
+      // A
+      if (a_go) begin
+        a_v <= c_v;
+        for (int b = 0; b < 4; b++) begin
+          a_ln[b] <= c_ln[b]; a_j[b] <= c_j[b]; a_eq[b] <= c_eq[b]; a_ss[b] <= c_ss[b];
+          a_hway[b] <= c_hway[b]; a_row[b] <= crow[b];
+          a_way[b] <= '0;
+        end
+        a_hit <= c_hit; a_ok <= ~c_use; a_use <= c_use; a_pay <= c_pay;
+      end else if (sweeping) begin
+        for (int b = 0; b < 4; b++) a_row[b] <= '0;   // a row read before the upload is not written back
+      end else begin
+        for (int b = 0; b < 4; b++) a_row[b] <= a_rowe[b];
+        if (alloc)                          // banks on the line are done
+          for (int b = 0; b < 4; b++) if (a_use[b] && !a_ok[b] && dup[b]) begin a_ok[b] <= 1'b1; a_way[b] <= vic; end
+      end
+      // W, Wq
+      w_v <= alloc; w_set <= a_set_mb; w_way <= vic; w_tg <= a_tag_mb; w_base <= a_rowe[mb];
+      wq_v <= w_v && !sweeping; wq_set <= w_set; wq_way <= w_way; wq_tg <= w_tg;
+      if (alloc) begin rr <= vic + WB'(1); alloc_n <= alloc_n + 1'b1; end
+      if (a_done) pix_n <= pix_n + 1'b1;
+      // fills
+      if (f_req && f_ack) iss_n <= iss_n + 1'b1;
+      if (f_rvalid) bb_wp <= bb_wp + 1'b1;
+      if (wr_go) begin
+        bb_rp <= bb_rp + 1'b1;
+        wk <= wk + 2'd1;
+        if (wk == 2'd3) done_n <= done_n + 1'b1;
+      end
+      // R: the head is valid once written before this edge
+      ph_v <= (pix_n - ra) != '0;
+      if (r_go) begin
+        rd_n <= rd_n + 1'b1;
+        r_pay <= ph[4 * LB + 8 +: PW];
+        for (int b = 0; b < 4; b++) r_j[b] <= ph[4 * LB + 2 * b +: 2];
+      end
+      if (out_free) begin
+        r_v <= r_go;
+        o_valid <= r_v;
+        if (r_v) begin
+          o_q0 <= pick(drq[0], r_j[0]); o_q1 <= pick(drq[1], r_j[1]);
+          o_q2 <= pick(drq[2], r_j[2]); o_q3 <= pick(drq[3], r_j[3]);
+          o_pay <= r_pay;
+        end
+      end
+    end
+  end
+
+endmodule

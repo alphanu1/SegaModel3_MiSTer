@@ -8,5 +8,6 @@ for d in $R/$1_s*; do
   m10=$(grep -m1 "Total RAM Blocks" $f | sed 's/.*: //; s/ \/.*//')
   dsp=$(grep -m1 "Total DSP Blocks" $f | sed 's/.*: //; s/ \/.*//')
   fmx=$(grep -A6 "Slow 1100mV 100C Model Fmax Summary" $s | grep -m1 "MHz" | awk '{print $2, $3}')
-  echo "$(basename $d): ALM $alm  reg $reg  M10K $m10  DSP $dsp  Fmax(100C) $fmx"
+  fmc=$(grep -A6 "^; Slow 1100mV -40C Model Fmax Summary" $s | grep -m1 "MHz" | awk '{print $2, $3}')
+  echo "$(basename $d): ALM $alm  reg $reg  M10K $m10  DSP $dsp  Fmax(100C) $fmx  Fmax(-40C) $fmc"
 done

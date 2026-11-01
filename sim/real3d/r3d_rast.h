@@ -148,12 +148,40 @@ uint32_t mame_decode(int fmt, uint32_t p);
 // set-up determinant, translucency as MAME's blend, a screen-door stipple, or
 // Supermodel's two layers; depth on 1/w is rtl_opts::oow. The cycle model is the
 // 100 MHz half-width pipeline of D-28.
+struct rtl_tri;
+// One pixel of a span in render_d25's order (Z-tested, or skipped by the
+// stipple), with every intermediate the RTL benches compare against.
+struct d25_px {
+  int32_t tri = -1; int layer = 0, x = 0, y = 0; rkind k = K_NONE;
+  uint32_t z = 0, zref = 0;
+  bool stip_out = false, zpass = false, ok = false, zw = false, fog = false;
+  uint32_t texel = 0, u = 0, v = 0; int32_t shade = 0, P = 0; int fb = -1;
+  uint32_t col_raw = 0, col_fog = 0, dst = 0, out = 0;   // before fog, after fog, the colour under it, the colour written
+  float K = 0; int32_t S = 0, fc[3] = {}; uint32_t fogint = 0;   // the viewport's fog record, when fog applies
+  int lv0 = 0, lv1 = -1; uint32_t lfr = 0;   // mip (d25_opts::mip): the level read, the second level and its weight /256 (trilinear)
+  uint32_t lodb = 0; int lvmax = 0;            // mip: the triangle's B word (lod = 1) and its highest level
+};
+struct d25_hook {
+  virtual ~d25_hook() = default;
+  virtual void tri(int32_t, int, rtl_tri const &, rkind, bool) {}   // after set-up: index, layer, set-up, kind, culled
+  virtual void px(d25_px const &) {}
+};
 struct d25_opts {
+  d25_hook *hook = nullptr;
   bool fog = true;
   int cull = 2;           // 0 none, 1 det sign xor sort parity, 2 the normal test (a flag from the geometry)
   int trans = 0;          // 0 MAME blend, 1 stipple, 2 two layers
   int band = 16;          // band rows (cycle model)
   int prod = 13;          // walker start product, cycles a (triangle, band) pair
+  // Mip levels (m3-notes MIP row): 0 level 0 (MAME), 1 the nearest level of
+  // Supermodel's LOD, 2 trilinear between the two levels around it. lod: 0 the
+  // LOD in double as Supermodel computes it per pixel; 1 the hardware form, one
+  // per-triangle term B and log2 of the pixel's 1/w Z word through a table.
+  int mip = 0;
+  int lod = 0;
+  // lod = 1: B words by polygon number in place of the ones formed from the
+  // list (the geometry's LOD word, r3d_geo lod_word); 0xffffffff = none given
+  std::vector<uint32_t> const *lodb = nullptr;
 };
 struct d25_stats {
   uint64_t tris = 0, culled = 0, pairs = 0, rows = 0, spans = 0, ztest = 0, zpass = 0, shaded = 0;
@@ -166,6 +194,30 @@ struct d25_stats {
   uint64_t store_bytes = 0;                     // set-up triangle records into the store
   uint64_t fog_px = 0;
 };
+uint32_t fetch_texel(rtri const &t, texram const &tex, uint32_t u, uint32_t v, bool &outside);
+// The same at mip level L (Supermodel's sheet bases, MAME's addressing and
+// filter on u, v >> L), and the four texel addresses it reads (22 bits, page 1
+// from row 1024; corners 00, 01, 10, 11)
+uint32_t fetch_texel_lv(rtri const &t, texram const &tex, uint32_t u, uint32_t v, int L);
+void texel_addr4(rtri const &t, uint32_t u, uint32_t v, int L, uint32_t a[4]);
+int mip_levels(rtri const &t);   // the highest level Supermodel reads: floor(log2(min side)) - 1
+// The hardware LOD form (d25_opts::lod = 1): the triangle's B = kz^2 dot(v0, n)
+// (-cota) NP as render_d25 forms it (FP32 word), and dot(v0, n); false without
+// a viewport. lb8 = -256 log2(B) through the 64-entry table, INT32_MIN when B
+// is not positive and finite (level 0).
+bool d25_lod_terms(rframe const &f, rtri const &t, double &dv, uint32_t &bw);
+int32_t d25_lod_lb8(uint32_t bw);
+uint8_t d25_log2t(int i);        // 256 log2(1 + (i + 1/2) / 64), rounded
+// fog_p at 24 bits (render_d25's fog depth term), for the RTL benches
+int64_t d25_fog_p(__int128 o2, int eo, float K);
+// render_d25's colour for one pixel (frag, then fog when fogint != 0): false when
+// the alpha test discards it; rgb after fog, fb the blend factor (-1 none)
+bool d25_colour(rkind k, uint32_t texel, uint32_t color, uint32_t trans, int32_t shade, uint32_t fogint,
+                int32_t const fc[3], int32_t S, int32_t P, uint32_t &rgb, int &fb, bool &zw);
+// render_d25's scroll fog: the rectangle [x0, x1) x [y0, y1) holds col (what a
+// blend reads) until drawn; a pixel left undrawn shows shown = col x alpha
+struct d25_sfog { int x0 = 0, x1 = 0, y0 = 0, y1 = 0; uint32_t col = 0, shown = 0, alpha = 0; };
+bool d25_scroll_fog(rframe const &f, d25_sfog &out);
 void render_d25(rframe const &f, texram const &tex, rtl_opts const &o, d25_opts const &d, rimage &img, d25_stats &st);
 
 // ---- per-triangle evaluators, for the lockstep comparison ----------------------

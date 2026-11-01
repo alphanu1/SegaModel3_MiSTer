@@ -27,6 +27,8 @@
 // layer, and with --sm / --smfull the MAME-against-Supermodel difference.
 
 #include "r3d_rast.h"
+#include "r3d_geo_lod.h"
+#include <memory>
 #include <zlib.h>
 #include <algorithm>
 #include <array>
@@ -181,6 +183,8 @@ int main(int argc, char **argv) {
   int frames = 1 << 30, threads = 8;
   bool compare_only = false, ablate = false, d25 = false;
   d25_opts dd;
+  int ref_mip = -1, ref_lod = 0;   // --d25: also render this mip variant and diff against it
+  std::string geo_vrom;
   int sm2d_dx = 2, sm2d_dy = 2;
   for (int i = 1; i < argc; i++) {
     std::string const a = argv[i];
@@ -208,6 +212,11 @@ int main(int argc, char **argv) {
     else if (a == "--trans") dd.trans = std::atoi(nx().c_str());
     else if (a == "--band") dd.band = std::atoi(nx().c_str());
     else if (a == "--oow") o.oow = true;
+    else if (a == "--mip") dd.mip = std::atoi(nx().c_str());
+    else if (a == "--lod") dd.lod = std::atoi(nx().c_str());
+    else if (a == "--ref-mip") ref_mip = std::atoi(nx().c_str());
+    else if (a == "--ref-lod") ref_lod = std::atoi(nx().c_str());
+    else if (a == "--geo-lod") geo_vrom = nx();   // --d25, lod 1: each polygon's B from the geometry model (r3d_geo_lod.h)
     else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
   }
   if (mame.empty() || (!compare_only && (tris.empty() || dumps.empty()))) {
@@ -225,12 +234,21 @@ int main(int argc, char **argv) {
 
   if (d25) {
     // D-25 RTL form against Supermodel's 3D-only grabs, and the 100 MHz cycle model
-    struct d25r { bool ok = false; idiff d, vs, vg; uint64_t vsk[K_COUNT] = {}; uint64_t cn = 0, cx = 0; d25_stats st; };
+    struct d25r { bool ok = false; idiff d, vs, vg, vm; uint64_t vsk[K_COUNT] = {}; uint64_t cn = 0, cx = 0; d25_stats st; };
     std::vector<d25r> rr(names.size());
     std::atomic<size_t> nx{0};
+    std::vector<uint32_t> vrom;
+    if (!geo_vrom.empty()) {
+      vrom.resize(0x1000000);
+      std::FILE *fv = std::fopen(geo_vrom.c_str(), "rb");
+      if (!fv) { std::fprintf(stderr, "no VROM %s\n", geo_vrom.c_str()); return 2; }
+      size_t n = std::fread(vrom.data(), 4, vrom.size(), fv); (void)n; std::fclose(fv);
+    }
     auto wk = [&]() {
       texram tex;
       std::vector<uint32_t> dl;
+      std::unique_ptr<r3d_mem> gm;
+      if (!vrom.empty()) { gm = std::make_unique<r3d_mem>(); gm->vrom = vrom; }
       for (size_t i; (i = nx++) < names.size();) {
         rframe f;
         if (!read_rframe(tris + "/" + names[i] + ".tri", f)) continue;
@@ -238,7 +256,17 @@ int main(int argc, char **argv) {
         for (auto &v : f.vps)
           for (int k = 0; k < 0x30; k++) v.node[k] = dl[((v.addr & 0x7fffff) + uint32_t(k)) & 0x3ffff];
         rimage img;
-        render_d25(f, tex, o, dd, img, rr[i].st);
+        d25_opts d1 = dd;
+        std::vector<uint32_t> lodb;
+        if (gm && geo_lod_load(dumps + "/" + names[i] + ".bin.gz", *gm)) { lodb = geo_lod_words(*gm); d1.lodb = &lodb; }
+        render_d25(f, tex, o, d1, img, rr[i].st);
+        if (ref_mip >= 0) {
+          d25_opts d2 = d1; d2.mip = ref_mip; d2.lod = ref_lod;
+          rimage im2; d25_stats s2;
+          render_d25(f, tex, o, d2, im2, s2);
+          for (size_t p = 0; p < img.px.size(); p++)
+            rr[i].vm.add(((img.px[p] >> 24) ? img.px[p] : 0) & 0xffffff, ((im2.px[p] >> 24) ? im2.px[p] : 0) & 0xffffff);
+        }
         char smn[64];
         std::snprintf(smn, sizeof(smn), "/full_%06d.bmp", std::atoi(names[i].c_str() + 1));
         std::vector<uint32_t> s3;
@@ -320,7 +348,15 @@ int main(int argc, char **argv) {
       for (int j = 0; j < K_COUNT; j++) std::printf(" %s %" PRIu64, kind_name(j), k[j]);
       std::printf("\n");
     }
-    std::printf("D-25 RTL form: fog %d cull %d trans %d oow %d band %d; %zu frames\n", dd.fog, dd.cull, dd.trans, o.oow, dd.band, nf);
+    std::printf("D-25 RTL form: fog %d cull %d trans %d oow %d band %d mip %d lod %d; %zu frames\n", dd.fog, dd.cull, dd.trans, o.oow, dd.band, dd.mip, dd.lod, nf);
+    if (ref_mip >= 0) {
+      idiff v; std::vector<double> pv;
+      for (auto const &r : rr) if (r.ok) { v.merge(r.vm); pv.push_back(r.vm.psnr()); }
+      std::sort(pv.begin(), pv.end());
+      std::printf("  against mip %d lod %d: pixels different %.3f%%, >8 %.3f%%, >32 %.3f%%; PSNR all %.2f dB, p50 frame %.2f dB, p1 frame %.2f dB\n",
+                  ref_mip, ref_lod, v.n ? 100.0 * double(v.ne) / double(v.n) : 0.0, v.n ? 100.0 * double(v.n8) / double(v.n) : 0.0,
+                  v.n ? 100.0 * double(v.n32) / double(v.n) : 0.0, v.psnr(), pv.empty() ? 0.0 : pv[pv.size() / 2], pv.empty() ? 0.0 : pv[pv.size() / 100]);
+    }
     if (cn) std::printf("  against Supermodel's 3D-only grabs: PSNR all %.2f dB, p50 frame %.2f dB, differ >8 %.3f%%, coverage disagrees %.3f%%\n",
                         t.psnr(), ps.empty() ? 0.0 : ps[ps.size() / 2], t.n ? 100.0 * double(t.n8) / double(t.n) : 0.0, 100.0 * double(cx) / double(cn));
     std::printf("  triangles %" PRIu64 ", culled %" PRIu64 "; pairs %" PRIu64 "; Z tests %" PRIu64 ", passed %" PRIu64 ", shaded %" PRIu64 ", fogged %" PRIu64 "\n",

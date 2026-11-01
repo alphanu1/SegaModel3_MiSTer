@@ -10,7 +10,9 @@
 //
 // ---------------------------------------------------------------------------
 //
-// Real3D display-list walker (M2), Step 1.0 node layout.
+// Real3D display-list walker (M2), Step 1.0 node layout, or Step 1.5's with
+// step15 (words 1 and 2 unused: word 0, then words 3-9 read into the same
+// places, MAME's offset of 2).
 //
 // Walks the culling RAM exactly as MAME 0.289's model3_v.cpp does (the M2 exit
 // test is MAME's triangle list; behaviour, not code, is taken from it, BSD-3-
@@ -62,6 +64,7 @@ module r3d_walker #(
   input  logic        rst,
 
   input  logic        start,          // walk one frame
+  input  logic        step15,         // Step 1.5 and later: ten-word nodes
   output logic        busy,
   output logic        overflow,       // a return-stack or chain limit was hit (sticky until start)
 
@@ -92,7 +95,7 @@ module r3d_walker #(
   typedef enum logic [4:0] {
     S_IDLE, S_RD, S_RD_DATA,
     S_VPC_RD, S_VPC_GOT, S_VP_NEXT, S_VP_SEL, S_VP_W22, S_VP_W2, S_VP_EMIT,
-    S_LINK, S_BLK_RD, S_BLK_GOT, S_BLK_XF, S_BLK_FRAME, S_BLK_L4, S_BLK_CQ, S_BLK_CW, S_BLK_SKIP,
+    S_LINK, S_BLK_RD, S_BLK_RD2, S_BLK_GOT, S_BLK_XF, S_BLK_FRAME, S_BLK_L4, S_BLK_CQ, S_BLK_CW, S_BLK_SKIP,
     S_LST_START, S_LST_SCAN, S_LST_SCAN_GOT, S_LST_PUSH, S_LST_ENT,
     S_RET, S_RET_POP, S_END
   } state_t;
@@ -103,6 +106,7 @@ module r3d_walker #(
   logic [31:0] rd_addr;
   logic [2:0]  rd_len;          // words - 1
   logic [2:0]  rd_beat;
+  logic [2:0]  rd_base;         // first rbuf word of the read
   logic [31:0] rbuf [0:7];
   logic        rd_hi, rd_lo;
   logic        rd_past;         // beat rd_beat is past the region's end
@@ -197,6 +201,7 @@ module r3d_walker #(
       case (st)
         S_IDLE: if (start) begin
           overflow <= 1'b0;
+          rd_base <= 3'd0;
           rs_sp <= '0;
           ldepth <= '0;
           pass <= 2'd0;
@@ -210,6 +215,7 @@ module r3d_walker #(
         S_RD: begin
           if (!(rd_hi || rd_lo)) begin
             for (int k = 0; k < 8; k++) rbuf[k] <= 32'd0;
+            rd_base <= 3'd0;
             st <= rd_ret;
           end else if (!mem_req) begin
             mem_req  <= 1'b1;
@@ -223,9 +229,9 @@ module r3d_walker #(
         end
         S_RD_DATA: if (mem_rvalid) begin
           // a word past the end of its region reads as zero
-          rbuf[rd_beat] <= rd_past ? 32'd0 : mem_rdata;
+          rbuf[rd_base + rd_beat] <= rd_past ? 32'd0 : mem_rdata;
           rd_beat <= rd_beat + 3'd1;
-          if (rd_beat == rd_len) st <= rd_ret;
+          if (rd_beat == rd_len) begin st <= rd_ret; rd_base <= 3'd0; end
         end
 
         // ---- viewport chain: collect, then draw last to first per pass
@@ -302,8 +308,13 @@ module r3d_walker #(
             overflow <= 1'b1;
             st <= S_RET;
           end else begin
-            rd_addr <= {8'd0, baddr}; rd_len <= CULL ? 3'd7 : 3'd6; rd_ret <= S_BLK_GOT; st <= S_RD;
+            rd_addr <= {8'd0, baddr}; rd_len <= step15 ? 3'd0 : CULL ? 3'd7 : 3'd6; rd_base <= 3'd0;
+            rd_ret <= step15 ? S_BLK_RD2 : S_BLK_GOT; st <= S_RD;
           end
+        end
+        S_BLK_RD2: begin                               // Step 1.5: words 3-9 into rbuf 1-7
+          rd_addr <= {8'd0, baddr} + 32'd3; rd_len <= CULL ? 3'd6 : 3'd5; rd_base <= 3'd1;
+          rd_ret <= S_BLK_GOT; st <= S_RD;
         end
         S_BLK_GOT: if (ev_free) begin
           ev_valid <= 1'b1; ev_type <= EV_PUSH;

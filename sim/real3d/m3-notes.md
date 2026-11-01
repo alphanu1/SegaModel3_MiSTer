@@ -636,7 +636,7 @@ The VPU is the geometry's only FP pool and today runs at 177% of a 50 MHz frame 
 p99 (R43, latency-bound, being restructured). The set-up can share it only if the
 restructured geometry comes in at about 40-55% of a frame. Then sharing saves
 1,300-1,600 ALM and 4 DSP. The micro-code is the geometry's (`gen_ucode.py`), so this is
-a request to that agent: a SIMD set-up kernel and one more client on the reciprocal.
+a request to the geometry work: a SIMD set-up kernel and one more client on the reciprocal.
 
 If it shares, the set-up should run once per triangle at the geometry's output, with
 the 15 coefficients stored in the polygon record (+60 B a triangle in DDR3, about +55
@@ -933,3 +933,839 @@ the divider bench at once.
 - **Bench:** the model's per-pass Z buffer and draw order (render_d25's loop), the RTL
   fed by r3d_rast_zspan's output and the per-triangle Z-write kind; compare every Z
   outcome and every written Z, with the contour verdict taken from the model.
+
+## 12. The shading lane, the Z band and the texture cache (D-28, D-29)
+
+Seven more blocks, each benched bit for bit against `render_d25` (depth on 1/w, the
+cull flag, fog, translucency 0), each with planted faults, each fitted standalone on
+three seeds at 10 ns. D-29 (plain blend, mode 0) is the build: the Z band's screen
+door is a parameter that folds away at 0, and mode 2's two-layer memory is not built.
+
+### The model's pixel stream (`d25_hook`)
+
+`render_d25` takes an observer (`d25_opts::hook`): each triangle after its set-up,
+and each pixel of each span in the model's order with every intermediate the RTL
+produces: Z and the Z it was tested against, the stipple, the pass, the texel, u, v,
+the shade, fog's P and record (K, S, fog colour, intensity), the colour before and
+after fog, the colour under it and the colour written. Every bench below compares
+against that stream, rebucketed band by band where the RTL's order differs. Three
+public wrappers give the random benches the model's own arithmetic: `d25_fog_p`,
+`d25_colour` (frag then fog) and `fetch_texel`. The images are unchanged (the hook
+is passive).
+
+### The intake on the R65 record
+
+The geometry's record moved (R65, m2-notes section 15): a 4-word header (word 3 the
+fog intensity, layer and facing bits), and SETUP4's planes 1/w, u/w, v/w, shade
+textured (23 words) or 1/w, shade (17), with no w plane. `r3d_rast_intake` takes it
+by default (`SETUP4 = 1`); `SETUP4 = 0` keeps R62's form. Its fields keep their tags,
+but the plane numbers follow the new order (plane 0 is now 1/w, 3 the shade).
+
+The header beats now carry tag 31, not 15: 15 was also plane 1's dy (8 + 4 + 3), so a
+consumer had to count header beats (the M2.5 viewer found it). No parameter tag
+reaches 31, so every tag now names one field. That is an interface change for anything
+that matched tag 15.
+
+Checks: every triangle of both games as a SETUP4 record (3,405,478 and 1,469,469;
+125 M fields) and 2 M random records, and the R62 form on 40 VF3 frames and 500,000
+random records, 0 wrong; I1-I5 caught again.
+
+### Fits (Quartus 17.0, 5CSEBA6U23I7, standalone, 10 ns)
+
+The fitter reports the ALMs the virtual pins take ("due to virtual I/Os"); inside the
+rasteriser those are wires, so the ledger is now kept both ways. The first three
+blocks had 122, 43 and 158 of them.
+
+| Block | ALM s1 / s2 / s3 (pins' ALMs) | ALM without them | M10K | DSP | Fmax slow 100C s1 / s2 / s3 |
+|---|---|---|---|---|---|
+| Z band, first build | 878 / 877 / 877 | | 12 | 0 | 79.6 / 78.2 / 75.4 MHz: fails |
+| Z band | 788 / 785 / 778 (146) | 642 / 639 / 632 | 12 | 0 | 119.3 / 114.9 / 114.1 MHz |
+| Interpolants, plane products one 31 x 11 each | 1,584 / 1,582 / 1,582 | | 0 | 21 | 119.7 / 114.1 / 115.5 MHz |
+| Interpolants | 1,510 / 1,513 / 1,511 (318) | 1,192 / 1,195 / 1,193 | 0 | 15 | 113.6 / 117.5 / 122.0 MHz |
+| Fog P | 183 / 183 / 180 (44) | 139 | 0 | 1 | 132.1 / 139.4 / 145.0 MHz |
+| Colour, first build (four stages) | 257 / 257 / 259 | | 0 | 13 | 95.9 / 93.6 / 96.3 MHz: fails |
+| Colour | 237 / 237 / 235 (107) | 130 | 0 | 13 | 182.4 / 172.0 / 175.8 MHz |
+| Texel, first build (v lerp's product and add in one stage) | 667 / 666 / 667 | | 0 | 12 | 92.3 / 93.5 / 92.1 MHz: fails |
+| Texel | 671 / 672 / 671 (144) | 527 / 528 / 527 | 0 | 12 | 112.0 / 113.1 / 115.3 MHz |
+| Intake on SETUP4 | 312 / 312 / 312 (43) | 269 | 0 | 0 | 141.7 / 154.3 / 147.6 MHz |
+| Texture cache, 32 KiB 4-way | 1,124 / 1,125 / 1,126 (152) | 972 / 973 / 974 | 43 | 1 | 50.1 / 47.9 / 47.1 MHz: fails |
+
+The cache's path is the L1 cycle: the tag RAM's word, the hit, the victim and the
+row update into the tag write, 17.5 ns. It needs L1 split into a compare stage and an
+allocate stage, with an allocation forwarded into the rows of the pixel waiting
+behind it; not done yet. The colour block's 13 DSP is one product a block: the three
+8 x 8 colour products, the three 8 x 5 wrap terms and the 5 x 11 fog term could go to
+logic (about 150 ALM, my estimate) for 6 blocks.
+
+### The Z band (`r3d_rast_zband.sv`)
+
+Two banks by x parity, word {stamp, Z} at {row, x[8:1]}, 2K x 30 a bank (six 2K x 5
+M10K). Lane 0 is pixel x, lane 1 x + 1, bank 0 holds the even one at x[8:1] + x[0].
+A (read issued) -> B (M10K out, forwarding matches and the stamp test) -> C (select,
+compare, write) -> O. C forwards from the two writes it cannot see: the one on the
+previous advance and the one on the edge it was read on.
+
+Done differently from section 11's design, and why:
+- **Stamps in the Z word, not an MLAB map.** A 6-bit stamp a pixel costs 2 M10K (12
+  against 10); the MLAB map (248 words of 16 valid bits and a stamp a bank) would be
+  about 16 LABs plus its own read-modify-write and forwarding, roughly 200 ALM.
+- **The sweep is 32 words of each bank a generation, and it writes the clear value.**
+  A swept word then reads as the clear value whether or not its stamp comes round, so
+  only words a pixel wrote must be swept within 64 generations: 2048 / 32 = 64 is
+  exactly enough. I had first reasoned that 33 were needed; that held only while the
+  sweep wrote zero, which is also wrong for w depth (its clear is all ones).
+- **The contour scoreboard is a count and an x range per band row,** not a CAM of
+  addresses: a pair holds while its row's range covers it, or while a contour pair of
+  another triangle is in B, C or the push register. Pending contour pairs wait in a
+  32-deep MLAB FIFO with their Z; a verdict that says write takes its bank's port the
+  next cycle and stalls the pipe one cycle if C holds a pair.
+
+Generations: 23,958 over 400 VF3 frames (60 a frame) and 16,990 for Bass Fishing,
+each about 35 cycles (drain, 32-word sweep), so about 2,100 cycles a frame (0.12%).
+
+Cycles with no gaps or stalls and a 20-cycle verdict delay: VF3 p50 / p99 / max
+275,413 / 583,638 / 699,438 (33.6% of a frame at p99), Bass Fishing 121,502 /
+351,327 / 516,319 (20.2%); 1.033 and 1.014 cycles a pair, the excess being the
+contour holds and the generation steps.
+
+Checks: every Z-tested pixel of all 800 frames, 208.4 M (VF3) and 95.6 M (Bass
+Fishing), with RAM contents random at power-up, 20% gaps, 20% stalls, verdicts after
+up to 40 cycles; eleven synthetic runs of 20,000 generations (micro-triangles
+stacked on the same pixels, sparse phases on one row for longer than the stamp's
+period, verdict delays 0 and 200); the screen-door build on 20,000 synthetic
+generations a seed and 40 VF3 frames. 0 wrong.
+
+Wrong turns:
+- A verdict from the previous generation landed just after the sweep had passed its
+  word, so its stamp came round live 64 generations later (seed 1 of the synthetic
+  set; the frames never showed it). Verdicts from an older generation now write
+  nothing.
+- The same race inside the sweep: a current-generation verdict landing behind the
+  sweep pointer. Once the sweep starts no pixel of the old generation is left to read
+  Z, so verdict writes are dropped while it runs, and the generation steps only on an
+  edge with no verdict arriving.
+- Timing: the first fit made 75-80 MHz; the compare in C fed the scoreboard's range
+  in the same cycle. The push now goes through a register (covered by the hold), and
+  B does the address matches and the stamp test, so C is a select and a compare:
+  114-119 MHz.
+
+### The shading lane's interpolants (`r3d_rast_interp.sv`, `r3d_rast_recip.sv`)
+
+One pixel a clock: shade, u/w and v/w planes, the 1/w value from the Z walk, the
+perspective reciprocal, u and v, and r, n out for fog. Each plane is two DSP blocks,
+each summing two 18 x 18 products: the gradients split at bit 18, lo = dxl (2x+1) +
+dyl (2y+1), hi likewise, v2 = 2c + (hi << 18) + lo. Written as one 31 x 11 product
+each, Quartus used two blocks a product: 21 DSP against 15 now, and 74 ALM more.
+
+The reciprocal, round(2^47 / m) for a 24-bit m, is r3d_recip's seed and two Newton
+steps cut to the reciprocal, with a clock enable (the geometry's runs free; the
+shading pipe stalls on texture misses). Exhaustive: all 8,388,608 mantissas with 25%
+stalls, 0 wrong. The values wait for it in a 16-deep MLAB delay line, not 11 stages
+of about 190 registers.
+
+Checks: every Z-passing pixel, 149.1 M (VF3) and 61.6 M (Bass Fishing), and 3 M
+random planes at make_plane's bounds (any exponent, 1/w of either sign or zero)
+through rtl_tri::eval; 0 wrong.
+
+### Fog (`r3d_rast_fogp.sv`, and the lerp in `r3d_rast_colour.sv`)
+
+P = min(floor(r km 2^(ke - eo - n - 123)), 4096), 4096 when 1/w <= 0 and 0 when K
+is not positive: r km lies in [2^46, 2^49), so only shifts of 35-49 need a shifter.
+One DSP. It runs beside the texel fetch and its 13 bits go with the pixel. Checks:
+146.7 M and 60.2 M pixels and 3 M random, 0 wrong.
+
+### Colour (`r3d_rast_colour.sv`)
+
+MAME's six draw kinds, colour modulation, the shade as clamp(int32(c s) >> 8) with
+the 32-bit wrap (c s[26:0] in one 27 x 27 and the low 5 bits of c s[31:27] in logic),
+then fog's lerp. The blend itself belongs to the band stage (the colour under the
+pixel). Checks: 32.5 M and 20.2 M pixels (100 frames each) and 3 M random (every
+kind, the shade over the whole int32 range), 0 wrong.
+
+Quartus 17 put one product in each DSP block even in "two independent 18 x 18"
+mode: the first build used 13 blocks for 13 products, so packing has to be written
+in (a sum of two, or one wider product).
+
+### The texel (`r3d_rast_texel.sv`)
+
+MAME's addressing (mirrors, the linear sheet address past x = 2047), the eight
+formats and the SSE2 filter as three products a channel (256 a + (b - a) fu, and the
+same in v: the same integers). Banks by (A[11], A[0]): the two u neighbours differ by
+an odd amount or not at all, the two v neighbours by an odd multiple of 2048 or not
+at all, carries included, so the four corners land in four banks or two corners
+share one address. Checks: 136.1 M and 46.9 M texels and 3 M random (any size,
+mirror and format over random texture RAM), 0 wrong.
+
+### The texture cache (`r3d_rast_tcache.sv`) and what it shows
+
+Non-blocking and in order, Model 2's m2_texel_bl in shape. Lines of 4 x 4 texels,
+tiled in the texture RAM (a line one burst of four 64-bit beats). Four data banks
+(a bank's 2 x 2 texels of a line in one word, two 32-bit lanes), four tag copies.
+Lookup runs up to 64 pixels ahead of the data read and keeps 8 fills in flight; a
+pixel reads when the fills allocated by its lookup are written, which is exact for
+an in-order reader since fills complete in order; a fill writes only after every
+earlier pixel has read (they may still want the victim). Default 256 sets x 4 ways,
+32 KiB: 32 M10K of data and 8 of tags.
+
+Checks: every textured Z-passing pixel's four words, 136.1 M (VF3, 400 frames) and
+46.9 M (Bass Fishing) with latency 20-40, and 100 frames each with latency 20-60,
+gaps and stalls; 5 M random quads, scattered, clustered and with corners in one set
+under other tags, with a texture upload (invalidate) between halves. 0 wrong.
+
+**Texture fills, not logic, bind the frame.** Measured in the RTL's order
+(`make measure_real3d_tcache`, `r3d_tcache_sim`), level-0 sampling as the model
+does:
+
+| Cache | VF3 fills p50 / p99 | MB/s at p99 | Bass fills p50 / p99 |
+|---|---|---|---|
+| 16 KiB 4-way | 75,452 / 406,757 | 749 | 11,527 / 113,466 |
+| 32 KiB 4-way | 67,187 / 297,099 | 547 | 7,875 / 104,993 |
+| 64 KiB 4-way | 55,443 / 231,272 | 426 | 5,955 / 94,663 |
+
+Textured pixels' cycles at p99, lookup 64 ahead, 8 fills in flight, latency 24
+(share of a 100 MHz frame):
+
+| Cache | VF3, a line every 4 cycles (64-bit port) | VF3, every 16 (16-bit SDRAM) | Bass, 4 | Bass, 16 |
+|---|---|---|---|---|
+| 32 KiB 4-way | 89.0% | 274.8% | 30.9% | 99.6% |
+| 64 KiB 4-way | 67.1% | 214.3% | 30.3% | 90.4% |
+
+The RTL with the bench's memory (acks refused 30% of cycles, beats missing 15%,
+latency 20-40) takes VF3 p99 to 132.7% and Bass Fishing to 46.6%. The p50 matches
+R16/R18 (64 KiB: 96 MB/s here, 94-99 there); the p99 tail is R18's 331 MB/s problem
+and worse in these frames. A 16-bit SDRAM cannot carry VF3's p99 at any size I can
+afford; a 64-bit DDR3-class port with 64 KiB just does. The levers are study
+decisions: a mip level (D-25 set LOD aside for its image effect, but its bandwidth
+effect is the large one here), the Z pre-pass (R17: -42% fetches), 64 KiB (+32
+M10K), and where the texture sheets live.
+
+Planted faults, this section:
+
+| Fault | Block | 20 frames | Synthetic / random |
+|---|---|---|---|
+| B1 no forward from the older write | zband | caught | caught |
+| B2 forward priority swapped | zband | not caught | caught |
+| B3 stamp compared on 5 bits | zband | caught | caught |
+| B4 sweep 31 words | zband | not caught | caught |
+| B5 no scoreboard | zband | caught | caught |
+| B6 no hold for contour in B/C | zband | caught | caught |
+| B7 strict compare | zband | caught | caught |
+| B8 verdict lane order | zband | caught | caught |
+| B9 range high end | zband | caught | caught |
+| B10 old-generation verdict writes | zband | not caught | caught |
+| B11 verdict writes in the sweep | zband | not caught | caught |
+| N1 no round-up | recip | caught | caught |
+| N2 delay line 10 | interp | caught | caught |
+| N3 shade floors negatives | interp | not caught | caught |
+| N4 u shift one short | interp | caught | caught |
+| N5 saturation at 32 | interp | not caught | caught |
+| N6 2x for 2x + 1 | interp | caught | caught |
+| F1 shift bias | fogp | caught | caught |
+| F2 saturation a step early | fogp | not caught | caught |
+| F3 negative K | fogp | not caught | caught |
+| C1 no 32-bit wrap | colour | not caught | caught |
+| C2 contour test 0xf7 | colour | not caught | caught |
+| C3 trans >> 2 wrong | colour | not caught | caught |
+| C4 fog shift toward zero | colour | caught | caught |
+| C5 fog g bits | colour | caught | caught |
+| T1 mirror seam | texel | caught | caught |
+| T2 format 4 nibbles | texel | not caught | caught |
+| T3 bank pick | texel | caught | caught |
+| T4 v lerp rounding | texel | caught | caught |
+| T5 u2 not wrapped | texel | caught | caught |
+| K1 beat counters a bit short | tcache | caught | not caught |
+| K2 no fill gate | tcache | caught | caught |
+| K3 victim may be this pixel's way | tcache | not caught | not caught |
+| K4 read a fill early | tcache | caught | caught |
+| K5 lanes swapped | tcache | caught | caught |
+| K6 no dedup of a shared line | tcache | not caught | not caught |
+| K7 texel select swapped | tcache | caught | caught |
+| K8 tag valid ignored | tcache | not caught | caught |
+
+36 of 38 caught. K3 and K6 are near-equivalent: round-robin victims give one pixel's
+allocations distinct ways, so losing K3's protection needs five allocations in one
+set within one pixel; without K6's dedup two banks on one line fill two slots with
+the same line, which costs a fill and no wrong texel. Both stay in.
+
+### Where the 8,000 ALM go now
+
+Seed 1; "logic" is without the virtual pins' ALMs, which become wires inside the
+rasteriser.
+
+| Block | ALM with pins | logic | M10K | DSP | 10 ns |
+|---|---|---|---|---|---|
+| Front | 1,450 | 1,328 | 0 | 0 | yes |
+| Intake (SETUP4) | 312 | 269 | 0 | 0 | yes |
+| Z span | 676 | 518 | 0 | 2 | yes |
+| Z band | 788 | 642 | 12 | 0 | yes |
+| Interpolants and reciprocal | 1,510 | 1,192 | 0 | 15 | yes |
+| Fog P | 183 | 139 | 0 | 1 | yes |
+| Colour | 237 | 130 | 0 | 13 | yes |
+| Texel | 671 | 527 | 0 | 12 | yes |
+| Texture cache, 32 KiB | 1,124 | 972 | 43 | 1 | no (47-50 MHz) |
+| **Built** | **6,951** | **5,717** | **55** | **44** | |
+| Band buffers, blend, DDR3 band write (estimate) | | 450-600 | 20 | 2 | |
+| Polygon-store client, bins, scheduler (estimate) | | 750 | 8-12 | 0 | |
+| Z-to-shading FIFO, shading control, triangle records by tag (estimate) | | 300-500 | 4-8 | 0 | |
+
+Against my section 11 estimates the built shading blocks came out larger: the
+interpolants 1,192 logic ALM against 1,080 (planes, reciprocal, u v), the Z band 642
+against 350 (its 84-bit payload rides four stages), the cache 972 against 750. By
+the logic count the whole rasteriser lands at about 7,300-7,700 of 8,000; by the
+pins-included count used for the first three blocks it would not fit. The DSP count
+is the larger miss: about 44 built against 28-32 planned, most of it products
+Quartus will not pack two to a block.
+
+### Not done
+
+- The band buffers (colour, the blend, 8-row bands double-buffered) and the DDR3
+  band write.
+- The D-20 polygon-store client, its SDRAM2 stub and a DDR3-like memory model.
+- The top level, the whole-rasteriser bench on 400 + 400 frames, and its fit.
+- The Z-to-shading FIFO and the shading control (the triangle record by tag).
+
+## 12, continued. Mip levels against texture bandwidth, and the cache at 100 MHz
+
+### Mip levels in `render_d25` (`d25_opts::mip`, `--mip`, `--lod`)
+
+The MIP row of section 8 lived only in `render_sm` (the float Supermodel form);
+`render_d25` had no switch. It has one now, off by default:
+- `--mip 0` level 0, as before (images unchanged, checked: 13.63 / 19.05 dB p50);
+- `--mip 1` the nearest level of Supermodel's LOD (rounded), no blend;
+- `--mip 2` trilinear: the two levels around the LOD, blended with an 8-bit weight
+  after each level's bilinear filter.
+
+Level L of a page sits at Supermodel's sheet bases (x 0, 1024, 1536, ...; y 0, 512,
+768, ...), the texture at (base + tex_x 32 >> L, base + tex_y 32 >> L), sized
+(32 << w) >> L, read with MAME's addressing and filter on u >> L, v >> L. The highest
+level is Supermodel's, floor(log2(min side)) - 1. `texel_addr4` gives the four
+addresses for any level and is shared with the fill tool.
+
+LOD = -log2((kz / w)^2 dot(v, n) (-cota) NP), as `render_sm` has it. Two forms:
+- `--lod 0`: Supermodel's, per pixel in double, the view position rebuilt from the
+  pixel and its 1/w.
+- `--lod 1`, the hardware candidate. On a flat triangle dot(v, n) is constant, so
+  LOD = -log2 B - 2 log2(1/w), with B = kz^2 dot(v0, n) (-cota) NP one FP32 word a
+  triangle, and log2(1/w) read off the pixel's Z word (it is already float-like:
+  exponent, then a 64-entry table on six mantissa bits). B <= 0 gives level 0.
+
+The two forms are not the same where the header's normal is not the face's normal.
+On 32 VF3 frames, 70.9% of textured pixels get the same LOD, 27.7% differ by under
+1/16 level, and 0.89% differ by two levels or more. Those come from triangles where
+dot(v, n) changes by about 10 a pixel and changes sign across the face. On one of
+them B at vertex 0 is negative, so the hardware form gives level 0 where
+Supermodel's goes up to level 8. Supermodel interpolates the dot per vertex, so
+matching it needs a fifth plane (below).
+
+### The image cost (400 + 400 frames, depth on 1/w, the cull flag, fog, translucency 0)
+
+Against Supermodel's 3D-only grabs, and against level 0 of the same form:
+
+| Form | VF3 PSNR all / p50 / differ >8 | Bass PSNR all / p50 / differ >8 | VF3 pixels changed (>8) vs level 0 | Bass pixels changed (>8) vs level 0 |
+|---|---|---|---|---|
+| Level 0 | 8.72 / 13.63 dB / 75.76% | 15.67 / 19.05 dB / 37.32% | | |
+| Nearest level | 8.73 / 13.72 dB / 75.47% | 15.73 / 19.17 dB / 37.11% | 21.65% (11.35%), 29.29 dB | 10.76% (3.98%), 35.29 dB |
+| Trilinear | 8.73 / 13.72 dB / 75.43% | 15.74 / 19.16 dB / 37.08% | 26.40% (11.32%), 29.50 dB | 12.67% (3.82%), 35.97 dB |
+
+The coverage disagreement does not move (4.51-4.53%, 2.22%). The per-triangle LOD
+against the per-pixel one: nearest, 1.14% of VF3 pixels change (0.70% by more than
+8) and 0.12% of Bass Fishing's; trilinear, 4.52% (0.64%) and 1.52% (0.00%). Against
+the grabs the two LOD forms are equal to 0.01 dB.
+
+So mip levels move the image towards Supermodel by 0.09 dB (VF3) and 0.12 dB (Bass
+Fishing) at p50. That is the size section 8's switch table gave (0.08 and 0.35 dB
+in the float form). Trilinear is worth nothing over the nearest level.
+
+### Fills, and the frame on three memories (`r3d_tcache_sim`)
+
+The tool now takes `--mip` and `--lod`. It replays the cache's own victim rule (a
+global round-robin way, never one the pixel uses; `TC_REPL=1` for true LRU) and
+runs each cache shape against these memories:
+- **ideal64**: R66's figure, a line every 4 cycles and latency 24.
+- **sdram**: one 16-bit SDRAM behind Model 2's `m2_sdram`. One transfer at a time;
+  3 cycles of arbitration and dispatch, then a CAS a word (16 a line). Rows stay
+  open; tRP 2, tRCD 2, tRAS 5, tRC 7, CL 2 plus 4 capture cycles; refresh every 700
+  cycles. So a line costs 19 cycles on a row hit, 21 on a closed bank and 24 on a
+  conflict. Map 0 is Model 2's {bank, row, column}, with the 8 MiB sheet in one bank.
+  Map 1 puts 8 x 4 lines in a row and spreads neighbouring blocks over the four
+  banks. Texture traffic only, nothing else on the chip.
+- **ddr3**: the 64-bit f2sdram port at 100 MHz. Reads are pipelined and data comes
+  back in order at a beat a cycle, after a fixed latency of 30 or 60 cycles. The
+  port is shared with R64's measured clients at their burst sizes: layer writes
+  43.8 MB/s in 248-beat bursts, scan-out 43.8 MB/s in 256-beat bursts, polygon RAM
+  28.4 MB/s in 32-beat bursts. "D-20" scales these to D-20's 180 MB/s.
+
+Lookup is 64 quads ahead with 8 fills in flight, as the RTL. A trilinear pixel is two
+quads (two lookups, so two cycles at four texels a clock) when it is minified. The
+cycles count textured pixels alone, as R66's table did. Under LRU the tool gives
+R66's figures exactly (VF3 297,099 fills p99 and 89.0%; Bass 104,993 and 30.9%). The
+RTL's round-robin victim costs 1.8% (VF3) and 7.2% (Bass) more fills at p99.
+
+**VF3**, 400 frames; p99 share of a 100 MHz frame (1,738,530 cycles):
+
+| Form | Cache | Fills p50 / p99 | MB/s p99 | ideal64 | SDRAM map 0 | SDRAM map 1 | DDR3 L30 | DDR3 L60 | DDR3 L60, 16 fills |
+|---|---|---|---|---|---|---|---|---|---|
+| Level 0 | 32 KiB | 69,429 / 302,324 | 556.5 | 90.7% | 406.2% | 390.8% | 117.0% | 183.1% | 110.6% |
+| Level 0 | 64 KiB | 57,249 / 222,723 | 410.0 | 67.3% | 298.2% | 287.2% | 81.9% | 128.9% | 80.9% |
+| Nearest | 32 KiB | 34,011 / 192,391 | 354.1 | 64.7% | 259.5% | 250.5% | 75.9% | 110.2% | 75.3% |
+| Nearest | 64 KiB | 30,261 / 166,758 | 306.9 | 57.2% | 228.1% | 220.6% | 64.9% | 97.3% | 65.2% |
+| Trilinear | 32 KiB | 47,293 / 204,853 | 377.1 | 86.8% | 276.6% | 266.2% | 99.7% | 128.0% | 99.3% |
+| Trilinear | 64 KiB | 40,879 / 180,026 | 331.4 | 79.6% | 244.2% | 235.5% | 88.6% | 106.3% | 89.5% |
+
+**Bass Fishing**, 400 frames:
+
+| Form | Cache | Fills p50 / p99 | MB/s p99 | ideal64 | SDRAM map 0 | SDRAM map 1 | DDR3 L30 | DDR3 L60 | DDR3 L60, 16 fills |
+|---|---|---|---|---|---|---|---|---|---|
+| Level 0 | 32 KiB | 8,785 / 112,590 | 207.2 | 31.3% | 141.3% | 132.7% | 41.1% | 66.4% | 38.2% |
+| Level 0 | 64 KiB | 7,034 / 96,393 | 177.4 | 30.3% | 121.9% | 114.7% | 37.0% | 58.3% | 34.7% |
+| Nearest | 32 KiB | 7,619 / 58,200 | 107.1 | 29.8% | 82.8% | 76.7% | 34.3% | 46.2% | 34.2% |
+| Nearest | 64 KiB | 5,823 / 49,545 | 91.2 | 28.5% | 72.7% | 67.5% | 32.5% | 42.4% | 32.8% |
+| Trilinear | 32 KiB | 8,529 / 76,032 | 139.9 | 37.3% | 108.0% | 100.0% | 44.3% | 59.7% | 44.1% |
+| Trilinear | 64 KiB | 6,428 / 64,467 | 118.7 | 35.7% | 94.1% | 87.3% | 41.7% | 54.5% | 42.1% |
+
+The DDR3 port at D-20's 180 MB/s and latency 30: VF3 nearest 80.3% (32 KiB) and 67.9%
+(64 KiB); Bass Fishing 36.6% and 34.4%.
+
+The per-triangle LOD (`--lod 1`), nearest level, VF3: 224,472 fills p99 at 32 KiB
+(+16.7%) and 200,620 at 64 KiB (+20.3%). The p99 cycles are 55.5% and 54.5% ideal,
+75.0% and 67.9% on DDR3 at L30, and 127.6% and 115.0% at L60. The p99 frames are not
+the same frames: the extra fills come from triangles that the per-triangle form
+puts at level 0. Bass Fishing is within 0.3% of the per-pixel form.
+
+What the tables say:
+- **The nearest level is the largest single lever.** VF3 p99 fills fall 36% at 32 KiB
+  and p50 fills 51%; Bass Fishing's p99 fills fall 48%. It also moves the image
+  slightly towards Supermodel. Minified pixels are 31.9% of VF3's textured pixels
+  and 35.0% of Bass Fishing's; levels 1-5 take 13.9 / 9.8 / 4.1 / 2.4 / 1.4% (VF3).
+- **Trilinear costs more cycles than its fills save.** 36-41% of textured pixels need
+  a second quad: VF3 p99 is 1,262,495 quads, 72.6% of a frame before any miss. On
+  the ideal port it is 86.8% against the nearest level's 64.7%.
+- **No 16-bit SDRAM carries VF3.** The best case is 220.6% (nearest level, 64 KiB,
+  map 1). R66's 274.8% assumed 16 cycles a line; Model 2's controller takes 19-24, so
+  level 0 at 32 KiB is 390.8%. Bass Fishing fits only with mip levels (67.5-76.7%).
+  The 2-D map is worth 3-8%.
+- **DDR3 carries it if its latency is near 30 cycles.** Nearest level: 75.9% at 32 KiB
+  and 64.9% at 64 KiB. At 60 cycles the 8 fills in flight bind (110.2% / 97.3%), and
+  16 fills bring it back to 75.3% / 65.2%. Level 0 at 32 KiB fails on every DDR3 case
+  except 16 fills (110.6%).
+- **The DDR3 latency is an assumption, not a measurement.** Nothing on the board has
+  timed an f2sdram read in this core. The viewer could count cycles from request to
+  first beat. That number decides between 8 and 16 fills in flight (16 is 4 KiB more
+  beat buffer, MLAB) and how much 64 KiB buys.
+- **The only board figure** is `m2_ddr3`'s header (Model 2 R351): 13 cycles typical
+  and 50 worst, a whole burst, from Model 2's self-test. MiSTer's own guidance is
+  about 200 ns typical. At 13 cycles, pipelined: VF3 70.0% (nearest, 32 KiB), 60.9%
+  (64 KiB), and level 0 102.2% / 74.7%. Bass Fishing is 31.7% / 31.0%.
+- **`m2_ddr3` as built takes one request at a time.** Run that way at 13 cycles it is
+  no better than the SDRAM: VF3 229.7% (nearest, 32 KiB), 201.4% (64 KiB), 363.5%
+  (level 0, 32 KiB); Bass Fishing 77.4%. A texture port on DDR3 needs a pipelined
+  master: several reads issued before the first returns, data in order. I have not
+  checked that MiSTer's f2sdram bridge accepts more than one pending read.
+
+### What the LOD needs from the geometry (not built)
+
+The per-triangle form needs one word a polygon (a polygon's triangles share it):
+- **B = d x NP x (-cota) x kz^2, FP32.**
+  - d is the facing dot `r3d_face` already forms, d = (V0 N0 + V1 N1) + V2 N2. Today
+    only its sign leaves the unit.
+  - NP is header[5] bits 8-31 / 4096.
+  - cota is viewport word 3.
+  - kz is the viewport record's w scale.
+- The record becomes 5 + 6n words. At about 7,300 VF3 polygons a frame that is about
+  1.7 MB/s more into the store.
+- **Geometry cost:**
+  - d as a 32-bit output of `r3d_face`;
+  - two FP32 products a polygon (d x NP, then x the viewport's constant). These fit
+    the face unit's free round-3 slots: 7 of every 28 are idle, so no throughput is
+    lost;
+  - NP (u12.12) through the existing word converter;
+  - the viewport constant -cota kz^2, two products once per viewport.
+- **Not checked:** whether `r3d_face`'s d has the same scale as the model's
+  dot(v, n). R65 checked only its sign. A factor of 2 is a whole level, so this has
+  to be benched before anything is built on it.
+
+Supermodel's exact form needs more, for no measured image gain (0.00 dB p50):
+- a per-vertex d_i (three more products a vertex);
+- a fifth plane d/w in the record (4 + 7n words), so SETUP4 gains three coefficient
+  dots and the intake one field;
+- the interpolants gain a plane (2 DSP, about 100 ALM);
+- a log2 of that plane per pixel.
+
+My estimate for the rasteriser side of the nearest level is 160-230 ALM, 0 DSP and
+0 M10K. The parts are the log2 table (64 x 8), the subtract, clamp and round, and in
+the texel path the level shift of u and v, the level bases and the size masks.
+Trilinear adds the second quad's cycles above, a lerp between levels (4 products)
+and about 250 ALM more.
+
+### The texture cache split into compare and allocate (`r3d_rast_tcache.sv`)
+
+R66's L1 did the whole lookup in one cycle: the tag word out of the M10K, the hit,
+the first missing bank, the victim and the row with the new tag into the tag write
+(17.5 ns, 47-50 MHz). It is now L0 (the read), C (compare) and A (allocate), with
+W writing the tag a cycle after A decides:
+- **C** compares the rows and registers the hits and ways. It does not keep rows: it
+  reads the tag RAM again every cycle the pixel waits, and forwards the two writes
+  a read cannot see. One is Wq, the write on the read's own edge (the M10K's
+  read-during-write is don't-care). The other is W, the write in flight.
+- **A** takes registered hits and does the allocation: the first missing bank, the
+  victim, the fill queue and the row for W. The pairwise same-line and same-set
+  relations of a pixel's four banks are computed once in L0 and registered. A
+  carries the four rows only to build W's word, and updates them with its own
+  allocations, as R66's L1 did.
+- **Nothing is forwarded into A.** A pixel leaves A only on a cycle with no
+  allocation (it leaves when it has no miss left), so the hits it brings from C
+  already hold every allocation before it. I had planned to forward A's allocation
+  into the pixel arriving behind it, with a hit fix-up, an install fix-up and two
+  4 x 4 compare matrices. Working through the hand-over cycle showed that case
+  cannot happen.
+- **A pixel still takes k + 1 cycles in A for k distinct missing lines,** as in R66.
+  The extra stage adds a cycle of latency only: the bench's frames run 1.989 against
+  1.988 cycles a pixel, and the random set 12.638 in both.
+- **A sweep (`inval`) holds C and A for the sweep and one cycle after,** so no row
+  read under the sweep is used. It clears A's rows, so a row read before the upload
+  is never written back. As before, `inval` is meant for an empty pipeline (between
+  frames); a pixel in A across it keeps the hits it had.
+- **The parameters stay:** SB 8 (32 KiB) or 9 (64 KiB at four ways), WAYS, DB and FB.
+  The cache takes bank word addresses, so a mip level's address (base plus
+  u, v >> L) needs no change here. Only the texel block's address path changes.
+
+**The bench now checks the fills.** A C++ model of the allocation rule gives every
+fill address in order: a pixel's distinct missing lines, lowest bank first; the
+victim a global round-robin way, never one the pixel uses. Every fill the RTL
+issues is compared with it, so a duplicate fill or a different victim is caught
+even when every texel is right. R66's RTL and the split one give the same sequence
+on every run (976,676 fills on the 300,000-quad random set, 196,592 on 4 VF3 frames).
+
+Checks, 0 wrong (texels and the fill sequence):
+
+| Set | Pixels | Fills |
+|---|---|---|
+| VF3, 400 frames, latency 20-40, gaps and stalls | 136,144,792 | 30,476,655 |
+| Bass Fishing, 400 frames, the same | 46,929,718 | 11,596,985 |
+| VF3 and Bass Fishing, 100 frames each, latency 20-60 | 28,591,281 + 20,139,953 | |
+| Random, 2 M quads twice with an upload between | 4,000,000 | 6,507,796 |
+| Random, latency 2-4, no gaps or stalls | 1,000,000 | 1,630,358 |
+| 64 KiB (SB 9): both games 100 frames, random 2 M and 500 K | as above | |
+
+Planted faults, 13 of 13 caught (10 VF3 frames / 200,000 random quads):
+
+| Fault | 10 frames | Random |
+|---|---|---|
+| K1 beat counters a bit short | caught | - |
+| K2 no fill gate | caught | caught |
+| K3 victim may be this pixel's way | - | caught |
+| K4 read a fill early | caught | caught |
+| K5 lanes swapped | caught | caught |
+| K6 no dedup of a shared line | caught | caught |
+| K7 texel select swapped | caught | caught |
+| K8 tag valid ignored | - | caught |
+| K9 no forward of the write on the read's edge (Wq) | caught | caught |
+| K10 no forward of the write in flight (W) | caught | caught |
+| K12 A's rows not updated by its own allocation | - | caught |
+| K13 no re-read while C waits | caught | caught |
+| K14 round-robin pointer not advanced | caught | caught |
+
+K3 and K6 were R66's two misses ("near-equivalent"); the fill check catches both.
+
+### Block 7: the colour bands, the blend and the layer write (`r3d_rast_band.sv`)
+
+Shaded pixels arrive one a clock in band order (the passes in turn, draw order),
+each with its colour after fog and, when it blends, MAME's factor f. An end-of-band
+mark follows each band. Translucency is D-29's plain blend (mode 0).
+- **Two band buffers,** each 8 rows x 512 of {drawn, RGB888} in two banks by x
+  parity: 4 x (2048 x 25) = 20 M10K. One is drawn while the other is written out to
+  the layer and cleared for the band two ahead.
+- **P0** reads the word, P1 has the colour under it, P2 the product, P3 the result,
+  W the write.
+- **The blend** is d + ((c - d) f >> 8). That equals render_d25's
+  (c f + d (256 - f)) >> 8 exactly, because 256 d is a multiple of 256, so it is one
+  product a channel, not two. It is done as d + (u f >> 8) - f with u = c - d + 256,
+  which is unsigned, so red and green share one 27 x 8 product
+  ({u_r, 9'd0, u_g} x f; u f < 2^17, so the halves cannot meet) and blue takes one
+  of its own. That is 2 DSP blocks for 3 channels.
+- **No forwarding.** A blending pixel waits in P0 while P1, P2, P3 or W holds a write
+  to its word. A plain write never waits, because writes stay in order.
+- **Scroll fog, render_d25's rule.** A band is cleared to the fog colour inside the
+  rectangle and to 0 outside, which is what a blend reads. A pixel still undrawn at
+  the flush shows the fog colour at the scroll-fog alpha. That colour is a constant
+  of the frame (`sf_out`, worked out once by the control), so the flush has no
+  products: six 8 x 8 products a beat would have been needed otherwise.
+  `d25_scroll_fog` now holds render_d25's rule, and render_d25 calls it; its images
+  are unchanged (13.63 / 19.05 dB p50, identical figures).
+- **The flush is the M2.5 viewer's** (`m3v_raster`, bit-exact on the board): a row
+  is one 248-beat burst, two pixels a beat in `m2_fb_read`'s form, from an 8-entry
+  queue read ahead of the port. The queue is now MLAB, not 400 flops: it is read
+  asynchronously and never written over an entry still to go.
+- **The port** is `m2_ddr3`'s request contract (request held to its ack, a beat taken
+  per `wacc`). `m2_sdram`'s ports share that contract, which is D-20's switch:
+  moving the layer to the second SDRAM is that controller's port, not a change here.
+  The 16-bit layer of D-6 is not built: four pixels a beat need four banks a buffer
+  (12 M10K a buffer against 10), or a two-cycle beat that a write burst cannot wait
+  for.
+- **An end-of-band mark** waits for the pixels in flight (3-4 cycles) and for the last
+  flush, then starts this band's flush and switches buffers.
+
+Checks against render_d25, every pixel of the layer (190,464 a frame) after the
+last flush, memory BUSY 30% and input gaps 10% unless stated:
+
+| Set | Pixels written (blended) | Wrong |
+|---|---|---|
+| VF3, 400 frames | 147,340,341 (36,087,187) | 0 |
+| Bass Fishing, 400 frames | 60,210,676 (10,889,020) | 0 |
+| VF3, 100 frames, BUSY 60%, no gaps | 31,737,817 (12,421,617) | 0 |
+| Random, 2,000 frames: pixels piled on a few words, half blending, random fog rectangles | 14,423,925 (7,210,583) | 0 |
+| Random, 300 frames, gaps 50%, BUSY 80% | 2,156,170 (1,077,710) | 0 |
+
+The cost of waiting instead of forwarding: VF3 34,357 cycles over 400 frames (86 a
+frame) and Bass Fishing 11,418, against 1,738,530 cycles a frame. The end-of-band
+waits in the bench (VF3 4,355 a frame, Bass Fishing 40,298) are an upper bound: the
+bench feeds a pixel a clock with nothing upstream, so an empty band leaves only the
+flush (about 2,000-2,900 cycles a band at 30% BUSY). In the rasteriser a band takes
+about 36,000 cycles on average, so only near-empty bands would wait.
+
+The pixel counts are render_d25's shaded counts exactly. The bench also runs its own
+C++ reading of the rules against render_d25 (0 wrong), so the random set's model is
+render_d25's.
+
+Wrong turn: the first build gated the shading writes by "not the flush's buffer"
+instead of "the buffer drawn". After reset neither buffer belongs to the flush, so
+band 0 went into both buffers and band 1 showed band 0's pixels. Only the first
+frame after reset shows it, and the VF3 and Bass Fishing frames draw nothing in rows
+0-7, so 3 frames passed. The random set caught it (79 pixels in band 1). It is
+planted as G8, which only the random set catches.
+
+Planted faults, 11 of 11 caught (10 VF3 frames / 200 random frames):
+
+| Fault | 10 frames | Random |
+|---|---|---|
+| G1 no wait for the write in W | caught | caught |
+| G2 no wait for the write in P3 | caught | caught |
+| G3 red without the - f | caught | caught |
+| G4 green's half shifted a bit | caught | caught |
+| G5 undrawn fog shows the raw colour | - | caught |
+| G6 cleared for the next band, not two ahead | - | caught |
+| G7 fog rectangle's right edge inclusive | - | caught |
+| G8 shading writes both buffers | - | caught |
+| G9 end of band without the drain | caught | caught |
+| G10 lanes swapped | caught | caught |
+| G11 banks swapped | caught | caught |
+
+G5-G7 need a scroll fog, which the first 10 VF3 frames do not have.
+
+Fit (Quartus 17.0, standalone, 10 ns, three seeds):
+
+| Seed | ALM (pins' ALMs) | ALM without pins | Registers | M10K | DSP | MLAB bits | Fmax slow 100C |
+|---|---|---|---|---|---|---|---|
+| 1 | 582 (134) | 448 | 490 | 20 | 2 | 400 | 123.6 MHz |
+| 2 | 579 (134) | 445 | 490 | 20 | 2 | 400 | 126.1 MHz |
+| 3 | 578 (134) | 444 | 490 | 20 | 2 | 400 | 125.6 MHz |
+
+The worst path is a band RAM's read into the flush queue (1.9-2.1 ns slack).
+Section 11's estimate for this block was 450-600 ALM, 20 M10K and 2 DSP.
+
+Area, section 8.4 technique by technique:
+
+| Technique | Here | Effect |
+|---|---|---|
+| Storage out of flops | the band buffers in M10K; the flush queue (8 x 50) in MLAB, not flops | queue: 400 flops to 400 MLAB bits (registers 490) |
+| MLAB / M10K trade | none; a single buffer with a row interlock would save 10 M10K (not built) | 20 M10K |
+| Built once and shared | one flush engine for the frame clear, the band write and the clear for the band two ahead; each bank's one read port serves shading or the flush by role | no second engine |
+| Sums in the DSP | red and green in one 27 x 8 product, {u_r, 9'd0, u_g} x f | 2 DSP for 3 channels; the plain formula would take 6 products |
+| Narrower / exact rewrite | d + ((c - d) f >> 8) for (c f + d (256 - f)) >> 8; u = c - d + 256 so it packs unsigned | one product a channel, exact |
+| Constants of the frame | the scroll fog's undrawn colour given as sf_out | no products at the flush (6 a beat otherwise) |
+| No forwarding | a blend waits for a write in flight to its word | 4 12-bit compares; 86 cycles a VF3 frame |
+| Parameters | FB_STRIDE | |
+| Did not work | gating shading writes by "not the flush's buffer" | band 0 drawn into both buffers after reset (G8) |
+
+
+**The cache's first split fit did not close** (`tcache2`, three seeds):
+- 73.6 / 77.4 / 80.0 MHz;
+- 1,965-1,989 ALM (152 of them the pins'), so 1,813-1,837 without pins against
+  R66's 972;
+- 864 registers, 43 M10K, and 3 DSP against R66's 1.
+
+The worst path ran from `a_hit` through the first missing bank, the victim and a
+variable part-select (`row[vic * EB +: EB]`) into A's rows and W's row word, 11.9-13.0
+ns. Quartus builds `vic * EB` as a multiplier, which is where the DSPs came from.
+These indexed writes were also the area: four rows of 44-bit demultiplexers, twice
+over in C's forwarding.
+
+The second form (`tcache3`):
+- every row update is a loop over constant ways (`put`);
+- A's rows take W's entry one cycle later, from registers;
+- W builds the tag word itself from the set's row and the way, so the victim reaches
+  only 2-bit registers;
+- the victim is worked out for each of the four candidate banks in parallel with the
+  choice of the first missing bank.
+
+It is bit-exact on the quick sets: 300,000 random quads (976,676 fills) and 4 VF3
+frames (196,592 fills), the same sequences. Its full benches pass: VF3 and Bass
+Fishing 400 frames, 100 frames each at 64 KiB, and the random sets at both sizes, 0
+wrong. Planted faults: 13 of 13 caught.
+
+Fit, three seeds at 10 ns:
+
+| Seed | ALM (pins' ALMs) | ALM without pins | Registers | M10K | DSP | Fmax slow 100C | Worst path |
+|---|---|---|---|---|---|---|---|
+| 1 | 933 (152) | 781 | 866 | 43 | 0 | 106.9 MHz | a_hway -> a_way |
+| 2 | 942 (152) | 790 | 866 | 43 | 0 | 108.3 MHz | a_hit -> a_way |
+| 3 | 942 (152) | 790 | 866 | 43 | 0 | 106.0 MHz | a_ok -> a_way |
+
+Against R66's single cycle (972 ALM without pins, 1 DSP, 47-50 MHz): 182-191 ALM and
+1 DSP fewer, and it closes.
+
+Area, section 8.4 technique by technique:
+
+| Technique | Here | Effect |
+|---|---|---|
+| Storage out of flops | C keeps no rows: the tag RAM is read again every cycle the pixel waits | no 176-flop row copy in C |
+| Built once and shared | the pixel's same-line and same-set relations computed once in L0 and registered | no 18-bit compares in A's path |
+| Narrower / exact rewrite | row updates as loops over constant ways (`put`), not `row[vic * EB +: EB]` | the first form's 1,813 to 781-790 ALM, 3 DSP to 0 |
+| Narrower / exact rewrite | W builds the tag word from the set's row and the way, so the victim reaches only 2-bit registers | |
+| In parallel, not in series | the victim for each of the four candidate banks, beside the choice of the first missing bank | the path is now about 9.2-9.4 ns |
+| Parameters | SB (8 = 32 KiB, 9 = 64 KiB), WAYS, DB, FB | 64 KiB benched, not fitted |
+| Did not work | variable part-selects (Quartus builds the index as a multiplier) | 73.6-80.0 MHz, +840 ALM |
+| Did not need | forwarding into A (fix-ups for the pixel behind) | none built |
+
+## 12, continued. Nearest-level sampling built (study D-33)
+
+The nearest mip level of the hardware LOD form (R67's `lod = 1`) is now RTL, behind
+`MIP` (default 0) in three blocks, with the geometry's LOD word behind `LOD_WORD`
+(m2-notes section 15). The arithmetic is render_d25's `mip = 1, lod = 1` exactly.
+
+### The LOD per pixel, in the interpolants (`r3d_rast_interp.sv`)
+
+The pixel's log2(1/w) is read off its Z word: exponent then a 64-entry table on six
+mantissa bits. The interpolants already have both for the reciprocal: the leading one
+n of |o2| and the normalised mantissa m2. So the Z word's exponent is n + eo + 86 (with
+the Z word's bounds: 0 for 1/w <= 0 or an exponent <= 0, all ones from 255) and its six
+bits are m2[22:17]; nothing is recomputed. With L = {exponent, T[m6]}:
+
+  lv = clamp((K - 2 L) >> 8, 0, lvmax), K = lb8 + 65152 (0 when B gives level 0)
+
+which folds render_d25's 2 x 127 x 256 and its +128 rounding into K. One 18-bit
+subtract and a compare against lvmax, formed off the S2 registers into the delay line,
+which grows by four bits; `o_lv` comes out with the pixel.
+
+### The triangle's term, in the intake (`r3d_rast_intake.sv`)
+
+With `MIP` the header has a fifth word, B, and its tag-31 beat carries the LOD terms in
+its place: [16:0] K = 97664 - {E(B), T[B's top six bits]} (0 when B is not positive and
+finite), [20:17] lvmax = 4 + min(width code, height code). The table is a second copy
+(eight ALM-sized LUTs).
+
+### The level's texel, in the texel block (`r3d_rast_texel.sv`)
+
+Level L of a page sits at Supermodel's sheet bases x 2048 - (2048 >> L), y 1024 - (1024
+>> L). Both bases come out of one shift each: x0 = ((2^L - 1) 2^11 + 32 tx) >> L and y0 =
+page 1024 + (((2^L - 1) 2^10 + 32 ty) >> L). The side is 2^max(0, 5 + w - L), so the
+mirror masks are a decoder, and u, v and their fractions are read off u >> L and v >> L.
+All of it sits in stage 1 beside the masks; stage 2 takes x0 and y0 where it took
+32 tx and page 1024 + 32 ty, so `MIP = 0` is the form before.
+
+### Checks (render_d25, `mip = 1, lod = 1`; `make test_real3d_rast100_mip`)
+
+| Block | Frames | Cases | Wrong |
+|---|---|---|---|
+| Texel, each pixel at its level | 400 VF3 + 400 Bass Fishing | 136,169,683 + 46,930,728 texels | 0 |
+| Texel, random levels up to each texture's highest | | 3,000,000 | 0 |
+| Interpolants, the level of every textured pixel (and u, v, shade, r, n as before) | 400 + 400 | 149,078,975 + 61,645,760 pixels | 0 |
+| Interpolants, random B (none, negative, zero, infinite, NaN, any positive) and lvmax 4-15 | | 3,000,000 | 0 |
+| Intake, the fifth beat (random B, random size codes) | 40 VF3 frames | 338,783 triangles | 0 |
+| Intake, random records | | 500,000 | 0 |
+| Texture cache, each pixel's quad at its level, fill sequence address by address | 400 + 400 | 136,169,683 + 46,930,728 pixels, 13,966,763 + 5,363,845 fills | 0 |
+
+With `MIP = 0` every block's own bench passes unchanged on 400 + 400 frames and its
+random sets (texel 136.1 M + 46.9 M texels, interpolants 149.1 M + 61.6 M pixels, intake
+on R65's and R62's records).
+
+Planted faults (`faults_rast.py` M1-M12): 12 of 12 caught: the LOD one level up, K's
+rounding half a level off, the x and y sheet bases, no upper clamp, lvmax one high, no
+lower clamp, the level-0 fraction, the level-0 mask, the Z exponent one off, B's sign
+not checked, the table read one bit low.
+
+### Fills with the hardware LOD, and with the geometry's B (`r3d_tcache_sim --mip 1 --lod 1 [--geo-lod VROM]`)
+
+The RTL's level is render_d25's, so R67's per-triangle figures stand; the tool gives them
+again to the fill (VF3 224,472 p99 at 32 KiB, 75.0% of a frame on DDR3 at latency 30).
+But render_d25 forms B from MAME's list, and the list is not what the geometry sends.
+`--geo-lod` runs the geometry model on each dump (MAME's frustum, every node walked, so
+the polygon numbers match) and gives each polygon the B of the record the geometry
+sends.
+
+p99 over 400 frames, 32 KiB / 64 KiB:
+
+| Form | VF3 fills | VF3 DDR3 L30 | VF3 SDRAM map 1 | Bass fills | Bass DDR3 L30 | Bass SDRAM map 1 |
+|---|---|---|---|---|---|---|
+| R67 per pixel (Supermodel's LOD) | 192,391 / 166,758 | 75.9% / 64.9% | 250.5% / 220.6% | 58,200 / 49,545 | 34.3% / 32.5% | 76.7% / 67.5% |
+| B from the list (render_d25 `lod = 1`, the RTL's level) | 224,472 / 200,620 | 75.0% / 67.9% | 292.5% / 263.7% | 58,344 / 49,648 | 34.3% / 32.5% | 76.8% / 67.6% |
+| B from the geometry, the polygon's own record (32 KiB) | 220,917 | 75.0% | 292.4% | 58,365 | 34.3% | 76.9% |
+| **B from the geometry, the record sent** | **53,790 / 47,015** | **56.5% / 55.7%** | **77.5% / 71.1%** | **41,569 / 33,831** | **31.4% / 29.7%** | **58.3% / 50.7%** |
+
+(Textured cycles only, as R66 and R67 count them; the SDRAM carries texture traffic and
+nothing else.)
+
+The difference is the double-sided polygon facing away. MAME's list draws it once with
+its own normal, so B < 0 and render_d25 (both LOD forms, and R67's figures) puts it at
+level 0. The geometry, like Supermodel, sends its inverted copy instead, whose B is -B > 0,
+so it gets its level. With the polygon's own B the geometry's figure is the list's
+again (220,917 against 224,472; Bass Fishing 58,365 against 58,344), so that one rule is
+the whole change. Minified pixels go from 32.8% to 34.2% (VF3) and 35.1% to 42.1% (Bass
+Fishing), but the p99 frames are the ones where large double-sided surfaces face away,
+and those lose three quarters of their fills.
+
+This bears on D-33: R67's DDR3 figures for the nearest level overstate VF3's p99 by 19
+points at 32 KiB (75.9% against 56.5% at latency 30), and the 16-bit SDRAM that R67 ruled out (220.6% at best) is 71-79% for
+VF3 and 51-58% for Bass Fishing on this form, texture traffic alone.
+
+Against Supermodel's grabs the image does not move (`r3d_rast_ref --d25 --mip 1 --lod 1
+--geo-lod`): VF3 13.72 dB p50 frame, Bass Fishing 19.16 dB, against 13.72 and 19.17 with
+the list's B. Coverage disagreement 4.55% against 4.50% (VF3; alpha-tested texels at the
+new levels) and 2.22% unchanged.
+
+### Area (Quartus 17.0, 10 ns, standalone, ALM without the virtual pins)
+
+| Block | Seed | ALM (pins' ALMs) | ALM without pins | Against `MIP = 0` (R66) | Registers | M10K | DSP | Fmax slow 100C |
+|---|---|---|---|---|---|---|---|---|
+| Texel, `MIP = 1` | 1 / 2 / 3 | 865 / 863 / 862 (146) | 719 / 717 / 716 | +189 to +192 (527-528) | 618 | 0 | 12 | 114.5 / 113.2 / 115.0 MHz |
+| Texel, first MIP form (21-bit window, all size codes) | 1 / 2 / 3 | 897 / 902 / 896 (146) | 751 / 756 / 750 | +223 to +229 | 624 | 0 | 12 | 114.4 / 113.4 / 114.7 MHz |
+| Interpolants, `MIP = 1` | 1 / 2 / 3 | 1,571 / 1,574 / 1,568 (330) | 1,241 / 1,244 / 1,238 | +46 to +49 (1,192-1,195) | 1,551 | 0 | 15 | 113.3 / 121.8 / 123.7 MHz |
+| Intake, `MIP = 1` | 1 / 2 / 3 | 340 / 344 / 339 (43) | 297 / 301 / 296 | +27 to +32 (269) | 439 | 0 | 0 | 146.2 / 151.9 / 150.2 MHz |
+
+Nearest-level sampling costs the rasteriser **+263 to +273 ALM, 0 M10K, 0 DSP**, against my
+estimate of 160-230: about 40 over its top. The texel's shifts are most of it. Every
+seed closes 10 ns; the texel's worst path is still the bilinear lerp (1.26 ns of slack),
+not the level logic. Rasteriser built so far: about 6,240 ALM without pins, 75 M10K and 45
+DSP.
+
+The first MIP texel kept u >> L 21 bits wide and the bases full width, exact for size codes
+6 and 7 too. The geometry never sends those (it ends a model at a code of 6 or more, as
+MAME does), so the form now is exact for codes up to 5 and levels up to 9: u >> L 19 bits
+wide, the bases from 20 and 19 bits. That saved 34 ALM in the fit (40 at map).
+
+Area, section 8.4 technique by technique:
+
+| Technique | Here | Effect |
+|---|---|---|
+| Built once and shared (pathway) | the LOD's log2(1/w) from the reciprocal's own leading one and normalised mantissa (the Z word's exponent n + eo + 86 and its six bits), not from a second normaliser of the Z word | about 30-40 ALM not built (my estimate: a 41-bit leading-one and shift) |
+| Built once and shared | the +128 rounding and 2 x 127 x 256 folded into the triangle's K; one 18-bit subtract a pixel, then a compare with lvmax | no separate round or offset adders |
+| Built once and shared | each sheet base and the texture's place in one shift: ((2^L - 1) 2^11 \| 32 tx) >> L, an OR for an add (the two fields cannot overlap) | no 11-bit adders, no MIPX / MIPY tables |
+| Narrower / exact rewrite | u >> L 19 bits wide and the bases from 20 and 19 bits: exact for every record the geometry sends | -34 ALM (fit) |
+| Storage out of flops | the level rides the interpolants' MLAB delay line (four bits more), not a register chain | about 40 flops not built |
+| Per-triangle work out of the pixel path | K and lvmax formed once a triangle in the intake's raw-field path (one table, one subtract), sent as the fifth header beat | no per-pixel table for B |
+| Parameters | `MIP` (texel, interpolants, intake) and `LOD_WORD` (geometry), all default 0 | default builds unchanged |
+| Did not work / not built | shifting u in the interpolants' quotient shifter (it is already a barrel shifter): a negative u's logical shift needs a sticky of the bits shifted out, which costs a wider shifter than it saves | estimated, not built |
+
+### Wrong turns (mip)
+
+- **The geometry model was not thread-safe.** Its matrix stack (`g_stack`) was a file-scope
+  global, and the fill and image tools run it in 12 threads. My first `--geo-lod` runs gave
+  55,566 p99 fills (VF3, 32 KiB) and changed between runs (57,333). The stack is now
+  `thread_local`; one thread and twelve now give the same figures to the fill on 40
+  frames. No single-threaded result (the geometry benches, `r3d_ref`) was affected.
+- R67's fill figures for the per-triangle LOD came from MAME's list, which has no
+  inverted copies, so a facing-away double-sided polygon stayed at level 0. It is the
+  largest error in R67's table, larger than the per-triangle against per-pixel
+  difference it reported.
+- I typed the log2 table by hand first; about a third of the entries were wrong. It is now
+  generated from 256 log2(1 + (i + 1/2) / 64).
