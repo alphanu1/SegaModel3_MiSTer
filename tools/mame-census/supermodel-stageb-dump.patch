@@ -1,0 +1,79 @@
+--- a/Src/Model3/Real3D.cpp
++++ b/Src/Model3/Real3D.cpp
+@@ -256,6 +256,9 @@
+ #include "Util/BitCast.h"
+ #include <cstring>
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
+ 
+ // Macros that divide memory regions into pages and mark them as dirty when they are written to
+ #define PAGE_WIDTH 12
+@@ -602,9 +605,37 @@
+   Render3D->BeginFrame();
+ }
+ 
++// Stage B oracle (M3SB_DIR, M3SB_LIST): at the listed bus-trace frames, the
++// Real3D memories as this frame is drawn (8C 4 MiB, 8E 1 MiB, polygon 4 MiB,
++// texture 8 MiB, raw), and the finished frame with the 3D (full_<frame>.bmp).
++// Frame numbers are the bus trace's (g_m3bus_frame). Run with -no-gpu-thread.
++int g_m3sb_grab = -1;
+ void CReal3D::RenderFrame(void)
+ {
+-    Render3D->RenderFrame();
++  extern uint32_t g_m3bus_frame_get();
++  static const char *dir = std::getenv("M3SB_DIR");
++  static const char *lst = std::getenv("M3SB_LIST");
++  if (dir && lst)
++  {
++    uint32_t f = g_m3bus_frame_get();
++    char key[16];
++    std::snprintf(key, sizeof(key), ",%u,", f);
++    if (std::strstr((std::string(",") + lst + ",").c_str(), key))
++    {
++      char name[512];
++      std::snprintf(name, sizeof(name), "%s/r3d_%06u.bin", dir, f);
++      if (FILE *fp = std::getenv("M3SB_NOMEM") ? nullptr : std::fopen(name, "wb"))
++      {
++        std::fwrite(cullingRAMLo, 1, 0x400000, fp);
++        std::fwrite(cullingRAMHi, 1, 0x100000, fp);
++        std::fwrite(polyRAM, 1, 0x400000, fp);
++        std::fwrite(textureRAM, 1, 0x800000, fp);
++        std::fclose(fp);
++      }
++      g_m3sb_grab = int(f);
++    }
++  }
++  Render3D->RenderFrame();
+ }
+ 
+ void CReal3D::EndFrame(void)
+--- a/Src/Model3/Model3.cpp
++++ b/Src/Model3/Model3.cpp
+@@ -952,6 +952,7 @@
+ int g_m3bus_master = 0;
+ static int g_m3bus_depth = 0;
+ static uint32_t g_m3bus_frame = 0;
++uint32_t g_m3bus_frame_get() { return g_m3bus_frame; }
+ static FILE *m3bus_file()
+ {
+   static FILE *f = nullptr;
+--- a/Src/OSD/SDL/Main.cpp
++++ b/Src/OSD/SDL/Main.cpp
+@@ -872,6 +872,15 @@
+   if (videoInputs)
+     s_crosshair->Update(currentInputs, videoInputs, xOffset, yOffset, xRes, yRes);
+ 
++  // stage B oracle: the finished frame, 3D included (Real3D.cpp, M3SB_LIST)
++  extern int g_m3sb_grab;
++  if (g_m3sb_grab >= 0)
++  {
++    char name[512];
++    std::snprintf(name, sizeof(name), "%s/full_%06d.bmp", std::getenv("M3SB_DIR"), g_m3sb_grab);
++    SaveFrameBuffer(name);
++    g_m3sb_grab = -1;
++  }
+   // Swap the buffers
+   SDL_GL_SwapWindow(s_window);
+ }

@@ -75,7 +75,7 @@
 +					{ "_cx_f2_la_s4", true, true, 2, true, false, false }, { "_cx_f1_la_s4", true, true, 1, true, false, false },
 +					{ "_cx_f2_dy_s4", true, true, 2, false, true, false },
 +					{ "_cx_f1_l6", true, true, 1, false, false, true }, { "_cx_f2_l6", true, true, 2, false, false, true },
-+					{ "_cx_f2_la_l6", true, true, 2, true, false, true } };
++					{ "_cx_f2_la_l6", true, true, 2, true, false, true }, { "_cx_f1_la_l6", true, true, 1, true, false, true } };
 +				for (auto const &o : l6s)
 +				{
 +					m3cpi_fpu f = unified(12, built, false, false, false);
@@ -121,7 +121,7 @@
  				else if (o.first.compare(0, 4, "lv3_") == 0) { if (mhz != 100) continue; }
 +				else if (o.first.compare(0, 4, "lv6_") == 0)
 +				{
-+					bool const full = o.first.find("_cx_f2_la_") != std::string::npos || o.first.find("_b0_f1_") != std::string::npos;
++					bool const full = o.first.find("_cx_f2_la_") != std::string::npos || o.first.find("_cx_f1_la_") != std::string::npos || o.first.find("_b0_f1_") != std::string::npos;
 +					if (mhz != 100 && !(mhz == 110 && full)) continue;
 +				}
 +				else if (o.first.compare(0, 4, "lv5_") == 0)

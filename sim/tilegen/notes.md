@@ -94,6 +94,9 @@ Which is the board, as far as I can tell without footage:
   The bit order (bit 15 leftmost) I cannot confirm: on VF3's character-portrait wipes
   (`mame_vf3/f002040`, `f009360`) the two emulators show mirror-image splits and neither
   looks obviously right in a still. **Needs cabinet footage of VF3's attract portraits.**
+  *Since settled for the bit order by cabinet footage: bit 15 is leftmost, as Supermodel
+  has it. Coordinate and pair form are still open. See "The stencil against cabinet
+  footage" below.*
 - **Line scroll (3, 4).** Nothing in VF3 or Bass Fishing uses it, so neither form is
   tested by a game. Supermodel documents the register's bit 15 as "line scroll enable";
   MAME's x2 has no comment. Supermodel's form is the default; Scud Race and Lost World
@@ -105,6 +108,137 @@ Which is the board, as far as I can tell without footage:
   "flash effect" TODO is this register pair.
 - **5 to 8 bits (7).** Both are emulator choices; the board's DAC is not documented.
   Supermodel's is the default to match its images; `pal5bit` is a switch.
+
+## The stencil against cabinet footage (VF3 attract, SEGA logo to Great Wall)
+
+**Result:** the board puts stencil bit 15 on the leftmost 32-pixel span, as Supermodel does,
+and not bit 0 as MAME does. The RTL default (`MASK_SCREEN = 1`) already does this, so the RTL is
+unchanged. This wipe cannot tell screen space from map space, or an exclusive pair from a
+per-layer test.
+
+**Footage.** YouTube kiv9COZRsys, a VF3 cabinet in attract mode, captured at 1280 x 720,
+60 fps (`sm3-builds/footage/vf3_wipe/`, frames `w001..w096`). The 496 x 384 picture occupies
+columns 140–1150. From the clean frames I fitted the geometry:
+- **Horizontal:** column = 140.375 + 2.0365 x.
+- **Vertical:** row = −1.13 + 1.883 n, where n is the line and row is the continuous
+  coordinate (pixel r covers [r, r+1)). The scale comes from the period of the wipe's line
+  stripes (3.766 rows for two lines, the same in 8 frames). The offset comes from 62
+  horizontal edges of the SEGA logo against the tile render of `mame_wipe/f001454` (rms
+  0.19 rows). At 1.883 rows a line, the capture shows lines 0 to about 381.
+
+**What the game does.** I dumped every frame across the transition: MAME frames 1300–1560
+(`sm3-builds/tilegen/mame_wipe`) and Supermodel frames 1150–1400 (`sm_wipe`). Both run the
+same 16-step wipe, MAME at frames 1455–1470 and Supermodel at 1275–1290:
+- **Pair A:** the stencil word stays FFFF.
+- **Pair B:** it alternates by line. In step k (1–16), even lines have `FFFF >> k` and odd
+  lines `FFFF << k`. In step 5 the words are `FFFF07FF` / `FFFFFFE0`.
+- **Layers:** layer 2 (the white logo screen, above the 3D, X scroll 0) shows where the bit
+  is 1. Layer 3 (below the 3D, which covers it) shows where the bit is 0.
+
+So each line clears one more span a frame from one side: even lines from one edge, odd lines
+from the other. The footage's "ghost" is not a translucent layer: it is every other line
+cleared.
+
+The character-portrait frames that showed the mirror-image split are the same wipe:
+- `mame_vf3/f002040` is step 5 and `f009360` is step 8, with the line parities swapped
+  (line 0 has `FFFFFFE0`);
+- every two-word VF3 stencil in the dumps is this wipe.
+
+The literals match their emulators with 0 differing pixels on all 512 new dumps (`tg_tool
+check`). The RTL matches `tg::param` with 0 differing pixels on the 38 wipe frames in both
+builds, and behind the 1–400-clock hostile memory.
+
+**What the footage shows,** matched by wipe step. The cabinet runs one span a game frame.
+The 60 fps capture repeats one frame (w063 = w064), so step k is w063 for k = 1 and w(063 + k)
+for k ≥ 2:
+
+| | Cabinet | MAME | Supermodel |
+|---|---|---|---|
+| Span grid | 32 px from screen x = 0: the first left band is 32 px wide, the first right band 16 px (span 15 is cut at 496) | same | same |
+| Where the white closes (k = 8) | x = 256, not the screen centre 248 | 256 | 256 |
+| Order | both edges together, one span per frame per line parity; clear from the centre outward from k = 9; all clear at k = 16 | same | same |
+| Which lines clear from the left | **even lines** | odd lines | **even lines** |
+
+The last row decides the bit order. I put the white-line pattern of each hypothesis on the
+registered line grid and correlated it with the detrended row profile of the ghost columns
+(span 0 and span 15). Then I averaged the left and right sides (`scripts/verdict.py`):
+
+| Rows (lines) | k = 2–3 (w065–66) | k = 5–15 (w068–78) |
+|---|---|---|
+| 4–110 (0–58), sky | Supermodel +0.41 to +0.48 / MAME the negative | Supermodel +0.72 to +0.76 |
+| 110–250 | +0.27 to +0.32 | +0.50 to +0.52 |
+| 250–400 | +0.30 to +0.31 | +0.44 to +0.49 |
+| 400–560 (little contrast) | +0.06 to +0.07 | +0.08 to +0.09 |
+
+Every band and every frame has the same sign. The Supermodel score stays positive while the
+line grid's offset lies anywhere from −1.95 to 0.0 rows; the registration puts it at −1.13 ±
+about 0.03. A free fit of the stripe phase alone gives −1.00 (left side) and +0.88 (right
+side, which is −1.13 + one line). So the two sides agree with each other and with the logo
+edges.
+
+**Which forms are distinguishable here** (`sm3-builds/tilegen/bin/tg_wipe`, coverage of
+above-3D tile pixels, 38 frames):
+- **b15, screen space** (Supermodel's form): 0 pixels from the Supermodel literal.
+- **b15, map space, exclusive or per layer:** also 0 from the Supermodel literal.
+- **b0, screen space; b0, map space, exclusive or per layer:** 0 from the MAME literal.
+- **The two literals:** up to 185,154 pixels apart (k = 8).
+
+Layer 2 has X scroll 0, and layer 3 (scroll 0–7) is under the 3D. So coordinate and pair form
+cannot show on this wipe.
+
+**One thing no form reproduces.** On the lines that clear from the right (odd lines), the
+white run ends early:
+- **Odd lines:** the white run ends 2.4–3.1 px before the span boundary in phase 1 (k = 4–7)
+  and 4.9–6.3 px before it in phase 2 (k = 9–14).
+- **Even lines:** the change from clear to white sits on the boundary (−1.6 to +1.7 px).
+- **At k = 8:** this leaves a fully clear column about x = 250–257 in w071. It is visible
+  top to bottom in the frame, and neither emulator draws it.
+- **Not the capture:** vertical logo edges measured on even lines and on odd lines separately
+  sit at −0.25 and −0.19 px.
+- **Not layer 3's scroll:** the shift does not follow it; it is −5 px at k = 10 and 11, where
+  both emulators have layer 3 at X 0. The cabinet's layer-3 jitter may differ from the
+  emulators', though.
+
+Unexplained and not modelled. It is about 5 px x 192 lines a frame for the 16 frames of a
+wipe.
+
+**What remains open, and what footage would settle it:**
+- **One assumption is left:** stencil word y applies to line y, the same y as the tile
+  content. Both emulators assume it. If the board read the word one line off, this
+  footage would mean bit 0 instead. Bass Fishing's line-level stencils would settle it with
+  line-resolution footage of those screens:
+  - pair A `0000FFFF` on lines 0–247 (f004200) or 128–319 (f007800);
+  - single-line interleaves on lines 8–16 and 63–71 (f011700).
+- **Map against screen space, and exclusive against per-layer:** these need a stencil
+  boundary across a visible layer with a non-zero X scroll. Nothing dumped does that
+  (§15 R77: Scud Race or Lost World).
+
+**Tools:**
+- **`sim/tilegen/tg_wipe.cpp`:** the stencil split into bit order, coordinate and pair form,
+  self-checked against `param()`. Built by hand:
+  `g++ -O2 -std=c++17 -o sm3-builds/tilegen/bin/tg_wipe sim/tilegen/tg_wipe.cpp`.
+- **Footage scripts** in `sm3-builds/footage/vf3_wipe/scripts/`: `register.py` / `edges.py`
+  (geometry), `stripes.py` / `verdict.py` (parity), `seams.py` (per-parity transitions),
+  `sidebyside.py` (comparison sheets in `sm3-builds/tilegen/wipe_out/cmp/`).
+
+**Wrong turns:**
+1. **I read the ghost as a translucent tile layer.** It is the line interleave of the
+   stencil; the footage's horizontal stripes are the lines.
+2. **I took the footage's active area as the picture.** I first scaled 384 lines into the
+   718 lit rows (1.870 rows a line). The stripe period says 1.883, so the capture crops the
+   last two or three lines.
+3. **A sine fit of the stripe phase first put the white lines a quarter period from both
+   hypotheses.** I had the sign of the phase wrong (a peak at y0 gives angle −2πy0/P, not
+   +). With the sign fixed, and with the sample-centre half row, it lands on the odd lines
+   (Supermodel).
+4. **Whole-band sine fits mixed in rows with no contrast.** The wall and ground regions are
+   about as bright as the white, and the video codec removes their stripes. The band-by-band
+   correlation shows where the signal is: the sky, rows 4–110.
+5. **A first logo registration fitted scale and offset together** on edges from lines
+   130–260 only. That gave 1.878 rows a line and, extrapolated to the sky, an offset about
+   half a row off. With the scale fixed from the stripes, only the offset is fitted.
+6. **The early frames (w063–w066) are soft vertically.** There the even-line and odd-line
+   profiles both show both transitions, so I measured the per-parity seams from w067 on.
 
 ## Reuse from Model 2, and where Model 3 differs
 

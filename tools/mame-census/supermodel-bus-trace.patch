@@ -1,0 +1,199 @@
+diff --git a/Src/Model3/53C810.cpp b/Src/Model3/53C810.cpp
+index 731c412..a1282bc 100644
+--- a/Src/Model3/53C810.cpp
++++ b/Src/Model3/53C810.cpp
+@@ -595,6 +595,9 @@ static Result SCRIPTS_MoveMemory(struct NCR53C810Context *Ctx)
+   //if (dest==0x94000000)printf("53C810: Move Memory %08X -> %08X, %X\n", src, dest, numBytes);
+ 
+   // Perform a 32-bit copy if possible
++  extern int g_m3bus_master;
++  g_m3bus_master = 1;
++  struct MasterReset { ~MasterReset() { g_m3bus_master = 0; } } masterReset;
+   for (i = 0; i < (numBytes/4); i++)
+   {
+     Ctx->Bus->Write32(dest, Ctx->Bus->Read32(src));
+diff --git a/Src/Model3/Model3.cpp b/Src/Model3/Model3.cpp
+index 27f21fe..d8014c2 100644
+--- a/Src/Model3/Model3.cpp
++++ b/Src/Model3/Model3.cpp
+@@ -940,7 +940,52 @@ void CModel3::WriteSystemRegister(unsigned reg, UINT8 data)
+  *
+  * Read handlers.
+  */
+-UINT8 CModel3::Read8(UINT32 addr)
++
++// M3BUS_TRACE (system bench, sim/system): every CPU and 53C810 access outside
++// work RAM (and outside CROM reads unless M3BUS_CROM=1), one 24-byte record
++// each: frame, PC, address, kind (0 read, 1 write, 2 event), size, master
++// (0 CPU, 1 53C810), data. Events: size 1 = IRQ assert (data = bits),
++// 2 = ping-pong flip, 3 = frame start (vblank begins).
++#include <cstdio>
++#include <cstdlib>
++#include <cstdint>
++int g_m3bus_master = 0;
++static int g_m3bus_depth = 0;
++static uint32_t g_m3bus_frame = 0;
++static FILE *m3bus_file()
++{
++  static FILE *f = nullptr;
++  static bool tried = false;
++  if (!tried) { tried = true; const char *p = std::getenv("M3BUS_TRACE"); if (p) f = std::fopen(p, "wb"); }
++  return f;
++}
++static bool m3bus_crom() { static int c = -1; if (c < 0) c = std::getenv("M3BUS_CROM") ? 1 : 0; return c == 1; }
++#pragma pack(push, 1)
++struct M3BusRec { uint32_t frame, pc, addr; uint8_t kind, size, master, pad; uint64_t data; };
++#pragma pack(pop)
++static void m3bus_log(int kind, int size, uint32_t addr, uint64_t data)
++{
++  FILE *f = m3bus_file();
++  if (!f) return;
++  if (kind != 2) {
++    if (addr < 0x00800000) return;
++    if (kind == 0 && addr >= 0xFF000000 && !m3bus_crom()) return;
++  }
++  M3BusRec r{g_m3bus_frame, (uint32_t)ppc_get_pc(), addr, (uint8_t)kind, (uint8_t)size, (uint8_t)g_m3bus_master, 0, data};
++  std::fwrite(&r, sizeof(r), 1, f);
++}
++struct M3BusGuard { bool top; M3BusGuard() : top(g_m3bus_depth++ == 0) {} ~M3BusGuard() { g_m3bus_depth--; } };
++
++UINT8 CModel3::Read8(UINT32 addr) { M3BusGuard g; UINT8 d = Read8Impl(addr); if (g.top || g_m3bus_master) m3bus_log(0, 1, addr, d); return d; }
++UINT16 CModel3::Read16(UINT32 addr) { M3BusGuard g; UINT16 d = Read16Impl(addr); if (g.top || g_m3bus_master) m3bus_log(0, 2, addr, d); return d; }
++UINT32 CModel3::Read32(UINT32 addr) { M3BusGuard g; UINT32 d = Read32Impl(addr); if (g.top || g_m3bus_master) m3bus_log(0, 4, addr, d); return d; }
++UINT64 CModel3::Read64(UINT32 addr) { M3BusGuard g; UINT64 d = Read64Impl(addr); if (g.top || g_m3bus_master) m3bus_log(0, 8, addr, d); return d; }
++void CModel3::Write8(UINT32 addr, UINT8 data) { M3BusGuard g; if (g.top || g_m3bus_master) m3bus_log(1, 1, addr, data); Write8Impl(addr, data); }
++void CModel3::Write16(UINT32 addr, UINT16 data) { M3BusGuard g; if (g.top || g_m3bus_master) m3bus_log(1, 2, addr, data); Write16Impl(addr, data); }
++void CModel3::Write32(UINT32 addr, UINT32 data) { M3BusGuard g; if (g.top || g_m3bus_master) m3bus_log(1, 4, addr, data); Write32Impl(addr, data); }
++void CModel3::Write64(UINT32 addr, UINT64 data) { M3BusGuard g; if (g.top || g_m3bus_master) m3bus_log(1, 8, addr, data); Write64Impl(addr, data); }
++
++UINT8 CModel3::Read8Impl(UINT32 addr)
+ {
+   // RAM (most frequently accessed)
+   if (addr<0x00800000)
+@@ -1059,7 +1104,7 @@ UINT8 CModel3::Read8(UINT32 addr)
+   return 0xFF;
+ }
+ 
+-UINT16 CModel3::Read16(UINT32 addr)
++UINT16 CModel3::Read16Impl(UINT32 addr)
+ {
+   UINT16  data;
+ 
+@@ -1177,7 +1222,7 @@ UINT16 CModel3::Read16(UINT32 addr)
+   return 0xFFFF;
+ }
+ 
+-UINT32 CModel3::Read32(UINT32 addr)
++UINT32 CModel3::Read32Impl(UINT32 addr)
+ {
+   UINT32  data;
+ 
+@@ -1367,7 +1412,7 @@ UINT32 CModel3::Read32(UINT32 addr)
+   return 0xFFFFFFFF;
+ }
+ 
+-UINT64 CModel3::Read64(UINT32 addr)
++UINT64 CModel3::Read64Impl(UINT32 addr)
+ {
+   UINT64  data;
+ 
+@@ -1386,7 +1431,7 @@ UINT64 CModel3::Read64(UINT32 addr)
+  *
+  * Write handlers.
+  */
+-void CModel3::Write8(UINT32 addr, UINT8 data)
++void CModel3::Write8Impl(UINT32 addr, UINT8 data)
+ {
+   // RAM (most frequently accessed)
+   if (addr < 0x00800000)
+@@ -1522,7 +1567,7 @@ void CModel3::Write8(UINT32 addr, UINT8 data)
+   }
+ }
+ 
+-void CModel3::Write16(UINT32 addr, UINT16 data)
++void CModel3::Write16Impl(UINT32 addr, UINT16 data)
+ {
+   if ((addr&1))
+   {
+@@ -1617,7 +1662,7 @@ void CModel3::Write16(UINT32 addr, UINT16 data)
+   }
+ }
+ 
+-void CModel3::Write32(UINT32 addr, UINT32 data)
++void CModel3::Write32Impl(UINT32 addr, UINT32 data)
+ {
+   if ((addr&3))
+   {
+@@ -1850,7 +1895,7 @@ void CModel3::Write32(UINT32 addr, UINT32 data)
+   }
+ }
+ 
+-void CModel3::Write64(UINT32 addr, UINT64 data)
++void CModel3::Write64Impl(UINT32 addr, UINT64 data)
+ {
+     //printf("write64 %x <- %x\n", addr, data);
+     Write32(addr+0, (UINT32) (data>>32));
+@@ -2076,6 +2121,8 @@ static unsigned GetCPUClockFrequencyInHz(const Game &game, Util::Config::Node &c
+ void CModel3::RunMainBoardFrame(void)
+ {
+ 	UINT32 start = CThread::GetTicks();
++	g_m3bus_frame++;
++	m3bus_log(2, 3, 0, 0);
+ 
+ 	/* 
+    * Compute display timings. Refresh rate is 57.524160 Hz and we assume frame timing is the same as System 24:
+@@ -2158,6 +2205,7 @@ void CModel3::RunMainBoardFrame(void)
+ 
+ 			// Process MIDI interrupt
+ 			IRQ.Assert(0x40);
++			m3bus_log(2, 1, 0, 0x40);
+ 			ppc_execute(1000); // give PowerPC time to acknowledge IR
+             vBlankCycles -= 1000;
+ 
+@@ -2171,6 +2219,7 @@ void CModel3::RunMainBoardFrame(void)
+         ppc_execute(vBlankCycles);
+ 
+ 		IRQ.Assert(0x0D);
++		m3bus_log(2, 1, 0, 0x0D);
+ 
+ 		// End VBlank
+ 		GPU.EndVBlank();
+@@ -2195,10 +2244,11 @@ void CModel3::RunMainBoardFrame(void)
+     {
+         if (i == pingPongFlipLine) {
+             GPU.FlipPingPongBit();
++            m3bus_log(2, 2, i, 0);
+         }
+ 
+         if (i == 383) {
+-            IRQ.Assert(0x02);       // irq2 is asserted at the start of the last line on system24 (as apposed to the end). Lost world won't work without this, the game soft locks. We assume the same here
++            IRQ.Assert(0x02); m3bus_log(2, 1, 383, 0x02);       // irq2 is asserted at the start of the last line on system24 (as apposed to the end). Lost world won't work without this, the game soft locks. We assume the same here
+         }
+ 
+         TileGen.DrawLine(i);
+diff --git a/Src/Model3/Model3.h b/Src/Model3/Model3.h
+index dad4f4c..c0e9dd0 100644
+--- a/Src/Model3/Model3.h
++++ b/Src/Model3/Model3.h
+@@ -105,6 +105,14 @@ public:
+   void WritePCIConfigSpace(unsigned device, unsigned reg, unsigned bits, unsigned offset, UINT32 data) override;
+ 
+   // IBus interface
++  UINT8 Read8Impl(UINT32 addr);
++  UINT16 Read16Impl(UINT32 addr);
++  UINT32 Read32Impl(UINT32 addr);
++  UINT64 Read64Impl(UINT32 addr);
++  void Write8Impl(UINT32 addr, UINT8 data);
++  void Write16Impl(UINT32 addr, UINT16 data);
++  void Write32Impl(UINT32 addr, UINT32 data);
++  void Write64Impl(UINT32 addr, UINT64 data);
+   UINT8 Read8(UINT32 addr) override;
+   UINT16 Read16(UINT32 addr) override;
+   UINT32 Read32(UINT32 addr) override;
+@@ -335,4 +343,4 @@ private:
+ };
+ 
+ 
+-#endif  // INCLUDED_MODEL3_H
+\ No newline at end of file
++#endif  // INCLUDED_MODEL3_H

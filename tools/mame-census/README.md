@@ -354,3 +354,36 @@ M3SCRIPTS_LOG=$PWD/mame_vf3.log ../mame289-scripts/m3 vf3 -rompath /home/ben/rom
 ```
 
 Logs and vectors hold RAM contents (the SCRIPTS words) and stay in `sm3-builds/scripts_cap/`.
+
+## System bus trace (stage A, `sim/system`)
+
+`supermodel-bus-trace.patch` applies on top of `supermodel-tilegen-dump.patch`
+(`sm3-builds/supermodel-sys`, a clean clone at `036af1c`). `M3BUS_TRACE=<file>` writes
+every CPU and 53C810 access outside work RAM, one 24-byte record each (frame, PC,
+address, kind, size, master, data), and events for the IRQs, the ping-pong flip and the
+frame start; CROM reads are left out unless `M3BUS_CROM=1`. The 53C810's moves run
+inside the CPU's DCNTL write, so they are logged by master, not by nesting depth.
+`sim/system/bustrace.py` summarises, dumps and compares traces; the system bench writes
+the same format. The edited sources keep their CRLF line endings, or the patch becomes
+a whole-file diff.
+
+```
+env -u WAYLAND_DISPLAY SDL_VIDEODRIVER=x11 \
+M3BUS_TRACE=$PWD/../sys/sm_bus.bin M3TG_DIR=$PWD/../sys/sm_tg M3TG_EVERY=30 M3TG_EXIT=1500 \
+xvfb-run -a -s "-screen 0 640x480x24 +extension GLX" \
+    ./bin/supermodel /home/ben/roms/Model3/vf3.zip -no-throttle -no-vsync -no-sound -no-dsb -no-gpu-thread
+```
+
+Start from no `NVRAM/` folder: the trace is then a fresh boot, as the core's.
+
+## Stage B oracle: Real3D memories and finished frames (`sim/system/notes.md`, Stage B)
+
+`supermodel-stageb-dump.patch` applies on top of the bus trace and tile dump patches
+(`sm3-builds/supermodel-sb`, a copy of `supermodel-sys`). At the bus-trace frames in
+`M3SB_LIST` (comma-separated, the trace's own numbering) it writes `r3d_<frame>.bin`
+into `M3SB_DIR`: 8C 4 MiB, 8E 1 MiB, polygon RAM 4 MiB and texture RAM 8 MiB, raw, as
+that frame is drawn. It also writes `full_<frame>.bmp`, the finished frame with its 3D.
+Run as the system trace above, with `-no-gpu-thread`, adding
+`M3SB_DIR=... M3SB_LIST=...` and, for the tile state at the same frames,
+`M3TG_START=249 M3TG_EVERY=25` (a tile dump is one frame behind: f001399 is trace
+frame 1400). The dumps are ROM-derived and stay in `sm3-builds/sb_oracle/`.
