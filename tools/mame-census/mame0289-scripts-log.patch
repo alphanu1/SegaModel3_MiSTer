@@ -1,0 +1,155 @@
+--- a/src/devices/machine/53c810.cpp
++++ b/src/devices/machine/53c810.cpp
+@@ -6,7 +6,32 @@
+ #include "53c810.h"
+ #include "bus/scsi/scsihle.h"
+ 
++#include "screen.h"
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++
+ #define DMA_MAX_ICOUNT  512     /* Maximum number of DMA Scripts opcodes to run */
++
++// M0-F capture (M3SCRIPTS_LOG=path): register accesses, starts, instructions,
++// memory moves and interrupts, prefixed by frame and emulated time in us.
++static FILE *m3s_file()
++{
++	static FILE *f = nullptr;
++	static bool init = false;
++	if (!init) { init = true; if (const char *p = std::getenv("M3SCRIPTS_LOG")) f = std::fopen(p, "w"); }
++	return f;
++}
++running_machine *m3s_machine = nullptr;
++void m3s_log(const char *fmt, ...)
++{
++	FILE *f = m3s_file();
++	if (!f || !m3s_machine) return;
++	screen_device *scr = screen_device_enumerator(m3s_machine->root_device()).first();
++	std::fprintf(f, "%u %.3f ", scr ? unsigned(scr->frame_number()) : 0u, m3s_machine->time().as_double() * 1e6);
++	va_list ap; va_start(ap, fmt); std::vfprintf(f, fmt, ap); va_end(ap);
++	std::fflush(f);
++}
+ #define DASM_OPCODES 0
+ 
+ uint32_t lsi53c810_device::FETCH()
+@@ -18,6 +43,7 @@
+ 
+ void lsi53c810_device::dmaop_invalid()
+ {
++	m3s_log("INV %08X %08X\n", dsp, dcmd);
+ 	fatalerror("LSI53C810: Invalid SCRIPTS DMA opcode %08X at %08X\n", dcmd, dsp);
+ }
+ 
+@@ -28,6 +54,7 @@
+ 	int count;
+ 
+ 	count = dcmd & 0xffffff;
++	m3s_log("M %08X %08X %06X\n", src, dst, count);
+ 	if (!m_dma_cb.isnull())
+ 		m_dma_cb(src, dst, count, 1);
+ }
+@@ -38,6 +65,7 @@
+ 		fatalerror("LSI53C810: INTFLY opcode not implemented\n");
+ 	}
+ 	dsps = FETCH();
++	m3s_log("INT %08X %08X dien=%02X\n", dsp, dsps, dien);
+ 
+ 	istat |= 0x1;   /* DMA interrupt pending */
+ 	dstat |= 0x4;   /* SIR (SCRIPTS Interrupt Instruction Received) */
+@@ -385,6 +413,7 @@
+ 			logerror("0x%08X: %s\n", dsp, buf);
+ 		}
+ 
++		m3s_log("X %08X %08X %08X %08X\n", dsp, m_fetch_cb(dsp), m_fetch_cb(dsp + 4), m_fetch_cb(dsp + 8));
+ 		dcmd = FETCH();
+ 
+ 		op = (dcmd >> 24) & 0xff;
+@@ -396,6 +425,14 @@
+ 
+ uint8_t lsi53c810_device::reg_r(int offset)
+ {
++	m3s_machine = &machine();
++	uint8_t v = reg_r_impl(offset);
++	m3s_log("R %02X %02X %s\n", offset, v, machine().describe_context().c_str());
++	return v;
++}
++
++uint8_t lsi53c810_device::reg_r_impl(int offset)
++{
+ //  logerror("53c810: read reg %d:0x%x %s\n", offset, offset, machine().describe_context());
+ 	switch(offset)
+ 	{
+@@ -479,6 +516,8 @@
+ 
+ void lsi53c810_device::reg_w(int offset, uint8_t data)
+ {
++	m3s_machine = &machine();
++	m3s_log("W %02X %02X %s halt=%d\n", offset, data, machine().describe_context().c_str(), halted);
+ //  logerror("53c810: %02x to reg %d:0x%x %s\n", data, offset, offset, machine().describe_context());
+ 	switch(offset)
+ 	{
+@@ -548,6 +587,7 @@
+ 			dsp |= data << 24;
+ 			halted = 0;
+ 			if((dmode & 0x1) == 0 && !halted) {
++				m3s_log("AUTO %08X dcntl=%02X\n", dsp, dcntl);
+ 				dma_exec();
+ 			}
+ 			break;
+@@ -569,6 +609,8 @@
+ 			if(dcntl & 0x14 && !halted)     /* single-step & start DMA */
+ 			{
+ 				int op;
++				m3s_log("SS dsp=%08X\n", dsp);
++				m3s_log("X %08X %08X %08X %08X\n", dsp, m_fetch_cb(dsp), m_fetch_cb(dsp + 4), m_fetch_cb(dsp + 8));
+ 				dcmd = FETCH();
+ 				op = (dcmd >> 24) & 0xff;
+ 				dma_opcode[op]();
+@@ -580,6 +622,7 @@
+ 			}
+ 			else if(dcntl & 0x04 && !halted)    /* manual start DMA */
+ 			{
++				m3s_log("MAN %08X\n", dsp);
+ 				dma_exec();
+ 			}
+ 			break;
+--- a/src/devices/machine/53c810.h
++++ b/src/devices/machine/53c810.h
+@@ -47,6 +47,7 @@
+ 	dma_delegate m_dma_cb;
+ 	fetch_delegate m_fetch_cb;
+ 
++	uint8_t reg_r_impl(int offset);
+ 	uint32_t FETCH();
+ 	void dmaop_invalid();
+ 	void dmaop_move_memory();
+--- a/src/mame/sega/model3.cpp
++++ b/src/mame/sega/model3.cpp
+@@ -733,6 +733,9 @@
+ 
+ #include "segabill.lh"
+ 
++void m3s_log(const char *fmt, ...);        // M0-F capture, 53c810.cpp
++extern running_machine *m3s_machine;
++
+ void model3_state::update_irq_state()
+ {
+ 	if ((m_irq_enable & m_irq_state) || m_scsi_irq_state)
+@@ -858,6 +861,8 @@
+ 			break;
+ 
+ 		case 14:        /* NCR 53C810 SCSI Controller */
++			m3s_machine = &machine();
++			m3s_log("PCIW %02X %08X\n", reg, value);
+ 			switch(reg)
+ 			{
+ 				case 0x04/4:    /* Status / Command */
+@@ -1128,6 +1133,7 @@
+ 
+ void model3_state::scsi_irq_callback(int state)
+ {
++	m3s_log("IRQ %d\n", state);
+ 	m_scsi_irq_state = state;
+ 	update_irq_state();
+ }

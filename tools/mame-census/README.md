@@ -268,3 +268,89 @@ base (load use 3, redirect 2, new line 1, way miss 2) it adds, at 100 MHz:
 writes a 16-byte record per busy branch, translation change and refetching op (format in
 `ppc603.c`, `trace()`); `_cpu.txt` then gives the `lv_` 256-entry BTB's hits over the
 window from empty, which `make test_btb BTB_TRACE=... BTB_R52=...` must reproduce.
+
+### The D-30 set as built (`supermodel-lv4.patch`)
+
+`supermodel-lv4.patch` applies on top of `supermodel-lv2.patch`. It models the fetch of
+`rtl/cpu/ppc_core.sv` per option, in the replay, so the BTB and the direction can depend
+on timing:
+- `lv4_<b0|c64>_<f1|f2>_<s|la|dy|lady>_<s4|l6>` (100 MHz; `_b0_f1_s_` and `_c64_f2_la_`
+  also at 110): no BTB or design C with 64 entries and the y-bit rule (entries only for
+  branches the rule predicts taken, bclr / bcctr included); one or two words a request
+  (two only inside a line; the request after a redirect target is one word in `lv5_`);
+  the static rule, the 603e's CR look-ahead (`la`: a branch whose CR and CTR writers have
+  all committed when its word arrives is resolved there), R61's direction from the entry
+  (`dy`), or both; singles at 4 (R61's base) or the built fast path at 6 with its
+  in-order rule (`l6`). A line crossing pays 1 only after a jump to words 5-7 (one word a
+  request) or 3-7 (two).
+- `lv5_<b0|c|cx>_<f1|f2>[_la|_dy]_<s4|l6>`: as `lv4_`, two words only on sequential
+  requests, and with `cx` the request after a fetch-side redirect (soft, BTB, a failed
+  check) looked up from its target, as the RTL does (`ppc_btb` `CURPC`). In `lv5_` the
+  `cx` test read the stream's break flag, which is set at every redirect target, so
+  `cx` never applied and equals `c`.
+- `lv6_<b0|cx>_<f1|f2>[_la|_dy]_<s4|l6>`: `lv5_`'s options with `cx` as built.
+- `_cpu.txt` gives each option's lookups, hits, fetch corrections, register targets
+  refetched, branches resolved at fetch, flushes and new-line cycles.
+
+Run with `M3CPI_FPU_ONLY=lv4_,ref66_dual` (or `lv5_`, `lv6_`); `sm3-builds/lv2runs/lv4_table.py`
+tabulates them as `lv2_table.py` does.
+
+## Tile generator dumps (M0-E)
+
+Two more instrumentation patches save the tile generator's state for the M0-E
+bench (`sim/tilegen`). Both write, per chosen frame, `fNNNNNN.vram` (F1000000-F111FFFF,
+0x120000 bytes in bus byte order) and `fNNNNNN.regs` (F1180000-F11800FF, bus order).
+
+- `mame0289-tilegen-dump.patch`, on top of the census patch (`sm3-builds/mame289-tg`, a
+  copy of `mame289-m3` so only `model3_v.cpp` rebuilds). The dump is taken inside
+  `screen_update_model3`, from the state `draw_layer` drew, and adds `fNNNNNN.tile`: the
+  below-3D and above-3D passes on cleared bitmaps (496 x 384 ARGB each, alpha 0 = not
+  drawn), so the reference renderer is checked against MAME's own `draw_layer`. A Lua
+  dump is not enough: `model3_vid_reg_r` does not return the scroll registers, a Lua write
+  tap on the 64-bit space aborts on data with bit 63 set ("integer value will be
+  misrepresented"), and a debugger watchpoint instead runs VF3 at under 1 frame a second.
+
+```
+M3TG_DIR=$PWD M3TG_START=600 M3TG_EVERY=60 M3TG_EXIT=9600 \
+../../mame289-tg/m3 vf3 -rompath /home/ben/roms/Model3 -video none -sound none -nothrottle \
+    -seconds_to_run 400 -skip_gameinfo -cfg_directory cfg -nvram_directory nvram \
+    -autoboot_script ../../census/play.lua
+```
+
+- `supermodel-tilegen-dump.patch` (`sm3-builds/supermodel-tg`, a clean clone at `036af1c`):
+  state at the start of the active display, `fNNNNNN.surf` (both of `CTileGen`'s draw
+  surfaces, 512 x 384 RGBA, bottom then top) at its end, and `fNNNNNN.info` saying whether
+  VRAM or the registers changed in between. Same `xvfb-run` command as above with
+  `M3TG_DIR`, `M3TG_START`, `M3TG_EVERY`, `M3TG_EXIT`.
+
+Dumps are ROM-derived and stay in `sm3-builds/tilegen/`.
+
+## 53C810 capture (M0-F)
+
+Two patches log what the games ask of the 53C810 (`sim/scripts`): every register access
+(width, value, PC), PCI configuration access, start, executed SCRIPTS instruction, memory
+move (source, destination, length) and interrupt change, one line each, prefixed by frame
+and time. `sim/scripts/cap2vec.py` turns a log into replay vectors.
+
+- `supermodel-scripts-log.patch` (`sm3-builds/supermodel-scripts`, a copy of
+  `sm3-builds/supermodel` with its census patches, so only three files rebuild). Also saves
+  the 1 KiB of code around the first access from each PC as `<log>.code_<addr>.bin`, for
+  `bin/ppcd`. The files are CRLF, as upstream's are.
+
+```
+env -u WAYLAND_DISPLAY SDL_VIDEODRIVER=x11 M3SCRIPTS_LOG=$PWD/sm_vf3.log M3DUMP_EXIT=4000 \
+xvfb-run -a -s "-screen 0 640x480x24 +extension GLX" \
+    ../supermodel-scripts/bin/supermodel /home/ben/roms/Model3/vf3.zip \
+    -no-throttle -no-vsync -no-sound -no-dsb -no-gpu-thread
+```
+
+- `mame0289-scripts-log.patch`, on top of the census patch (`sm3-builds/mame289-scripts`, a
+  copy of `mame289-m3`). MAME logs byte accesses only; one time stamp is one CPU access.
+
+```
+M3SCRIPTS_LOG=$PWD/mame_vf3.log ../mame289-scripts/m3 vf3 -rompath /home/ben/roms/Model3 \
+    -video none -sound none -nothrottle -seconds_to_run 70 -skip_gameinfo \
+    -cfg_directory cfg -nvram_directory nvram
+```
+
+Logs and vectors hold RAM contents (the SCRIPTS words) and stay in `sm3-builds/scripts_cap/`.

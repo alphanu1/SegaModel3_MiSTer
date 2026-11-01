@@ -1,0 +1,76 @@
+--- a/src/mame/sega/model3_v.cpp	2026-10-30 22:57:08.653252095 +0000
++++ b/src/mame/sega/model3_v.cpp	2026-11-01 05:05:57.438865348 +0000
+@@ -575,6 +575,73 @@
+ 	if ((layer_data[1] & 0x80000000) && (m_layer_priority & 0x2) != 0)
+ 		draw_layer(bitmap, cliprect, 1, layer_scroll_x[1], layer_scroll_y[1], 1);
+ 
++	// M0-E census (M3TG_DIR, M3TG_START, M3TG_EVERY, M3TG_EXIT): the tile generator state this update drew from,
++	// in bus byte order, and the tile layers alone (below and above the 3D, each on a cleared bitmap, alpha 0 =
++	// nothing drawn). Instrumentation only.
++	{
++		static const char *tgdir = getenv("M3TG_DIR");
++		static const long tgstart = getenv("M3TG_START") ? atol(getenv("M3TG_START")) : 0;
++		static const long tgevery = getenv("M3TG_EVERY") ? atol(getenv("M3TG_EVERY")) : 60;
++		static const long tgexit = getenv("M3TG_EXIT") ? atol(getenv("M3TG_EXIT")) : 0;
++		const long fr = (long)screen.frame_number();
++		if (tgdir && fr >= tgstart && (fr - tgstart) % tgevery == 0)
++		{
++			char name[600];
++			auto put64 = [](FILE *f, uint64_t v) { for (int k = 7; k >= 0; k--) fputc((int)((v >> (8 * k)) & 0xff), f); };
++			snprintf(name, sizeof(name), "%s/f%06ld.vram", tgdir, fr);
++			if (FILE *f = fopen(name, "wb"))
++			{
++				for (int i = 0; i < 0xf8000 / 8; i++) put64(f, m_m3_char_ram[i]);
++				for (int i = 0; i < 0x8000 / 8; i++) put64(f, m_m3_tile_ram[i]);
++				for (int i = 0; i < 0x20000 / 8; i++) put64(f, m_paletteram64[i]);
++				fclose(f);
++			}
++			snprintf(name, sizeof(name), "%s/f%06ld.regs", tgdir, fr);
++			if (FILE *f = fopen(name, "wb"))
++			{
++				for (int i = 0; i < 32; i++)
++				{
++					uint64_t v = 0;
++					if (i == 0x00 / 8) v = m_vid_reg0;
++					if (i == 0x20 / 8) v = (uint64_t)m_layer_priority << 48;
++					if (i == 0x40 / 8) v = ((uint64_t)m_layer_modulate1 << 32) | (uint64_t)m_layer_modulate2;
++					if (i == 0x60 / 8) v = m_layer_scroll[0];
++					if (i == 0x68 / 8) v = m_layer_scroll[1];
++					put64(f, v);
++				}
++				fclose(f);
++			}
++			snprintf(name, sizeof(name), "%s/f%06ld.tile", tgdir, fr);
++			if (FILE *f = fopen(name, "wb"))
++			{
++				for (int pass = 0; pass < 2; pass++)
++				{
++					bitmap_rgb32 tmp(bitmap.width(), bitmap.height());
++					tmp.fill(0);
++					if (pass == 0)
++					{
++						if ((layer_data[3] & 0x80000000) && (m_layer_priority & 0x8) == 0) draw_layer(tmp, cliprect, 3, layer_scroll_x[3], layer_scroll_y[3], 0);
++						if ((layer_data[2] & 0x80000000) && (m_layer_priority & 0x4) == 0) draw_layer(tmp, cliprect, 2, layer_scroll_x[2], layer_scroll_y[2], 0);
++						if ((layer_data[1] & 0x80000000) && (m_layer_priority & 0x2) == 0) draw_layer(tmp, cliprect, 1, layer_scroll_x[1], layer_scroll_y[1], 0);
++						if ((layer_data[0] & 0x80000000) && (m_layer_priority & 0x1) == 0) draw_layer(tmp, cliprect, 0, layer_scroll_x[0], layer_scroll_y[0], 0);
++					}
++					else
++					{
++						if ((layer_data[3] & 0x80000000) && (m_layer_priority & 0x8) != 0) draw_layer(tmp, cliprect, 3, layer_scroll_x[3], layer_scroll_y[3], 1);
++						if ((layer_data[2] & 0x80000000) && (m_layer_priority & 0x4) != 0) draw_layer(tmp, cliprect, 2, layer_scroll_x[2], layer_scroll_y[2], 1);
++						if ((layer_data[0] & 0x80000000) && (m_layer_priority & 0x1) != 0) draw_layer(tmp, cliprect, 0, layer_scroll_x[0], layer_scroll_y[0], 1);
++						if ((layer_data[1] & 0x80000000) && (m_layer_priority & 0x2) != 0) draw_layer(tmp, cliprect, 1, layer_scroll_x[1], layer_scroll_y[1], 1);
++					}
++					for (int y = cliprect.min_y; y <= cliprect.max_y; y++)
++						fwrite(&tmp.pix(y, cliprect.min_x), 4, cliprect.width(), f);
++				}
++				fclose(f);
++			}
++		}
++		if (tgexit && fr >= tgexit)
++			machine().schedule_exit();
++	}
++
+ 	return 0;
+ }
+ 

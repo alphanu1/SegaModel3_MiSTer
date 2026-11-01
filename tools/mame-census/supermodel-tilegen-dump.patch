@@ -1,0 +1,117 @@
+diff --git a/Src/Model3/Model3.cpp b/Src/Model3/Model3.cpp
+index bff2cf6..27f21fe 100644
+--- a/Src/Model3/Model3.cpp
++++ b/Src/Model3/Model3.cpp
+@@ -2179,6 +2179,17 @@ void CModel3::RunMainBoardFrame(void)
+ 
+     auto pingPongFlipLine = TileGen.ReadRegister(0x08);
+ 
++	// M0-E census (M3TG_DIR, M3TG_START, M3TG_EVERY, M3TG_EXIT): tile generator state at the start of the active
++	// display and its draw surfaces at the end, every M3TG_EVERY frames.
++	static const char *tgDir = std::getenv("M3TG_DIR");
++	static const int tgStart = std::getenv("M3TG_START") ? std::atoi(std::getenv("M3TG_START")) : 0;
++	static const int tgEvery = std::getenv("M3TG_EVERY") ? std::atoi(std::getenv("M3TG_EVERY")) : 60;
++	static const int tgExit = std::getenv("M3TG_EXIT") ? std::atoi(std::getenv("M3TG_EXIT")) : 0;
++	static int tgFrame = 0;
++	const bool tgDump = tgDir && tgFrame >= tgStart && (tgFrame - tgStart) % tgEvery == 0;
++	if (tgDump)
++		TileGen.M3TgBegin();
++
+ 	// Run the PowerPC for the active display part of the frame
+     for (unsigned int i = 0; i < 384; i++)
+     {
+@@ -2195,6 +2206,16 @@ void CModel3::RunMainBoardFrame(void)
+         ppc_execute(lineCycles);
+     }
+ 
++	if (tgDump)
++	{
++		char base[512];
++		std::snprintf(base, sizeof(base), "%s/f%06d", tgDir, tgFrame);
++		TileGen.M3TgEnd(base);
++	}
++	tgFrame++;
++	if (tgExit && tgFrame >= tgExit)
++		std::exit(0);
++
+ 	timings.ppcTicks = CThread::GetTicks() - start;
+ }
+ 
+diff --git a/Src/Model3/TileGen.cpp b/Src/Model3/TileGen.cpp
+index 460ae7f..916a938 100644
+--- a/Src/Model3/TileGen.cpp
++++ b/Src/Model3/TileGen.cpp
+@@ -54,6 +54,7 @@
+ #include "TileGen.h"
+ 
+ #include <cstring>
++#include <cstdio>
+ #include <algorithm>
+ #include "Supermodel.h"
+ 
+@@ -679,6 +680,31 @@ void CTileGen::RecomputePalettes(int layer)
+ 	}
+ }
+ 
++void CTileGen::M3TgBegin(void)
++{
++	m_tgVramCopy.assign(m_vram, m_vram + 0x120000);
++	std::memcpy(m_tgRegsCopy, m_regs, sizeof(m_tgRegsCopy));
++}
++
++void CTileGen::M3TgEnd(const char *base)
++{
++	char name[600];
++	std::snprintf(name, sizeof(name), "%s.vram", base);
++	if (FILE *f = std::fopen(name, "wb")) { std::fwrite(m_tgVramCopy.data(), 1, 0x120000, f); std::fclose(f); }
++	std::snprintf(name, sizeof(name), "%s.regs", base);
++	if (FILE *f = std::fopen(name, "wb")) { std::fwrite(m_tgRegsCopy, 1, 0x100, f); std::fclose(f); }
++	std::snprintf(name, sizeof(name), "%s.surf", base);
++	if (FILE *f = std::fopen(name, "wb")) {
++		std::fwrite(m_drawSurface[0]->data, 4, 512 * 384, f);
++		std::fwrite(m_drawSurface[1]->data, 4, 512 * 384, f);
++		std::fclose(f);
++	}
++	bool vramChanged = std::memcmp(m_tgVramCopy.data(), m_vram, 0x120000) != 0;
++	bool regsChanged = std::memcmp(m_tgRegsCopy, m_regs, 0x100) != 0;
++	std::snprintf(name, sizeof(name), "%s.info", base);
++	if (FILE *f = std::fopen(name, "w")) { std::fprintf(f, "vram_changed %d\nregs_changed %d\n", vramChanged, regsChanged); std::fclose(f); }
++}
++
+ void CTileGen::DrawLine(int line)
+ {
+ 	for (int i = 2; i-- > 0;) {
+diff --git a/Src/Model3/TileGen.h b/Src/Model3/TileGen.h
+index 5ae3b22..4d751af 100644
+--- a/Src/Model3/TileGen.h
++++ b/Src/Model3/TileGen.h
+@@ -32,6 +32,7 @@
+ #include "CPU/IRQController.h"
+ #include "Graphics/Render2D.h"
+ #include "TileGenBuffer.h"
++#include <vector>
+ 
+   /*
+    * CTileGen:
+@@ -252,6 +253,12 @@ public:
+ 	 */
+ 	void DrawLine(int line);	// from 0-383
+ 
++	// M0-E census: save VRAM + palette (bus byte order) and registers at the start of the active display,
++	// and both draw surfaces (512 x 384 RGBA, 0 = below 3D, 1 = above) at its end, with whether VRAM or the
++	// registers changed in between. Instrumentation only; nothing it does changes emulation.
++	void M3TgBegin(void);
++	void M3TgEnd(const char *base);
++
+ 	/*
+ 	 * Tile and palette RAM bus timing
+ 	 *
+@@ -376,6 +383,8 @@ private:
+ 	bool	m_busFetching = false;	// in the active part of the frame
+ 
+ 	// buffers we draw to
++	std::vector<UINT8> m_tgVramCopy;
++	UINT32 m_tgRegsCopy[64];
+ 	std::shared_ptr<TileGenBuffer> m_drawSurface[2];	// drawing surfaces 0 = bottom, 1 = top
+ 	std::shared_ptr<TileGenBuffer> m_drawSurfaceRO[2];	// read only version for threading, we can swap between the 2. Maybe not needed.
+ };

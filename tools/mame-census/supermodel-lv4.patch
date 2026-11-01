@@ -1,0 +1,312 @@
+--- a/Src/CPU/PowerPC/ppc603.c
++++ b/Src/CPU/PowerPC/ppc603.c
+@@ -376,6 +376,18 @@
+ 					// at the branch's own request (a hit costs 1); 256, 128, 64 entries
+ 	int fetch_w = 0, fetch_q = 4;	// lv2_ fetch model: words a cycle (0: bubbles charged at issue,
+ 					// as lv_), queue entries
++	int l4 = 0;			// lv4_: the D-30 set as built (rtl/cpu/ppc_core.sv): 1 on; the BTB, fetch
++					// and direction are modelled per option in replay (l4_* below)
++	bool l4_btb = false;		// design C, 64 entries, y-bit rule honoured
++	bool l4_la = false;		// 603e CR look-ahead (603e 2.3.4.4): a bc whose CR bit and CTR have no
++					// writer in flight when its word arrives is resolved there
++	bool l4_x = false;		// lv5_: the request after a fetch-side redirect (soft, BTB, a failed
++					// check) is looked up too, from the redirect's target (rd_pc)
++	bool l4_p2s = false;		// lv5_: two words only on sequential requests (a redirect target
++					// comes alone, as the built cache answers it)
++	bool l4_dy = false;		// R61's direction from the entry (not the manual's): every taken
++					// branch written, a hit predicts taken
++	bool fast_wb = false; int fast_lat = 6;	// the built fast single path (l6_)
+ 	bool fold = false;		// 603e branch folding (User's Manual 6.4.1.1): a branch takes no
+ 					// dispatch slot and a taken branch hitting in the cache costs nothing;
+ 					// a misprediction refetches 2 cycles after the CR is ready, and
+@@ -400,6 +412,16 @@
+ 	unsigned tqi = 0;
+ 	bool f_hard = false, f_soft = false;	// the previous instruction redirects: from issue / from arrival
+ 	int f_nb = 0;
++	// lv4_ state: the BTB, the fetch grouping, CR / CTR commit times
++	struct l4e { UINT32 key = 0, tgt = 0, ctx = 0; bool v = false, reg = false; int slot = 0; };
++	l4e l4t[64];
++	uint64_t cr_commit = 0, ctr_commit = 0, pipe_due = 0;
++	int l4_req = 0, l4_pos = 0, l4_lentry = 0;	// request index since the last redirect, word in the request, line entry word
++	UINT32 l4_preq = 0, l4_creq = 0, l4_ppc = 0;	// first word of the previous / current request; previous word
++	bool l4_redir = true;			// the previous word redirected fetch (or a break)
++	bool l4_soft = false, l4_srdir = false;	// the stream began at a fetch-side redirect; the previous word made one
++	bool l4_open = false;			// the previous word began a request that can take a second word
++	uint64_t l4_look = 0, l4_hit = 0, l4_good = 0, l4_bmis = 0, l4_tmis = 0, l4_res = 0, l4_resq = 0, l4_flush = 0, l4_nl = 0;
+ };
+ 
+ enum { R_CR = 64, R_LR, R_CTR, R_NONE = 127 };
+@@ -769,6 +791,78 @@
+ 							opts.emplace_back(std::string("lv3x") + (bt ? "_bDy" : "_bCy") + (lv ? "_n0w1" : "_n1w2"), f);
+ 						}
+ 				}
++			// lv4_ (100 MHz; the full set also at 110): the D-30 set as built, one addition at a
++			// time. <b0|c64> no BTB / design C 64 entries with the y-bit rule; <f1|f2> one or two
++			// words a request; <s|la|dy|lady> static direction, the 603e CR look-ahead, R61's
++			// direction from the entry, both; <s4|l6> singles at 4 (R61's base) or the built
++			// fast path at 6 with its in-order rule
++			{
++				struct l4o { const char *n; bool btb; int fw; bool la, dy; };
++				static const l4o l4s[] = {
++					{ "_b0_f1_s", false, 1, false, false }, { "_c64_f1_s", true, 1, false, false },
++					{ "_c64_f2_s", true, 2, false, false }, { "_c64_f2_la", true, 2, true, false },
++					{ "_c64_f1_la", true, 1, true, false }, { "_b0_f2_s", false, 2, false, false },
++					{ "_c64_f2_dy", true, 2, false, true }, { "_c64_f2_lady", true, 2, true, true },
++					{ "_c64_f1_dy", true, 1, false, true } };
++				for (auto const &o : l4s)
++					for (int l6 = 0; l6 < 2; l6++)
++					{
++						m3cpi_fpu f = unified(12, built, false, false, false);
++						for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, l6 ? 6 : 4, 0);
++						set(f, FC_FRSQRTE, l6 ? 6 : 12, 0);
++						f.icbuilt = true; f.ld1b = true; f.redirect = 2;
++						f.l4 = 1; f.l4_btb = o.btb; f.l4_la = o.la; f.l4_dy = o.dy;
++						f.fetch_w = o.fw; f.fetch_q = 4;
++						if (l6) { f.fast_wb = true; f.fast_lat = 6; }
++						opts.emplace_back(std::string("lv4") + o.n + (l6 ? "_l6" : "_s4"), f);
++					}
++			}
++			// lv6_: lv5_'s options with the cx lookup as built (lv5_'s cx equalled c, a model bug)
++			{
++				struct l6o { const char *n; bool btb, x; int fw; bool la, dy, l6; };
++				static const l6o l6s[] = {
++					{ "_b0_f1_s4", false, false, 1, false, false, false }, { "_b0_f1_l6", false, false, 1, false, false, true },
++					{ "_cx_f1_s4", true, true, 1, false, false, false }, { "_cx_f2_s4", true, true, 2, false, false, false },
++					{ "_cx_f2_la_s4", true, true, 2, true, false, false }, { "_cx_f1_la_s4", true, true, 1, true, false, false },
++					{ "_cx_f2_dy_s4", true, true, 2, false, true, false },
++					{ "_cx_f1_l6", true, true, 1, false, false, true }, { "_cx_f2_l6", true, true, 2, false, false, true },
++					{ "_cx_f2_la_l6", true, true, 2, true, false, true } };
++				for (auto const &o : l6s)
++				{
++					m3cpi_fpu f = unified(12, built, false, false, false);
++					for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, o.l6 ? 6 : 4, 0);
++					set(f, FC_FRSQRTE, o.l6 ? 6 : 12, 0);
++					f.icbuilt = true; f.ld1b = true; f.redirect = 2;
++					f.l4 = 1; f.l4_btb = o.btb; f.l4_x = o.x; f.l4_p2s = true; f.l4_la = o.la; f.l4_dy = o.dy;
++					f.fetch_w = o.fw; f.fetch_q = 4;
++					if (o.l6) { f.fast_wb = true; f.fast_lat = 6; }
++					opts.emplace_back(std::string("lv6") + o.n, f);
++				}
++			}
++			// lv5_ (100 MHz; b0_f1 and cx_f2_la also at 110): as lv4_, two words only on sequential
++			// requests (p2s, as built) and, with cx, the lookup of a fetch-side redirect's target
++			{
++				struct l5o { const char *n; bool btb, x; int fw; bool la, dy, l6; };
++				static const l5o l5s[] = {
++					{ "_b0_f1_s4", false, false, 1, false, false, false }, { "_b0_f1_l6", false, false, 1, false, false, true },
++					{ "_c_f1_s4", true, false, 1, false, false, false }, { "_cx_f1_s4", true, true, 1, false, false, false },
++					{ "_c_f2_s4", true, false, 2, false, false, false }, { "_cx_f2_s4", true, true, 2, false, false, false },
++					{ "_cx_f2_la_s4", true, true, 2, true, false, false }, { "_cx_f1_la_s4", true, true, 1, true, false, false },
++					{ "_cx_f2_dy_s4", true, true, 2, false, true, false }, { "_cx_f1_dy_s4", true, true, 1, false, true, false },
++					{ "_cx_f2_la_l6", true, true, 2, true, false, true }, { "_cx_f2_s4_l6", true, true, 2, false, false, true },
++					{ "_cx_f1_l6", true, true, 1, false, false, true }, { "_b0_f2_s4", false, false, 2, false, false, false } };
++				for (auto const &o : l5s)
++				{
++					m3cpi_fpu f = unified(12, built, false, false, false);
++					for (int cl : { FC_S_ADD, FC_S_MUL, FC_S_FMA }) set(f, cl, o.l6 ? 6 : 4, 0);
++					set(f, FC_FRSQRTE, o.l6 ? 6 : 12, 0);
++					f.icbuilt = true; f.ld1b = true; f.redirect = 2;
++					f.l4 = 1; f.l4_btb = o.btb; f.l4_x = o.x; f.l4_p2s = true; f.l4_la = o.la; f.l4_dy = o.dy;
++					f.fetch_w = o.fw; f.fetch_q = 4;
++					if (o.l6) { f.fast_wb = true; f.fast_lat = 6; }
++					opts.emplace_back(std::string("lv5") + o.n, f);
++				}
++			}
+ 			// lv2s_ (100 MHz) BTB sizes; lv2x_ (110 MHz) single issue with new line 0 and way
+ 			// miss 1 beside the BTB options: <bt>_<n1w2|n0w1>
+ 			for (int bx = 0; bx < 8; bx++)
+@@ -817,6 +911,21 @@
+ 					if (mhz != 100) continue;
+ 				}
+ 				else if (o.first.compare(0, 4, "lv3_") == 0) { if (mhz != 100) continue; }
++				else if (o.first.compare(0, 4, "lv6_") == 0)
++				{
++					bool const full = o.first.find("_cx_f2_la_") != std::string::npos || o.first.find("_b0_f1_") != std::string::npos;
++					if (mhz != 100 && !(mhz == 110 && full)) continue;
++				}
++				else if (o.first.compare(0, 4, "lv5_") == 0)
++				{
++					bool const full = o.first.find("_cx_f2_la_") != std::string::npos || o.first.find("_b0_f1_") != std::string::npos;
++					if (mhz != 100 && !(mhz == 110 && full)) continue;
++				}
++				else if (o.first.compare(0, 4, "lv4_") == 0)
++				{
++					bool const full = o.first.find("_c64_f2_la_") != std::string::npos || o.first.find("_b0_f1_s_") != std::string::npos;
++					if (mhz != 100 && !(mhz == 110 && full)) continue;
++				}
+ 				else if (o.first.compare(0, 5, "lv3x_") == 0) { if (mhz != 110) continue; }
+ 				else if (o.first.compare(0, 5, "lv2x_") == 0)
+ 				{
+@@ -863,6 +972,10 @@
+ 						// this instruction, and whether they count from its issue (EX
+ 						// redirect) or its arrival
+ 		int8_t gsrc, gdst;		// GPRs read and written
++		// lv4_: what the per-option BTB and fetch model need
++		UINT32 pc, npc, ctx;
++		uint8_t bk;			// 0 not a branch, 1 b, 2 bc, 3 bclr, 4 bcctr
++		uint8_t bo, stk, tkn, brk4, refetch4, flush4, wcr, wctr;
+ 	};
+ 	std::vector<fp_rec> recs;
+ 	uint64_t ld_hit_pred = 0, ld_way_miss = 0;	// shared D-cache load hits in the predicted / another way
+@@ -999,6 +1112,22 @@
+ 			bool const xlate = (p == 31 && (x == 210 || x == 242 || x == 306 || x == 978 || x == 1010)) || (p == 31 && x == 467 && spr >= 528 && spr <= 535);
+ 			UINT32 const ctx = MSR & (MSR_IR | MSR_PR);
+ 			bool const brk = redirect || idle_gap || prev_pc != pc - 4;	// not reached by falling through
++			{	// lv4_ fields. The y-bit rule (PEM 4.2.4.2) for every conditional form, bclr and
++				// bcctr included: taken when BO says always, else (S || reg ? ...) per the PEM:
++				// bc taken if (BO[0] & BO[2]) | S, reversed by y; bclr / bcctr not taken unless y.
++				r.pc = pc; r.npc = npc; r.ctx = ctx;
++				r.bk = !isbr ? 0 : p == 18 ? 1 : p == 16 ? 2 : x == 16 ? 3 : 4;
++				r.bo = uint8_t(bo); r.tkn = taken;
++				bool const always = (bo & 0x14) == 0x14;
++				r.stk = p == 18 || always || ((p == 16 && (op & 0x8000)) != 0) != ((bo & 1) != 0);
++				r.brk4 = brk;
++				r.refetch4 = refetch || redirect;
++				// translation changes that matter to fetch: mtsr, mtsrin, tlbie, tlbli, IBAT writes
++				// (tlbld changes only the data TLB)
++				r.flush4 = (p == 31 && (x == 210 || x == 242 || x == 306 || x == 1010)) || (p == 31 && x == 467 && spr >= 528 && spr <= 535);
++				r.wcr = 0; r.wctr = 0;
++				for (int k = 0; k < 3; k++) { if (d.dst[k] == R_CR) r.wcr = 1; if (d.dst[k] == R_CTR) r.wctr = 1; }
++			}
+ 			for (int k = 0; k < 8; k++)
+ 			{
+ 				btb_design &b = bd[k];
+@@ -1072,7 +1201,7 @@
+ 	{
+ 		for (fp_rec const &r : recs)
+ 		{
+-			if (r.idle) { c.pending_bubbles = 0; c.last_pairable = false; c.f_hard = true; c.f_nb = 0; continue; }
++			if (r.idle) { c.pending_bubbles = 0; c.last_pairable = false; c.f_hard = true; c.f_nb = 0; c.l4_redir = true; continue; }
+ 			if (c.fpu.fold && r.xu == 4)
+ 			{
+ 				uint64_t const gate = c.last + (r.ic_miss ? c.stall : 0);
+@@ -1114,6 +1243,31 @@
+ 				t = c.last + (pair ? 0 : 1) + bubbles + r.redirect + (c.fpu.icbuilt && r.nl ? c.fpu.nl_cost : 0);
+ 				t += uint64_t(r.ic_miss) * (c.fpu.icbuilt ? c.ist : c.stall);
+ 			}
++			else if (c.fpu.l4)
++			{	// lv4_: the fetch as built. A request carries one word, or with fetch_w = 2 the word
++				// and the next if it is in the same line; a redirect target starts a request.
++				// Sequential crossings into a new line are free unless the line was entered by a
++				// jump too late for the cache's lookahead (words 5-7 at one word a request, 3-7 at
++				// two: R61), which pays 1.
++				bool const seq = !r.brk4 && !c.l4_redir;
++				bool partner = false;
++				if (!seq) { c.l4_req = 0; c.l4_pos = 0; c.l4_preq = 0; c.l4_creq = r.pc; c.l4_lentry = (r.pc >> 2) & 7;
++					c.l4_soft = c.l4_srdir && !r.redirect; /* lv6: lv5 tested brk4, true at every target */ c.l4_open = !c.fpu.l4_p2s && ((r.pc >> 2) & 7) != 7; }
++				else if (c.fpu.fetch_w == 2 && c.l4_open) { partner = true; c.l4_pos = 1; c.l4_open = false; }
++				else { c.l4_req++; c.l4_pos = 0; c.l4_preq = c.l4_creq; c.l4_creq = r.pc; c.l4_open = ((r.pc >> 2) & 7) != 7; }
++				int nl = 0;
++				if (seq && (r.pc & 31) == 0) { if (c.l4_lentry >= (c.fpu.fetch_w == 2 ? 3 : 5)) nl = 1; c.l4_lentry = 0; c.l4_nl += nl; }
++				c.l4_ppc = r.pc;
++				if (r.redirect) arrive = c.last + 1 + r.redirect;
++				else if (c.f_hard) arrive = c.last + 1 + c.f_nb;
++				else if (c.f_nb) arrive = c.fa1 + 1 + c.f_nb;
++				else arrive = partner ? c.fa1 : c.fa1 + 1;
++				arrive += nl + uint64_t(r.ic_miss) * c.ist;
++				unsigned const cap = unsigned(c.fpu.fetch_q) + 1u;
++				uint64_t const room = c.tq[(c.tqi - cap) & 15] + 1;
++				if (room > arrive) arrive = room;
++				t = std::max(c.last + 1, arrive);
++			}
+ 			else
+ 			{	// fetch stream (lv2_ f*): words arrive fetch_w a cycle into a queue of fetch_q
+ 				// (plus ID's one or two); a redirect counts from the redirecting instruction's
+@@ -1135,6 +1289,11 @@
+ 			int lat = r.lat, busy = r.busy, unit = r.unit;
+ 			if (fc != FC_NONE) { lat = c.fpu.c[fc].lat; busy = c.fpu.c[fc].busy; unit = c.fpu.c[fc].unit; }
+ 			if (unit == FU_PIPE && c.fpu_free > t) t = c.fpu_free;
++			{	// the built fast single path (l6_): a fast op issues only when no pipeline result is
++				// due at t + its latency or later (results are written in order)
++				bool const fast = c.fpu.fast_wb && (fc == FC_S_ADD || fc == FC_S_MUL || fc == FC_S_FMA || (fc == FC_FRSQRTE && unit == FU_PIPE));
++				if (fast && c.pipe_due + 1 > t + uint64_t(c.fpu.fast_lat)) t = c.pipe_due + 1 - c.fpu.fast_lat;
++			}
+ 			if (unit == FU_DIV && c.fdiv_free > t) t = c.fdiv_free;
+ 			if (unit == 2 && c.div_free > t) t = c.div_free;
+ 			if (((c.fpu.serial && (fc == FC_CMP || fc == FC_FPSCR)) || (c.fpu.serial_fpscr && fc == FC_FPSCR)) && c.drain > t) t = c.drain;
+@@ -1148,6 +1307,7 @@
+ 			if (unit == FU_DIV) c.fdiv_free = t + busy;
+ 			if (unit == 2) c.div_free = t + busy;
+ 			if (fc != FC_NONE && t + lat > c.drain) c.drain = t + lat;
++			if (c.fpu.fast_wb && unit == FU_PIPE && fc != FC_NONE && t + lat > c.pipe_due) c.pipe_due = t + lat;
+ 			if (t == c.last && c.slot == 1) c.slot = 2;
+ 			else { c.slot = 1; c.last_xu = r.xu; c.last_fpop = fpop; c.last_pairable = !r.extra && !r.ld_miss && !r.io_ld && !r.io_st;
+ 				c.last_simple = r.simple; c.last_crx = r.crx; c.last_gsrc = r.gsrc; c.last_gdst = r.gdst; }
+@@ -1162,6 +1322,65 @@
+ 				else { nb = c.fpu.redirect; hard = r.regtgt; }
+ 			}
+ 			if (c.fpu.btbd) { nb = r.nbX[c.fpu.btbd - 1]; hard = r.hX[c.fpu.btbd - 1]; }
++			if (c.fpu.l4)
++			{	// lv4_: the BTB (design C, 64 entries) and the direction, per option
++				nb = 0; hard = false;
++				bool redir = false;
++				if (r.bk)
++				{
++					bool const isreg = r.bk >= 3;
++					bool const needcr = (r.bo & 0x10) == 0, needctr = (r.bo & 4) == 0 && r.bk != 4;
++					// 603e 2.3.4.4: no writer of the CR (or CTR) in flight when the word arrives,
++					// so the committed register decides. A writer issued at t has committed for
++					// a word arriving at t + lat + 3 (the model issues at arrival; the core's
++					// word reaches EX two cycles after it arrives).
++					bool res = false;
++					if (c.fpu.l4_la && r.bk >= 2) res = (!needcr || arrive >= c.cr_commit) && (!needctr || arrive >= c.ctr_commit);
++					if (r.bk >= 2) { if (res) c.l4_res++; else c.l4_resq++; }
++					bool const dir = r.bk == 1 ? true : res ? r.tkn != 0 : r.stk != 0;
++					bool const capable = c.fpu.l4_btb && (c.l4_req >= 2 || (c.fpu.l4_x && c.l4_req == 1 && c.l4_soft));
++					UINT32 const key = c.fpu.fetch_w == 2 ? c.l4_preq : r.pc - 4;
++					m3cpi_fcfg::l4e &e = c.l4t[(key >> 2) & 63];
++					bool const hit = capable && e.v && e.key == key && e.ctx == r.ctx && e.slot == c.l4_pos;
++					if (capable) c.l4_look++;
++					bool follow = false;
++					if (hit)
++					{
++						c.l4_hit++;
++						follow = c.fpu.l4_dy || dir;
++						if (follow)
++						{
++							if (r.tkn && e.tgt == r.npc) { nb = 0; c.l4_good++; }
++							else if (r.tkn) { nb = 3; hard = true; c.l4_tmis++; e.tgt = r.npc; }	// register target: MEM
++							else { nb = 2; hard = true; if (c.fpu.l4_dy) e.v = false; }		// not taken: EX
++						}
++						else
++						{	// the entry says taken, the 603e rule not: fetch corrects
++							c.l4_bmis++; e.v = false;
++							if (r.tkn) { nb = 2; hard = true; } else nb = 3;
++						}
++					}
++					else if (!isreg)
++					{
++						if (dir) { nb = 2; hard = !r.tkn; }
++						else if (r.tkn) { nb = 2; hard = true; }
++					}
++					else if (r.tkn) { nb = 2; hard = true; }			// no target at fetch: EX
++					redir = r.tkn || hard || (hit && !follow);
++					c.l4_srdir = redir && !hard;		// soft, BTB-followed or a fetch correction: rd_pc knows the target
++					if (c.fpu.l4_btb && r.tkn && (dir || c.fpu.l4_dy) && (c.fpu.fetch_w == 1 || c.l4_req >= 1) && !(hit && follow))
++					{
++						m3cpi_fcfg::l4e &w = c.l4t[(key >> 2) & 63];
++						w.v = true; w.key = key; w.ctx = r.ctx; w.tgt = r.npc; w.slot = c.l4_pos; w.reg = isreg;
++					}
++				}
++				else if (r.refetch4) { nb = 2; hard = true; redir = true; }
++				if (!r.bk) c.l4_srdir = false;
++				if (r.flush4) { for (auto &e : c.l4t) e.v = false; c.l4_flush++; }
++				c.l4_redir = redir;
++				for (int x : r.dst) if (x == R_CR) c.cr_commit = std::max(c.cr_commit, t + lat + 3);
++				if (r.wctr) c.ctr_commit = std::max(c.ctr_commit, t + lat + 3);
++			}
+ 			c.pending_bubbles = nb;
+ 			if (fw)
+ 			{
+@@ -1321,6 +1540,11 @@
+ 				(unsigned long long)b.look, (unsigned long long)b.hit, (unsigned long long)b.good, (unsigned long long)b.wrong, (unsigned long long)b.nottaken_hit,
+ 				(unsigned long long)b.taken, (unsigned long long)b.flushes);
+ 		}
++		for (auto const &c : cpi.fcfg)
++			if (c.fpu.l4)
++				std::fprintf(o, "%s: lookups %llu, hits %llu, right %llu, fetch corrections %llu, register targets wrong %llu, resolved at fetch %llu of %llu bc/bclr/bcctr, flushes %llu, new-line cycles %llu\n",
++					c.name.c_str(), (unsigned long long)c.l4_look, (unsigned long long)c.l4_hit, (unsigned long long)c.l4_good, (unsigned long long)c.l4_bmis,
++					(unsigned long long)c.l4_tmis, (unsigned long long)c.l4_res, (unsigned long long)(c.l4_res + c.l4_resq), (unsigned long long)c.l4_flush, (unsigned long long)c.l4_nl);
+ 		if (cpi.brt)
+ 		{
+ 			std::fprintf(o, "trace frames %llu-%llu: lv_ 256-entry BTB, taken branches %llu, hits %llu\n", (unsigned long long)cpi.brt_from,

@@ -1,0 +1,263 @@
+--- a/Src/Model3/53C810.cpp
++++ b/Src/Model3/53C810.cpp
+@@ -90,6 +90,49 @@
+ #include <cstring>
+ #include "Supermodel.h"
+ #include "CPU/PowerPC/ppc.h"
++#include <cstdio>
++#include <cstdlib>
++
++// M0-F capture (M3SCRIPTS_LOG=path): every register access, start, instruction,
++// memory move and interrupt, one line each, prefixed by frame and PPC cycle.
++unsigned g_m3s_frame = 0;
++int g_m3s_width = 0;
++static FILE *M3SLog()
++{
++  static FILE *f = nullptr;
++  static bool init = false;
++  if (!init)
++  {
++    init = true;
++    const char *p = std::getenv("M3SCRIPTS_LOG");
++    if (p)
++      f = std::fopen(p, "w");
++  }
++  return f;
++}
++#include <set>
++#include <string>
++// First access from each PC: save the 1 KiB of code around it (M3SCRIPTS_LOG.code_<pc>.bin)
++static void M3SCode(IBus *bus, UINT32 pc)
++{
++  static std::set<UINT32> seen;
++  const char *p = std::getenv("M3SCRIPTS_LOG");
++  if (!p || pc >= 0x800000 || !seen.insert(pc & ~0x3FF).second)
++    return;
++  char name[600];
++  std::snprintf(name, sizeof(name), "%s.code_%08X.bin", p, pc & ~0x3FF);
++  if (FILE *f = std::fopen(name, "wb"))
++  {
++    for (UINT32 a = pc & ~0x3FF; a < (pc & ~0x3FF) + 0x400; a += 4)
++    {
++      UINT32 w = bus->Read32(a);
++      UINT8 b[4] = { UINT8(w >> 24), UINT8(w >> 16), UINT8(w >> 8), UINT8(w) };
++      std::fwrite(b, 1, 4, f);
++    }
++    std::fclose(f);
++  }
++}
++#define M3S(...) do { if (FILE *f_ = M3SLog()) { std::fprintf(f_, "%u %llu ", g_m3s_frame, (unsigned long long) ppc_total_cycles()); std::fprintf(f_, __VA_ARGS__); } } while (0)
+ 
+ /******************************************************************************
+  Save States
+@@ -569,11 +612,12 @@
+     Ctx->regDSP += 8;
+     return Result::OKAY;
+   }
++  M3S("INT %08X %08X dien=%02X\n", Ctx->regDSP, Ctx->regDSPS, Ctx->regDIEN);
+   Ctx->halt = true;   // halt SCRIPTS execution
+   Ctx->regISTAT |= 1; // DMA interrupt pending
+   Ctx->regDSTAT |= 4; // SCRIPTS interrupt instruction received
+   if (Ctx->regDIEN & 4)
+-    Ctx->IRQ->Assert(Ctx->scsiIRQ);
++    { M3S("IRQ 1\n"); Ctx->IRQ->Assert(Ctx->scsiIRQ); }
+   if ((Ctx->regDBC&0x100000)) // INTFLY
+     return ErrorLog("53C810 INTFLY instruction not emulated!");
+   // DSP not incremented (VF3 relies on this)
+@@ -594,10 +638,13 @@
+   DebugLog("53C810: Move Memory %08X -> %08X, %X\n", src, dest, numBytes);
+   //if (dest==0x94000000)printf("53C810: Move Memory %08X -> %08X, %X\n", src, dest, numBytes);
+ 
++  UINT32 m3sum = 2166136261u, m3src = src, m3dst = dest, m3len = numBytes;
+   // Perform a 32-bit copy if possible
+   for (i = 0; i < (numBytes/4); i++)
+   {
+-    Ctx->Bus->Write32(dest, Ctx->Bus->Read32(src));
++    UINT32 m3w = Ctx->Bus->Read32(src);
++    m3sum = (m3sum ^ m3w) * 16777619u;
++    Ctx->Bus->Write32(dest, m3w);
+     dest += 4;
+     src += 4;
+   }
+@@ -610,6 +657,7 @@
+     --numBytes;
+   }
+ 
++  M3S("M %08X %08X %06X %08X\n", m3src, m3dst, m3len, m3sum);
+   // Update registers
+   Ctx->regDBC = 0;
+   Ctx->regDSPS = src;
+@@ -622,6 +670,7 @@
+ // Invalid instruction handler
+ static Result SCRIPTS_Invalid(struct NCR53C810Context *Ctx)
+ {
++  M3S("INV %08X %02X%06X\n", Ctx->regDSP, Ctx->regDCMD, Ctx->regDBC);
+   DebugLog("53C810 encountered an unrecognized instruction (%02X%06X, DSP=%08X)\n!", Ctx->regDCMD, Ctx->regDBC, Ctx->regDSP);
+   return Result::FAIL;
+ }
+@@ -639,6 +688,10 @@
+   Ctx.regDBC = op&0x00FFFFFF;
+   Ctx.regDCMD = (op>>24)&0xFF;
+   Ctx.regDSPS = Fetch(&Ctx, 4); // word 2
++  if ((Ctx.regDCMD & 0xE0) == 0xC0)
++    M3S("X %08X %02X%06X %08X %08X\n", Ctx.regDSP, Ctx.regDCMD, Ctx.regDBC, Ctx.regDSPS, Fetch(&Ctx, 8));
++  else
++    M3S("X %08X %02X%06X %08X\n", Ctx.regDSP, Ctx.regDCMD, Ctx.regDBC, Ctx.regDSPS);
+ 
+   // Execute!
+   return OpTable[Ctx.regDCMD](&Ctx);
+@@ -668,6 +721,7 @@
+ void C53C810::SingleStep(void)
+ {
+   // Executes even when halted (see notes at top of file)
++  M3S("SS halt=%d idle=%d dsp=%08X\n", Ctx.halt ? 1 : 0, Ctx.idle ? 1 : 0, Ctx.regDSP);
+   ExecuteInstruction();
+ 
+   // Issue IRQ and finish
+@@ -675,7 +729,7 @@
+   Ctx.regDSTAT |= 8;            // single step interrupt
+   if (Ctx.regDIEN & 8)
+   {
+-    Ctx.IRQ->Assert(Ctx.scsiIRQ); // generate an interrupt
++    { M3S("IRQ 1\n"); Ctx.IRQ->Assert(Ctx.scsiIRQ); } // generate an interrupt
+     DebugLog("53C810: Asserted IRQ\n");
+   }
+ }
+@@ -718,7 +772,8 @@
+     return;
+   }
+   
+-  DebugLog("53C810 write: %02X=%02X (PC=%08X, LR=%08X)\n", reg, data, ppc_get_pc(), ppc_get_lr());
++  M3SCode(Ctx.Bus, ppc_get_pc());
++  M3S("W%d %02X %02X pc=%08X lr=%08X halt=%d idle=%d\n", g_m3s_width, reg, data, ppc_get_pc(), ppc_get_lr(), Ctx.halt ? 1 : 0, Ctx.idle ? 1 : 0);
+   
+   // Dump everything into the register file
+   Ctx.regs[reg&0xFF] = data;
+@@ -739,7 +794,7 @@
+         Ctx.initiator->Disconnected();
+       Ctx.regISTAT = ISTAT_SRST;
+       Ctx.regs[0x14] = ISTAT_SRST;
+-      Ctx.IRQ->Deassert(Ctx.scsiIRQ);
++      { M3S("IRQ 0\n"); Ctx.IRQ->Deassert(Ctx.scsiIRQ); }
+       break;
+     }
+     Ctx.regISTAT = (data & ~ISTAT_CON) | (Ctx.regISTAT & ISTAT_CON); // CON is read-only
+@@ -814,6 +869,7 @@
+     // To-Do: is this correct? Should single step really be tested first?
+     //if (!(Ctx.regDCNTL&0x10) && !(Ctx.regDMODE&1))  // if MAN=0 and not single stepping, start SCRIPTS automatically
+     {
++      M3S("AUTO %08X dcntl=%02X\n", Ctx.regDSP, Ctx.regDCNTL);
+       DebugLog("53C810: Automatically starting (PC=%08X, LR=%08X, single step=%d)\n", ppc_get_pc(), ppc_get_lr(), !!(Ctx.regDCNTL&0x10));
+       Ctx.idle = false;
+       Run(MAX_IMMEDIATE_INSTRUCTIONS);  // automatic
+@@ -850,7 +906,7 @@
+     }
+     else if ((Ctx.regDCNTL&0x04))     // start DMA bit
+     {
+-      DebugLog("53C810: Manually starting\n");
++      M3S("MAN %08X\n", Ctx.regDSP);
+       Ctx.idle = false;
+       Run(MAX_IMMEDIATE_INSTRUCTIONS);
+     }
+@@ -862,6 +918,14 @@
+ 
+ UINT8 C53C810::ReadRegister(unsigned reg)
+ {
++  M3SCode(Ctx.Bus, ppc_get_pc());
++  UINT8 v = ReadRegisterImpl(reg);
++  M3S("R%d %02X %02X pc=%08X lr=%08X\n", g_m3s_width, reg, v, ppc_get_pc(), ppc_get_lr());
++  return v;
++}
++
++UINT8 C53C810::ReadRegisterImpl(unsigned reg)
++{
+   UINT8 ret;
+   
+   if (reg >= 0x60)
+@@ -883,7 +947,7 @@
+     Ctx.regDSTAT &= 0xF7; // clear SSI (single step interrupt)
+     //Ctx.regISTAT |= 1;  // doing this is another way to fix VF3
+     //Ctx.regDSTAT |= 8;
+-    Ctx.IRQ->Deassert(Ctx.scsiIRQ);
++    { M3S("IRQ 0\n"); Ctx.IRQ->Deassert(Ctx.scsiIRQ); }
+     //DebugLog("53C810: DSTAT read\n");
+     return ret;
+   case 0x14:    // ISTAT
+@@ -946,6 +1010,7 @@
+ UINT32 C53C810::ReadPCIConfigSpace(unsigned device, unsigned reg, unsigned bits, unsigned offset) const
+ {
+   UINT32  d;
++  M3S("PCIR %02X %d %d\n", reg, bits, offset);
+   
+   if (bits == 8)
+   {
+@@ -981,7 +1046,7 @@
+   
+ void C53C810::WritePCIConfigSpace(unsigned device, unsigned reg, unsigned bits, unsigned offset, UINT32 data)
+ {
+-  DebugLog("53C810 PCI %d-bit write request for reg=%02X, data=%08X\n", bits, reg, data);
++  M3S("PCIW %02X %d %d %08X\n", reg, bits, offset, data);
+ 
+   if (reg == 4) // set base address of SCSI device
+       baseAddress = data & 0xFF;
+--- a/Src/Model3/53C810.h
++++ b/Src/Model3/53C810.h
+@@ -238,6 +238,7 @@
+ 	Result	ExecuteInstruction(void);	// fetches and executes the instruction at DSP
+ 	void	SingleStep(void);			// executes one instruction and raises the single step interrupt
+ 	void	BuildOpTable(void);
++	UINT8	ReadRegisterImpl(unsigned reg);
+ 	void	Insert(UINT8 mask, UINT8 op, Result (*Handler)(struct NCR53C810Context *));
+ 	Result	(*OpTable[256])(struct NCR53C810Context *);
+ 
+--- a/Src/Model3/Model3.cpp
++++ b/Src/Model3/Model3.cpp
+@@ -212,6 +212,8 @@
+  *
+  */
+ 
++extern unsigned g_m3s_frame;   // M0-F capture, 53C810.cpp
++extern int g_m3s_width;
+ #include "Model3.h"
+ 
+ #include <new>
+@@ -1047,6 +1049,7 @@
+   else if (m_stepping > Game::Stepping::MODEL3_1_5 || SCSI.GetBaseAddress() != 0xC0) break;
+   case 0xF9:
+   case 0xC1:
++    g_m3s_width = 8;
+     return SCSI.ReadRegister(addr&0xFF);
+ 
+   // Unknown
+@@ -1351,6 +1354,7 @@
+     else if (m_stepping > Game::Stepping::MODEL3_1_5 || SCSI.GetBaseAddress() != 0xC0) break;
+   case 0xF9:
+   case 0xC1:
++    g_m3s_width = 32;
+     data =  (SCSI.ReadRegister((addr+0)&0xFF) << 24);
+     data |= (SCSI.ReadRegister((addr+1)&0xFF) << 16);
+     data |= (SCSI.ReadRegister((addr+2)&0xFF) << 8);
+@@ -1510,6 +1514,7 @@
+     else if (m_stepping > Game::Stepping::MODEL3_1_5 || SCSI.GetBaseAddress() != 0xC0) break;
+   case 0xF9:
+   case 0xC1:
++    g_m3s_width = 8;
+     SCSI.WriteRegister(addr&0xFF,data);
+     break;
+ 
+@@ -1834,6 +1839,7 @@
+     else if (m_stepping > Game::Stepping::MODEL3_1_5 || SCSI.GetBaseAddress() != 0xC0) break;
+   case 0xF9:
+   case 0xC1:
++    g_m3s_width = 32;
+     SCSI.WriteRegister((addr&0xFF)+0,(data>>24)&0xFF);
+     SCSI.WriteRegister((addr&0xFF)+1,(data>>16)&0xFF);
+     SCSI.WriteRegister((addr&0xFF)+2,(data>>8)&0xFF);
+@@ -2075,6 +2081,7 @@
+ 
+ void CModel3::RunMainBoardFrame(void)
+ {
++  ++g_m3s_frame;
+ 	UINT32 start = CThread::GetTicks();
+ 
+ 	/* 
