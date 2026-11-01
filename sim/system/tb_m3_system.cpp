@@ -85,6 +85,9 @@ static std::set<long> parse_list(const char *s) {
 
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
+  bool prof = false, pf_req = false;
+  uint32_t pf_last = 0;
+  uint64_t pf_cyc = 0, pf_ins = 0, pf_w[256] = {}, pf_n[256][4] = {};
   std::string img_fn, trace_fn, dump_dir, ppm_dir, save_fn, restore_fn;
   long nframes = 10, window = 0x10000;
   std::set<long> dump_at, ppm_at, r3d_at;
@@ -102,6 +105,7 @@ int main(int argc, char **argv) {
     else if (a == "--ppm-at") ppm_at = parse_list(nx().c_str());
     else if (a == "--window") window = std::strtol(nx().c_str(), nullptr, 0);
     else if (a == "--quiet") quiet = true;
+    else if (a == "--prof") prof = true;
     else if (a == "--tb-fast") tb_fast = true;
     else if (a == "--no-fatal-stop") fatal_stop = false;
     else if (a == "--save") save_fn = nx();
@@ -149,6 +153,16 @@ int main(int argc, char **argv) {
     }
     t->clk = 1; t->eval();
     cyc++;
+    // --prof: the CPU's data-memory wait cycles by the region of the data
+    // cache's last memory request (m3_cpu_mon's ev_q[5], a clock late)
+    if (prof) {
+      auto *q = t->rootp;
+      if (q->m3_system__DOT__u_cpu__DOT__dm_req && !pf_req) { pf_last = q->m3_system__DOT__u_cpu__DOT__dm_addr; pf_n[pf_last >> 24][q->m3_system__DOT__u_cpu__DOT__dm_cmd & 3]++; }
+      pf_req = q->m3_system__DOT__u_cpu__DOT__dm_req;
+      uint8_t const e = q->m3_system__DOT__g_mon__DOT__u_mon__DOT__ev_q;
+      pf_cyc++; if (e & 1) pf_ins++;
+      if (e & 0x20) pf_w[pf_last >> 24]++;
+    }
   };
 
   // power-on
@@ -436,6 +450,15 @@ int main(int argc, char **argv) {
     if (t->frame != frame_seen) {
       frame_seen = t->frame;
       if (trf) { Rec r{t->frame, last_pc, 0, 2, 3, 0, 0, 0}; std::fwrite(&r, sizeof r, 1, trf); std::fflush(trf); }
+      if (prof && frame_seen % 10 == 0 && pf_cyc) {
+        std::printf("prof frame %u: cycles %" PRIu64 " CPI %.2f data wait %.1f%%;", frame_seen, pf_cyc,
+                    pf_ins ? double(pf_cyc) / double(pf_ins) : 0.0, 100.0 * double([&] { uint64_t a = 0; for (auto w : pf_w) a += w; return a; }()) / double(pf_cyc));
+        for (int r = 0; r < 256; r++) if (pf_w[r] * 200 >= pf_cyc || pf_n[r][0] + pf_n[r][1] + pf_n[r][2] + pf_n[r][3] >= 1000)
+          std::printf(" %02X: %.1f%% (cmd0 %" PRIu64 " cmd1 %" PRIu64 " cmd2 %" PRIu64 " cmd3 %" PRIu64 ")", r, 100.0 * double(pf_w[r]) / double(pf_cyc),
+                      pf_n[r][0], pf_n[r][1], pf_n[r][2], pf_n[r][3]);
+        std::printf("\n"); std::fflush(stdout);
+        pf_cyc = pf_ins = 0; for (auto &w : pf_w) w = 0; for (auto &n : pf_n) for (auto &c : n) c = 0;
+      }
       if (!quiet && (frame_seen % 10 == 0 || frame_seen < 5)) {
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::printf("frame %5u  cycle %11" PRIu64 "  pc %08X  %6.0f kHz  records %ld\n", frame_seen, cyc, last_pc,

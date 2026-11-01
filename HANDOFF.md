@@ -28,6 +28,10 @@ The study's §15 R83–R94 and D-37–D-42 carry every finding and decision; thi
 - **Limb trails** in attacks, and some polygons out of place (R95). Check against Supermodel's frames
   (`sm3-builds/sysb/runp/`, frames 1300 and 1390).
 - Everything at 110 MHz if it closes, after a timing pass; otherwise only the CPU at 110.
+- **Bass Fishing Deluxe** (`bassdx`, R96): shows a still 2D water screen and never any 3D (the
+  Real3D counter says 359 draws begun), then freezes
+  with the CPU looping in the boot ROM; the last exception was an alignment interrupt (0x600). Screen grab
+  `sm3-builds/board/bassdx_frozen.png`; bench image `sm3-builds/bass_sdram.bin`. MRA in `mra/`, uncommitted.
 - On the board: `_Arcade/_Model3/` has the 3D build and "stage A, 2D only" (`M3stageA.rbf`, 9ae84cd8), for
   recording progress.
 - Triage the 3D glitches against Supermodel: run the bench chain to the fights (`sm3-builds/sysb/ext2.sh`).

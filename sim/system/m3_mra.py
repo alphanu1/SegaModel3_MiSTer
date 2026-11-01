@@ -41,7 +41,20 @@ VF3 = {
              'mpr-19217.32', 'mpr-19218.33', 'mpr-19219.34', 'mpr-19220.35', 'mpr-19221.36', 'mpr-19222.37',
              'mpr-19223.38', 'mpr-19224.39', 'mpr-19225.40', 'mpr-19226.41'],
 }
-SETS = {'vf3': VF3}
+# ROM_START(bassdx): three CROM banks; CROM3 is unpopulated (00, as MAME's region)
+BASSDX = {
+    'setname': 'bassdx', 'name': 'Sega Bass Fishing Deluxe (USA)', 'year': '1997', 'zip': 'bassdx.zip',
+    'category': 'Sports',
+    'crom': [
+        [('mpr-20256.1', 6), ('mpr-20257.2', 4), ('mpr-20258.3', 2), ('mpr-20259.4', 0)],
+        [('mpr-20260.5', 6), ('mpr-20261.6', 4), ('mpr-20262.7', 2), ('mpr-20263.8', 0)],
+        [('mpr-20264.9', 6), ('mpr-20265.10', 4), ('mpr-20266.11', 2), ('mpr-20267.12', 0)],
+        None,
+    ],
+    'fixed': [('epr-20783.17', 6), ('epr-20784.18', 4), ('epr-20785.19', 2), ('epr-20786.20', 0)],
+    'vrom': ['mpr-%d.%d' % (20270 + k, 26 + k) for k in range(16)],
+}
+SETS = {'vf3': VF3, 'bassdx': BASSDX}
 # ROM_LOAD64_WORD_SWAP offset -> the output bytes of its pair in word form
 OFF_MAP = {2: '00000021', 0: '00002100', 6: '00210000', 4: '21000000'}
 SEQ_MAP = ['00000021', '00002100', '00210000', '21000000']
@@ -73,11 +86,14 @@ def mra(args):
     w('    <mameversion>0289</mameversion>')
     w('    <year>%s</year>' % s['year'])
     w('    <manufacturer>Sega</manufacturer>')
-    w('    <category>Fighter</category>')
+    w('    <category>%s</category>' % s.get('category', 'Fighter'))
     w('')
     w('    <rom index="0" zip="%s" md5="none">' % s['zip'])
     for b, bank in enumerate(s['crom']):
         w('        <!-- 0x%07x  CROM%d, 16 MiB (banks %d-%d) -->' % (b * 0x1000000, b, 2 * b, 2 * b + 1))
+        if bank is None:
+            w('        <part repeat="0x1000000">00</part>')
+            continue
         w('        <interleave output="64">')
         for name, off in sorted(bank, key=lambda p: OFF_MAP[p[1]][::-1]):
             w('            <part name="%s" crc="%s" map="%s"/>' % (name, crc[name], OFF_MAP[off]))

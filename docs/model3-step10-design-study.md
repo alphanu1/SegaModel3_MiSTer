@@ -4732,3 +4732,26 @@ Open issues seen on the board in the same build:
 - **Clocks:** one 90 MHz clock drives the CPU, the SDRAM, the DDR3 port, the geometry, the rasteriser and the
   video. I want everything at 110 MHz if it closes; at 100 MHz the integrated build misses by 2 ns (R93), so a
   timing pass comes first. Failing that, only the CPU at 110 (D-38) with a clock-domain crossing.
+
+**R96 — Bass Fishing Deluxe (`bassdx`) on the 3D core: a still 2D water screen, no 3D shown, then a freeze.** This is the
+first game other than VF3 on the core. MAME 0.289 marks `bassdx` "I/O board error". `sim/system/m3_mra.py` gained
+its layout (three CROM banks; CROM3 filled with 00 as MAME's region); the packed image is VF3's size, 102,891,520
+bytes. `sysb90_s1` (5f02194c) on the board, overlay after about 87 s (screen grab
+`sm3-builds/board/bassdx_frozen.png`):
+
+| Row | Words |
+|---|---|
+| 0 | PC at vblank FFF01890 (boot ROM); frame 0x138A (5,002); 53C810 interrupts 0x09E3 |
+| 1 | 672 frames submitted, 359 drawn, 5 dropped |
+| 5 | longest CPU bus wait 0x3A2F0 (238,320 clocks, 2.6 ms); CPI × 256 0x1755 (CPI 23) |
+| 6–7 | 90 M cycles, 3.86 M instructions, no data wait, fetch waiting and decode starved 86 M each |
+| 8 | first exception: 0x1200 (DTLB store miss) at 0008A780, `stwu r6,4(r7)` |
+| 10 | the entry before the most recent: 0x1100 at 00083AB8 |
+| 11 | 10,065 entries; the most recent vector 0x600 (alignment); fatal handler not reached |
+
+No 3D ever appeared on the screen, although the Real3D's counter shows 359 draws begun; why the draws do not
+show (empty scenes, or the compositor) is open. The CPU ended up back in the boot ROM. It runs there uncached at
+CPI 23, almost all fetch wait, the way a ROM-resident wait or error loop would. The last exception taken was an
+alignment interrupt. That may be D-39's crossing trap reached by a pattern VF3 never makes, or a real error path
+(the I/O board check MAME stops on). Not yet looked at. Next: the 2D-only core on the same MRA, then the system
+bench on `sm3-builds/bass_sdram.bin` to the freeze, with the instruction history at the 0x600 entry.
