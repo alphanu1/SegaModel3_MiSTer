@@ -77,6 +77,30 @@ module m3_cpu_mon #(
     return r;
   endfunction
 
+  // The CRC is linear, crc40(c, d) = crc40(c, 0) ^ crc40(0, d): the data's
+  // part is registered first (sd_q), so the signature register's own loop
+  // is only its 32-bit part (the 72-input form missed 100 MHz in the R63
+  // batch-6 full build). Each update lands a cycle later; the report latches
+  // the signature two cycles after the final branch retires, after the last
+  // GPR write's update.
+  logic [31:0] sd_q;
+  logic        su_q;
+  // crc40(sig, 0) as an XOR of sig's bits per output bit, the columns being
+  // crc40 of each unit vector (constants): Quartus built the loop's form as
+  // a chain seven LUTs deep (R63 final-candidate full build, sig to sig)
+  logic [31:0] a_col [0:31];
+  logic [31:0] sig_a;
+  always_comb begin
+    for (int j = 0; j < 32; j++) a_col[j] = crc40(32'd1 << j, 40'd0);
+    for (int i = 0; i < 32; i++) begin
+      sig_a[i] = 1'b0;
+      for (int j = 0; j < 32; j++) sig_a[i] = sig_a[i] ^ (a_col[j][i] & sig[j]);
+    end
+  end
+  always_ff @(posedge clk) begin
+    sd_q <= crc40(32'd0, {3'b000, rt_gpr_q, rt_gpr_val_q});
+    su_q <= rt_valid_q && rt_gpr_we_q && !rst && !clear_q;
+  end
   always_ff @(posedge clk) begin
     if (rst) begin
       runs <= 32'd0;
@@ -88,7 +112,7 @@ module m3_cpu_mon #(
     end else begin
       cnt[0] <= cnt[0] + 32'd1;
       for (int i = 0; i < 8; i++) if (ev_q[i]) cnt[i + 1] <= cnt[i + 1] + 32'd1;
-      if (rt_valid_q && rt_gpr_we_q) sig <= crc40(sig, {3'b000, rt_gpr_q, rt_gpr_val_q});
+      if (su_q) sig <= sig_a ^ sd_q;
       if (report_q) runs <= runs + 32'd1;
     end
   end

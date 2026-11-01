@@ -40,7 +40,7 @@ static uint64_t cyc = 0, errors = 0;
 
 static void apply(btb_in const &in)
 {
-	dut->rst = in.rst; dut->rd_pc = in.rd_pc & 0x3fffffff; dut->ctx = in.ctx; dut->cap = in.cap;
+	dut->rst = in.rst; dut->rd_pc = in.rd_pc & 0x3fffffff; dut->ctx = in.ctx; dut->cap = in.cap; dut->cur_pc = 0;
 	dut->p_take = in.p_take; dut->kill = in.kill;
 	dut->w_en = in.w_en; dut->w_v = in.w_v; dut->w_pc = in.w_pc & 0x3fffffff; dut->w_ctx = in.w_ctx;
 	dut->w_reg = in.w_reg; dut->w_tgt = in.w_tgt & 0x3fffffff; dut->w_x = in.w_x;

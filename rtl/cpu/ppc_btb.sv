@@ -141,11 +141,24 @@
 //   64, MLAB        0 M10K, 107 ALM                          179.7 MHz
 //   128, MLAB       0 M10K, 205 ALM                          180.7 MHz
 //   256, MLAB       0 M10K, 388 ALM                          145.0 MHz
+//
+// TD > 0 leaves PC[29 -: TD] out of the tag, so an entry fits two M10K
+// with a wider payload (D-30: 56 + 24 bits with TD = 2). An alias then only
+// costs a check that fails: the core checks every prediction (above). PC[31:30]
+// stay, which tell RAM (0x0...) from the boot ROM (0xFFF...).
+//
+// CURPC = 1 (the core's use, D-30): cap only says a request goes out, and
+// cur_pc is its address; a hit also needs cur_pc to be the address read
+// (rpc_q). The core may then present any address it expects the coming
+// request to carry (a redirect's target included), and a guess that turns
+// out wrong costs only the lookup, never a wrong prediction.
 
 module ppc_btb #(
   parameter int N     = 256,                 // entries: 256, 128 or 64
   parameter int XW    = 0,                   // extra payload bits
-  parameter int STYLE = 0                    // 0 M10K, 1 MLAB
+  parameter int STYLE = 0,                   // 0 M10K, 1 MLAB
+  parameter bit CURPC = 1'b0,                // the hit also compares cur_pc (above)
+  parameter int TD    = 0                    // tag bits PC[29 -: TD] left out (below)
 )(
   input  logic          clk,
   input  logic          rst,
@@ -153,6 +166,7 @@ module ppc_btb #(
   input  logic [31:2]   rd_pc,
   input  logic [1:0]    ctx,
   input  logic          cap,
+  input  logic [31:2]   cur_pc,
 
   output logic          p_v,
   output logic [31:2]   p_tgt,
@@ -174,7 +188,7 @@ module ppc_btb #(
 );
 
   localparam int IW = $clog2(N);
-  localparam int TW = 30 - IW;                // tag bits PC[31:IW+2]
+  localparam int TW = 30 - IW - TD;           // tag bits PC[31:IW+2], less PC[29 -: TD]
   localparam int BW = 1 + TW + 2 + 1 + 30;    // the entry without x
   localparam int EW = BW + XW;
   localparam logic [IW-1:0] LAST = IW'(N - 1);
@@ -197,7 +211,12 @@ module ppc_btb #(
   logic          we;
   logic [IW-1:0] wa;
   logic [EW-1:0] wd;
-  wire  [BW-1:0] wb = {w_v && !sw_act, w_pc[31:IW+2], w_ctx, w_reg, w_tgt};
+  function automatic logic [TW-1:0] tag_of(input logic [31:2] a);
+    logic [29:0] f;
+    f = a[31:2];
+    tag_of = {f[29:28], f[27-TD:IW]};               // (TD = 0: f[29:IW])
+  endfunction
+  wire  [BW-1:0] wb = {w_v && !sw_act, tag_of(w_pc), w_ctx, w_reg, w_tgt};
   assign we = sw_act || (w_en && !rst && !flush);
   assign wa = sw_act ? sw_cnt : w_pc[IW+1:2];
   generate
@@ -229,13 +248,18 @@ module ppc_btb #(
     end
   endgenerate
 
-  // the address read and whether a write met it on the read edge
-  logic [31:2] rpc_q;
-  logic        rdw_q;
+  // the address read and whether a write met it on the read edge (the write
+  // is registered and compared with the registered read address after the
+  // edge: the read address comes late from the core's fetch decision)
+  logic [31:2]   rpc_q;
+  logic          we_q;
+  logic [IW-1:0] wa_q;
   always_ff @(posedge clk) begin
     rpc_q <= rd_pc;
-    rdw_q <= we && wa == ra;
+    we_q  <= we;
+    wa_q  <= wa;
   end
+  wire           rdw_q = we_q && wa_q == rpc_q[IW+1:2];
 
   // ------------------------------------------------------------- compare
   wire          e_v   = q[EW-1];
@@ -243,22 +267,29 @@ module ppc_btb #(
   wire [1:0]    e_ctx = q[EW-2-TW -: 2];
   wire          e_reg = q[EW-4-TW];
   wire [31:2]   e_tgt = q[XW+29 -: 30];
-  wire          hit   = e_v && e_tag == rpc_q[31:IW+2] && e_ctx == ctx && !rdw_q;   // (a sweep clears p_v below)
+  wire          hit   = e_v && e_tag == tag_of(rpc_q) && e_ctx == ctx && !rdw_q &&   // (a sweep clears p_v below)
+                        (!CURPC || cur_pc == rpc_q);
 
+  // the payload loads on a capture whatever the kill (p_v alone says it is
+  // live), so the core's late kill drives one flip-flop, not the payload's
+  // enables
+  wire          cap_h = cap && hit && (!p_v || p_take);
   always_ff @(posedge clk) begin
     if (rst || flush || sw_act || kill)
       p_v <= 1'b0;
-    else if (cap && hit && (!p_v || p_take)) begin
-      p_v   <= 1'b1;
+    else if (cap_h)
+      p_v <= 1'b1;
+    else if (p_take)
+      p_v <= 1'b0;
+    if (cap_h) begin
       p_tgt <= e_tgt;
       p_reg <= e_reg;
-    end else if (p_take)
-      p_v <= 1'b0;
+    end
   end
   generate
     if (XW > 0) begin : g_x
       always_ff @(posedge clk)
-        if (cap && hit && (!p_v || p_take)) p_x <= q[XW-1:0];
+        if (cap_h) p_x <= q[XW-1:0];
     end else begin : g_nx
       assign p_x = 1'b0;
     end

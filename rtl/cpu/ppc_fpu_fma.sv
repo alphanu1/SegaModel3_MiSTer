@@ -220,7 +220,11 @@ module ppc_fpu_fma
   logic [5:0] lzfa, lzfb, lzfc;
   ppc_fpu_lzc #(.W(53)) u_lza (.clk (clk), .x({~a_e0, a_f}), .n(lzfa));
   ppc_fpu_lzc #(.W(53)) u_lzb (.clk (clk), .x({~b_e0, b_f}), .n(lzfb));
-  ppc_fpu_lzc #(.W(53)) u_lzc (.clk (clk), .x({~c_e0, c_f}), .n(lzfc));
+  // (frC counted raw and 1.0's count, 0, chosen after: the op decode was in
+  // front of the count, R63 batch 3)
+  logic [5:0] lzfc_r;
+  ppc_fpu_lzc #(.W(53)) u_lzc (.clk (clk), .x({c_er != 11'd0, in_c[51:0]}), .n(lzfc_r));
+  assign lzfc = has_c ? lzfc_r : 6'd0;
 
   wire single_e = (in_single & ~cvt) | rsp;
   // frB only where it is normalised, see the header (a zero frB counts too:

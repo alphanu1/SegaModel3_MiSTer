@@ -83,6 +83,8 @@ module m3_cputest
   ppc_core u_cpu (
     .clk (clk), .rst (cpu_rst),
     .i_req (i_req), .i_addr (i_addr), .i_wimg (), .i_seq (), .i_valid (i_valid), .i_data (i_data),
+    .i_way (2'd0), .i_arr (1'b0), .i_pa (20'd0), .i_pv (), .i_pidx (), .i_pway (), .i_ppa (), .i_pre (), .ev_btb (),
+    .i_two (1'b0), .i_w2 (), .i_data2 (32'd0),
     .d_req (d_req), .d_we (d_we), .d_addr (d_addr), .d_be (d_be), .d_wdata (d_wdata),
     .d_wimg (), .d_op (), .d_rdy (1'b1), .d_idle (1'b1), .d_valid (d_valid), .d_rdata (d_rdata),
     .hid_ice (), .hid_dce (), .hid_ilock (), .hid_dlock (), .hid_icfi (), .hid_dcfi (), .hid_noopti (),
@@ -158,7 +160,7 @@ module m3_cputest
     .clk (clk), .rst (cpu_rst),
     .m_req (m_req), .m_cmd (m_cmd), .m_addr (m_addr), .m_be (m_be), .m_wdata (m_wdata),
     .m_ack (m_ack), .m_wnext (m_wnext), .m_rvalid (m_rvalid), .m_rdata (m_rdata),
-    .tb_tick (tb_tick), .ext_int (1'b0), .ev (ev), .ev_mmu (),
+    .tb_tick (tb_tick), .ext_int (1'b0), .ev (ev), .ev_mmu (), .ev_btb (),
     .rt_valid (rt_valid), .rt_last (rt_last), .rt_pc (rt_pc), .rt_insn (rt_insn),
     .rt_gpr_we (rt_gpr_we), .rt_gpr (rt_gpr), .rt_gpr_sh (), .rt_irq (), .rt_gpr_val (rt_gpr_val),
     .rt_cr (), .rt_xer (), .rt_lr (), .rt_ctr (), .rt_msr (), .rt_srr0 (), .rt_srr1 (),

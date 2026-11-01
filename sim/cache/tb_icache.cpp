@@ -110,6 +110,7 @@ int main(int argc, char **argv) {
   uint64_t mark[5] = {};
 
   bool out = false; uint32_t cur_a = 0, cur_exp = 0; bool cur_hit = false; uint64_t t0 = 0;
+  bool cur_two = false; uint32_t cur_exp2 = 0; uint64_t n_two = 0;   // FETCH2: a two-word request
   uint32_t pc = 0x00000000; bool have_pc = false;
   std::vector<Alloc> dut_allocs;
   uint64_t n_f = 0, n_seq = 0, n_jump = 0, n_icbi = 0, n_icfi = 0, n_ice = 0, n_ilock = 0, n_mod = 0, n_para = 0;
@@ -120,13 +121,17 @@ int main(int argc, char **argv) {
   long max_cyc = nf * 120 + 200000;
 
   while (ph != DONE && (long)cyc < max_cyc) {
-    bool iv = t->i_valid; uint32_t idata = t->i_data;
+    bool iv = t->i_valid; uint32_t idata = t->i_data, idata2 = t->i_data2;
     if (t->t_alloc) dut_allocs.push_back({t->t_alloc_set, t->t_alloc_way, t->t_alloc_tag});
     t->i_req = 0;
     if (out && iv) {
       out = false;
       if (idata != cur_exp) {
         if (errors < 10) std::printf("FETCH MISMATCH cyc %lu addr %08X got %08X exp %08X\n", (unsigned long)cyc, cur_a, idata, cur_exp);
+        errors++;
+      }
+      if (cur_two && idata2 != cur_exp2) {
+        if (errors < 10) std::printf("FETCH MISMATCH (second word) cyc %lu addr %08X got %08X exp %08X\n", (unsigned long)cyc, cur_a + 4, idata2, cur_exp2);
         errors++;
       }
       unsigned lat = cyc - t0; int c = cur_hit ? 0 : 1;
@@ -195,10 +200,14 @@ int main(int argc, char **argv) {
         if (si >= script.size() && !seq && wimg == 0 && rnd(0, 99) < 8 && ref.resident(a)) { wimg = 4; n_para++; }
         pc = a; have_pc = true;
         cur_a = a; cur_exp = ref.fetch(a, wimg, cur_hit); t0 = cyc; n_f++;
-        t->i_req = 1; t->i_addr = a; t->i_seq = seq; t->i_wimg = wimg;
+        // two words when the cache offers them on a sequential request (the core's rule)
+        cur_two = si >= script.size() && seq && t->i_two && !no_seq && rnd(0, 3) != 0;
+        if (cur_two) { bool h2; cur_exp2 = ref.fetch(a + 4, wimg, h2); pc = a + 4; n_two++; }
+        t->i_req = 1; t->i_addr = a; t->i_seq = seq; t->i_wimg = wimg; t->i_w2 = cur_two;
         out = true;
       }
     }
+    if (!(t->i_req)) t->i_w2 = 0;
 
     ma.step(t->m_req, t->m_cmd, t->m_addr, t->m_be, 0);
     t->m_ack = ma.ack; t->m_rvalid = ma.rvalid; t->m_rdata = ma.rdata;
@@ -228,6 +237,7 @@ int main(int argc, char **argv) {
   std::printf("  ref hits %lu misses %lu bypassed %lu; allocations %zu; singles %zu; port fills %lu single reads %lu\n",
               (unsigned long)ref.hits, (unsigned long)ref.misses, (unsigned long)ref.byp, ref.allocs.size(), ref.singles.size(),
               (unsigned long)ma.n_fill, (unsigned long)ma.n_rd);
+  std::printf("  two-word requests %lu\n", (unsigned long)n_two);
   for (int c = 0; c < 2; c++) if (lat_n[c])
     std::printf("  %s request to i_valid: min %lu mean %.2f max %lu cycles (%lu)\n", c ? "miss/bypass" : "hit        ",
                 (unsigned long)lat_mn[c], (double)lat_s[c] / lat_n[c], (unsigned long)lat_mx[c], (unsigned long)lat_n[c]);

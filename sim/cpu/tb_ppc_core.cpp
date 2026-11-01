@@ -66,7 +66,7 @@
 // cycles its uop waited in MEM) moves the cycle at which an interrupt or a
 // DEC / timebase read was decided.
 //
-//   tb_ppc_core [seeds] [first_seed] [length] [max_wait] [--mode n] [--dlat n] [--ilat n] [--rdy p]
+//   tb_ppc_core [seeds] [first_seed] [length] [max_wait] [--mode n] [--dlat n] [--ilat n] [--rdy p] [--loops]
 
 #ifdef PPC_CPU
 // rtl/cpu/ppc_cpu.sv: the core with both caches, behind the caches' memory
@@ -98,7 +98,8 @@ namespace {
 
 bool dtrace = getenv("DTRACE") != nullptr;   // every data request, answer and retirement
 int g_dlat = 0, g_ilat = 0, g_rdy = 0;
-bool g_board = false;                         // --emit: the board harness without caches cannot dcbz       // fixed data / fetch wait (0: random), % of cycles with d_rdy low
+bool g_board = false;
+bool g_loops = false;                         // --loops: backward branches, calls and (real mode) rewritten code                         // --emit: the board harness without caches cannot dcbz       // fixed data / fetch wait (0: random), % of cycles with d_rdy low
 
 // ---------------------------------------------------------------- memory
 struct Mem {
@@ -471,6 +472,94 @@ struct Gen {
         emit(SPR(12, 9, 467));
         emit(BC(rnd(2) ? 16 : 18, rnd(32), 4 * (skip + 1)));
         filler(skip);
+        break;
+      }
+    }
+  }
+  // --loops (never in --emit's board program): code run more than once, so the
+  // BTB sees its branches again (rtl/cpu/ppc_btb.sv). The bodies are plain
+  // operations, so nothing in them writes CTR or LR or branches.
+  void body(int n) {
+    for (int i = 0; i < n; i++) {
+      int k = rnd(10);
+      if (fp && k == 0) fp_insn();
+      else if (k < 4) alu_imm(); else if (k < 6) alu_xo(); else if (k < 7) alu_x();
+      else if (k < 8) rotate(); else if (k < 9) compare(); else mem();
+    }
+  }
+  void loop_form() {
+    switch (rnd(xl ? 4 : 5)) {
+      case 0: {                                          // counted: bdnz back
+        emit(D(14, 12, 0, 2 + rnd(4))); emit(MTSPR(9, 12));
+        uint32_t top = here();
+        body(1 + rnd(5));
+        emit(BC(16, 0, int32_t(top - here())));
+        break;
+      }
+      case 1: {                                          // through LR: blr back, bdz out
+        uint32_t top = here() + 20;
+        li32(12, top); emit(MTSPR(8, 12)); emit(D(14, 12, 0, 2 + rnd(3))); emit(MTSPR(9, 12));
+        body(1 + rnd(4));
+        emit(BC(18, 0, 8));
+        emit(XL(20, 0, 0, 16));
+        break;
+      }
+      case 2: {                                          // a subroutine called from several sites
+        size_t at = code.size(); emit(0);
+        uint32_t sub = here();
+        body(1 + rnd(3));
+        // sometimes first a conditional return the y-bit rule predicts taken
+        // (BO 01101, 00101: on a CR bit, y = 1), not always taken
+        if (rnd(2)) emit(XL(rnd(2) ? 13 : 5, rnd(32), 0, 16));
+        emit(XL(20, 0, 0, 16));                          // blr: a different return each call
+        code[at] = B(int32_t(here() - (base + 4 * uint32_t(at))));
+        for (int c = 0, nc = 2 + rnd(3); c < nc; c++) {
+          if (rnd(3) == 0) { li32(12, sub); emit(MTSPR(9, 12)); emit(XL(20, 0, 0, 528, 1)); }   // bctrl
+          else emit(B(int32_t(sub - here()), 0, 1));                                            // bl
+          body(rnd(2));
+        }
+        break;
+      }
+      case 3: {                                          // a call inside a counted loop
+        size_t at = code.size(); emit(0);
+        uint32_t sub = here();
+        body(1 + rnd(2));
+        emit(XL(20, 0, 0, 16));
+        code[at] = B(int32_t(here() - (base + 4 * uint32_t(at))));
+        emit(D(14, 12, 0, 2 + rnd(3))); emit(MTSPR(9, 12));
+        uint32_t top = here();
+        body(rnd(3));
+        emit(B(int32_t(sub - here()), 0, 1));
+        body(rnd(2));
+        emit(BC(16, 0, int32_t(top - here())));
+        break;
+      }
+      default: {                                         // real mode: a branch in a loop is rewritten
+        int skip = 1 + rnd(2);
+        int kind = rnd(3);                               // 0 b, 1 bc always, 2 blr (LR set before the loop)
+        size_t lr_at = code.size();                      // (blr: LR jumps over the filler, as b would)
+        if (kind == 2) { li32(12, 0); emit(MTSPR(8, 12)); }
+        emit(D(14, 12, 0, 2 + rnd(3))); emit(MTSPR(9, 12));
+        uint32_t top = here();
+        body(rnd(3));
+        uint32_t x = here();
+        if (kind == 2) {                                 // LR = x + 4 (skip + 1), fixed up now x is known
+          uint32_t t = x + 4 * uint32_t(skip + 1);
+          code[lr_at] = D(15, 12, 0, t >> 16); code[lr_at + 1] = D(24, 12, 12, t & 0xFFFF);
+        }
+        emit(kind == 0 ? B(4 * (skip + 1)) : kind == 1 ? BC(20, 0, 4 * (skip + 1)) : XL(20, 0, 0, 16));
+        filler(skip);
+        body(rnd(2));
+        uint32_t w;
+        switch (rnd(4)) {
+          case 0:  w = D(24, 0, 0, 0); break;                     // a nop
+          case 1:  w = B(4); break;                               // another target
+          case 2:  w = BC(4, rnd(32), 4 * (skip + 1)); break;     // a bc the rule predicts not taken
+          default: w = BC(20, 0, 4 * skip); break;                // b... one word short
+        }
+        li32(12, x); li32(11, w); emit(D(36, 11, 12, 0));          // stw: the next pass runs w
+        emit(X(0, 0, 12, 54)); emit(SYNC); emit(X(0, 0, 12, 982)); emit(ISYNC);   // dcbst sync icbi isync
+        emit(BC(16, 0, int32_t(top - here())));
         break;
       }
     }
@@ -859,7 +948,7 @@ struct Gen {
       else if (k < 72) msr();
       else if (k < 86) mem();
       else if (k < 89) muldiv();
-      else if (k < 97) branch();
+      else if (k < 97) { if (g_loops && rnd(3) == 0) loop_form(); else branch(); }
       else exc();
     }
     if (fp) emit(FX(fr(), 0, 0, 583));                    // mffs: the FP state settles before the end
@@ -927,6 +1016,7 @@ void install(Mem &m, const Gen &g, std::mt19937 &rng) {
 struct Cov {
   uint64_t vec[0x20] = {};                    // exceptions taken, by vector / 0x100
   uint64_t ext = 0, dec = 0, sh_writes = 0, seeds[4] = {}, replays = 0, fslow = 0;
+  uint64_t btb[4] = {};                       // ev_btb: predicted targets, failed checks, MEM refetches, writes
   uint64_t insns[4] = {}, cycles[4] = {};
   uint64_t fpc = 0, fprec = 0, fpdel = 0, fpsupp = 0, fpld = 0, fpst = 0, fpops[ppcfpu::NUM_OPS] = {};
   void add(const Cov &c) {
@@ -934,6 +1024,7 @@ struct Cov {
     for (int i = 0; i < ppcfpu::NUM_OPS; i++) fpops[i] += c.fpops[i];
     for (int i = 0; i < 0x20; i++) vec[i] += c.vec[i];
     ext += c.ext; dec += c.dec; sh_writes += c.sh_writes; replays += c.replays; fslow += c.fslow;
+    for (int i = 0; i < 4; i++) btb[i] += c.btb[i];
     for (int i = 0; i < 4; i++) { insns[i] += c.insns[i]; cycles[i] += c.cycles[i]; }
     for (int i = 0; i < 4; i++) seeds[i] += c.seeds[i];
   }
@@ -1018,7 +1109,8 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
 
   bool i_pend = false;
   int i_cnt = 0;
-  uint32_t i_word = 0;
+  uint32_t i_word = 0, i_word2 = 0;
+  bool i_two = false;                                  // two-word fetch offered this cycle (random)
   struct DAns { uint64_t t; uint32_t word; };
   std::deque<DAns> dq;                                 // data answers outstanding, in order
   uint64_t d_last = 0;                                 // cycle of the latest answer scheduled
@@ -1033,6 +1125,7 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
   top.clk = 0; top.rst = 1; top.m_ack = 0; top.m_rvalid = 0; top.m_wnext = 0; top.m_rdata = 0; top.tb_tick = 0; top.ext_int = 0;
 #else
   top.clk = 0; top.rst = 1; top.i_valid = 0; top.d_valid = 0; top.tb_tick = 0; top.ext_int = 0;
+  top.i_way = 0; top.i_arr = 0; top.i_pa = 0;          // no I-cache: the BTB's pre-read is not used
 #endif
   for (int i = 0; i < 4; i++) { top.clk = 0; top.eval(); top.clk = 1; top.eval(); }
   top.rst = 0;
@@ -1068,6 +1161,8 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
 #else
     top.i_valid = i_pend && i_cnt == 0;
     top.i_data  = i_word;
+    top.i_data2 = i_word2;
+    top.i_two   = i_two;
     top.d_valid = !dq.empty() && dq.front().t == cycles;
     top.d_rdata = top.d_valid ? dq.front().word : uint32_t(rrng());   // junk outside an answer
     top.d_rdy   = d_rdy;
@@ -1082,6 +1177,7 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
       fq_rtl[top.rt_fw_idx].push_back(top.rt_fw_val);
       if (fq_rtl[top.rt_fw_idx].size() > 4) { printf("seed %u: f%d written by the RTL with no model write\n", seed, top.rt_fw_idx); return false; }
     }
+    for (int i = 0; i < 4; i++) cov.btb[i] += (top.ev_btb >> i) & 1;
     static uint32_t last_fs = 0;
     if (fptrace && top.rt_fpscr != last_fs) { printf("    rtl   fpscr %08X (cycle %llu)\n", top.rt_fpscr, (unsigned long long)cycles); last_fs = top.rt_fpscr; }
 #ifdef PPC_CPU
@@ -1114,7 +1210,11 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
     if (i_took) i_pend = false;
     if (d_took) dq.pop_front();
     if (i_pend) i_cnt--;
-    if (ireq) { i_pend = true; i_cnt = (g_ilat ? g_ilat : wait_for()) - 1; i_word = rtl_mem.rd32(ia); }
+    if (ireq) { i_pend = true; i_cnt = (g_ilat ? g_ilat : wait_for()) - 1; i_word = rtl_mem.rd32(ia);
+                if (top.i_w2) { if (!i_two) { printf("seed %u: i_w2 without i_two\n", seed); return false; }
+                                i_word2 = rtl_mem.rd32(ia + 4); }
+                else i_word2 = uint32_t(rrng()); }
+    i_two = (rrng() & 3) != 0;                          // the memory side's offer for the next cycle
     d_rdy = !(g_rdy && int(rrng() % 100) < g_rdy);     // next cycle's, registered
     uint32_t d_word = 0;
     if (dreq) {
@@ -1302,6 +1402,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--dlat") && i + 1 < argc) g_dlat = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--ilat") && i + 1 < argc) g_ilat = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--rdy") && i + 1 < argc) g_rdy = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--loops")) g_loops = true;
     else pos.push_back(argv[i]);
   }
   int seeds = pos.size() > 0 ? atoi(pos[0]) : 200;
@@ -1317,6 +1418,15 @@ int main(int argc, char **argv) {
     if (run(seed, len, max_wait, mode, insns, cyc)) pass++;
     else { printf("FAIL\n"); return 1; }
     cycles_all += cyc;
+  }
+  // --loops runs the BTB's paths (ev_btb): with 100 seeds or more, each must have
+  // been taken, rewritten code (real mode) checked, and a register target refetched,
+  // so a BTB that has stopped predicting fails here although nothing else would
+  if (g_loops && seeds >= 100 && (g_cov.btb[0] == 0 || g_cov.btb[3] == 0 || g_cov.btb[2] == 0 ||
+                                  (force_mode < 0 && g_cov.btb[1] == 0))) {
+    printf("FAIL: --loops coverage: BTB targets predicted %llu, failed checks %llu, register targets refetched %llu, writes %llu\n",
+           (unsigned long long)g_cov.btb[0], (unsigned long long)g_cov.btb[1], (unsigned long long)g_cov.btb[2], (unsigned long long)g_cov.btb[3]);
+    return 1;
   }
   printf("PASS: %d seeds, %llu instructions compared against the model, %llu cycles (max wait %d)\n",
          pass, (unsigned long long)insns, (unsigned long long)cycles_all, max_wait);
@@ -1335,6 +1445,8 @@ int main(int argc, char **argv) {
   printf("\n");
   printf("  TGPR shadow writes %llu, data micro-TLB replays %llu, fetch translation slow cycles %llu\n",
          (unsigned long long)c.sh_writes, (unsigned long long)c.replays, (unsigned long long)c.fslow);
+  printf("  BTB: targets predicted %llu, failed word checks %llu, register targets refetched %llu, entries written %llu\n",
+         (unsigned long long)c.btb[0], (unsigned long long)c.btb[1], (unsigned long long)c.btb[2], (unsigned long long)c.btb[3]);
   static const char *kn[] = {"integer", "translated", "translated+interrupts", "interrupts"};
   for (int i = 0; i < 4; i++)
     if (c.insns[i]) printf("  %s: %llu instructions, %llu cycles, CPI %.3f\n", kn[i], (unsigned long long)c.insns[i],

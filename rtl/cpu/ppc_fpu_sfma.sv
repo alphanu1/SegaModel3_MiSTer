@@ -129,51 +129,44 @@ module ppc_fpu_sfma
   wire special = a_e1 | (has_c & c_e1) | (has_b & b_e1);
   wire sp_isnan = nan_any | imz | isi;
 
-  logic sp_sign;
-  always_comb begin
-    if (a_nan)           sp_sign = a_s;
-    else if (pb_nan)     sp_sign = b_s;
-    else if (c_nan)      sp_sign = c_s;
-    else if (imz | isi)  sp_sign = 1'b0;
-    else if (pinf)       sp_sign = sp_;
-    else                 sp_sign = sbe;
-  end
-
+  // (the special result's sign and the effective operation are formed in
+  // S2, from these registered: sp_sign2 below)
   wire prod_on   = ~special;
   wire prod_live = prod_on & ~a_zero & ~c_zero;
   wire add_on    = special | (has_b & ~b_zero);
-  wire r_sp      = special ? sp_sign : sp_;
-  wire r_sb      = special ? sp_sign : (has_b ? sbe : sp_);
-  wire effsub    = ~special & (r_sp ^ r_sb);
 
-  // unbiased exponents; sh puts the addend's hidden bit at V[74 - sh]
-  exp_t ea, ec, eb, ep0, sh_raw, e0;
-  assign ea     = exp_t'({2'b00, a_e}) - exp_t'(1023);
-  assign ec     = has_c ? (exp_t'({2'b00, c_e}) - exp_t'(1023)) : exp_t'(0);
-  assign eb     = exp_t'({2'b00, b_e}) - exp_t'(1023);
-  assign ep0    = ea + ec - exp_t'(46);
-  assign sh_raw = ea + ec - eb + exp_t'(27);
+  // unbiased exponents; sh puts the addend's hidden bit at V[74 - sh].
+  // ea + ec - eb + 27 is formed for both values of has_c from the raw
+  // fields (one three-input add each, with has_c, the op's, choosing after),
+  // and E0's choice between eb - 73 and ep0 is registered and made in S2,
+  // where E0 is first used: the has_c mux in front of the adders and the
+  // E0 mux after them led the core's spike (fc_q into R1, R63)
+  exp_t ep0, sh_raw, e0b, shc, shn, epc, epn;
+  assign shc    = exp_t'({2'b00, a_e}) + exp_t'({2'b00, c_e}) - exp_t'({2'b00, b_e}) - exp_t'(996);
+  assign shn    = exp_t'({2'b00, a_e}) - exp_t'({2'b00, b_e}) + exp_t'(27);
+  assign epc    = exp_t'({2'b00, a_e}) + exp_t'({2'b00, c_e}) - exp_t'(2092);
+  assign epn    = exp_t'({2'b00, a_e}) - exp_t'(1069);
+  assign sh_raw = has_c ? shc : shn;                   // ea + ec - eb + 27
+  assign ep0    = has_c ? epc : epn;                   // ea + ec - 46
+  assign e0b    = exp_t'({2'b00, b_e}) - exp_t'(1096); // eb - 73
+  wire   sh_neg = has_c ? shc < 0 : shn < 0;
+  wire   sh_big = has_c ? shc > exp_t'(127) : shn > exp_t'(127);
+  // E0 = eb - 73 for a special result, no live product, or an addend above
+  // the window; else ep0
+  wire   e0_b   = special || !prod_live || (add_on && sh_neg);
   logic [6:0] sh;
   always_comb begin
-    if (special || !prod_live) begin
-      e0 = eb - exp_t'(73);
-      sh = 7'd0;
-    end else if (!add_on || sh_raw < 0) begin
-      e0 = add_on ? (eb - exp_t'(73)) : ep0;
-      sh = add_on ? 7'd0 : 7'd127;
-    end else begin
-      e0 = ep0;
-      sh = (sh_raw > exp_t'(127)) ? 7'd127 : sh_raw[6:0];
-    end
+    if (special || !prod_live)  sh = 7'd0;
+    else if (!add_on)           sh = 7'd127;
+    else if (sh_neg)            sh = 7'd0;
+    else if (sh_big)            sh = 7'd127;
+    else                        sh = sh_raw[6:0];
   end
 
-  // The addend: a NaN operand's payload (quieted), or frB. The other special
-  // results (infinity, the default QNaN) are put in place in S2, beside the
-  // alignment shift: special is the deepest term here (0.02 ns over).
-  wire [22:0] nan_frac = a_nan ? in_a[51:29] : pb_nan ? in_b[51:29] : in_c[51:29];
-  wire [23:0] b_use = nan_any ? {1'b0, nan_frac | (23'd1 << 22)}
-                              : ({24{has_b & ~b_zero}} & {1'b1, in_b[51:29]});
-  wire        spz   = special & ~nan_any;   // payload 0, or the default QNaN's
+  // The addend frB. A special result (a NaN operand's payload quieted, an
+  // infinity or the default QNaN) takes its place in S2, after the alignment
+  // shift, which is 0 for it.
+  wire [23:0] b_nrm = {24{has_b & ~b_zero}} & {1'b1, in_b[51:29]};
   wire [23:0] ma = {~a_zero, in_a[51:29]};
   wire [23:0] mc = has_c ? {~c_zr, in_c[51:29]} : 24'h80_0000;
 
@@ -197,9 +190,13 @@ module ppc_fpu_sfma
   typedef struct packed {
     logic [23:0] ma, mc, b;
     logic [6:0]  sh;
-    exp_t        e0;
-    logic        spz;
-    logic        sp, sb, effsub, pon;
+    exp_t        e0p, e0b;                // E0's two values, chosen in S2 by e0s
+    logic        e0s;
+    // for S2: the NaN operand choice, and the signs' inputs (the special
+    // value and the signs are formed there, so the NaN tests are not in
+    // front of R1's addend and signs: R63 batches 3 and 4, fa_q / fb_q into R1)
+    logic        a_nan, pb_nan, c_nan, a_s, b_s, c_s, pinf, sp_, sbe, has_b;
+    logic        pon;
     side_t       sd;
   } r1_t;
   // R1 and R4 are kept where they are (preserve): Quartus merged R1 with
@@ -209,8 +206,10 @@ module ppc_fpu_sfma
   (* preserve *) r1_t r1_q;
   logic r1_v;
   always_comb begin
-    s1_d.ma = ma;  s1_d.mc = mc;  s1_d.b = b_use;  s1_d.sh = sh;  s1_d.e0 = e0;  s1_d.spz = spz;
-    s1_d.sp = r_sp;  s1_d.sb = r_sb;  s1_d.effsub = effsub;  s1_d.pon = prod_on;  s1_d.sd = s1_sd;
+    s1_d.ma = ma;  s1_d.mc = mc;  s1_d.b = b_nrm;  s1_d.sh = sh;  s1_d.e0p = ep0;  s1_d.e0b = e0b;  s1_d.e0s = e0_b;
+    s1_d.a_nan = a_nan;  s1_d.pb_nan = pb_nan;  s1_d.c_nan = c_nan;  s1_d.a_s = a_s;  s1_d.b_s = b_s;  s1_d.c_s = c_s;
+    s1_d.pinf = pinf;  s1_d.sp_ = sp_;  s1_d.sbe = sbe;  s1_d.has_b = has_b;
+    s1_d.pon = prod_on;  s1_d.sd = s1_sd;
   end
   generate if (Q1) begin : g_r1
     always_ff @(posedge clk) begin
@@ -228,14 +227,31 @@ module ppc_fpu_sfma
 
   // the addend at V[74:51], shifted right; bit j ends at V[51 + j - sh] and is
   // sticky when that is 0 or below (a compare per bit, not a second shifter)
-  // a special result other than a NaN operand's: infinity (payload 0) or the
-  // default QNaN (its quiet bit), unshifted (sh = 0)
-  wire [23:0] b2  = r1_q.spz ? {1'b0, r1_q.sd.sp_isnan, 22'd0} : r1_q.b;
-  wire [73:0] al2 = {b2, 50'd0} >> r1_q.sh;
+  // A special result goes in unshifted (its sh is 0), chosen after the
+  // shift: a NaN operand's payload, quieted (frA's, frB's, frC's in that
+  // order; ma, b and mc hold them), else infinity (payload 0) or the
+  // default QNaN (its quiet bit)
+  wire        nan2 = r1_q.a_nan | r1_q.pb_nan | r1_q.c_nan;
+  wire [22:0] nf2  = r1_q.a_nan ? r1_q.ma[22:0] : r1_q.pb_nan ? r1_q.b[22:0] : r1_q.mc[22:0];
+  wire [23:0] spv2 = nan2 ? {1'b0, nf2 | (23'd1 << 22)} : {1'b0, r1_q.sd.sp_isnan, 22'd0};
+  wire [73:0] al2 = r1_q.sd.special ? {spv2, 50'd0} : {r1_q.b, 50'd0} >> r1_q.sh;
   logic [23:0] lost2;
   always_comb
     for (int j = 0; j < 24; j++) lost2[j] = (8'(j) + 8'd51 <= {1'b0, r1_q.sh});
-  wire st2 = |(b2 & lost2);
+  wire st2 = !r1_q.sd.special && |(r1_q.b & lost2);
+  // the signs, as S1 had them (sp_sign: the special result's)
+  logic sp_sign2;
+  always_comb begin
+    if (r1_q.a_nan)                              sp_sign2 = r1_q.a_s;
+    else if (r1_q.pb_nan)                        sp_sign2 = r1_q.b_s;
+    else if (r1_q.c_nan)                         sp_sign2 = r1_q.c_s;
+    else if (r1_q.sd.vximz | r1_q.sd.vxisi)      sp_sign2 = 1'b0;
+    else if (r1_q.pinf)                          sp_sign2 = r1_q.sp_;
+    else                                         sp_sign2 = r1_q.sbe;
+  end
+  wire r_sp2  = r1_q.sd.special ? sp_sign2 : r1_q.sp_;
+  wire r_sb2  = r1_q.sd.special ? sp_sign2 : (r1_q.has_b ? r1_q.sbe : r1_q.sp_);
+  wire effs2  = ~r1_q.sd.special & (r_sp2 ^ r_sb2);
 
   typedef struct packed {
     logic [47:0] p;
@@ -247,8 +263,8 @@ module ppc_fpu_sfma
   r2_t  s2_d, r2_q;
   logic r2_v;
   always_comb begin
-    s2_d.p = prod2;  s2_d.al = {al2, st2};  s2_d.e0 = r1_q.e0;
-    s2_d.sp = r1_q.sp;  s2_d.sb = r1_q.sb;  s2_d.effsub = r1_q.effsub;  s2_d.pon = r1_q.pon;  s2_d.sd = r1_q.sd;
+    s2_d.p = prod2;  s2_d.al = {al2, st2};  s2_d.e0 = r1_q.e0s ? r1_q.e0b : r1_q.e0p;
+    s2_d.sp = r_sp2;  s2_d.sb = r_sb2;  s2_d.effsub = effs2;  s2_d.pon = r1_q.pon;  s2_d.sd = r1_q.sd;
   end
   generate if (Q2) begin : g_r2
     always_ff @(posedge clk) begin
@@ -289,25 +305,37 @@ module ppc_fpu_sfma
     s3_d.t1 = t1[74:0];  s3_d.t2 = t2[74:0];  s3_d.neg = neg3;  s3_d.e0 = r2_q.e0;  s3_d.pd = pd3;
     s3_d.sign = neg3 ? r2_q.sb : r2_q.sp;  s3_d.effsub = r2_q.effsub;  s3_d.sd = r2_q.sd;
   end
+  // the select into each of S4's two counts from a copy of neg of its own
+  // (neg drove 150 selects; it led S4 on two seeds in the core's spike)
+  logic n3_lz, n3_tz;
   generate if (Q3) begin : g_r3
+    (* preserve *) logic n3a, n3b;
     always_ff @(posedge clk) begin
       if (rst) r3_v <= 1'b0;
       else     r3_v <= r2_v;
       r3_q <= s3_d;
+      n3a  <= neg3;
+      n3b  <= neg3;
     end
+    assign n3_lz = n3a;
+    assign n3_tz = n3b;
   end else begin : g_c3
     assign r3_v = r2_v;
     assign r3_q = s3_d;
+    assign n3_lz = neg3;
+    assign n3_tz = neg3;
   end endgenerate
 
   // ================================================================== S4
-  wire [74:0] s4 = r3_q.neg ? r3_q.t2 : r3_q.t1;
+  wire [74:0] s4  = r3_q.neg ? r3_q.t2 : r3_q.t1;
+  wire [74:0] s4l = n3_lz ? r3_q.t2 : r3_q.t1;       // = s4
+  wire [74:0] s4t = n3_tz ? r3_q.t2 : r3_q.t1;       // = s4
   // A special result is not shifted: a stopper at V[74] stops the count at 0.
   wire force4 = r3_q.sd.special;
   logic [6:0] lz4, tz4;
-  ppc_fpu_lzc #(.W(75)) u_lz (.clk (clk), .x (s4 | {force4, 74'd0}), .n (lz4));
+  ppc_fpu_lzc #(.W(75)) u_lz (.clk (clk), .x (s4l | {force4, 74'd0}), .n (lz4));
   logic [74:0] s_rev;
-  always_comb for (int i = 0; i < 75; i++) s_rev[i] = s4[74 - i];
+  always_comb for (int i = 0; i < 75; i++) s_rev[i] = s4t[74 - i];
   ppc_fpu_lzc #(.W(75)) u_tz (.clk (clk), .x (s_rev), .n (tz4));
   wire zero4 = (s4 == 75'd0);
 

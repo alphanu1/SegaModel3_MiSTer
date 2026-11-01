@@ -16,6 +16,9 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_fpu.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_fpu_sfma.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_fpu_rsqe.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_fpu_fast.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_pdec.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_pdw.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_btb.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_core.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_cache_pkg.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_cache_ram.sv

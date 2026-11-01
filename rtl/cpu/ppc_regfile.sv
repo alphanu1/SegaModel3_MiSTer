@@ -52,8 +52,15 @@ module ppc_regfile (
 
   // Before the edge the arrays hold the old value, so a same-edge write is
   // seen only through the core's forward, in simulation as on the MLAB.
-  assign qa = mem_a[ra];
-  assign qb = mem_b[rb];
-  assign qs = mem_s[rs];
+  // The read addresses through a LUT of their own, so Quartus does not
+  // copy the queue head's register into each array's address register: the
+  // pop's next-state logic then reached every array (R63 batch-7 full
+  // builds: the pop into the files' rdaddr_reg)
+  (* keep = 1 *) wire [5:0] ra_k = ra;
+  (* keep = 1 *) wire [5:0] rb_k = rb;
+  (* keep = 1 *) wire [5:0] rs_k = rs;
+  assign qa = mem_a[ra_k];
+  assign qb = mem_b[rb_k];
+  assign qs = mem_s[rs_k];
 
 endmodule

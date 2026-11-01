@@ -126,4 +126,46 @@ package ppc_pkg;
     logic        fser;            // waits in EX until no older FP op can change the FPSCR
   } uop_t;
 
+  // the fetch queue's predecode of a word (ppc_pdw.sv, ppc_core.sv)
+  typedef struct packed {
+    logic [3:0] ck;          // CR writer kind: stwcx., mtcrf, a field (mcrf, mcrxr), a bit (CR logic)
+    logic       w_spr, w_ctr, w_lr, w_xer, w_cr;   // special registers written
+    logic [4:0] rk;          // result kind: group, or logical op (below)
+    logic [2:0] immk;        // y's immediate: 0 SIMM, 1 UIMM, 2 shifted, 3 SH, 4 SIMM + 4 step, 5 zero, 6 -1
+    logic       mfmsr, mfcr;
+    logic [2:0] mf_sel;      // mfspr's source
+    logic [5:0] spr_idx;     // 63: not an SPR the core has
+    logic       yreg;        // y from rB
+    logic       az;          // (rA|0)
+    logic       xs;          // first operand from rS
+    logic [1:0] crack;       // 0 single uop, 1 update form, 2 lmw / stmw
+    logic       ua, ub, us;  // reads rA, rB, rS
+    logic [2:0] sh;          // rA, rB, rS is a TGPR shadow: MSR[TGPR] and the field < 4
+    logic       ifault;      // a fetch fault marker, not an instruction
+    logic       l0;          // the first uop is the last (not cracked, or lmw / stmw of r31)
+    logic       fua, fub, fuc, fpw;   // FPRs read (A, B, C port) and written
+    logic [4:0] fci;         // the C port's FPR: frC, or frS for a store
+    logic       fdx;         // lfd / stfd: step 1 takes step 0's EA + 4
+    logic       fwcr, fck1;  // an FP CR writer: any (a compare, mcrfs, Rc = 1); a field (mcrfs, CR1)
+    logic       hh;          // mfspr HASH1 / HASH2 (from the raw word: ID's hash wait is one AND)
+    logic       ra0;         // the rA field is 0 (from the raw word: (rA|0) without a compare in ID)
+    logic       ill;         // illegal, opcodes 59 and 63 aside (dcbi's privilege is ID's)
+    alu_op_t    pop;         // the first uop's op, opcodes 59 and 63 aside (ID's id_opf)
+    // EX's FP controls, so they are not behind the decoder: the unit (1 fma,
+    // 2 div, 3 misc), a misc op that writes an FPR, an FPSCR op, a compare or
+    // stfs (a second EX cycle), and the fast port's route kind (frsqrte; a
+    // single op the single unit runs when its operands allow)
+    logic       ffma, fdiv, fmsc, fmw, ffsx, ff2c, frq, frs;
+    // fetch-side, set by the core (ppc_pdw leaves them 0), for the BTB's keys
+    // (D-30): the word's slot in its two-word request, whether the request
+    // before it was two words, and whether its request was sequential
+    logic       bslot, bpp, bsq;
+    // set by the core: the word's direction was resolved at fetch from the
+    // committed CR and CTR (the 603e's look-ahead, D-30) and fetch followed it
+    // (a bclr / bcctr resolved taken without a BTB target cannot be), for
+    // EX's check
+    logic       lar;
+  } pd_t;
+  localparam int PDW = 74;                             // (alu_op_t is 6 bits)
+
 endpackage

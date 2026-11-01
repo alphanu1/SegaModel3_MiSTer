@@ -90,7 +90,21 @@ module ppc_core
   // the multiply-add unit's optional stage boundaries (ppc_fpu_fma.sv); all
   // in, L = 12, is what 120 MHz needs
   parameter bit P1A = 1'b1, P2 = 1'b1, P3 = 1'b1, P4A = 1'b1, P5A = 1'b1,
-  parameter bit P5  = 1'b1, P6A = 1'b1, P6 = 1'b1, P7 = 1'b1
+  parameter bit P5  = 1'b1, P6A = 1'b1, P6 = 1'b1, P7 = 1'b1,
+  // D-30's fetch additions, each of which can be turned off: BTB = 1 the
+  // branch target buffer looked up a request ahead (R61 design C, with the
+  // I-cache's pre-read port), BTB_N entries
+  parameter bit BTB = 1'b1,
+  parameter int BTB_N = 64,
+  // FETCH2 = 1: two-word fetch, the I-cache's fast path answering a
+  // sequential request with the word and the next (ppc_icache FETCH2)
+  parameter bit FETCH2 = 1'b1,
+  // LA = 1: the 603e's CR look-ahead (603e 2.3.4.4): a conditional branch
+  // whose CR bit and CTR no instruction in flight may change is resolved as
+  // its word arrives; otherwise the static rule (the y bit) predicts it
+  parameter bit LA = 1'b1,
+  // SOFTLU = 1: the BTB also looks up a soft redirect's target (see bt_rd)
+  parameter bit SOFTLU = 1'b1
 )(
   input  logic        clk,
   input  logic        rst,
@@ -101,6 +115,22 @@ module ppc_core
   output logic        i_seq,        // i_addr is the previous request's + 4, same translation
   input  logic        i_valid,
   input  logic [31:0] i_data,
+  // the BTB's side of the I-cache (ppc_icache "Pre-read port"): with an
+  // answer, the way, whether it came from the arrays, and the physical page;
+  // with B's request the pre-read of T, with T's request i_pre
+  input  logic [1:0]  i_way,
+  input  logic        i_arr,
+  input  logic [19:0] i_pa,
+  output logic        i_pv,
+  output logic [11:2] i_pidx,
+  output logic [1:0]  i_pway,
+  output logic [19:0] i_ppa,
+  output logic        i_pre,
+  // two-word fetch: the cache offers two words to a sequential request
+  // (i_two), the core asks (i_w2), the second comes in i_data2
+  input  logic        i_two,
+  output logic        i_w2,
+  input  logic [31:0] i_data2,
 
   output logic        d_req,
   output logic        d_we,
@@ -133,6 +163,9 @@ module ppc_core
   //           3 external or decrementer interrupt taken
   //           4 data micro-TLB miss (a replay)   5 fetch translation slow cycle
   output logic [5:0]  ev_mmu,
+  //   ev_btb: 0 a BTB prediction's target requested   1 its word failed the check
+  //           2 a register target refetched from MEM   3 an entry written
+  output logic [3:0]  ev_btb,
 
   // retire trace: one record per uop leaving WB, with the special registers it
   // committed. Unconnected in the core build, so it costs nothing there.
@@ -266,8 +299,11 @@ module ppc_core
     logic        tch;                                  // dcbt / dcbtst: a translation fault is a no-op
     logic        icbi;                                 // icbi: its set goes to the I-cache from here
     logic [1:0]  hcfi;                                 // mtspr HID0: ICFI, DCFI as written
+    logic        rtm;                                  // a bclr / bcctr the BTB predicted to the wrong
+                                                       // target: MEM refetches from sprv (its target)
   } mem_t;
   mem_t m;
+  (* preserve *) logic m_rpq;                          // = m.rp, for the queue's hold (below)
   wire         m_c1w = m.valid && m.fcr1 && !m_fsok;    // MEM holds an Rc = 1 arithmetic op: CR1 follows
 
   // WB
@@ -362,11 +398,42 @@ module ppc_core
   // (redir_q); the next request takes its address from redir_pc_q, and that
   // request was always going out the cycle after the decision, so the register
   // costs no fetch latency.
+  //
+  // BTB (BTB = 1; study D-30, R61 design C; ppc_btb.sv). An entry is keyed by
+  // the word before a branch B (B - 4) and holds B's target T, with T's
+  // physical page and I-cache way. It is read as B - 4's request goes out
+  // (rd_pc is f_pc's next value), so a hit is known (bt_pv) by the time B's
+  // request goes out: that request carries the cache's pre-read of T (i_pv),
+  // and the next request is T itself (pt_q, i_pre), answered in one cycle when
+  // the cache's tag for the stored way is the stored page. A taken branch then
+  // costs nothing. Both B - 4 and B must go out as f_pc requests, so the first
+  // two words after a redirect are never predicted.
+  //   - Every prediction is checked as B's word arrives, and the outcome is
+  //     registered: the word must be a branch the static rule predicts taken
+  //     to T, or for an entry of a bclr / bcctr (reg), such a branch the y-bit
+  //     rule predicts taken. Otherwise (a stale entry) the next cycle discards
+  //     T's answer and fetch moves to what the word itself asks (bmis_q), and
+  //     a stale entry is invalidated.
+  //   - A bclr / bcctr's target is checked in EX against the register; a
+  //     difference is registered (mx.rtm) and MEM refetches from the right
+  //     target, as for a resync. One such prediction is in flight at a time
+  //     (rp_v, rp_tgt), so the target needs no space in the queue.
+  //   - Entries are written for the branches the 603e's rule predicts taken
+  //     (PEM 4.2.4.2: b; bc by S and y; bclr and bcctr when BO says always or
+  //     y = 1) as their target's first word arrives, from that answer's way,
+  //     page and arrays bit (a single read stores RSV_TAG, which never hits).
+  //     The y bit is honoured: a branch the rule predicts not taken is never
+  //     written, so a hit never predicts against it.
+  //   - The page in an entry is trusted by the cache, so every change to
+  //     instruction translation (mtsr, mtsrin, tlbie, tlbli, a BAT write)
+  //     empties the table; tlbld does not touch fetch.
   logic [31:0] f_pc;
   logic        f_out, f_discard;
   logic [2:0]  q_cnt;
 
   logic        redirect;                               // hard, decided this cycle
+  logic        redirect_c;                             // ... all but a mispredicted branch
+  logic        br_go;                                  // a branch leaving EX
   logic [31:0] redirect_pc;
   logic        redir_q, redir_hard_q;
   logic [31:0] redir_pc_q;
@@ -407,34 +474,51 @@ module ppc_core
   // chosen with the address, so the compare is not behind the address mux.
   logic        f_fpend, f_stall, f_slow, f_slow2, f_xm;
   logic        f_ir, f_pr, f_tg;                       // MSR[IR, PR, TGPR] as fetch must see them
+  // the BTB's fetch state ("BTB" above; formed below)
+  logic        bt_pv, bt_preg;                         // a prediction for the request after the next
+  logic [31:2] bt_tgt;                                 // ... its target
+  logic [23:0] bt_x;                                   // ... and {its key's size, slot, the target's page, way}
+  logic        pt_q;                                   // B's request has gone: the next is bt_tgt
+  logic        bq_out;                                 // the outstanding request is B's
+  logic        bmis_q;                                 // B's word failed its check: discard, redirect
+  logic [31:2] cr_tgt_q;                               // ... to what the word asks
+  logic        rp_v;                                   // a bclr / bcctr predicted taken is in flight
+  logic [31:2] rp_tgt;                                 // ... to this target
   wire  i_vld   = i_valid || f_fpend;
   wire  rsp     = f_out && i_vld;
-  wire  rsp_ok  = rsp && !f_discard && !redir_q;       // the response is the one wanted
+  wire  rsp_ok  = rsp && !f_discard && !redir_q && !bmis_q;   // the response is the one wanted
   wire  rsp_xm  = rsp_ok && f_xm;                      // ... but it was not translated: translate it
   wire  rsp_use = rsp_ok && !f_xm;
   assign redir_pc_q = (redir_k_q == 2'd0) ? redir_a_q : (redir_k_q == 2'd1) ? redir_b_q : redir_s_q;
-  wire  [31:0] fetch_pc = redir_q ? redir_pc_q : f_pc;
+  wire  [31:0] fetch_pc = redir_q ? redir_pc_q : pt_q ? {bt_tgt, 2'b00} : f_pc;
 
   logic [1:0]        iu_v, iu_nx, iu_pr;
   logic [1:0][19:0]  iu_pg, iu_pa;
   logic [1:0][3:0]   iu_wimg;
-  logic [3:0][3:0]   fc_hit;                           // [candidate][IBAT]
-  logic [3:0]        fc_ok;                            // candidate may go out at once
-  logic [3:0][31:0]  fc_pc;
+  logic [4:0][3:0]   fc_hit;                           // [candidate][IBAT]
+  logic [4:0][1:0]   fc_iu;                            // [candidate][micro-TLB entry]
+  logic [4:0]        fc_ok;                            // candidate may go out at once
+  logic [4:0][31:0]  fc_pc;
   always_comb begin
-    fc_pc = {redir_s_q, redir_b_q, redir_a_q, f_pc};
-    for (int c = 0; c < 4; c++) begin
+    fc_pc = {bt_tgt, 2'b00, redir_s_q, redir_b_q, redir_a_q, f_pc};
+    for (int c = 0; c < 5; c++) begin
       fc_ok[c] = 1'b0;
       for (int k = 0; k < 4; k++) begin
         fc_hit[c][k] = bat_match(fc_pc[c][31:17], bat_bepi[k], bat_bl[k], f_pr ? bat_vp[k] : bat_vs[k]);
         // a BAT hit that allows the fetch: PP not 00, not guarded (table 5-3)
         fc_ok[c] = fc_ok[c] | (fc_hit[c][k] && bat_pp[k] != 2'd0 && !bat_wimg[k][0]);
       end
-      for (int e = 0; e < 2; e++) fc_ok[c] = fc_ok[c] | (iu_v[e] && iu_pr[e] == f_pr && iu_pg[e] == fc_pc[c][31:12]);
+      for (int e = 0; e < 2; e++) begin
+        fc_iu[c][e] = iu_v[e] && iu_pr[e] == f_pr && iu_pg[e] == fc_pc[c][31:12];
+        fc_ok[c]    = fc_ok[c] | fc_iu[c][e];
+      end
     end
   end
-  wire  [1:0]  f_sel  = !redir_q ? 2'd0 : (redir_k_q == 2'd0) ? 2'd1 : (redir_k_q == 2'd1) ? 2'd2 : 2'd3;
+  wire  [2:0]  f_sel  = !redir_q ? (pt_q ? 3'd4 : 3'd0) : (redir_k_q == 2'd0) ? 3'd1 : (redir_k_q == 2'd1) ? 3'd2 : 3'd3;
   wire  [3:0]  ib_hit = fc_hit[f_sel];
+  // the micro-TLB's hit chosen too, not compared after the address mux (the
+  // R63 full build's ROM address path ran through that compare)
+  wire  [1:0]  iu_hit = fc_iu[f_sel];
   wire         f_fast = !f_ir || fc_ok[f_sel];
   logic [14:0] ib_pa;
   logic [19:0] iu_pahi;
@@ -451,8 +535,8 @@ module ppc_core
       ib_wimg = ib_wimg | ({4{ib_hit[k]}} & bat_wimg[k] & 4'b1110);   // an IBAT has no G (3.5)
     end
     for (int e = 0; e < 2; e++) begin
-      iu_pahi   = iu_pahi   | ({20{iu_v[e] && iu_pr[e] == f_pr && iu_pg[e] == fetch_pc[31:12]}} & iu_pa[e]);
-      iu_wimg_s = iu_wimg_s | ({4{iu_v[e] && iu_pr[e] == f_pr && iu_pg[e] == fetch_pc[31:12]}} & iu_wimg[e]);
+      iu_pahi   = iu_pahi   | ({20{iu_hit[e]}} & iu_pa[e]);
+      iu_wimg_s = iu_wimg_s | ({4{iu_hit[e]}} & iu_wimg[e]);
     end
   end
   // the fetch's WIMG: real mode 0011 (3.5), an IBAT's, or the micro-TLB's
@@ -506,10 +590,92 @@ module ppc_core
   // (a fault marker's word is whatever is on the bus, and may predict a
   // branch: harmless, since fetch has stopped and the marker's exception in EX
   // overrides any redirect of its own)
-  wire         pw_pred = (pw_op == 6'd18) ||
-                         (pw_op == 6'd16 && ((pw_bo[4] && pw_bo[2]) || (i_data[15] ^ pw_bo[0])));
+  // Direction (D-30), the 603e's rule: a conditional branch is resolved from
+  // the committed CR and CTR when no instruction in flight writes them (the
+  // queue's entries, EX, MEM: 603e 2.3.4.4 "scans the execution pipelines
+  // ... if no interlock is found, the branch can be resolved immediately");
+  // otherwise the static rule predicts it (PEM 4.2.4.2: S and the y bit).
+  // The scan is per register, not per CR bit (a writer of any field counts),
+  // which only resolves fewer branches. A word behind another in a two-word
+  // answer counts that word as in flight too.
+  // (declared here, before the look-ahead's scan uses them: Quartus 17 wants
+  // a struct declared before its fields are named)
+  pd_t         pd_w, pd_w2, q_pd, q1_pd;
+  logic [PDW-1:0] q2_pdv, q3_pdv;
+  pd_t         q2_pd, q3_pd;
+  assign q2_pd = pd_t'(q2_pdv);
+  assign q3_pd = pd_t'(q3_pdv);
+  wire         la_crb = (q_cnt > 3'd0 && (q_pd.w_cr  || q_pd.fwcr))  || (q_cnt > 3'd1 && (q1_pd.w_cr || q1_pd.fwcr)) ||
+                        (q_cnt > 3'd2 && (q2_pd.w_cr || q2_pd.fwcr)) || (q_cnt > 3'd3 && (q3_pd.w_cr || q3_pd.fwcr)) ||
+                        (ex_valid && ex_w_cr) || (m.valid && m.cr_we);
+  wire         la_ctb = (q_cnt > 3'd0 && q_pd.w_ctr)  || (q_cnt > 3'd1 && q1_pd.w_ctr) ||
+                        (q_cnt > 3'd2 && q2_pd.w_ctr) || (q_cnt > 3'd3 && q3_pd.w_ctr) ||
+                        (ex_valid && ex_w_ctr) || (m.valid && m.ctr_we);
+  // resolved (r) and its direction (d) for a word w with BO bo, BI bi: a bc,
+  // bclr or bcctr that is not "branch always"
+  function automatic logic [1:0] la_f(input logic [31:0] w, input logic crb, input logic ctb,
+                                      input logic [31:0] cr, input logic c1);
+    logic [4:0] bo;
+    logic cond, r, d;
+    bo   = w[25:21];
+    cond = w[31:26] == 6'd16 || (w[31:26] == 6'd19 && (w[10:1] == 10'd16 || (w[10:1] == 10'd528 && bo[2])));
+    r    = cond && !(bo[4] && bo[2]) && (bo[4] || !crb) && (bo[2] || !ctb);
+    d    = (bo[2] || (!c1 ^ bo[1])) && (bo[4] || cr[5'd31 - w[20:16]] == bo[3]);
+    la_f = {r, d};
+  endfunction
+  wire  [1:0]  la1 = LA ? la_f(i_data, la_crb, la_ctb, cr_q, ctr1_q) : 2'b00;
+  wire         pw_spred = (pw_op == 6'd18) ||
+                          (pw_op == 6'd16 && ((pw_bo[4] && pw_bo[2]) || (i_data[15] ^ pw_bo[0])));
+  wire         pw_pred = la1[1] ? (pw_op == 6'd16 && la1[0]) : pw_spred;
   wire  [31:0] pw_tgt  = (i_data[1] ? 32'd0 : f_rsp_pc) + pw_disp;
-  wire         f_soft  = rsp_use && pw_pred;
+  // a word the BTB already redirected for (bq_out) makes no soft redirect of
+  // its own: its check is registered (bmis_q, below)
+  wire         f_soft1 = rsp_use && pw_pred && !bq_out;
+  wire         f_soft  = f_soft1 || f_soft2;
+  // bclr, or bcctr (BO[2] = 1), and the y-bit rule's taken for it (PEM 4.2.4.2)
+  wire         pw_reg  = pw_op == 6'd19 && (i_data[10:1] == 10'd16 || (i_data[10:1] == 10'd528 && pw_bo[2]));
+  wire         pw_rstk = la1[1] ? la1[0] : (pw_bo[4] && pw_bo[2]) || pw_bo[0];
+  // the queue's predicted bit: the static rule's, or a register branch the BTB
+  // redirected for, whose word passes its check
+  wire         bt_slot = FETCH2 && bt_x[22];            // the branch is the second word of its request
+  wire         w_prd   = pw_pred || (bq_out && !bt_slot && bt_preg && pw_reg && pw_rstk);
+  // two-word fetch: the second word's prediction, from i_data2 at f_rsp_pc + 4.
+  // A first word predicted taken drops the second (it is not pushed).
+  logic        f_w2_q;                                 // the outstanding request asked for two words
+  wire  [31:2] f_rsp4  = f_rsp_pc[31:2] + 30'd1;
+  wire  [31:2] f_rsp8  = f_rsp_pc[31:2] + 30'd2;
+  wire  [5:0]  pw2_op  = i_data2[31:26];
+  wire  [4:0]  pw2_bo  = i_data2[25:21];
+  wire  [31:0] pw2_disp = (pw2_op == 6'd18) ? {{6{i_data2[25]}}, i_data2[25:2], 2'b00}
+                                            : {{16{i_data2[15]}}, i_data2[15:2], 2'b00};
+  // the first word as a writer, from its raw fields: a superset of the CR and
+  // CTR writers, shallow (the predecode's own bits sat behind its tables and
+  // led a cached full build, i_data through la2 into the queue's bit)
+  function automatic logic [1:0] w_may(input logic [31:0] w);
+    logic [5:0] op;
+    logic [9:0] x;
+    op = w[31:26]; x = w[10:1];
+    w_may[1] = op == 6'd10 || op == 6'd11 || op == 6'd13 || op == 6'd19 || op == 6'd28 || op == 6'd29 ||
+               op == 6'd59 || op == 6'd63 || ((op == 6'd20 || op == 6'd21 || op == 6'd23) && w[0]) ||
+               (op == 6'd31 && (w[0] || x == 10'd0 || x == 10'd32 || x == 10'd144 || x == 10'd512));
+    w_may[0] = ((op == 6'd16 || op == 6'd19) && !w[23]) || (op == 6'd31 && x == 10'd467);
+  endfunction
+  wire  [1:0]  w1_may = w_may(i_data);
+  wire  [1:0]  la2 = (LA && FETCH2) ? la_f(i_data2, la_crb || w1_may[1], la_ctb || w1_may[0], cr_q, ctr1_q) : 2'b00;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && rsp_use && !f_fpend && (((pd_w.w_cr || pd_w.fwcr) && !w1_may[1]) || (pd_w.w_ctr && !w1_may[0])))
+      $fatal(1, "w_may misses a CR or CTR writer: %08X", i_data);
+`endif
+  wire         pw2_spred = (pw2_op == 6'd18) ||
+                           (pw2_op == 6'd16 && ((pw2_bo[4] && pw2_bo[2]) || (i_data2[15] ^ pw2_bo[0])));
+  wire         pw2_pred = FETCH2 && (la2[1] ? (pw2_op == 6'd16 && la2[0]) : pw2_spred);
+  wire  [31:0] pw2_tgt  = (i_data2[1] ? 32'd0 : {f_rsp4, 2'b00}) + pw2_disp;
+  wire         pw2_reg  = pw2_op == 6'd19 && (i_data2[10:1] == 10'd16 || (i_data2[10:1] == 10'd528 && pw2_bo[2]));
+  wire         pw2_rstk = la2[1] ? la2[0] : (pw2_bo[4] && pw2_bo[2]) || pw2_bo[0];
+  wire         w2_in    = FETCH2 && f_w2_q;            // the answer has a second word
+  wire         f_soft2  = rsp_use && w2_in && !pw_pred && pw2_pred && !bq_out;
+  wire         w2_prd   = pw2_pred || (bq_out && bt_slot && bt_preg && pw2_reg && pw2_rstk);
 
   // A fetch goes out (f_issue) as without translation, except while
   // translating and on the cycle its untranslated response comes back (the
@@ -517,8 +683,11 @@ module ppc_core
   // request (its response is the marker, next cycle). None goes out on a fault
   // response's cycle, so the held fault is never overwritten before its marker
   // is in the queue.
+  // (an answer counts as two words if two were asked for, pushed or not)
+  wire  [2:0] f_nin  = {1'b0, rsp_use && w2_in, rsp_use && !w2_in};
   wire  f_issue = !rst && !f_stall && !f_fpend && !f_slow && !f_slow2 && !rsp_xm && (!f_out || rsp) &&
-                  (redir_hard_q || ({1'b0, q_cnt} + {3'd0, rsp_use} < 4'd4));
+                  (redir_hard_q || ({1'b0, q_cnt} + {1'b0, f_nin} < 4'd4));
+  wire  f_room2 = {1'b0, q_cnt} + {1'b0, f_nin} < 4'd3;
   assign i_addr = {i_pahi, fetch_pc[11:0]};
   assign i_req  = f_issue;
   // i_seq: the request follows the previous one at + 4, both translated at
@@ -527,7 +696,7 @@ module ppc_core
   // (the translation part is f_xm's: a request that went out translated
   // has f_xm = 0, so f_fast drives one register, not two)
   logic f_sq;
-  assign i_seq  = !redir_q && f_sq && !f_xm;
+  assign i_seq  = !redir_q && !pt_q && f_sq && !f_xm;
   always_ff @(posedge clk)
     if (rst)                         f_sq <= 1'b0;
     else if (f_issue)                f_sq <= 1'b1;
@@ -580,15 +749,18 @@ module ppc_core
       redir_q      <= 1'b0;
       redir_hard_q <= 1'b0;
     end else begin
-      redir_q      <= redirect || f_soft;
-      redir_hard_q <= redirect;
+      // (a failed check made in the cycle of a hard redirect is dropped here,
+      // a cycle on, so EX's late decision does not reach bmis_q)
+      redir_q      <= redirect_f || f_soft || (bmis_q && !redir_hard_q);
+      redir_hard_q <= redirect_f;
       // the candidates load every cycle; only the 2-bit choice waits on the
-      // redirect decision (R23 timing)
+      // redirect decision (R23 timing). A failed BTB check's redirect is a
+      // soft one, its address loaded from a register (cr_tgt_q).
       redir_a_q    <= redirect_pc;
       redir_b_q    <= redirect_pc_b;
-      redir_s_q    <= pw_tgt;
+      redir_s_q    <= bmis_q ? {cr_tgt_q, 2'b00} : (pw_pred || !FETCH2) ? pw_tgt : pw2_tgt;
       redir_k_q    <= !redirect ? 2'd2 : redirect_sel ? 2'd0 : 2'd1;
-      if (f_issue)      f_pc <= fetch_pc + 32'd4;
+      if (f_issue)      f_pc <= fetch_pc + (i_w2 ? 32'd8 : 32'd4);
       else if (redir_q) f_pc <= redir_pc_q;
       else if (s_ok)    f_pc <= f_rsp_pc;              // fetch it again, now translated
       if (redir_q) begin
@@ -608,6 +780,185 @@ module ppc_core
   logic [31:0] q_hi, q_hp;
   logic        q_hd;
   always_ff @(posedge clk) if (f_issue) f_rsp_pc <= fetch_pc;
+  // the outstanding request: two words; the one before it was two; it was
+  // sequential (the BTB's key for a branch in it is the request before)
+  logic        rq_pp_q, rq_sq_q;
+  always_ff @(posedge clk) begin
+    if (rst || s_flt) f_w2_q <= 1'b0;                   // (a fault marker is one word)
+    else if (f_issue) f_w2_q <= i_w2;
+    if (f_issue) begin
+      rq_pp_q <= f_w2_q;
+      rq_sq_q <= i_seq;
+    end
+  end
+  wire  [31:2] f_rkey = f_rsp_pc[31:2] - (rq_pp_q ? 30'd2 : 30'd1);
+
+  // ---------------------------------------------------------------- BTB
+  // (see "BTB" above). b_go: B's request goes out now, with the pre-read;
+  // t_go: T's. A register prediction waits while another is in flight.
+  // With two-word fetch an entry also says which word of B's request is the
+  // branch (bt_slot): the first, and that request asks for one word; the
+  // second, and it must be a two-word request, or the prediction is dropped.
+  logic        bt_kill;
+  wire         bt_use = bt_pv && !(bt_preg && rp_v);
+  // (never across a line, so never across a page: the second word is
+  // translated with the first; the cache does not offer it there anyway)
+  wire         w2_can = FETCH2 && i_two && i_seq && f_room2 && fetch_pc[4:2] != 3'd7;   // this request may ask for two
+  // the entry also holds the size of its key request (one or two words): the
+  // request after the key is then the one the entry was written for, so the
+  // slot means the same word. f_w2_q is the key request's size while B's
+  // request is still to go (no request goes out in between).
+  wire         bt_xok = !FETCH2 || bt_x[23] == f_w2_q;
+  wire         b_ok   = bt_use && bt_xok && !pt_q && !redir_q && (!bt_slot || w2_can);
+  wire         b_go   = f_issue && b_ok;
+  wire         t_go   = f_issue && pt_q && !redir_q;
+  assign i_w2   = w2_can && !(b_ok && !bt_slot);
+  assign i_pv   = b_go;
+  assign i_pidx = bt_tgt[11:2];
+  assign i_pway = bt_x[1:0];
+  assign i_ppa  = bt_x[21:2];
+  assign i_pre  = pt_q && !redir_q;
+  // any change of stream drops a prediction (and one whose slot cannot be met)
+  // (a hard redirect kills from its registered copy, a cycle on: until then
+  // b_go and t_go wait on redir_q, and EX's late decision stays off these)
+  assign bt_kill = redir_hard_q || f_soft || bmis_q || s_ok || s_flt || rsp_xm || (bt_pv && bt_preg && rp_v) ||
+                   (f_issue && bt_use && !pt_q && !redir_q && bt_slot && !w2_can) || (bt_pv && !pt_q && !bt_xok);
+  // B's check, from its word: a branch the rule predicts taken to T (pw_tgt
+  // is T's adder, the compare goes to one register), or for a register entry
+  // a bclr / bcctr the y-bit rule predicts taken; in the second slot, with a
+  // first word that predicts nothing
+  wire         bq_ok1 = bt_preg ? (pw_reg && pw_rstk) : (pw_pred && pw_tgt[31:2] == bt_tgt);
+  wire         bq_ok2 = w2_in && !pw_pred && (bt_preg ? (pw2_reg && pw2_rstk) : (pw2_pred && pw2_tgt[31:2] == bt_tgt));
+  wire         bq_ok  = bt_slot ? bq_ok2 : bq_ok1;
+  logic        bmr_q;                                  // the failed check was a register entry's
+  logic        cr_pred_q;                              // ... and a word predicts taken (to cr_tgt_q)
+  logic        cr_slot_q, cr_sq_q, cr_pp_q;            // ... which word; its request was sequential; the key's size
+  logic [31:2] cr_key_q;                               // ... the key of B's request (the one before it)
+  // the BTB's writes: an allocation as a redirect target's first word
+  // arrives; an invalidation for a stale entry. Keys are the request before
+  // the branch's (the word before it with one word a request).
+  logic        al_v, al_reg, al_slot, al_pp;
+  logic        al_sq, al_s2q;                          // a soft redirect last cycle; for the second word
+  logic        al_pp1, al_sv1;                         // ... and its key, registered every cycle
+  logic [31:2] al_k1;
+  logic [31:2] al_key;
+  logic        rx_q, rt_q;                             // last cycle: EX redirected for a taken bclr / bcctr
+                                                       // the rule predicts taken; MEM refetched (rtm)
+  logic [31:2] rx_key_q;                               // the key of the last uop to leave EX
+  logic        rx_slot_q, rx_kv_q, rx_pp_q;
+  wire         bw_al  = rsp_use && al_v;
+  wire         bw_inv = bmis_q && !cr_pred_q;
+  wire  [31:2] bw_key = bw_inv ? cr_key_q : al_key;
+  wire         bt_flush = m_ok && (m.srw || m.tlbie || (m.tlbl && m.insn[6]) || m_bat);
+  // the address the coming request is expected to carry, so its entry is out
+  // when it goes: after a soft redirect, B's request or a failed check, their
+  // target; else the next sequential one. A wrong guess only misses a lookup
+  // (the BTB compares the request's address, CURPC). A hard redirect's
+  // target is not known in time, so the request after one is not looked up.
+  // A soft redirect's target (SOFTLU = 1) is presented on the static rule's
+  // guess, not on the look-ahead's direction: with the look-ahead's CR select
+  // in it, the arriving word into the table's address led the first cached
+  // full build (-0.44 ns). A wrong guess only misses the lookup.
+  wire         g_soft1 = rsp_use && pw_spred && !bq_out;
+  wire         g_soft  = g_soft1 || (rsp_use && w2_in && !pw_spred && pw2_spred && !bq_out);
+  wire  [31:2] bt_rd = (SOFTLU && g_soft) ? (g_soft1 ? pw_tgt[31:2] : pw2_tgt[31:2]) : bmis_q ? cr_tgt_q :
+                       (b_go || (pt_q && !f_issue)) ? bt_tgt :
+                       f_issue ? fetch_pc[31:2] + (i_w2 ? 30'd2 : 30'd1) : redir_q ? redir_pc_q[31:2] :
+                       s_ok ? f_rsp_pc[31:2] : f_pc[31:2];
+  assign ev_btb = {bw_al, rt_q && redir_hard_q, bmis_q, t_go};
+  generate
+    if (BTB) begin : g_btb
+      ppc_btb #(.N (BTB_N), .XW (24), .STYLE (0), .CURPC (1'b1), .TD (2)) u_btb (
+        .clk (clk), .rst (rst),
+        .rd_pc (bt_rd),
+        .ctx ({f_ir, f_pr}),
+        .cap (f_issue), .cur_pc (fetch_pc[31:2]),
+        .p_v (bt_pv), .p_tgt (bt_tgt), .p_reg (bt_preg), .p_x (bt_x),
+        .p_take (t_go), .kill (bt_kill),
+        .w_en (bw_al || bw_inv), .w_v (bw_al), .w_pc (bw_key), .w_ctx ({f_ir, f_pr}), .w_reg (al_reg),
+        .w_tgt (f_rsp_pc[31:2]), .w_x ({FETCH2 && al_pp, al_slot, i_arr ? i_pa : 20'hF00FF, i_way}),
+        .flush (bt_flush), .busy ()
+      );
+      always_ff @(posedge clk) begin
+        if (rst || bt_kill) pt_q <= 1'b0;
+        else if (b_go)      pt_q <= 1'b1;
+        else if (t_go)      pt_q <= 1'b0;
+        if (rst || bt_kill) bq_out <= 1'b0;
+        else if (f_issue)   bq_out <= b_go;
+        // (a hard redirect in the same cycle discards B's word: its
+        // correction is dropped at redir_q, below)
+        bmis_q    <= rsp_use && bq_out && !bq_ok && !rst;
+        bmr_q     <= bt_preg;
+        cr_pred_q <= pw_pred || (w2_in && pw2_pred);
+        cr_slot_q <= !pw_pred;
+        cr_tgt_q  <= pw_pred ? pw_tgt[31:2] : (w2_in && pw2_pred) ? pw2_tgt[31:2] : w2_in ? f_rsp8 : f_rsp4;
+        cr_key_q  <= f_rkey;
+        cr_sq_q   <= rq_sq_q;
+        cr_pp_q   <= rq_pp_q;
+        // the register prediction in flight: from T's request until the
+        // branch leaves EX (its target is checked there), or its word fails
+        if (rst || redir_hard_q)                                rp_v <= 1'b0;
+        else if (t_go && bt_preg)                               rp_v <= 1'b1;
+        else if ((bmis_q && bmr_q) || (ex_adv && ex_u.op == OP_BRANCH && ex_pred &&
+                                       (ex_u.bkind == BR_BCLR || ex_u.bkind == BR_BCCTR))) rp_v <= 1'b0;
+        if (t_go) rp_tgt <= bt_tgt;
+        // allocation. The key of the last uop to leave EX is kept until another
+        // leaves (a MEM refetch, rt_q, uses it too: nothing younger leaves EX
+        // past a uop MEM kills)
+        rx_q    <= ex_adv && ex_u.op == OP_BRANCH && !ex_xcm && (ex_u.bkind == BR_BCLR || ex_u.bkind == BR_BCCTR) &&
+                   ((ex_u.bo[4] && ex_u.bo[2]) || ex_u.bo[0]);
+        if (ex_adv && !m_kp) begin
+          rx_key_q  <= ex_u.pc[31:2] - {29'd0, ex_bk[2]} - (ex_bk[1] ? 30'd2 : 30'd1);
+          rx_slot_q <= ex_bk[2];
+          rx_kv_q   <= ex_bk[0];
+          rx_pp_q   <= ex_bk[1];
+        end
+        rt_q    <= m_kill && m.rtm;
+        al_sq   <= f_soft && !rst;
+        al_s2q  <= !f_soft1;
+        al_k1   <= f_rkey;
+        al_pp1  <= rq_pp_q;
+        al_sv1  <= rq_sq_q;
+        if (rst) al_v <= 1'b0;
+        else if (redir_hard_q) begin
+          al_v    <= ((redir_k_q == 2'd0 && rx_q) || (redir_k_q == 2'd1 && rt_q)) && rx_kv_q;
+          al_key  <= rx_key_q;
+          al_slot <= rx_slot_q;
+          al_pp   <= rx_pp_q;
+          al_reg  <= 1'b1;
+        end else if (al_sq) begin                            // a soft redirect last cycle: its key
+          al_v    <= al_sv1;                                 // was registered then (a request may
+          al_key  <= al_k1;                                  // have gone out since)
+          al_slot <= al_s2q;
+          al_pp   <= al_pp1;
+          al_reg  <= 1'b0;
+        end else if (bmis_q) begin
+          al_v    <= cr_pred_q && cr_sq_q;
+          al_key  <= cr_key_q;
+          al_slot <= cr_slot_q;
+          al_pp   <= cr_pp_q;
+          al_reg  <= 1'b0;
+        end else if (rsp_use) al_v <= 1'b0;
+      end
+`ifdef VERILATOR
+      always_ff @(posedge clk)
+        if ($test$plusargs("btbdbg") && (f_issue || rsp || bmis_q || redirect_f))
+          $display("  f: iss %b pc %h w2 %b b_go %b t_go %b pt %b rq %b k %0d | rsp %b use %b w %h %h @%h two %b bq %b ok %b soft %b | bmis %b hard %b | bt %b %h reg %b sl %b rd %h",
+                   f_issue, fetch_pc, i_w2, b_go, t_go, pt_q, redir_q, redir_k_q, rsp, rsp_use, i_data, i_data2, f_rsp_pc, w2_in, bq_out, bq_ok, f_soft,
+                   bmis_q, redirect_f, bt_pv, {bt_tgt, 2'b0}, bt_preg, bt_slot, {bt_rd, 2'b0});
+`endif
+    end else begin : g_nobtb
+      assign bt_pv = 1'b0; assign bt_preg = 1'b0; assign bt_tgt = '0; assign bt_x = '0;
+      assign pt_q = 1'b0; assign bq_out = 1'b0; assign bmis_q = 1'b0; assign cr_tgt_q = '0;
+      assign rp_v = 1'b0; assign rp_tgt = '0;
+      assign bmr_q = 1'b0; assign cr_pred_q = 1'b0; assign cr_slot_q = 1'b0; assign cr_sq_q = 1'b0; assign cr_key_q = '0;
+      assign cr_pp_q = 1'b0;
+      assign al_v = 1'b0; assign al_reg = 1'b0; assign al_slot = 1'b0; assign al_key = '0; assign al_pp = 1'b0;
+      assign al_sq = 1'b0; assign al_s2q = 1'b0; assign al_pp1 = 1'b0; assign al_sv1 = 1'b0; assign al_k1 = '0;
+      assign rx_q = 1'b0; assign rt_q = 1'b0; assign rx_key_q = '0; assign rx_slot_q = 1'b0; assign rx_kv_q = 1'b0;
+      assign rx_pp_q = 1'b0;
+    end
+  endgenerate
 
   // Predecode as the word arrives, so the queue's pop needs no decoder (R23
   // timing): which of rA, rB, rS the first uop reads, and how it cracks
@@ -618,223 +969,22 @@ module ppc_core
   // select and truth table, the special registers written, the CR writer's
   // kind, the SPR number's decode and the move-from source. Each was four or
   // five LUT levels of the decoder in front of an EX register (R23 timing).
-  uop_t        pd_u;
-  typedef struct packed {
-    logic [3:0] ck;          // CR writer kind: stwcx., mtcrf, a field (mcrf, mcrxr), a bit (CR logic)
-    logic       w_spr, w_ctr, w_lr, w_xer, w_cr;   // special registers written
-    logic [4:0] rk;          // result kind: group, or logical op (below)
-    logic [2:0] immk;        // y's immediate: 0 SIMM, 1 UIMM, 2 shifted, 3 SH, 4 SIMM + 4 step, 5 zero, 6 -1
-    logic       mfmsr, mfcr;
-    logic [2:0] mf_sel;      // mfspr's source
-    logic [5:0] spr_idx;     // 63: not an SPR the core has
-    logic       yreg;        // y from rB
-    logic       az;          // (rA|0)
-    logic       xs;          // first operand from rS
-    logic [1:0] crack;       // 0 single uop, 1 update form, 2 lmw / stmw
-    logic       ua, ub, us;  // reads rA, rB, rS
-    logic [2:0] sh;          // rA, rB, rS is a TGPR shadow: MSR[TGPR] and the field < 4
-    logic       ifault;      // a fetch fault marker, not an instruction
-    logic       l0;          // the first uop is the last (not cracked, or lmw / stmw of r31)
-    logic       fua, fub, fuc, fpw;   // FPRs read (A, B, C port) and written
-    logic [4:0] fci;         // the C port's FPR: frC, or frS for a store
-    logic       fdx;         // lfd / stfd: step 1 takes step 0's EA + 4
-    logic       fwcr, fck1;  // an FP CR writer: any (a compare, mcrfs, Rc = 1); a field (mcrfs, CR1)
-    logic       hh;          // mfspr HASH1 / HASH2 (from the raw word: ID's hash wait is one AND)
-    logic       ra0;         // the rA field is 0 (from the raw word: (rA|0) without a compare in ID)
-    logic       ill;         // illegal, opcodes 59 and 63 aside (dcbi's privilege is ID's)
-    alu_op_t    pop;         // the first uop's op, opcodes 59 and 63 aside (ID's id_opf)
-  } pd_t;
-  localparam int PDW = 62;                             // (alu_op_t is 6 bits)
-  pd_t         pd_w, q_pd, q1_pd;
   logic [31:0] q1_hi;                                  // queue entry 1: the head after a pop
-  ppc_decode #(.FPA (1'b0)) u_pdec (.insn (i_data), .pc (32'd0), .step (5'd0), .pr (1'b0), .u (pd_u));
-  // FP arithmetic is predecoded apart, from the raw word: which FPRs an op of
-  // opcode 59 / 63 reads and writes, and whether it writes the CR. Shallow
-  // (an encoding the 603e does not have only costs a stall); the decoder
-  // above leaves 59 / 63 alone, so FP adds no depth to the integer fields
-  // on the fetch path, which limits the full build (R28). FP loads and
-  // stores are predecoded by the decoder, as the integer ones.
-  wire  [4:0]  pa5 = i_data[5:1];
-  wire         pa_op = pd_op == 6'd59 || pd_op == 6'd63;
-  wire         pa_a  = pa5 == 5'd18 || pa5 == 5'd20 || pa5 == 5'd21 || pa5 >= 5'd23;   // A form
-  wire         pa_xb = pd_x == 10'd12 || pd_x == 10'd14 || pd_x == 10'd15 ||          // frsp fctiw(z)
-                       pd_x == 10'd40 || pd_x == 10'd72 || pd_x == 10'd136 || pd_x == 10'd264;   // moves
-  wire         pa_cmp = pd_x == 10'd0 || pd_x == 10'd32;
-  wire         pa_mcrfs = pd_x == 10'd64;
-  wire         pa_ua = pa_op && (pa_a ? (pa5 != 5'd24 && pa5 != 5'd26) : pa_cmp);
-  wire         pa_ub = pa_op && (pa_a ? pa5 != 5'd25 : (pa_cmp || pa_xb || pd_x == 10'd711));
-  wire         pa_uc = pa_op && pa_a && (pa5 == 5'd23 || pa5 == 5'd25 || pa5 >= 5'd28);
-  wire         pa_w  = pa_op && (pa_a || pa_xb || pd_x == 10'd583);
-  wire         pa_rc = pa_op && i_data[0] && !(!pa_a && (pa_cmp || pa_mcrfs));
-  // a store: frS on the C port
-  wire         pd_fst = (pd_op >= 6'd52 && pd_op <= 6'd55) ||
-                        (pd_op == 6'd31 && (pd_x == 10'd663 || pd_x == 10'd695 || pd_x == 10'd727 ||
-                                            pd_x == 10'd759 || pd_x == 10'd983));
-  wire  [5:0]  pd_op = i_data[31:26];
-  wire  [9:0]  pd_x  = i_data[10:1];
-  // 3: lfdu / lfdux, three uops (ppc_decode.sv)
-  wire  [1:0]  pd_crack =
-          (pd_op == 6'd46 || pd_op == 6'd47) ? 2'd2 :
-          (pd_op == 6'd51 || (pd_op == 6'd31 && pd_x == 10'd631)) ? 2'd3 :
-          (pd_op == 6'd33 || pd_op == 6'd35 || pd_op == 6'd41 || pd_op == 6'd43 ||
-           pd_op == 6'd49 || pd_op == 6'd50 || pd_op == 6'd54 || pd_op == 6'd55 ||
-           (pd_op == 6'd31 && (pd_x == 10'd55 || pd_x == 10'd119 || pd_x == 10'd311 || pd_x == 10'd375 ||
-                               pd_x == 10'd567 || pd_x == 10'd599 || pd_x == 10'd727 || pd_x == 10'd759))) ? 2'd1 : 2'd0;
+  // the predecode (ppc_pdw.sv): the arriving word's fields for the queue
+  ppc_pdw u_pdw (.clk (clk), .rst (rst), .w (i_data), .tg (f_tg), .mark (f_fpend), .pd (pd_w));
+  // the second word of a two-word answer (never a fault marker)
+  generate
+    if (FETCH2) begin : g_pdw2
+      ppc_pdw u_pdw2 (.clk (clk), .rst (rst), .w (i_data2), .tg (f_tg), .mark (1'b0), .pd (pd_w2));
+    end else begin : g_nopdw2
+      assign pd_w2 = '0;
+    end
+  endgenerate
 
-  // SPR number to its home: mf_sel picks mfspr's source (0 generic/SRR, 1 XER,
-  // 2 LR, 3 CTR, 4 DEC, 5 TBL, 6 TBU, 7 PVR); spr_idx is the SPR array's
-  // entry (0 SRR0 and 1 SRR1 are flip-flops, not the array).
-  wire  [9:0]  pd_spr = {i_data[15:11], i_data[20:16]};
-  logic        pd_spr_hit;
-  logic [5:0]  pd_spr_idx;
-  logic [2:0]  pd_mf_sel;
-  always_comb begin
-    case (pd_spr)
-      10'd1:   pd_mf_sel = 3'd1;  10'd8:   pd_mf_sel = 3'd2;  10'd9:   pd_mf_sel = 3'd3;
-      10'd22:  pd_mf_sel = 3'd4;  10'd268: pd_mf_sel = 3'd5;  10'd269: pd_mf_sel = 3'd6;
-      10'd287: pd_mf_sel = 3'd7;  default: pd_mf_sel = 3'd0;
-    endcase
-  end
-  always_comb begin
-    pd_spr_hit = 1'b1;
-    case (pd_spr)
-      10'd26:   pd_spr_idx = 6'd0;    // SRR0 (flip-flops, not the array)
-      10'd27:   pd_spr_idx = 6'd1;    // SRR1
-      10'd272:  pd_spr_idx = 6'd2;    10'd273: pd_spr_idx = 6'd3;      // SPRG0-3
-      10'd274:  pd_spr_idx = 6'd4;    10'd275: pd_spr_idx = 6'd5;
-      10'd18:   pd_spr_idx = 6'd6;    // DSISR
-      10'd19:   pd_spr_idx = 6'd7;    // DAR
-      10'd25:   pd_spr_idx = 6'd8;    // SDR1
-      10'd1008: pd_spr_idx = 6'd9;    // HID0
-      10'd1009: pd_spr_idx = 6'd10;   // HID1
-      10'd1010: pd_spr_idx = 6'd11;   // IABR
-      10'd282:  pd_spr_idx = 6'd12;   // EAR
-      10'd976:  pd_spr_idx = 6'd13;   10'd977: pd_spr_idx = 6'd14;     // DMISS DCMP
-      10'd978:  pd_spr_idx = 6'd15;   10'd979: pd_spr_idx = 6'd16;     // HASH1 HASH2
-      10'd980:  pd_spr_idx = 6'd17;   10'd981: pd_spr_idx = 6'd18;     // IMISS ICMP
-      10'd982:  pd_spr_idx = 6'd19;   // RPA
-      default: begin
-        if (pd_spr >= 10'd528 && pd_spr <= 10'd543)
-          pd_spr_idx = 6'd20 + {2'b00, pd_spr[3:0]};                 // IBAT0U .. DBAT3L
-        else begin
-          pd_spr_idx = 6'd63;
-          pd_spr_hit = 1'b0;
-        end
-      end
-    endcase
-  end
-
-  // the immediate's form, as the decoder builds id_u.imm for y
-  logic [2:0] pd_immk;
-  always_comb begin
-    pd_immk = 3'd0;
-    case (pd_op)
-      6'd10, 6'd24, 6'd26, 6'd28: pd_immk = 3'd1;     // cmpli ori xori andi.
-      6'd15, 6'd25, 6'd27, 6'd29: pd_immk = 3'd2;     // addis oris xoris andis.
-      6'd20, 6'd21:               pd_immk = 3'd3;     // rlwimi rlwinm
-      6'd46, 6'd47:               pd_immk = 3'd4;     // lmw stmw
-      6'd31: begin
-        if (pd_x == 10'd824) pd_immk = 3'd3;          // srawi
-        if (pd_x == 10'd210 || pd_x == 10'd595) pd_immk = 3'd7;   // mtsr mfsr: SR || 28 zeros
-        if (pd_u.bsel == BSEL_ZERO)   pd_immk = 3'd5;
-        if (pd_u.bsel == BSEL_MINUS1) pd_immk = 3'd6;
-      end
-      default: ;
-    endcase
-  end
-
-  // Result kind, five bits in the queue; ID expands it into the one-hot
-  // result select and the logical truth table (one LUT level from the queue
-  // register, where storing those fourteen bits cost 36 queue flip-flops):
-  //   0 sum (add, subtract, compare, EA)  1 slw  2 srw  3 sraw  4 rotate
-  //   5 cntlzw  6 extsb  7 extsh  8 multiply/divide  9 move-from
-  //   10 none (segment and TLB instructions)  16-23 and or xor nand nor eqv andc orc
-  logic [4:0] pd_rk;
-  always_comb begin
-    case (pd_u.op)
-      OP_SLW:    pd_rk = 5'd1;
-      OP_SRW:    pd_rk = 5'd2;
-      OP_SRAW:   pd_rk = 5'd3;
-      OP_RLW:    pd_rk = 5'd4;
-      OP_CNTLZW: pd_rk = 5'd5;
-      OP_EXTSB:  pd_rk = 5'd6;
-      OP_EXTSH:  pd_rk = 5'd7;
-      OP_MUL, OP_MULH, OP_MULHU, OP_DIV, OP_DIVU: pd_rk = 5'd8;
-      OP_MFSPR, OP_MFCR, OP_MFMSR:               pd_rk = 5'd9;
-      OP_MTSR, OP_MFSR, OP_TLBIE, OP_TLBL, OP_FP: pd_rk = 5'd10;  // no ALU group: y is used raw
-      OP_AND:    pd_rk = 5'd16;
-      OP_OR:     pd_rk = 5'd17;
-      OP_XOR:    pd_rk = 5'd18;
-      OP_NAND:   pd_rk = 5'd19;
-      OP_NOR:    pd_rk = 5'd20;
-      OP_EQV:    pd_rk = 5'd21;
-      OP_ANDC:   pd_rk = 5'd22;
-      OP_ORC:    pd_rk = 5'd23;
-      default:   pd_rk = 5'd0;
-    endcase
-  end
-
-  // The op compares behind the special-register bits, from the raw word: the
-  // decoder's op is a four-level mux on the fetch path (i_data to the queue,
-  // R38), and these compares sat behind it. Same values as from pd_u.op
-  // (checked in simulation below).
-  wire         r_31    = pd_op == 6'd31, r_19 = pd_op == 6'd19;
-  wire         r_bc    = pd_op == 6'd16 || (r_19 && pd_x == 10'd16);          // bc bclr
-  wire         r_br    = r_bc || pd_op == 6'd18 || (r_19 && pd_x == 10'd528); // and b bcctr
-  wire         r_mtspr = r_31 && pd_x == 10'd467;
-  wire         r_mtcrf = r_31 && pd_x == 10'd144;
-  wire         r_mcrxr = r_31 && pd_x == 10'd512;
-  wire         r_stwcx = r_31 && pd_x == 10'd150;
-  wire         r_crlog = r_19 && (pd_x == 10'd0 || pd_x == 10'd33 || pd_x == 10'd129 || pd_x == 10'd193 ||
-                                  pd_x == 10'd225 || pd_x == 10'd257 || pd_x == 10'd289 || pd_x == 10'd417 ||
-                                  pd_x == 10'd449);
-  wire         r_cmp   = pd_op == 6'd10 || pd_op == 6'd11 || (r_31 && (pd_x == 10'd0 || pd_x == 10'd32));
-
-  always_comb begin
-    pd_w         = '0;
-    pd_w.ua      = pd_u.a_used;
-    pd_w.ub      = pd_u.b_used;
-    pd_w.us      = pd_u.s_used;
-    pd_w.crack   = pd_crack;
-    pd_w.xs      = pd_u.x_from_s;
-    pd_w.az      = pd_u.a_zero;
-    pd_w.yreg    = pd_u.bsel == BSEL_RB;
-    pd_w.spr_idx = pd_spr_idx;
-    pd_w.mf_sel  = pd_mf_sel;
-    pd_w.mfcr    = r_31 && pd_x == 10'd19;
-    pd_w.mfmsr   = r_31 && pd_x == 10'd83;
-    pd_w.immk    = pd_immk;
-    pd_w.rk      = pd_rk;
-    // the special registers this uop writes
-    pd_w.w_cr    = pd_u.rc || r_cmp || r_crlog || r_mtcrf || r_mcrxr || r_stwcx;
-    pd_w.w_xer   = pd_u.set_ca || pd_u.oe || r_mcrxr || (r_mtspr && pd_spr == 10'd1);
-    pd_w.w_lr    = (r_br && i_data[0]) || (r_mtspr && pd_spr == 10'd8);
-    pd_w.w_ctr   = (r_bc && !i_data[23]) || (r_mtspr && pd_spr == 10'd9);
-    pd_w.w_spr   = r_mtspr && pd_spr_hit && pd_spr_idx != 6'd15 && pd_spr_idx != 6'd16;   // HASH1/2 read-only
-    // fetch-side state, from registers (no logic on the word's path but the
-    // three shadow compares)
-    pd_w.sh      = {3{f_tg}} & {i_data[20:18] == 3'd0, i_data[15:13] == 3'd0, i_data[25:23] == 3'd0};
-    pd_w.ifault  = f_fpend;
-    pd_w.l0      = pd_crack == 2'd0 || (pd_crack == 2'd2 && i_data[25:21] == 5'd31);
-    pd_w.ck      = {r_stwcx, r_mtcrf, (r_crlog && pd_x == 10'd0) || r_mcrxr, r_crlog && pd_x != 10'd0};
-    // FP: nothing for a fault marker, whose word is not run
-    pd_w.fua     = pa_ua && !f_fpend;
-    pd_w.fub     = pa_ub && !f_fpend;
-    pd_w.fuc     = (pa_uc || pd_u.fuc) && !f_fpend;
-    pd_w.fpw     = (pa_w || pd_u.fpw || pd_u.fhi) && !f_fpend;   // lfd: frD from its first uop on
-    pd_w.fci     = pd_fst ? i_data[25:21] : i_data[10:6];
-    pd_w.fwcr    = pa_op && (pa_rc || (!pa_a && (pa_cmp || pa_mcrfs)));
-    pd_w.fck1    = pa_op && (pa_rc || (!pa_a && pa_mcrfs));
-    pd_w.hh      = pd_op == 6'd31 && (pd_x == 10'd339 || pd_x == 10'd371) && (pd_spr == 10'd978 || pd_spr == 10'd979);
-    pd_w.fdx     = pd_u.fdbl;
-    pd_w.ra0     = i_data[20:16] == 5'd0;
-    pd_w.ill     = pd_u.op == OP_ILLEGAL && !pa_op;
-    pd_w.pop     = pd_u.op;
-  end
-
-  // the pop, one copy for each entry (each copy drives an entry's 120 bits),
-  // from a copy of EX's hold of its own (q_hold, below): ex_hold drives some
-  // 700 enables across the core, and the queue's pop was behind that net
+  // the pop, one copy for each half of queue entries 0 and 1 (ppc_fetchq:
+  // entries 2 and 3 do not move on a pop), from a copy of EX's hold of its
+  // own (q_hold, below): ex_hold drives some 700 enables across the core, and
+  // the queue's pop was behind that net
   logic q_hold;
   wire  q_take = id_valid && !q_hold && !load_use && !fp_haz && id_last;
   (* keep = 1 *) wire q_pop0 = q_take && !redir_hard_q;
@@ -842,12 +992,20 @@ module ppc_core
   (* keep = 1 *) wire q_pop2 = q_take && !redir_hard_q;
   (* keep = 1 *) wire q_pop3 = q_take && !redir_hard_q;
   wire [3:0] q_pop = {q_pop3, q_pop2, q_pop1, q_pop0};
-  ppc_fetchq #(.PDW (PDW)) u_q (
+  // the key bits go with each word (pd_t's bslot, bpp, bsq)
+  pd_t pd_w1, pd_w2f;
+  always_comb begin
+    pd_w1 = pd_w;   pd_w1.bslot  = 1'b0; pd_w1.bpp  = FETCH2 && rq_pp_q; pd_w1.bsq  = rq_sq_q; pd_w1.lar  = la1[1] && (pw_op == 6'd16 || !la1[0] || (bq_out && !bt_slot && bt_preg));
+    pd_w2f = pd_w2; pd_w2f.bslot = 1'b1; pd_w2f.bpp = FETCH2 && rq_pp_q; pd_w2f.bsq = rq_sq_q; pd_w2f.lar = la2[1] && (pw2_op == 6'd16 || !la2[0] || (bq_out && bt_slot && bt_preg));
+  end
+  ppc_fetchq #(.PDW (PDW), .F2 (FETCH2)) u_q (
     .clk (clk), .clear (rst || redir_hard_q), .we (rsp_use && !redir_hard_q),
-    .w_insn (i_data), .w_pc (f_rsp_pc), .w_pred (pw_pred), .w_pd (pd_w),
+    .w_insn (i_data), .w_pc (f_rsp_pc), .w_pred (w_prd), .w_pd (pd_w1),
+    .we2 (rsp_use && w2_in && !pw_pred && !redir_hard_q),
+    .w2_insn (i_data2), .w2_pc ({f_rsp4, 2'b00}), .w2_pred (w2_prd), .w2_pd (pd_w2f),
     .pop (q_pop), .count (q_cnt),
     .r_insn (q_hi), .r_pc (q_hp), .r_pred (q_hd), .r_pd (q_pd),
-    .r1_insn (q1_hi), .r1_pd (q1_pd)
+    .r1_insn (q1_hi), .r1_pd (q1_pd), .r2_pd (q2_pdv), .r3_pd (q3_pdv)
   );
 
   // ==================================================================== decode
@@ -1054,29 +1212,41 @@ module ppc_core
   assign fq0 = {q_hi[25:21], q_hi[15:11], q_hi[20:16]};
   assign fq1 = {q1_hi[25:21], q1_hi[15:11], q1_hi[20:16]};
   assign fin = {i_data[25:21], i_data[15:11], i_data[20:16]};
-  wire        hn_q0 = !id_take && q_cnt != 3'd0;       // the head next cycle: entry 0
-  wire        hn_q1 = id_take && q_cnt >= 3'd2;        // entry 1; else the arriving word
+  // ID takes the head (id_take) only where EX does not hold, so each compare
+  // is chosen for both cases, the head ID would take with EX free (h_tk, the
+  // take without the hold) and the head it keeps, and the holds pick last:
+  // EX's hold is then not in front of the head's choice (R63: the queue head
+  // and ex_valid into qe_e)
+  wire        h_adv = id_valid && !load_use && !fp_haz;   // id_advr where EX is free
+  wire        h_tk  = h_adv && id_last;                    // id_take where EX is free
   // id_s0, id_rs_q next cycle; a redirect is left out (ID then holds no uop)
-  wire        id_advr = id_valid && !ex_hold && !load_use && !fp_haz;
-  wire        hn_s0 = id_advr ? id_last : id_s0;
-  wire  [4:0] hn_rq = id_advr ? id_rs + 5'd1 : id_rs_q;
+  wire        hn_s0 = h_adv ? id_last : id_s0;             // (EX free; held: id_s0, id_rs_q)
   logic [3:0][4:0] qe_rd;                              // the producers: ID, EX, MEM, WB
   assign qe_rd = {wb_rd, m.rd, ex_u.rd, id_u.rd};
-  logic [3:0][3:0] qe_hc;                              // [producer][field], for next cycle's head
+  // [producer][field] for next cycle's head: qe_hk where EX holds (entry 0,
+  // else the arriving word), qe_hf where it is free (entry 1 after a take)
+  // (every candidate compared, then chosen: the take is not in front of a
+  // compare)
+  logic [3:0][3:0] qe_hk, qe_hf;
+  wire  [4:0] id_rs1 = id_rs + 5'd1;
   always_comb
     for (int r = 0; r < 4; r++) begin
-      for (int f = 0; f < 3; f++)
-        qe_hc[r][f] = hn_q0 ? qe_rd[r] == fq0[f] : hn_q1 ? qe_rd[r] == fq1[f] : qe_rd[r] == fin[f];
-      qe_hc[r][3] = hn_s0 ? qe_hc[r][2] : qe_rd[r] == hn_rq;
+      for (int f = 0; f < 3; f++) begin
+        qe_hk[r][f] = q_cnt != 3'd0 ? qe_rd[r] == fq0[f] : qe_rd[r] == fin[f];
+        qe_hf[r][f] = !h_tk ? qe_hk[r][f] : q_cnt >= 3'd2 ? qe_rd[r] == fq1[f] : qe_rd[r] == fin[f];
+      end
+      qe_hk[r][3] = id_s0 ? qe_hk[r][2] : qe_rd[r] == id_rs_q;
+      qe_hf[r][3] = hn_s0 ? qe_hf[r][2] : h_adv ? qe_rd[r] == id_rs1 : qe_rd[r] == id_rs_q;
     end
   // qf_m, qf_w: the same, with the producer's GPR write folded in (MEM:
   // rd_we and not a load; WB: rd_we), so that a forward select is one LUT of
-  // the stage's valid bit and these (registered below, after EX)
+  // the stage's valid bit and these (registered below, after EX). (A MEM
+  // hold implies EX's; a WB hold does not, with MEM empty.)
   logic [3:0] qf_m, qf_w;
   always_ff @(posedge clk) begin
-    qe_e <= ex_hold  ? qe_hc[1] : qe_hc[0];
-    qe_m <= mem_hold ? qe_hc[2] : qe_hc[1];
-    qe_w <= wb_hold  ? qe_hc[3] : qe_hc[2];
+    qe_e <= ex_hold  ? qe_hk[1] : qe_hf[0];
+    qe_m <= mem_hold ? qe_hk[2] : ex_hold ? qe_hk[1] : qe_hf[1];
+    qe_w <= ex_hold ? (wb_hold ? qe_hk[3] : qe_hk[2]) : (wb_hold ? qe_hf[3] : qe_hf[2]);
   end
 
   // the sixth address bit selects TGPR0-3: predecoded for the reads; for the
@@ -1206,14 +1376,34 @@ module ppc_core
   (* keep = 1 *) wire [1:0] y_k = fw_k(y_m, y_wb, wb_live);
   (* keep = 1 *) wire [1:0] a_k = fw_k(a_m, a_wb, wb_live);
   (* keep = 1 *) wire [1:0] s_k = fw_k(s_m, s_wb, wb_live);
-  wire [31:0] x_b   = id_xz ? 32'd0 : id_xrf;
-  wire [31:0] y_b   = id_yreg ? rf_rb : id_imm;
+  // The capture as two LUTs side by side, the base (register file or
+  // immediate) and the forward (MEM, WB's arriving word, WB), and the choice
+  // between them in x_pre below: one LUT of five inputs, so a forward select
+  // is three levels from MEM's valid bit, not five (R63 batch 6 full build:
+  // m.valid into op_x through the 4:1 built three deep). Same values as
+  // fw_mux.
+  (* keep = 1 *) wire [31:0] x_b   = id_xz ? 32'd0 : id_xrf;
+  (* keep = 1 *) wire [31:0] y_b   = id_yreg ? rf_rb : id_imm;
   wire [31:0] a_b   = rf_ra;
   wire [31:0] s_b   = rf_rs;
-  wire [31:0] x_cap = fw_mux(x_k, x_b, m.result, ld_val, wb_result);
-  wire [31:0] y_cap = fw_mux(y_k, y_b, m.result, ld_val, wb_result);
-  wire [31:0] a_cap = fw_mux(a_k, a_b, m.result, ld_val, wb_result);
-  wire [31:0] s_cap = fw_mux(s_k, s_b, m.result, ld_val, wb_result);
+  function automatic logic [31:0] fw_fwd(input logic [1:0] k, input logic [31:0] vm, input logic [31:0] vl,
+                                         input logic [31:0] vw);
+    fw_fwd = !k[1] ? vm : !k[0] ? vl : vw;           // k = 1, 2, 3
+  endfunction
+  (* keep = 1 *) wire [31:0] x_fw = fw_fwd(x_k, m.result, ld_val, wb_result);
+  (* keep = 1 *) wire [31:0] y_fw = fw_fwd(y_k, m.result, ld_val, wb_result);
+  (* keep = 1 *) wire [31:0] a_fw = fw_fwd(a_k, m.result, ld_val, wb_result);
+  (* keep = 1 *) wire [31:0] s_fw = fw_fwd(s_k, m.result, ld_val, wb_result);
+  wire [31:0] x_cap = x_k == 2'd0 ? x_b : x_fw;
+  wire [31:0] y_cap = y_k == 2'd0 ? y_b : y_fw;
+  wire [31:0] a_cap = a_k == 2'd0 ? a_b : a_fw;
+  wire [31:0] s_cap = s_k == 2'd0 ? s_b : s_fw;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (x_cap != fw_mux(x_k, x_b, m.result, ld_val, wb_result) || y_cap != fw_mux(y_k, y_b, m.result, ld_val, wb_result) ||
+        a_cap != fw_mux(a_k, a_b, m.result, ld_val, wb_result) || s_cap != fw_mux(s_k, s_b, m.result, ld_val, wb_result))
+      $fatal(1, "operand capture against fw_mux");
+`endif
 
   wire [31:0] x_val = op_x;
   wire [31:0] y_val = op_y;
@@ -1235,6 +1425,8 @@ module ppc_core
   // its result (R23 timing).
   wire        m_z   = (m.result == 32'd0);
   wire [3:0]  m_cr0 = {m.result[31], !m.result[31] && !m_z, m_z, m.xer[31]};
+  wire [3:0]  m_cr0z0 = {m.result[31], !m.result[31], 1'b0, m.xer[31]};   // m_cr0 for m_z = 0
+  wire [3:0]  m_cr0z1 = {m.result[31], 1'b0, 1'b1, m.xer[31]};            // ... for m_z = 1
   logic [31:0] m_crn, m_cr;
   always_comb begin
     // a compare's field: crm already marks it, so its value goes in under
@@ -1255,6 +1447,11 @@ module ppc_core
   wire [31:0] xer_in = fs_xer ? m.xer : xer_q;
   wire [31:0] lr_in  = fs_lr  ? m.lr  : lr_q;
   wire [31:0] ctr_in = fs_ctr ? m.ctr : ctr_q;
+  // the BTB's register-target check (mx.rtm): the compares made on both
+  // sources of the forward, from registers, and chosen by it (the compare
+  // behind the forward mux led the first BTB spike's paths)
+  wire        rt_eq  = (ex_u.bkind == BR_BCLR) ? (fs_lr  ? m.lr[31:2]  == rp_tgt : lr_q[31:2]  == rp_tgt)
+                                               : (fs_ctr ? m.ctr[31:2] == rp_tgt : ctr_q[31:2] == rp_tgt);
   wire        ctr1_in = fs_ctr ? m.ctr1 : ctr1_q;
 
   // The two CR bits a branch (BI) or a CR logic op (crbA, crbB) reads. In ID,
@@ -1285,10 +1482,11 @@ module ppc_core
   wire [31:0] m_crv  = m.valid ? m_crn : cr_q;
   wire        id_cra = (m.valid && m.rc0 && id_cba[4:2] == 3'd0) ? m_cr0[2'd3 - id_cba[1:0]] : m_crv[5'd31 - id_cba];
   wire        id_crb = (m.valid && m.rc0 && id_cbb[4:2] == 3'd0) ? m_cr0[2'd3 - id_cbb[1:0]] : m_crv[5'd31 - id_cbb];
-  wire        cr_a   = ex_cra_s[0] ? m_cr0[2'd3 - ex_u.crba[1:0]] :
-                       ex_cra_s[1] ? m.cmpv[2'd3 - ex_u.crba[1:0]] :
+  // (BI's value without the CR0-from-Rc case, for the branch's two decisions)
+  wire        cr_an  = ex_cra_s[1] ? m.cmpv[2'd3 - ex_u.crba[1:0]] :
                        ex_cra_s[2] ? m.crlb : ex_cra_s[3] ? m.crf4[2'd3 - ex_u.crba[1:0]] :
                        ex_cra_s[4] ? m.mtca : ex_cra;
+  wire        cr_a   = ex_cra_s[0] ? m_cr0[2'd3 - ex_u.crba[1:0]] : cr_an;
 `ifdef VERILATOR
   always_ff @(posedge clk)
     if (!rst && ex_valid && ((ex_cra_s[4:2] != 3'd0 && cr_a != m.cr[5'd31 - ex_u.crba]) ||
@@ -1393,10 +1591,13 @@ module ppc_core
                           id_k_spr && id_mf_sel == 3'd2 && ex_valid && ex_w_lr,
                           id_k_spr && id_mf_sel == 3'd1 && ex_valid && ex_w_xer};
   wire  [2:0]  id_mf_t = {id_k_spr && id_mf_sel == 3'd6, id_k_spr && id_mf_sel == 3'd5, id_k_spr && id_mf_sel == 3'd4};
-  wire  [31:0] mf_now  = ({32{mf_b}} & ex_mfv) | ({32{mf_f[0]}} & m.xer) | ({32{mf_f[1]}} & m.lr) |
-                         ({32{mf_f[2]}} & m.ctr) | ({32{mf_f[3]}} & m.sprv) | ({32{mf_f[4]}} & m_crn) |
-                         {{4{mf_c0}} & m_cr0, 28'd0};
-  wire  [31:0] mf_val  = mf_now | ({32{mf_t[0]}} & dec_q) | ({32{mf_t[1]}} & tb_q[31:0]) | ({32{mf_t[2]}} & tb_q[63:32]);
+  // (mf_c0's CR0 from Rc, behind MEM's zero detect, joins EX's result in its
+  // late part, r_late, not here)
+  wire  [31:0] mf_c0v  = {{4{mf_c0}} & m_cr0, 28'd0};
+  wire  [31:0] mf_nowe = ({32{mf_b}} & ex_mfv) | ({32{mf_f[0]}} & m.xer) | ({32{mf_f[1]}} & m.lr) |
+                         ({32{mf_f[2]}} & m.ctr) | ({32{mf_f[3]}} & m.sprv) | ({32{mf_f[4]}} & m_crn);
+  wire  [31:0] mf_now  = mf_nowe | mf_c0v;
+  wire  [31:0] mf_val  = mf_nowe | ({32{mf_t[0]}} & dec_q) | ({32{mf_t[1]}} & tb_q[31:0]) | ({32{mf_t[2]}} & tb_q[63:32]);
 
   // ALU
 
@@ -1442,19 +1643,40 @@ module ppc_core
   wire        bo_nocond = ex_u.bo[4];
   wire        bo_cond   = ex_u.bo[3];
   wire [31:0] ctr_dec   = ctr_in - 32'd1;
-  wire        cr_bit    = cr_a;                                     // BI
   wire        br_ctr_ok = bo_noctr || (!ctr1_in ^ bo_ctrz);         // CTR-1 != 0, from a flag
-  wire        br_cnd_ok = bo_nocond || (cr_bit == bo_cond);
-  logic       br_taken;
+  // The decision for both values of MEM's zero detect (m_z, CR0[EQ] and
+  // CR0[GT] of an Rc producer one step ahead), chosen by it last: the
+  // detect was in front of BI's select, the decision and the redirect
+  // (R63: MEM's result into redir_q and its fanout)
+  function automatic logic br_tk(input logic cb, input br_kind_t k, input logic ctr_ok, input logic nocond,
+                                 input logic cond);
+    case (k)
+      BR_B:              br_tk = 1'b1;
+      BR_BC, BR_BCLR:    br_tk = ctr_ok && (nocond || cb == cond);
+      default:           br_tk = nocond || cb == cond;
+    endcase
+  endfunction
+  wire        cra_z0    = ex_cra_s[0] ? m_cr0z0[2'd3 - ex_u.crba[1:0]] : cr_an;
+  wire        cra_z1    = ex_cra_s[0] ? m_cr0z1[2'd3 - ex_u.crba[1:0]] : cr_an;
+  wire        brt_z0    = br_tk(cra_z0, ex_u.bkind, br_ctr_ok, bo_nocond, bo_cond);
+  wire        brt_z1    = br_tk(cra_z1, ex_u.bkind, br_ctr_ok, bo_nocond, bo_cond);
+  wire        br_taken  = m_z ? brt_z1 : brt_z0;
   logic [31:0] br_target;
   always_comb begin
     case (ex_u.bkind)
-      BR_B:     begin br_taken = 1'b1;                    br_target = (ex_u.aa ? 32'd0 : ex_u.pc) + ex_u.imm; end
-      BR_BC:    begin br_taken = br_ctr_ok && br_cnd_ok;  br_target = (ex_u.aa ? 32'd0 : ex_u.pc) + ex_u.imm; end
-      BR_BCLR:  begin br_taken = br_ctr_ok && br_cnd_ok;  br_target = {lr_in[31:2], 2'b00};  end
-      default:  begin br_taken = br_cnd_ok;               br_target = {ctr_in[31:2], 2'b00}; end
+      BR_B, BR_BC: br_target = (ex_u.aa ? 32'd0 : ex_u.pc) + ex_u.imm;
+      BR_BCLR:     br_target = {lr_in[31:2], 2'b00};
+      default:     br_target = {ctr_in[31:2], 2'b00};
     endcase
   end
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && ex_valid && ex_u.op == OP_BRANCH) begin
+      automatic logic cnd = bo_nocond || (cr_a == bo_cond);
+      if (br_taken != (ex_u.bkind == BR_B ? 1'b1 : ex_u.bkind == BR_BC || ex_u.bkind == BR_BCLR ? br_ctr_ok && cnd : cnd))
+        $fatal(1, "branch decision against BI");
+    end
+`endif
 
   // memory access
   assign alu_res = r_sum;
@@ -1505,11 +1727,33 @@ module ppc_core
   logic [3:0]  db_hit, db_go;
   logic [14:0] db_pa;
   logic [3:0]  db_wimg;
+  // The DBAT compare without most of the adder in front (R63: the address
+  // add, this compare and the address mux led two full builds). EA[i] =
+  // BEPI[i] for every unmasked bit i holds exactly when, in each run of
+  // unmasked bits, the run's lowest bit matches as summed (ea_x) and every
+  // bit above it in the run passes the carry-free test of sum_is (below),
+  // which is exact once the bits below it in the run match. Bit 17 + j is
+  // BEPI bit j (BL masks bits 17 to 27; 28 to 31 are always compared).
+  function automatic logic dbat_hit(input logic [31:17] x, input logic [31:17] y, input logic [31:17] s,
+                                    input logic [14:0] bepi, input logic [10:0] bl, input logic valid);
+    logic [14:0] um, rs, ok;                          // unmasked; a run's lowest; the bit's test
+    logic [14:0] gx;
+    um = {4'b1111, ~bl};
+    for (int j = 0; j < 15; j++) begin
+      rs[j] = um[j] && (j == 0 || !um[(j + 14) % 15]);
+      gx[j] = (x[17 + j] & y[17 + j]) | ((x[17 + j] ^ y[17 + j]) & ~bepi[j]);
+    end
+    for (int j = 0; j < 15; j++)
+      if (!um[j])     ok[j] = 1'b1;
+      else if (rs[j]) ok[j] = s[17 + j] == bepi[j];
+      else            ok[j] = (x[17 + j] ^ y[17 + j] ^ bepi[j]) == gx[(j + 14) % 15];
+    dbat_hit = valid && &ok;
+  endfunction
   always_comb begin
     db_pa = 15'd0; db_wimg = 4'd0;
     for (int k = 0; k < 4; k++) begin
-      db_hit[k] = bat_match(ea_x[31:17], bat_bepi[4 + k], bat_bl[4 + k],
-                            msr_q[MSR_PR] ? bat_vp[4 + k] : bat_vs[4 + k]);
+      db_hit[k] = dbat_hit(op_x[31:17], op_y[31:17], ea_x[31:17], bat_bepi[4 + k], bat_bl[4 + k],
+                           msr_q[MSR_PR] ? bat_vp[4 + k] : bat_vs[4 + k]);
       // BAT protection (PEM 7.4.4): PP = 00 none, 10 read/write, x1 read only
       db_go[k]  = db_hit[k] && (is_st ? bat_pp[4 + k] == 2'd2 : bat_pp[4 + k] != 2'd0);
       db_pa   = db_pa   | ({15{db_hit[k]}} & (bat_brpn[4 + k] | {4'd0, ea_x[27:17] & bat_bl[4 + k]}));
@@ -1517,6 +1761,13 @@ module ppc_core
     end
   end
   wire         db_any  = |db_hit;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    for (int k = 0; k < 4; k++)
+      if (!rst && db_hit[k] != bat_match(ea_x[31:17], bat_bepi[4 + k], bat_bl[4 + k],
+                                         msr_q[MSR_PR] ? bat_vp[4 + k] : bat_vs[4 + k]))
+        $fatal(1, "DBAT %0d compare against bat_match", k);
+`endif
   // micro-TLB: entries filled by MEM's page translation (below), each tagged
   // with the MSR[PR] it was made under (the key depends on it). The tag is
   // compared against x + y without waiting for the adder: x + y = K holds
@@ -1537,22 +1788,53 @@ module ppc_core
     c = {(x[18:0] & y[18:0]) | ((x[18:0] ^ y[18:0]) & ~k[18:0]), cin};
     sum_is = (x ^ y ^ k) == c;
   endfunction
+  // The address and WIMG are taken from an entry's page match alone
+  // (du_hit), without the load / store permission, which only decides
+  // whether there is a request (du_use): the op decode was in front of the
+  // address (R63 batch-8 full build, ex_u.op into the RAM's address). An
+  // entry refused for a store is never beside another for the same page:
+  // the refusal is a replay that faults (DSI, DTLB store miss), and the
+  // handler's tlbld or tlbie empties the micro-TLB before a refill.
+  logic [3:0]  du_hit;
   always_comb begin
     du_pahi = 20'd0; du_wimg_s = 4'd0;
     for (int k = 0; k < 4; k++) begin
-      du_use[k] = du_v[k] && du_pr[k] == msr_q[MSR_PR] && (is_ld || du_wr[k]) &&
-                  sum_is(op_x[31:12], op_y[31:12], du_pg[k], ea_lo[12]);
-      du_pahi   = du_pahi | ({20{du_use[k]}} & du_pa[k]);
-      du_wimg_s = du_wimg_s | ({4{du_use[k]}} & du_wimg[k]);
+      du_hit[k] = du_v[k] && du_pr[k] == msr_q[MSR_PR] && sum_is(op_x[31:12], op_y[31:12], du_pg[k], ea_lo[12]);
+      du_use[k] = du_hit[k] && (is_ld || du_wr[k]);
+      du_pahi   = du_pahi | ({20{du_hit[k]}} & du_pa[k]);
+      du_wimg_s = du_wimg_s | ({4{du_hit[k]}} & du_wimg[k]);
     end
   end
   wire         d_xl    = msr_q[MSR_DR] && (is_ld || is_st);
   // the access goes ahead from EX when a BAT allows it or the micro-TLB does;
   // anything else, a BAT protection fault included, is translated in MEM
   wire         xl_rp   = d_xl && !((|db_go) || (|du_use));
-  wire  [19:0] d_pahi  = !msr_q[MSR_DR] ? ea_x[31:12] : db_any ? {db_pa, ea_x[16:12]} : du_pahi;
+  // A DBAT hit and a micro-TLB hit never coincide: an entry is filled only by
+  // a replay, which no allowing DBAT hit makes and a refusing one turns into
+  // a DSI; a BAT write empties the micro-TLB, and its entries carry MSR[PR],
+  // which picks the BATs' valid bits. So the two translations are ORed, with
+  // no select by db_any (the select was a level of the R63 full builds' EX
+  // address paths); where neither hits there is no request.
+  wire         du_any  = |du_hit;
+  wire  [19:0] d_pahi  = !msr_q[MSR_DR] ? ea_x[31:12] :
+                         {db_pa | du_pahi[19:5], du_any ? du_pahi[4:0] : ea_x[16:12]};
   // the access's WIMG: real mode 0011 (603e 3.5), the DBAT's, the micro-TLB's
-  wire  [3:0]  d_wimg_x = !msr_q[MSR_DR] ? 4'b0011 : db_any ? db_wimg : du_wimg_s;
+  wire  [3:0]  d_wimg_x = !msr_q[MSR_DR] ? 4'b0011 : db_wimg | du_wimg_s;
+`ifdef VERILATOR
+  // against the selected form from the permitted entries (du_use)
+  always_ff @(posedge clk)
+    if (!rst && d_req && msr_q[MSR_DR]) begin
+      automatic logic [19:0] up = 20'd0;
+      automatic logic [3:0]  uw = 4'd0;
+      for (int k = 0; k < 4; k++) begin
+        up = up | ({20{du_use[k]}} & du_pa[k]);
+        uw = uw | ({4{du_use[k]}} & du_wimg[k]);
+      end
+      if (db_any && du_any || d_pahi != (db_any ? {db_pa, ea_x[16:12]} : up) ||
+          d_wimg_x != (db_any ? db_wimg : uw))
+        $fatal(1, "a DBAT and a micro-TLB hit together, or the ORed translation differs");
+    end
+`endif
   // dcbz to a W or I page takes the alignment exception from MEM (3.7.4,
   // table 3-8). The request goes out regardless (the data cache leaves a dcbz
   // to a W or I page alone, ppc_dcache.sv), so the translation's WIMG is not
@@ -1574,6 +1856,8 @@ module ppc_core
   // that instruction. A kill from MEM (m_kill) is older and wins.
   logic        int_q, dec_pend;
   logic        ex_first, ex_ifault, ex_mmuw;
+  logic [2:0]  ex_bk;                                  // the BTB key bits {bslot, bpp, bsq} (fetch)
+  logic        ex_lar;                                 // resolved at fetch (LA): EX must agree
   logic [4:0]  ex_step;
   logic        m_fpxr;                                 // MEM's FP op takes its program exception
   logic        tnop;                                   // MEM's touch faulted: it completes as a no-op
@@ -1583,7 +1867,7 @@ module ppc_core
   wire         m_algc   = m.dz && !m.rp && msr_q[MSR_DR] && (m.dbany ? m.dbwi : m.duwi);
   // (as two products: a replay's, then the rest)
   (* keep = 1 *) wire m_kp1 = m.valid && m.rp && sl_done && !(m.tch && (sl_dsi_q || sl_tm_q));
-  (* keep = 1 *) wire m_kp2 = m.valid && (m.resync || m_fpxr || m_algc);
+  (* keep = 1 *) wire m_kp2 = m.valid && (m.resync || m.rtm || m_fpxr || m_algc);
   wire         m_kp     = m_kp1 || m_kp2;
   wire         m_kill   = m_kp && !wb_hold;
   // (where EX advances, MEM does too, so WB is not holding: there m_kill is
@@ -1608,12 +1892,22 @@ module ppc_core
   // the queue's copy (q_take above): the same terms, kept apart
   (* keep = 1 *) wire qh_1 = m.valid && wb_valid && wb_iss && !wb_got && !d_valid;
   (* keep = 1 *) wire qh_2 = m.valid && wb_valid && wb_fl && !(wb_got && wb_c2 && !fr_at[0] && !wb_blk);
-  (* keep = 1 *) wire qh_3 = m.valid && ((m.rp && !sl_done) || (m.fsm && (fr_at[1] || wb_blk)));
+  (* keep = 1 *) wire qh_3 = m.valid && ((m_rpq && !sl_done) || (m.fsm && (fr_at[1] || wb_blk)));
   (* keep = 1 *) wire qh_4 = m.valid && ((m.fpser && !m_fsok) || (m.icbi && !m_ibdone && !icbi_ack));
-  (* keep = 1 *) wire qh_x = md_wait || fp_wait || ser_wait || sync_wait || (ex_valid && ex_ls && !d_rdy);
+  (* keep = 1 *) wire qh_x = md_wait || fp_wait || ser_wait_q || sync_wait_q || (ex_valid && ex_ls && !d_rdy);
+  // (the queue's copies of ser_wait and sync_wait take MEM's request from
+  // m_rpq, a copy of m.rp of their own: m.rp drives some 65 loads, and led
+  // the queue pop's paths in the R63 batch-7 full builds)
+  wire  m_issq      = m.req && !m_rpq;
+  wire  ser_wait_q  = ex_valid && ex_serz && (wb_mayh || (m.valid && (m_issq || m.fld)));
+  wire  sync_wait_q = ex_valid && ex_u.sync && (wb_mayh || (m.valid && m_issq) || !d_idle);
   assign q_hold = qh_1 || qh_2 || qh_3 || qh_4 || qh_x;
+  // a third copy for the FP operand registers' 194 enables (R63 batch 3:
+  // EX's hold into fa_q / fb_q / fc_q)
+  (* keep = 1 *) wire f_hold = qh_1 || qh_2 || qh_3 || qh_4 || qh_x;
 `ifdef VERILATOR
   always_ff @(posedge clk) if (!rst && q_hold != ex_hold) $fatal(1, "q_hold");
+  always_ff @(posedge clk) if (!rst && m.valid && m_rpq != m.rp) $fatal(1, "m_rpq");
 `endif
   wire  ex_adv  = ex_valid && !ex_hold;
   // A program exception for an enabled FP exception left pending by an MSR
@@ -1634,12 +1928,12 @@ module ppc_core
   wire  xc_fpx   = fpx_cond && ex_first;
   wire  ex_xcm   = ex_ifault || xc_irq || xc_fpx || ex_fpun;
 
-  // the early forward selects' write bits (qe_hc, qf_m, qf_w above)
+  // the early forward selects' write bits (qe_hk / qe_hf, qf_m, qf_w above)
   wire        qf_mx = ex_u.rd_we && !ex_xcm && !is_ld;   // mx.rd_we && !mx.is_load
   wire        qf_wm = m.rd_we && !m.rp;                  // wb_rd_we as WB takes MEM's uop
   always_ff @(posedge clk) begin
-    qf_m <= mem_hold ? qe_hc[2] & {4{m.rd_we && !m.is_load}} : qe_hc[1] & {4{qf_mx}};
-    qf_w <= wb_hold  ? qe_hc[3] & {4{wb_rd_we}}              : qe_hc[2] & {4{qf_wm}};
+    qf_m <= mem_hold ? qe_hk[2] & {4{m.rd_we && !m.is_load}} : (ex_hold ? qe_hk[1] : qe_hf[1]) & {4{qf_mx}};
+    qf_w <= wb_hold  ? (ex_hold ? qe_hk[3] : qe_hf[3]) & {4{wb_rd_we}} : (ex_hold ? qe_hk[2] : qe_hf[2]) & {4{qf_wm}};
   end
 
   assign d_req   = ex_adv && (is_ld || (is_st && st_ok)) && !xl_rp && !ex_xcm && !m_kp;
@@ -1739,10 +2033,16 @@ module ppc_core
   // word arrives in MEM), which is read from the file a cycle later
   wire  [63:0] fw_fdt = fo_valid ? fo_res : wb_fdat_q;
 
+  // the written value's !fpu_sgl_val, per source (fw_dat's select after)
+  logic        rf_na, rf_nb, rf_nc;
+  // (lfs's word converted is always a single value: 1, checked at every read
+  // below; its conversion is in front of the write, R63 batch 4)
+  wire         fw_nsv = !(fo_valid ? sv_fo : !wb_isld ? sv_wbf :
+                          wb_fsl ? 1'b1 : fpu_sgl_val({fhi_q, wb_dq}));
   ppc_fpregfile u_frf (
     .clk (clk), .ra (id_fa), .rb (id_fb), .rc (id_fc),
-    .qa (rf_fa), .qb (rf_fb), .qc (rf_fc),
-    .we (fw_we), .wa (fw_idx), .wd (fw_dat)
+    .qa (rf_fa), .qb (rf_fb), .qc (rf_fc), .na (rf_na), .nb (rf_nb), .nc (rf_nc),
+    .we (fw_we), .wa (fw_idx), .wd (fw_dat), .wn (fw_nsv)
   );
 
   // ------------------------------------------------------------ scoreboard
@@ -1786,7 +2086,8 @@ module ppc_core
   // ready, frD free, and the whole hazard. Entry 1 is the head only after a
   // pop, when today's head has gone to EX: its frD counts as pending too.
   logic [1:0][2:0] nx_hit, nx_rdy, hd_hit;
-  logic [1:0]      nx_wfr, nx_haz, hd_haz;
+  logic [1:0]      nx_wfr, nx_haz;
+  logic            hd_fz;
   logic            hd_sel, hd_val;
   wire             id_fpw = id_valid && q_pd.fpw;
   wire  [1:0]      nx_fua = {q1_pd.fua, q_pd.fua}, nx_fub = {q1_pd.fub, q_pd.fub};
@@ -1811,7 +2112,7 @@ module ppc_core
   wire         id_pop = id_take && !redir_hard_q;
   always_ff @(posedge clk) begin
     hd_hit <= nx_hit;
-    hd_haz <= nx_haz;
+    hd_fz  <= id_pop ? nx_haz[1] : nx_haz[0];          // hd_haz chosen by hd_sel, as registered
     hd_sel <= id_pop;
     hd_val <= !rst && !redir_hard_q && (id_pop ? q_cnt >= 3'd2 : q_cnt >= 3'd1);
   end
@@ -1819,8 +2120,7 @@ module ppc_core
   // a head with nothing formed for it (straight from fetch) waits a cycle if
   // it names an FPR
   always_comb
-    fp_haz = id_valid && id_s0 && (hd_val ? (hd_sel ? hd_haz[1] : hd_haz[0]) :
-                                            (q_pd.fua || q_pd.fub || q_pd.fuc || q_pd.fpw));
+    fp_haz = id_valid && id_s0 && (hd_val ? hd_fz : (q_pd.fua || q_pd.fub || q_pd.fuc || q_pd.fpw));
   always_ff @(posedge clk)
     for (int i = 0; i < 32; i++)
       if (rst) pend[i] <= 1'b0;
@@ -1831,20 +2131,33 @@ module ppc_core
   wire  [63:0] fa_cap = f_hit_id[0] ? fw_fdt : rf_fa;
   wire  [63:0] fb_cap = f_hit_id[1] ? fw_fdt : rf_fb;
   wire  [63:0] fc_cap = f_hit_id[2] ? fw_fdt : rf_fc;
+  // The fast route (fpu_fast_route) for these operands, without testing 64
+  // bits after the file's read: each FPR carries !fpu_sgl_val of its value
+  // (ppc_fpregfile, written below), the forward's values are tested from
+  // their registers, and the op's kind is predecoded (frsqrte; a single op
+  // reading A with B, C or both, q_pd.fub / fuc)
+  wire         sv_fo  = fpu_sgl_val(fo_res);
+  wire         sv_wbf = fpu_sgl_val(wb_fdat_q);
+  wire         sv_fw  = fo_valid ? sv_fo : sv_wbf;
+  wire         sv_a   = f_hit_id[0] ? sv_fw : !rf_na;
+  wire         sv_b   = f_hit_id[1] ? sv_fw : !rf_nb;
+  wire         sv_c   = f_hit_id[2] ? sv_fw : !rf_nc;
+  wire         id_frt = q_pd.frq || (q_pd.frs && sv_a && (!q_pd.fub || sv_b) && (!q_pd.fuc || sv_c));
   // One register per operand for every FP unit and the store data. Separate
   // copies per unit (the FPU's standalone fits pointed at the operand
   // fanout) measured worse in the core on all three seeds and cost 357
   // registers (fit batches b5 and b7)
   // ex_ffast: the fast port's route for these operand values (D-21)
+  // (ex_ffast is 0 for an op that is not the multiply-add port's, which
+  // fpu_fast_route need not be: it is used only with ex_fma)
   logic [63:0] fa_q, fb_q, fc_q;
-  logic        ex_ffast;
-  logic        ex_ffw;                                 // ex_fma && ex_ffast, for fp_wait alone (fanout)
+  (* preserve *) logic ex_ffast;
+  (* preserve *) logic ex_ffw;                         // = ex_ffast, for fp_wait alone (fanout)
   always_ff @(posedge clk)
-    if (!ex_hold) begin
+    if (!f_hold) begin
       fa_q <= fa_cap; fb_q <= fb_cap; fc_q <= fc_cap;
-      ex_ffast <= fpu_fast_route(fma_op_t'(id_u.fop), id_u.fsgl, fa_cap, fb_cap, fc_cap);
-      ex_ffw   <= id_u.funit == 2'd1 && !q_pd.ifault &&
-                  fpu_fast_route(fma_op_t'(id_u.fop), id_u.fsgl, fa_cap, fb_cap, fc_cap);
+      ex_ffast <= id_frt;
+      ex_ffw   <= id_frt;
     end
 
   // ------------------------------------------------------------- the units
@@ -1963,15 +2276,37 @@ module ppc_core
       ffbl_q <= (fr_at_n >> LS) != '0;
     end
   end
+  // All of it but the fast op's term is registered as fwq, formed for both
+  // cases of this cycle's EX hold: EX keeps its uop (no FP op leaves, ex_c2
+  // and ex_fs2 are set) or takes ID's (EX's FP op leaves if it is not killed;
+  // ID's controls are predecoded). The hold picks as the last level, so EX's
+  // wait is one LUT after registers (it led the queue pop's paths, R63).
+  // ex_valid is left out of fwq (EX's controls load with any uop) and ANDed
+  // here. With FDL < 4 the WB slot's divider term stays out (wb_blk).
+  logic fwq;
+  wire  fw_go  = ex_valid && !m_kp && !ex_xcm;         // fp_go where EX advances
+  wire  fw_bk  = d_go || (div_out && !inj_fall);       // fblk_q next cycle, no divide leaving EX
+  wire  fw_ba  = (ex_div && fw_go) || fw_bk;           // ... a divide in EX leaving
+  wire  [FL-1:0] fw_rk = (fr_at >> 1) | ({FL{inj_fall}} & (FL'(1) << (FDL - 2)));   // fr_at next, EX held
+  wire  [FL-1:0] fw_ra = fw_rk | ({FL{ex_fma && fw_go && !ex_ffast}} & (FL'(1) << (FL - 1))) |
+                                 ({FL{ex_fma && fw_go &&  ex_ffast}} & (FL'(1) << (LS - 1)));
+  wire  fw_idl = (fr_at >> 1) == '0 && !div_out && !d_go &&
+                 !(ex_valid && (ex_fma || ex_div || (ex_fcmp && fs_idle)) && !mfp_hold);   // fs_idle next
+  wire  fwk_h   = (ex_fma && fw_bk) || (ex_div && (fw_bk || (fw_rk & FPRE) != '0)) || (ex_fsw && !fw_idl) ||
+                 (ex_fsx && !(ex_valid && ex_fsop != 3'd0 && fs_idle)) || (ex_f2c && !ex_valid) ||
+                 (ex_mw && fw_rk[2]);
+  wire  fw_n   = (q_pd.ffma && fw_ba) || (q_pd.fdiv && (fw_ba || (fw_ra & FPRE) != '0)) ||
+                 (((h_fser && !q_pd.ifault) || h_rfi || h_mtmsr) && !fw_idl) || q_pd.ffsx || q_pd.ff2c ||
+                 (q_pd.fmw && fw_ra[2]);
+  always_ff @(posedge clk) fwq <= ex_hold ? fwk_h : fw_n;
   always_comb
-    fp_wait = ex_valid && (
-              (ex_fma && fblk_q) ||
-              (ex_ffw && ffbl_q) ||
-              (ex_div && (fblk_q || fpre_q)) ||
-              (ex_fsw && !fs_idle) ||
-              (ex_fsx && !ex_fs2) ||
-              (ex_f2c && !ex_c2) ||
-              (ex_mw && (fr_at[2] || wb_blk)));
+    fp_wait = ex_valid && (fwq || (ex_ffw && ffbl_q) || (ex_mw && wb_blk));
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && ex_valid && fwq != ((ex_fma && fblk_q) || (ex_div && (fblk_q || fpre_q)) || (ex_fsw && !fs_idle) ||
+                                    (ex_fsx && !ex_fs2) || (ex_f2c && !ex_c2) || (ex_mw && fr_at[2])))
+      $fatal(1, "fwq against EX's FP wait");
+`endif
 
   // FPSCR: one update a cycle, from the FPU port, a compare in MEM or an FPSCR
   // instruction leaving EX; the waits above keep them apart
@@ -2030,21 +2365,6 @@ module ppc_core
   end
 
 `ifdef VERILATOR
-  // the predecode's raw-word compares against the decoder's op, every cycle
-  always_ff @(posedge clk)
-    if (!rst && (
-        pd_w.w_cr  != (pd_u.rc || pd_u.op == OP_CMP || pd_u.op == OP_CMPL || pd_u.op == OP_CRLOG ||
-                       pd_u.op == OP_MTCRF || pd_u.op == OP_MCRXR || (pd_u.op == OP_STORE && pd_u.cond)) ||
-        pd_w.w_xer != (pd_u.set_ca || pd_u.oe || pd_u.op == OP_MCRXR || (pd_u.op == OP_MTSPR && pd_spr == 10'd1)) ||
-        pd_w.w_lr  != ((pd_u.op == OP_BRANCH && pd_u.lk) || (pd_u.op == OP_MTSPR && pd_spr == 10'd8)) ||
-        pd_w.w_ctr != ((pd_u.op == OP_BRANCH && pd_u.bkind != BR_B && pd_u.bkind != BR_BCCTR && !pd_u.bo[2]) ||
-                       (pd_u.op == OP_MTSPR && pd_spr == 10'd9)) ||
-        pd_w.w_spr != (pd_u.op == OP_MTSPR && pd_spr_hit && pd_spr_idx != 6'd15 && pd_spr_idx != 6'd16) ||
-        pd_w.mfcr  != (pd_u.op == OP_MFCR) || pd_w.mfmsr != (pd_u.op == OP_MFMSR) ||
-        pd_w.ck    != {pd_u.op == OP_STORE && pd_u.cond, pd_u.op == OP_MTCRF,
-                       (pd_u.op == OP_CRLOG && pd_x == 10'd0) || pd_u.op == OP_MCRXR,
-                       pd_u.op == OP_CRLOG && pd_x != 10'd0}))
-      $fatal(1, "predecode raw compares against the decoder, word %h", i_data);
   // the schedule's invariants, checked in simulation
   always_ff @(posedge clk)
     if (!rst) begin
@@ -2058,7 +2378,24 @@ module ppc_core
       if (fblk_q != (div_out || d_go))   $fatal(1, "fblk_q");
       if (fpre_q != ((fr_at & FPRE) != '0)) $fatal(1, "fpre_q");
       if (ffbl_q != ((fr_at >> LS) != '0)) $fatal(1, "ffbl_q");
-      if (ex_ffw != (ex_fma && ex_ffast)) $fatal(1, "ex_ffw");
+      if (ex_ffw != ex_ffast || (ex_ffast && !ex_fma)) $fatal(1, "ex_ffw");
+      if (ex_valid && ex_fma && !ex_ifault && ex_ffast != fpu_fast_route(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_q, fb_q, fc_q))
+        $fatal(1, "fast route %0d for EX's operands", ex_ffast);
+      if (rf_na != !fpu_sgl_val(rf_fa) || rf_nb != !fpu_sgl_val(rf_fb) || rf_nc != !fpu_sgl_val(rf_fc))
+        $fatal(1, "FPR single-value bit against the value read");
+      if (id_valid && {q_pd.ffma, q_pd.fdiv, q_pd.fmsc, q_pd.fmw, q_pd.ffsx, q_pd.ff2c} !=
+          ({6{!q_pd.ifault}} & {id_u.funit == 2'd1, id_u.funit == 2'd2, id_u.funit == 2'd3,
+                                id_u.funit == 2'd3 && id_u.fpw, id_u.fsop != 3'd0, id_u.fcmp || (id_u.fst && id_u.fsl)}))
+        $fatal(1, "FP predecode of %08X against the decoder", q_hi);
+      if (id_valid && !q_pd.ifault && id_u.funit == 2'd1 &&
+          (q_pd.frq || q_pd.frs) != (id_u.fop == 4'(FMA_RSQRTE) ||
+                                     (id_u.fsgl && (id_u.fop == 4'(FMA_ADD) || id_u.fop == 4'(FMA_SUB) ||
+                                                    id_u.fop == 4'(FMA_MUL) || id_u.fop == 4'(FMA_MADD) ||
+                                                    id_u.fop == 4'(FMA_MSUB) || id_u.fop == 4'(FMA_NMADD) ||
+                                                    id_u.fop == 4'(FMA_NMSUB)))))
+        $fatal(1, "fast route kind of %08X against the decoder", q_hi);
+      if (id_valid && (q_pd.frq || q_pd.frs) && (q_pd.ifault || id_u.funit != 2'd1))
+        $fatal(1, "fast route kind of %08X off the multiply-add port", q_hi);
       if (wb_live_q != (wb_isld && !wb_got)) $fatal(1, "wb_live_q");
       if (f_iss && ex_ffast && !f_fast_ok) $fatal(1, "fast op issued against the unit's own check");
       if (f_iss && ex_ffast != fpu_fast_route(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_q, fb_q, fc_q))
@@ -2082,7 +2419,7 @@ module ppc_core
   // rotators' last level and the adder (R23 timing). keep holds Quartus to
   // that split; left to itself it merged the result into a tree three levels
   // deep after the rotators and only then muxed the capture in.
-  wire [31:0]                r_late  = r_sum | r_rl | r_rr | r_clz;
+  wire [31:0]                r_late  = r_sum | r_rl | r_rr | r_clz | mf_c0v;
   (* keep = 1 *) wire [31:0] r_early = r_mid | ({32{ex_rsel[7]}} & md_val) | mf_val;
   (* keep = 1 *) wire [31:0] x_pre   = x_ex ? r_early : x_cap;
   (* keep = 1 *) wire [31:0] y_pre   = y_ex ? r_early : y_cap;
@@ -2239,8 +2576,12 @@ module ppc_core
     mx.ctr1   = ctr1_in;
     mx.msr    = msr_q;
 
-    // branch side effects
+    // branch side effects. A bclr / bcctr the BTB predicted (ex_pred: the
+    // static rule never predicts them) that is taken to another target than
+    // the prediction's refetches from MEM (mx.rtm), from its target in sprv
     if (ex_u.op == OP_BRANCH) begin
+      mx.sprv = br_target;
+      mx.rtm  = BTB && ex_pred && (ex_u.bkind == BR_BCLR || ex_u.bkind == BR_BCCTR) && br_taken && !rt_eq;
       if (ex_u.lk) begin mx.lr = ex_u.pc + 32'd4; mx.lr_we = 1'b1; end
       if (ex_u.bkind != BR_B && ex_u.bkind != BR_BCCTR && !bo_noctr) begin
         mx.ctr = ctr_dec; mx.ctr1 = (ctr_in == 32'd2); mx.ctr_we = 1'b1;
@@ -2344,6 +2685,7 @@ module ppc_core
       mx.exc     = 1'b0;
       mx.srw     = 1'b0;
       mx.resync  = 1'b0;
+      mx.rtm     = 1'b0;
       mx.tlbie   = 1'b0;
       mx.tlbl    = 1'b0;
       mx.fpw     = 1'b0;
@@ -2397,7 +2739,8 @@ module ppc_core
   logic [31:0] exc_vec;
   always_comb begin
     exc_vec = msr_q[MSR_IP] ? 32'hFFF0_0000 : 32'd0;
-    redirect      = 1'b0;
+    redirect_c    = 1'b0;
+    br_go         = 1'b0;
     redirect_pc   = 32'd0;
     // b: a branch that falls through, or a redirect from MEM or WB. Which
     // one is chosen by registers: MEM can kill (m_kp) only where EX cannot
@@ -2405,7 +2748,7 @@ module ppc_core
     // WB with EX empty (it waits in EX for MEM and WB to drain), so the late
     // kill decides only the 2-bit choice, not 32 address bits
     redirect_pc_b = wb_trap ? exc_vec | 32'h0700 :
-                    m_kp    ? (m.resync ? m.pc + 32'd4 : (m.rp && !sl_flt) ? m.pc : exc_vec | {19'd0, m_xvec}) :
+                    m_kp    ? (m.resync ? m.pc + 32'd4 : m.rtm ? m.sprv : (m.rp && !sl_flt) ? m.pc : exc_vec | {19'd0, m_xvec}) :
                               ex_u.pc + 32'd4;
     redirect_sel  = 1'b1;
     if (ex_adv) begin
@@ -2413,33 +2756,48 @@ module ppc_core
         OP_BRANCH:  begin
                       redirect_pc  = br_target;          // not behind the taken decision
                       redirect_sel = br_taken;
-                      if (br_taken != ex_pred) redirect = 1'b1;
+                      br_go        = 1'b1;          // redirects on a mispredict (below)
                     end
-        OP_SC:      begin redirect = 1'b1; redirect_pc = exc_vec | 32'h0C00; end
-        OP_ILLEGAL: begin redirect = 1'b1; redirect_pc = exc_vec | 32'h0700; end
+        OP_SC:      begin redirect_c = 1'b1; redirect_pc = exc_vec | 32'h0C00; end
+        OP_ILLEGAL: begin redirect_c = 1'b1; redirect_pc = exc_vec | 32'h0700; end
         // A trap redirects to the next instruction from EX, decided by the
         // opcode alone; if it fired, MEM redirects again to the vector one cycle
         // later (below). The operand compare is then off the fetch path entirely
         // (R23 timing). Nothing younger can be in EX or ID by then: the first
         // redirect flushed them. Traps do not appear in VF3's census (R12).
-        OP_TRAP:    begin redirect = 1'b1; redirect_pc = ex_u.pc + 32'd4; end
-        OP_RFI:     begin redirect = 1'b1; redirect_pc = {srr0_in[31:2], 2'b00}; end
+        OP_TRAP:    begin redirect_c = 1'b1; redirect_pc = ex_u.pc + 32'd4; end
+        OP_RFI:     begin redirect_c = 1'b1; redirect_pc = {srr0_in[31:2], 2'b00}; end
         OP_MTMSR, OP_ISYNC:
-                    begin redirect = 1'b1; redirect_pc = ex_u.pc + 32'd4; end
+                    begin redirect_c = 1'b1; redirect_pc = ex_u.pc + 32'd4; end
         default: ;
       endcase
       if (ex_xcm) begin                                // (a kill from MEM overrides it below)
-        redirect = 1'b1; redirect_pc = exc_vec | {19'd0, mx.xvec}; redirect_sel = 1'b1;
+        redirect_c = 1'b1; redirect_pc = exc_vec | {19'd0, mx.xvec}; redirect_sel = 1'b1;
       end
     end
     // from MEM: a data translation fault, one cycle on, or the refetch after
     // an MMU write (its commit is this cycle, so the refetch, next cycle,
     // translates with it)
     if (m_kill || wb_trap) begin
-      redirect     = 1'b1;
+      redirect_c   = 1'b1;
       redirect_sel = 1'b0;                             // redirect_pc_b
     end
   end
+
+  // A mispredict from both values of MEM's zero detect, chosen by it last
+  // (br_tk above); the redirect for fetch's registers is a copy of its own
+  // (the redirect drives some 50 loads, 1.1 ns of the R63 batch-4 spike's
+  // MEM result into redir_q path)
+  wire br_mis = m_z ? (brt_z1 != ex_pred) : (brt_z0 != ex_pred);
+  assign redirect = redirect_c || (br_go && br_mis);
+`ifdef VERILATOR
+  // a branch resolved at fetch (LA) was resolved on the CR and CTR it meets
+  // here: nothing that could change them was in flight
+  always_ff @(posedge clk)
+    if (!rst && ex_valid && ex_adv && ex_u.op == OP_BRANCH && ex_lar && br_mis && !ex_xcm)
+      $fatal(1, "branch at %08X resolved at fetch, mispredicted in EX", ex_u.pc);
+`endif
+  (* keep = 1 *) wire redirect_f = redirect_c || (br_go && br_mis);
 
   // the MSR that fetch continues under, loaded with every redirect (a trap's
   // first redirect, to the next instruction, keeps the MSR; a fired trap's
@@ -2495,10 +2853,12 @@ module ppc_core
         ex_first   <= id_s0;
         ex_step    <= id_step;
         ex_ifault  <= q_pd.ifault;
+        ex_bk      <= {q_pd.bslot, q_pd.bpp, q_pd.bsq};
+        ex_lar     <= q_pd.lar && !q_pd.ifault;
         // FP: none of it for a fault marker
-        ex_fma     <= id_u.funit == 2'd1 && !q_pd.ifault;
-        ex_div     <= id_u.funit == 2'd2 && !q_pd.ifault;
-        ex_misc    <= id_u.funit == 2'd3 && !q_pd.ifault;
+        ex_fma     <= q_pd.ffma;                       // (predecoded, a marker's cleared)
+        ex_div     <= q_pd.fdiv;
+        ex_misc    <= q_pd.fmsc;
         ex_fpw     <= id_u.fpw && !q_pd.ifault;
         ex_frw     <= id_u.fpw && !q_pd.ifault;
         ex_froh    <= 32'd1 << q_hi[25:21];             // frD (pend's set is gated by ex_frw)
@@ -2542,9 +2902,9 @@ module ppc_core
         ex_serc    <= h_kmsr2 || h_rfi || h_mtmsr || h_isync || q_pd.ifault ||
                       (id_u.fp && id_s0 && !msr_q[13] && !q_pd.ifault);   // as ex_kmsr, ex_isync, ex_ifault, ex_fpun
         ex_fsw     <= (h_fser && !q_pd.ifault) || h_rfi || h_mtmsr;
-        ex_fsx     <= id_u.fsop != 3'd0 && !q_pd.ifault;
-        ex_f2c     <= (id_u.fcmp || (id_u.fst && id_u.fsl)) && !q_pd.ifault;
-        ex_mw      <= id_u.funit == 2'd3 && id_u.fpw && !q_pd.ifault;
+        ex_fsx     <= q_pd.ffsx;
+        ex_f2c     <= q_pd.ff2c;
+        ex_mw      <= q_pd.fmw;
         ex_fsfld   <= id_u.fsop == 3'(FS_MCRFS) ? id_u.insn[20:18] : id_u.insn[25:23];
         fs_cr      <= ex_valid && ex_w_cr;
         fs_rc0     <= ex_valid && ex_u.rc;
@@ -2701,6 +3061,7 @@ module ppc_core
       m <= mx;
       m.valid <= ex_adv && !m_kp;
     end
+    if (!mem_hold) m_rpq <= mx.rp;
     // CR1 as the FPSCR settles, for an arithmetic op with Rc = 1 held in MEM:
     // chosen by registers (the op is held until m_fsok), not by mem_hold
     if (m_c1w) begin

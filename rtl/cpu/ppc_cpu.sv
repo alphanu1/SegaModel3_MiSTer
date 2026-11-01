@@ -29,7 +29,10 @@ module ppc_cpu
   import ppc_pkg::*, ppc_cache_pkg::*;
 #(
   parameter logic [31:0] RESET_PC = 32'hFFF0_0100,
-  parameter logic [31:0] PVR      = 32'h0006_0101
+  parameter logic [31:0] PVR      = 32'h0006_0101,
+  parameter bit          BTB      = 1'b1,             // the core's BTB and the I-cache's pre-read port (D-30)
+  parameter bit          FETCH2   = 1'b1,             // two-word fetch (D-30)
+  parameter bit          LA       = 1'b1              // the 603e's CR look-ahead (D-30)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -49,6 +52,7 @@ module ppc_cpu
   input  logic        ext_int,
   output logic [7:0]  ev,
   output logic [5:0]  ev_mmu,
+  output logic [3:0]  ev_btb,
 
   // retire trace (ppc_core), and the core's data requests for a bench
   output logic        rt_valid,
@@ -85,6 +89,12 @@ module ppc_cpu
   // ------------------------------------------------------------ the core
   logic        i_req, i_seq, i_valid;
   logic [31:0] i_addr, i_data;
+  logic [1:0]  i_way, i_pway;
+  logic        i_arr, i_pv, i_pre;
+  logic [19:0] i_pa, i_ppa;
+  logic [11:2] i_pidx;
+  logic        i_two, i_w2;
+  logic [31:0] i_data2;
   logic [3:0]  i_wimg;
   logic        d_req, d_we, d_rdy, d_valid, d_idle;
   logic [31:0] d_addr, d_wdata, d_rdata;
@@ -94,15 +104,17 @@ module ppc_cpu
   logic        icbi_req, icbi_ack;
   logic [6:0]  icbi_set;
 
-  ppc_core #(.RESET_PC (RESET_PC), .PVR (PVR)) u_core (
+  ppc_core #(.RESET_PC (RESET_PC), .PVR (PVR), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA)) u_core (
     .clk (clk), .rst (rst),
     .i_req (i_req), .i_addr (i_addr), .i_wimg (i_wimg), .i_seq (i_seq), .i_valid (i_valid), .i_data (i_data),
+    .i_way (i_way), .i_arr (i_arr), .i_pa (i_pa), .i_pv (i_pv), .i_pidx (i_pidx), .i_pway (i_pway), .i_ppa (i_ppa),
+    .i_pre (i_pre), .i_two (i_two), .i_w2 (i_w2), .i_data2 (i_data2),
     .d_req (d_req), .d_we (d_we), .d_addr (d_addr), .d_be (d_be), .d_wdata (d_wdata),
     .d_wimg (d_wimg), .d_op (d_op), .d_rdy (d_rdy), .d_idle (d_idle), .d_valid (d_valid), .d_rdata (d_rdata),
     .hid_ice (hid_ice), .hid_dce (hid_dce), .hid_ilock (hid_ilock), .hid_dlock (hid_dlock),
     .hid_icfi (hid_icfi), .hid_dcfi (hid_dcfi), .hid_noopti (hid_noopti),
     .icbi_req (icbi_req), .icbi_set (icbi_set), .icbi_ack (icbi_ack),
-    .tb_tick (tb_tick), .ext_int (ext_int), .ev (ev), .ev_mmu (ev_mmu),
+    .tb_tick (tb_tick), .ext_int (ext_int), .ev (ev), .ev_mmu (ev_mmu), .ev_btb (ev_btb),
     .rt_valid (rt_valid), .rt_last (rt_last), .rt_pc (rt_pc), .rt_insn (rt_insn),
     .rt_gpr_we (rt_gpr_we), .rt_gpr (rt_gpr), .rt_gpr_sh (rt_gpr_sh), .rt_irq (rt_irq), .rt_gpr_val (rt_gpr_val),
     .rt_cr (rt_cr), .rt_xer (rt_xer), .rt_lr (rt_lr), .rt_ctr (rt_ctr), .rt_msr (rt_msr),
@@ -127,9 +139,11 @@ module ppc_cpu
   logic [31:0] dm_addr, dm_wdata;
   logic [3:0]  dm_be;
 
-  ppc_icache u_ic (
+  ppc_icache #(.PRE (BTB), .FETCH2 (FETCH2)) u_ic (
     .clk (clk), .rst (rst),
     .i_req (i_req), .i_addr (i_addr), .i_seq (i_seq), .i_wimg (i_wimg), .i_valid (i_valid), .i_data (i_data),
+    .i_way (i_way), .i_arr (i_arr), .i_pa (i_pa), .i_pv (i_pv), .i_pidx (i_pidx), .i_pway (i_pway), .i_ppa (i_ppa),
+    .i_pre (i_pre), .i_two (i_two), .i_w2 (i_w2), .i_data2 (i_data2),
     .hid_ice (hid_ice), .hid_ilock (hid_ilock), .hid_icfi (hid_icfi), .icfi_ack (),
     .icbi_req (icbi_req), .icbi_set (icbi_set), .icbi_ack (icbi_ack), .i_idle (),
     .m_req (im_req), .m_cmd (im_cmd), .m_addr (im_addr), .m_be (im_be),

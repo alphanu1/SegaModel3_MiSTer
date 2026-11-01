@@ -1,0 +1,30 @@
+set_global_assignment -name FAMILY "Cyclone V"
+set_global_assignment -name DEVICE 5CSEBA6U23I7
+set_global_assignment -name TOP_LEVEL_ENTITY ppc_dual_proto
+set_global_assignment -name LAST_QUARTUS_VERSION "17.0.0 Lite Edition"
+set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+set_global_assignment -name SDC_FILE dual_spike.sdc
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_pkg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_alu.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_regfile2w.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../rtl/cpu/ppc_dual_proto.sv
+set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"
+set_global_assignment -name FINAL_PLACEMENT_OPTIMIZATION ALWAYS
+set_global_assignment -name PHYSICAL_SYNTHESIS_COMBO_LOGIC ON
+set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION ON
+set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING ON
+set_global_assignment -name OPTIMIZATION_TECHNIQUE SPEED
+set_global_assignment -name NUM_PARALLEL_PROCESSORS 4
+set_global_assignment -name SEED 1
+set_parameter -name DUAL 1
+set_parameter -name BOPS 2
+set_parameter -name BW2 1
+set_parameter -name BLD 0
+set_parameter -name BCR 1
+set_parameter -name PMUX 0
+set_instance_assignment -name VIRTUAL_PIN ON -to n_*
+set_instance_assignment -name VIRTUAL_PIN ON -to b_older
+set_instance_assignment -name VIRTUAL_PIN ON -to ld_word*
+set_instance_assignment -name VIRTUAL_PIN ON -to wb_*
+set_instance_assignment -name VIRTUAL_PIN ON -to cr0_out*
+set_instance_assignment -name VIRTUAL_PIN ON -to ca_out
