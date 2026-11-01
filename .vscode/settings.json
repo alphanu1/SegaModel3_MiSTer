@@ -11,7 +11,16 @@
   //   sm3-builds/supermodel   Supermodel clone, the Real3D reference.
   //   sm3-builds/supermodel-r3d  Supermodel clone with a finished-frame grab
   //                           (M3SHOT3D_LIST). Measurement only.
+  //   sm3-builds/supermodel-tg   Supermodel clone with the tile generator dump
+  //                           (M3TG_DIR). Measurement only.
+  //   sm3-builds/mame289-tg   copy of mame289-m3 with the tile generator dump
+  //                           (M3TG_DIR). Measurement only.
+  //   sm3-builds/mame289-scripts   copy of mame289-m3 with the 53C810 capture
+  //                           (M3SCRIPTS_LOG). Measurement only.
+  //   sm3-builds/supermodel-scripts  Supermodel copy with the 53C810 capture
+  //                           (M3SCRIPTS_LOG). Measurement only.
   //   tools/sloppc603-ref     SloPPC603, a GPL-2.0+ 603e core under review.
+  //   tools/ddr3test-ref      Robert Peip's MiSTerDDR3Test, read for its DDR3 reader.
   //   tools/*-ref             read-only reference clones of other cores.
   //   third_party/*           upstream clones, never vendored.
   //
@@ -22,7 +31,12 @@
     "sm3-builds/mame289-r3d",
     "sm3-builds/supermodel",
     "sm3-builds/supermodel-r3d",
-    "tools/sloppc603-ref"
+    "sm3-builds/supermodel-tg",
+    "sm3-builds/mame289-tg",
+    "sm3-builds/mame289-scripts",
+    "sm3-builds/supermodel-scripts",
+    "tools/sloppc603-ref",
+    "tools/ddr3test-ref"
   ],
   "git.repositoryScanIgnoredFolders": [
     "node_modules",

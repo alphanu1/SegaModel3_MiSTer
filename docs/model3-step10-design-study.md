@@ -248,7 +248,7 @@ The 53C810 is the surprise. Supermodel's `53C810.cpp` header states `[SRC]`:
 
 - Model 3 games use the SCRIPTS processor **only as a DMA engine** — memory-move and
   interrupt instructions in initiator mode.
-- **VF3 does something odd:** it writes DSP, which starts SCRIPTS automatically, *then*
+- **(Corrected by R80: the captured games never auto-start SCRIPTS, and no quirk is needed.)** **VF3 does something odd:** it writes DSP, which starts SCRIPTS automatically, *then*
   sets single-step mode and expects an interrupt. Disabling auto-execution breaks
   Scud Race. The accepted workaround leaves invalid instructions being hit each time.
 - Supermodel's save-state code notes that when the 53C810 register window is inactive,
@@ -534,7 +534,7 @@ quad store alone is 153 blocks.
 | Item | KiB | Basis |
 |---|---|---|
 | Matrix stack, 256 × 16 words × 4 B | 16 | `[CALC]` |
-| Palette, 32 K × 16 bit | 64 | `[CALC]` |
+| Palette, 32 K × 16 bit | 64 | `[CALC]`. Measured 52 M10K (R77): 48 for colour as 2 K × 5-bit banks and 4 for the suppress bit. The 32 M10K used in later projections cannot hold 524,288 bits. |
 | CPU instruction and data caches | up to 32 | 603e has 16 + 16 KiB; size set by M0-A1 |
 | Texture cache, banked for four texels per clock | 32+ | Model 2's cache as the starting point |
 | DDR3 3D-layer write buffers | `[OPEN]` | Model 2's measured figure (M0-G) |
@@ -1086,8 +1086,13 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-27 | Hard per-block ALM budgets, totalling about 40,830 against a 41,000 working ceiling. Framework plus CPU 17,780 (R57's measured 17,266, plus the D-21/D-22 FPU at +910 and a BTB at about +200, less about 600 of test harness). Real3D geometry 8,550. Rasteriser 8,000. Sound 3,000 (68000 plus both SCSPs on one engine plus glue). Everything else 3,500 (tile generator, SDRAM and DDR3 controllers, PCI bridge, I/O and SCRIPTS, Real3D command and texture upload). Dual issue does not fit and is not built; the CPU stays single-issue and gains CPI through cheap levers. Every block works to its number with §8.4 sharing first, and a block over its number is paid back from another block, recorded in an R-entry. |
 | D-28 | The rasteriser runs at 100 MHz, every cycle, at half R46's width: 2 Z tests and 1 shaded, bilinear-textured pixel a clock (4 texels a clock), the same throughput as 4 + 2 at 50 MHz (VF3 p99 about 66% of a frame). Halving the lanes, texel ports and DSPs is how it meets D-27's 8,000 ALM. The whole Real3D, CPU and SDRAM then share one 100 MHz clock, with no crossings inside the core. D-3's 50 MHz Real3D clock is withdrawn (R50 already moved the geometry). Every rasteriser block closes at 100 MHz. |
 | D-29 | Sound keeps FM: it is used, so `FM` stays on in the shared SCSP engine. The sound engine runs at 80 MHz, as Model 2's does (R59), from the main PLL with an 800 MHz VCO (100 / 80 / 50 MHz), with one crossing to the SDRAM. Translucency is the plain blend (R62 mode 0, MAME's), with no extra M10K; modes 1 and 2 stay as parameters. |
-| D-30 | The CPU gains R61's set, budgeted at about 750 ALM and 2 M10K. The set is: a 64-entry BTB looked up one fetch ahead (design C, a 0-cycle hit), with the I-cache pre-read port; dynamic branch direction; and 2-word fetch. Together they lose 3 frames against the branch-folding 603e at 100 MHz (R61). It is built after the timing pass that makes 100 MHz close on every seed (R63), so that timing margin and the new fetch paths are measured together. Dual issue stays out (D-27). |
+| D-30 | The CPU gains R61's set, budgeted at about 750 ALM and 2 M10K. The set is: a 64-entry BTB looked up one fetch ahead (design C, a 0-cycle hit), with the I-cache pre-read port; dynamic branch direction; and 2-word fetch. Together they lose 3 frames against the branch-folding 603e at 100 MHz (R61). It is built after the timing pass that makes 100 MHz close on every seed (R63), so that timing margin and the new fetch paths are measured together. Dual issue stays out (D-27). Revised after R70 (2026-11-01): the set is built now, without waiting for every seed to close. The CPU spike runs 108–110 MHz, and the remaining full-build failures include test-harness paths the real core does not have. So timing is measured with the additions in, and full-build closure is judged in the real core. Built 2026-11-01 (R78). Direction follows the 603e's own rule: the look-ahead of §2.3.4.4, with the y bit otherwise. R61's direction from the BTB entry is not the manual's behaviour, so it is not built. |
 | D-31 | A milestone M2.5 goes in before M1: one real VF3 frame drawn on the MiSTer by the Real3D RTL, from a Supermodel dump of the Real3D memories loaded through the framework, with no CPU. It is untextured first, and textured once the rasteriser has textures. It is a separate MiSTer project (`quartus/m3_viewer/`), so the main core's build is untouched. Its exit is the board's image matching the bench's, which matches the RTL-form model. The dump is ROM-derived and never enters the repository. |
+| D-32 | The geometry trades M10K for ALM to get back under its 7,600 target (R65): its output buffer (`OUT_M10K`, R65: −228 ALM, +4 M10K) and its side memories (`SIDE_M10K`, −336 ALM, +16 M10K) go into M10K by default, about −564 ALM for +20 M10K. The core's M10K projection is about 300–320 of 553 with a 32 KiB texture cache, and 365–385 with a 64 KiB cache and this trade, so M10K has the room and ALM does not. `BC_M10K` (−140, +8) stays available. |
+| D-33 | Texture memory goes on DDR3 behind a pipelined read master (R67): no 16-bit SDRAM form carries VF3, and the best is 220.6% of a frame. Before the cache size (32 or 64 KiB) and the number of fills in flight (8 or 16) are fixed, the viewer measures two things on the board: DDR3 read latency, and whether the f2sdram bridge takes several pending reads. Texture sampling uses the nearest mip level by default; trilinear stays a parameter, to come back if hardware footage shows the blend. The two equal each other to 0.01 dB, and trilinear costs VF3 99.7% of a frame at 32 KiB and latency 30, against 75.9% for nearest. This goes against §7.3 and D-6. There, texture sheets were ruled out of DDR3 on my Model 2 core (Model 2 R557, latency), and the core's DDR3 port was taken as about 100 MB/s usable. Those figures came from `m2_ddr3`'s one-request-at-a-time form. If the probe shows the pipelined master cannot do much better, neither memory carries VF3's textures. The fallbacks are a per-polygon texture prefetch (§7.3), a larger cache, or textures split across DDR3 and the second SDRAM. |
+| D-34 | With textures in DDR3 (D-33), the 3D layer and the binned polygon store may have to come out of DDR3 to the second SDRAM. That is decided by measurement, not now. The viewer's DDR3 probe measures texture-pattern reads, latency and MB/s at 1–16 in flight, in three cases: idle, with layer scan-out only, and with full drawing traffic. It also notes the framework scaler's share. R67's model puts VF3 nearest at 75.9% alone and 80.3% with 180 MB/s of other traffic, and it leaves the scaler out. If sharing costs too much, the move is cheap, because both clients already sit behind D-20's switchable request contract (`r3d_rast_band`'s flush on `m2_ddr3`/`m2_sdram`). A 16-bit layer is about 22 MB/s written and 22 MB/s scanned out, both sequential, which suits SDRAM. Until the measurement and the modules exist, D-6's placement stands. |
+| D-35 | Timing is analysed at every corner (`TIMEQUEST_MULTICORNER_ANALYSIS ON`) in `Model3.qsf`, the viewer and the probe, against the MiSTer template's OFF. With it off, the fitter optimised and timed the slow 100C model only, and the −40C misses went unseen (R73, R79). Compiles take longer. Block spikes report both slow corners from their own timing scripts. |
+| D-36 | Two-word fetch (`FETCH2`) is turned off, and the BTB and the 603e look-ahead stay. The projection (R81) is about 41.4K ALM with it, over the 41,000 ceiling, and about 40.6K without. It costs about 880 ALM for 5 frames lost in 56,700 (R78). It stays a parameter. The default changes only after the core regression has passed with `FETCH2 = 0`, `BTB = LA = 1`, a combination not yet benched on its own. |
 
 ### Open
 
@@ -3160,3 +3165,1044 @@ The failing paths are earlier core paths pushed out by the FPU's area:
 
 **100 MHz closure is not yet robust.** The CPU needs a timing pass for margin, and
 R58's 110 MHz target still stands.
+
+**R64 — M2.5: the first Model 3 image on the MiSTer, bit-exact with the bench.** The
+viewer (`quartus/m3_viewer`, D-31) draws VF3 frame 7860 from a geometry dump:
+- the real `r3d_geo`;
+- the real rasteriser intake, front, zspan and zband;
+- three temporary blocks that later work replaces.
+
+| Temporary block | ALM | Stands in for |
+|---|---|---|
+| `m3v_setup`, one multiplier, adder and reciprocal | 1,831 | set-up on the geometry pool (R60) |
+| `m3v_store`, unbinned DDR3 lists | 1,096 | D-20's binned polygon store |
+| Gouraud shader, every texel white, fog off | about 535 | textures and fog |
+
+Every band replays every triangle, so a frame takes 0.25–0.52 s. The set-up holds the
+geometry for 6.66 M of its 7.07 M busy cycles. The 3D layer is 32 bits a pixel (Model 2's
+`m2_fb_read` format) rather than D-6's 16, so the board can be compared bit for bit.
+Everything runs on the primary SDRAM: the release form still has `MISTER_DUAL_SDRAM`,
+with the second module's pins tri-stated.
+
+**Bench.** Frames 1800, 7800, 7860, 7920 and 13770 are bit-exact against the RTL-form
+model:
+- every set-up record;
+- every list count;
+- 0 of 190,464 layer pixels differ;
+- the DDR3 model at 20–60% busy and 2–120 cycles of latency.
+
+Planted faults: 12 of 15 caught. One miss is equivalent at the image, because a negative
+shade clamps to 0 either way. The other two (flat triangles, and a polygon-RAM read that
+ends on an odd word) do not occur in frame 7860.
+
+**Fit, release form at 100 MHz:**
+
+| Seed | Fmax | Slack | Note |
+|---|---|---|---|
+| 1 | 106.7 MHz | +0.62 ns | no critical warning |
+| 2 | 108.0 MHz | +0.74 ns | critical warning on another corner |
+| 3 | 105.6 MHz | +0.53 ns | no critical warning |
+
+All three seeds use 23.2K ALM, 118 M10K and 52 DSP. `r3d_geo` inside the viewer is 8,107
+ALM, 20 M10K and 11 DSP. This batch was built without `AUTO_SHIFT_REGISTER_RECOGNITION
+OFF`: synthesis put delay pipes in `r3d_recip`, `r3d_fp_add` and `r3d_face` into RAM shift
+taps. The setting is now in the viewer's qsf. These area figures are not the study's until
+a batch with the setting is fitted.
+
+**On the board,** 2026-10-31 at 21:11, seed 1 (RBF md5 b3ee2a03…). It was loaded by an
+MGL that loads both files, so no OSD input is needed. Main's screenshot is 496×384 and
+matches the bench's `f007860_rtl.png` on every pixel outside the hex overlay. The
+overlay reads 9,424 triangles, 0 dropped, 262,314 pixels and lists 7,281 / 2,139 / 4, as
+the bench does.
+
+**Findings:**
+- **Intake tag 15** marks both the three header beats and plane 1's dy (8 + 4 + 3). A
+  consumer must count header beats; reading dy as a header word gave 120 pixels the wrong
+  shade.
+- **SDRAM read capture.** With `rd_lat_sel` = 2 (Model 2's board value), data comes 2
+  cycles after READ. `m2_sdram`'s comments on that index are out of date.
+- **Geometry record.** The record changed during the work to 4 + 6n words, with viewport
+  records and 1/w. The viewer follows the new form and drops the viewport records, so it
+  has no fog yet.
+- **Wrong turns:**
+  - the first loader check windows sat in all-zero polygon RAM and missed a lane-swap
+    fault; they now start at each region's first non-zero word;
+  - the fit script did not rewrite `SEARCH_PATH`;
+  - the shift-tap setting was missed in the first batch.
+- **Traffic at 57.52 Hz, frame 7860:**
+  - SDRAM: 31.9 MB/s transferred, about 25% of the usable bandwidth;
+  - DDR3: 28.4 MB/s of polygon RAM, 43.8 MB/s each of layer writes and scan-out;
+  - D-20 bins would bring the real-time DDR3 total to about 180 MB/s at 16 bits a pixel.
+
+**R65 — The facing test from the normal costs about 780 ALM, and Daytona 2 cannot carry
+the set-up on the pool.** R60 estimated 250–450 ALM for "port plus facing", but that
+assumed a 2D cross product. The real test is a dot of the transformed vertex with the
+transformed normal: 21 FP32 products and 17 sums a polygon. It is built as a dedicated
+multiply-add beside the pool (`r3d_face.sv`), reusing `r3d_fp_mul` and `r3d_fp_add`:
+766–792 ALM, 1 DSP, 0 M10K. The adder alone is 332–336 ALM.
+
+**What did not work:**
+- **Cheaper forms.** Measured on 4.07M polygons, every model-space shortcut is wrong:
+  - Q = M·Mᵀ and r = M·t with an exact integer d: 28K–806K VF3 polygons wrong, from
+    cancellation;
+  - the eye position assuming a similarity: 31 wrong;
+  - the eye position with the true inverse: 840 wrong.
+
+  Nothing under about 20 bits of precision avoids an adder.
+- **The pool's idle slots.** These would save the adder and multiplier, but Daytona 2's
+  heaviest frames leave the engine only 24% idle.
+
+**The facing model is now FP32 in the hardware's order:**
+- V_j = ((x·T0j + y·T1j) + z·T2j) + T3j
+- N_j = (n0·T0j + n1·T1j) + n2·T2j
+- d = (V0·N0 + V1·N1) + V2·N2
+
+Against the old double test it differs on 0 of VF3's 2,930,333 polygons, 0 of Bass
+Fishing's 1,133,455, and 14 of Daytona 2's 2,136,440.
+
+**Back faces are dropped in the geometry by default (`FACE_DROP=1`),** before their clip and
+projection. They are 42% of single-sided polygons in all three games.
+
+**Record format, R62's fields.** A polygon record is 4 + 6n words:
+- per vertex: x, y, 1/w, 256u/w, 256v/w and shade;
+- 1/w always present; window z and w dropped;
+- word 3 carries the fog intensity, the translucency layer and the facing bit;
+- a 6-word viewport record, marked by nv = 0, carries fog and kz.
+
+SETUP5 becomes SETUP4 (no w plane): 63 ops, 97 cycles.
+
+**Step 2.1.** The RTL takes a `step15` input, and the Daytona 2 model matches MAME on every
+field over 400 frames of each dump set (4.17M triangles).
+- A fresh Supermodel run did not reproduce the 2026-10-30 Daytona 2 dumps: all 5 frames
+  checked differ, unlike VF3 and Bass Fishing.
+- A new set of 400 frames is in `dumps_daytona2_r62`; the old set is kept.
+
+**Checks:**
+- RTL bit-exact on 800 VF3/Bass Fishing frames in eleven builds, and on 400 Daytona 2
+  frames;
+- `test_real3d_face`: 900K random polygons, none wrong;
+- planted faults: 59 of 65 caught. All 15 new ones are caught; the 6 misses are R60's six.
+
+A real bug was found: the decoder wrote a normal into a facing slot still in use. It gave
+112 wrong verdicts in VF3 frame 190, all on a model's first polygon. It is fixed and
+planted as FA10.
+
+**Fit, 10 ns, three seeds:** 8,077–8,084 ALM without pins, 12 M10K, 11 DSP, 105.6–112.6 MHz.
+That is +800 over R60. It is inside D-27's 8,550 but about 480 over the 7,600 target, before
+the set-up port (estimated 150–300 more).
+
+**Frame load, p99 of a 100 MHz frame over 400 frames:**
+
+| Build | VF3 | Bass Fishing | Daytona 2 |
+|---|---|---|---|
+| Without the facing test | 62.5% | 62.1% | 96.9% |
+| Default, no set-up | 61.3% | 56.9% | 93.9% |
+| With set-up on the pool | 78.7% | 73.2% | **120.7%** |
+
+**Why Daytona 2 is heavy.** It is bound per node and per model: 2,582 models and 3,927 nodes
+a frame at p99, against VF3's 1,096 and 1,831.
+
+| Share of the frame | % |
+|---|---|
+| Node culling (CULLU + CULLT, 93 latency-bound cycles a node) | 15.7 |
+| Transform and light | 27.6 |
+| Matrix product | 9.4 |
+| Model set-up | 9.4 |
+
+R20 sized the geometry from the vertex count alone, which was wrong for Step 2.x.
+
+**Open:**
+- Option (a), the set-up on the pool (D-28), holds for Step 1.0 but not for Daytona 2.
+- The geometry alone leaves Daytona 2 6% margin at p99.
+- Area options to pay back the 480 ALM:
+
+| Option | ALM | M10K |
+|---|---|---|
+| `OUT_M10K` | −228 | +4 |
+| `BC_M10K` | −140 | +8 |
+| `SIDE_M10K` | −336 | +16 |
+
+**R66 — Rasteriser blocks 1–6 built and exact; texture fills, not logic, now bind the
+frame.** Built:
+- the Z band;
+- the shading interpolants with a stallable copy of the reciprocal;
+- fog's depth term;
+- colour with the fog blend;
+- the texel path (8 formats, bilinear);
+- a 32 KiB 4-way texture cache.
+
+All are bit-exact against `render_d25`: 136–208 M pixels on VF3 + Bass Fishing frames per
+block, plus 3–5 M random cases each, and the reciprocal is exhaustive over its 8,388,608
+mantissas. Planted faults: 36 of 38 caught; the two cache misses are near-equivalent
+mutants.
+
+**The intake now takes R65's record by default (`SETUP4=1`).** The header goes out as 4 beats
+on tag 31, so no tag is shared any more (R64's tag-15 clash is gone). The planes come in the
+order 1/w, u/w, v/w, shade. The M2.5 viewer was built on the old intake, so it must move to
+this form before its next build.
+
+**Area, ALM counted without the virtual pins.** Inside the rasteriser the pins are wires;
+the interpolants alone had 318 pin ALMs.
+
+| Block | ALM | M10K | DSP | Fmax at 10 ns |
+|---|---|---|---|---|
+| Z band | 632–642 | 12 | 0 | 114–119 MHz |
+| Interpolants and reciprocal | 1,192–1,195 | 0 | 15 | 114–122 MHz |
+| Fog depth term | 139 | 0 | 1 | 132–145 MHz |
+| Colour and fog blend | 130 | 0 | 13 | 172–182 MHz |
+| Texel | 527–528 | 0 | 12 | 112–115 MHz |
+| Texture cache, 32 KiB | 972–974 | 43 | 1 | **47–50 MHz, fails** |
+| Intake, SETUP4 | 269 | 0 | 0 | 142–154 MHz |
+
+Built so far: 5,717 ALM, 55 M10K and 44 DSP, with the first three blocks (R62) included.
+The unbuilt blocks are estimated at 1,500–1,850 ALM: band buffers and blend, the D-20 store
+client, and control. That projects to 7,300–7,700 of 8,000, with M10K at about 85–95
+against 70–80. DSP is over plan, 44 against 28–32: Quartus 17 puts one product in every
+block, even in its two-18×18 mode. Moving colour's small products to logic would save 7 DSP
+for about 150 ALM.
+
+The cache's worst path is tag read, hit, victim choice and tag write in one cycle. It needs
+the lookup split into compare and allocate stages.
+
+**Texture bandwidth, p99 share of a 100 MHz frame, level-0 sampling:**
+
+| Case | VF3 | Bass Fishing |
+|---|---|---|
+| Z walk alone | 33.6% | 20.2% |
+| Cache RTL, 32 KiB, harsh memory model | 132.7% | 46.6% |
+| 32 KiB, ideal 64-bit port | 89.0% | 30.9% |
+| 64 KiB, ideal 64-bit port | 67.1% | 30.3% |
+| 32 KiB, 16-bit SDRAM | 274.8% | 99.6% |
+
+VF3's p99 frame needs about 300 K line fills (547 MB/s) at 32 KiB and about 425 MB/s at
+64 KiB. That agrees with R16/R18 at p50 and is worse at p99. A 16-bit SDRAM cannot carry
+it at any cache size I can afford.
+
+Supermodel samples mip levels (m3-notes, row MIP). The rasteriser model so far samples
+level 0, which reads far more texels than the hardware for every minified texture. D-25's
+LOD is the geometry's model LOD (row 6), not this. The levers are:
+- the mip level, nearest-level or trilinear;
+- a 64 KiB cache;
+- a 64-bit texture port;
+- the Z pre-pass.
+
+The mip level's effect on fills is measured next, before a decision.
+
+**Wrong turns:**
+- The Z band had a verdict race. An old generation's verdict landed behind the sweep, and
+  its stamp came round live again 64 generations later; only one synthetic seed showed
+  it. Rule: a verdict is dropped once the sweep starts or when it is stale.
+- The cache's beat counters were one bit short, so a full 32-beat buffer read as empty and
+  the cache locked up on real frames after 169,953 pixels.
+- The cache simulation first chained each lookup to the previous pixel, which hid the
+  look-ahead.
+- Timing splits were needed in the Z band (75–80 → 114 MHz), colour (93–96 → 172 MHz) and
+  texel (92–93 → 112 MHz).
+- An inline `genvar` was rejected by Quartus 17.
+
+**R67 — Mip levels cut texture fills by a third to a half. No SDRAM form carries VF3; DDR3
+needs a pipelined master. The texture cache and the band stage close at 100 MHz.** render_d25 now has Supermodel's mip levels. Before this only
+`render_sm` had them, and level 0 had been the model's default. The settings are
+`d25_opts::mip` (0 = level 0, 1 = nearest level, 2 = trilinear) and `lod` (0 = Supermodel's
+per-pixel LOD; 1 = a hardware form, below).
+
+The fill tool now replays the RTL's round-robin victim rather than LRU. With LRU it
+reproduces R66 exactly; the RTL's rule costs 1.8% (VF3) and 7.2% (Bass Fishing) more p99
+fills.
+
+**VF3, p99 share of a 100 MHz frame over 400 frames, textured cycles:**
+
+| Form | Cache | Fills p99 | MB/s | Ideal 64-bit | SDRAM, `m2_sdram` | DDR3 pipelined, latency 13 / 30 / 60 |
+|---|---|---|---|---|---|---|
+| Level 0 | 32 KiB | 302,324 | 557 | 90.7% | 390.8–406.2% | 102.2 / 117.0 / 183.1% |
+| Level 0 | 64 KiB | 222,723 | 410 | 67.3% | 287.2–298.2% | 74.7 / 81.9 / 128.9% |
+| Nearest | 32 KiB | 192,391 | 354 | 64.7% | 250.5–259.5% | 70.0 / 75.9 / 110.2% |
+| Nearest | 64 KiB | 166,758 | 307 | 57.2% | 220.6–228.1% | 60.9 / 64.9 / 97.3% |
+| Trilinear | 32 KiB | 204,853 | 377 | 86.8% | 266.2–276.6% | 93.1 / 99.7 / 128.0% |
+| Trilinear | 64 KiB | 180,026 | 331 | 79.6% | 235.5–244.2% | 84.3 / 88.6 / 106.3% |
+
+**Bass Fishing** at 32 KiB, p99:
+
+| Form | Fills | SDRAM | DDR3, latency 30 |
+|---|---|---|---|
+| Level 0 | 112,590 | 132.7% | 41.1% |
+| Nearest | 58,200 | 76.7% | 34.3% |
+| Trilinear | 76,032 | 100.0% | 44.3% |
+
+**The memories:**
+- **SDRAM:** modelled as `m2_sdram` with one transfer at a time, 19 / 21 / 24 cycles a line for
+  a row hit, a closed bank and a conflict, plus refresh. R66's 16 cycles a line was
+  optimistic: level 0 at 32 KiB is 390.8%, not 274.8%.
+- **DDR3:** modelled as a pipelined master on the 64-bit f2sdram port, shared with R64's
+  measured clients. With D-20's 180 MB/s of other traffic at latency 30, VF3 nearest is
+  80.3% (32 KiB) and 67.9% (64 KiB). With 16 fills in flight at latency 60, it is
+  75.3% / 65.2%.
+- **`m2_ddr3` as built,** one request at a time, gives no gain: VF3 nearest at 32 KiB is
+  229.7%.
+
+**Findings:**
+- **The nearest level is the largest single lever.** VF3 p99 fills fall 36% (p50: 51%), and
+  Bass Fishing's fall 48%.
+- **Trilinear costs more cycles than its fills save.** 36–41% of textured pixels need a
+  second quad, and VF3 p99 is 72.6% of a frame before any miss.
+- **No 16-bit SDRAM form carries VF3;** the best is 220.6%. Textures need the DDR3 port with
+  a pipelined master. Two things are not yet known: whether MiSTer's f2sdram bridge accepts
+  more than one pending read, and the core's DDR3 latency. The only board figure is
+  `m2_ddr3`'s header: 13 cycles typical, 50 worst (Model 2 R351). Both must be measured on
+  the board; the result decides 8 against 16 fills in flight and the cache size.
+
+**Image cost against Supermodel's grabs, p50 frame PSNR:**
+- level 0: VF3 13.63 dB, Bass Fishing 19.05 dB;
+- nearest: VF3 13.72 dB, Bass Fishing 19.17 dB;
+- trilinear: VF3 13.72 dB, Bass Fishing 19.16 dB.
+
+Nearest and trilinear are equal to 0.01 dB.
+
+**LOD in hardware form.** The LOD needs one FP32 word per polygon from the geometry:
+B = d·NP·(−cota)·kz².
+- **Where the terms come from:** d is `r3d_face`'s facing dot, NP is header[5] bits 8–31 /
+  4096, and cota is viewport word 3.
+- **What it adds:** the record becomes 5 + 6n words. The two products fit in the face unit's
+  idle slots.
+- **Rasteriser cost:** 160–230 ALM, 0 DSP, 0 M10K, by estimate.
+- **Against Supermodel's per-pixel form:** it changes 1.14% of VF3 pixels, at +16.7% p99 fills.
+- **Not checked:** whether `r3d_face`'s d has the model's scale. A factor of 2 is a whole
+  level.
+- **Supermodel's exact form** would need a fifth plane, d/w, for 0.00 dB more.
+
+**Block 7, `r3d_rast_band.sv`:**
+- two 8-row band buffers by x parity, D-29's plain blend done exactly as d + ((c−d)f >> 8),
+  and a flush on `m2_ddr3`'s request contract (D-20's switch);
+- **fit:** 444–448 ALM without pins, 20 M10K, 2 DSP, 123.6–126.1 MHz;
+- **checks:** 0 wrong on 147.3 M VF3 and 60.2 M Bass Fishing pixels, 2,000 random frames, and
+  busy and gap stress runs; 11 of 11 planted faults caught.
+
+**The texture cache closes at 100 MHz once split.** Its lookup is now four stages: read, compare, allocate, then a tag write. Compare re-reads the tags while it waits, and forwards the tag writes on the read edge and in flight. The victim is chosen for each candidate bank in parallel, and rows are updated by loops over constant ways.
+- **Fit, three seeds:** 106.0–108.3 MHz at 781–790 ALM without pins, 43 M10K and 0 DSP. R66's form was 972 ALM, 1 DSP and 47–50 MHz.
+- **Checks:** 0 wrong on 800 frames, with the fill sequence checked address by address, and on random sets at 32 and 64 KiB. Planted faults: 13 of 13 caught. The fill-sequence check also catches R66's two misses.
+- **The first split failed:** 73.6–80.0 MHz at 1,813 ALM. Quartus 17 builds variable part-select writes (`row[vic*EB +: EB]`) as multipliers in the path. Rule: write rows with constant-index loops.
+- **Not fitted:** the 64 KiB form (it is benched).
+
+**Rasteriser built so far:** about 5,970 ALM without pins, 75 M10K and 45 DSP.
+
+**Wrong turns:**
+- Forwarding into the allocate stage was planned, then found unnecessary.
+- The band block's write gate put band 0 into both buffers after reset; only the random set
+  catches it, and it is now planted as G8.
+- An inline `genvar` was written again and caught before analysis.
+
+**R68 — D-32 built: the geometry is 7,532–7,568 ALM, 32 M10K, 103–106 MHz.**
+`OUT_M10K` and `SIDE_M10K` are now the defaults, and nothing else had to change:
+- the output buffer's read-ahead was already built for R62's record;
+- the side memories are read registered either way.
+
+**Checks:**
+- **Bit-exact:** the default and set-up-load builds on 400 VF3, 400 Bass Fishing and 400 Daytona 2
+  frames; every other build on VF3 and Bass Fishing.
+- **Cycles:** identical to the old defaults in all ten builds.
+- **Planted faults:** 64 of 70 caught, all five new read-timing faults included; the misses are
+  R60's six.
+
+**Fit, three seeds:** 7,532–7,568 ALM without pins, 32 M10K, 11 DSP, 103.1–106.3 MHz. That is
+−527 ALM on average for +20 M10K. The memories gave −566, as predicted, and the controller logic
+around them gave back about 35. The worst path is now the decoder's normal conversion, at
+0.30–0.59 ns of slack; that logic did not change, so the fitter placed it worse. The geometry is
+30–70 ALM under its 7,600 target, before the set-up port (an estimated 150–300).
+
+**Wrong turn:** R65's first verify pass differs from these runs by a few hundred cycles at p99.
+The old-default controls reproduce the new numbers exactly, so that pass ran on an earlier RTL
+or bench, not on anything D-32 changed.
+
+**R69 — DDR3 on this board, measured with one read at a time: 15 cycles typical latency, and
+up to 719 MB/s per port with long bursts.** I used Robert Peip's MiSTerDDR3Test (GPL-3.0,
+commit 1a11970, its release RBF md5 a93630ba…), read in `tools/ddr3test-ref`, on my MiSTer
+on 2026-10-31 at 100 MHz.
+- Its reader issues one read command, waits for every beat, then issues the next. So it
+  measures the one-in-flight case, like Model 2's `m2_ddr3`, and not pipelined reads.
+- It ran with the framework's scaler live (HDMI out), and nothing else in the core.
+- The settings went in through `DDR3TEST.CFG` and the screen was read with Main's
+  screenshot command: about 14 s a case, min/max over that time, average over 65,536
+  transfers.
+
+| Burst (64-bit words) | Bytes | Random 4 MiB, MB/s | Sequential, MB/s |
+|---|---|---|---|
+| 1 | 8 | 45.6 | 51.0 |
+| 2 | 16 | 87.6 | 95.8 |
+| 4 | 32 | 158.3 | — |
+| 8 | 64 | 260.1 | 279.4 |
+| 16 | 128 | 392.5 | 408.9 |
+| 32 | 256 | 523.7 | 549.2 |
+| 128 | 1,024 | 708.7 | 718.7 |
+
+**Latency, command to first beat:**
+
+| | Random | Sequential |
+|---|---|---|
+| Minimum | 12–13 cycles | 12–13 cycles |
+| Average | 15.0–15.3 cycles | 13.3–13.4 cycles |
+| Maximum over 14 s | 81–99 cycles | 81–99 cycles |
+
+Bursts are interrupted part way (Burstwait non-zero), so a reader must take beats as
+`DOUT_READY` gives them.
+
+**What it shows:**
+- **Throughput fits latency.** One in flight, a request costs about latency + beats + 1
+  cycles. For a 32-byte line, 32 / (15.2 + 4 + 1) × 100 MHz = 158 MB/s, as measured. This is
+  why Model 2 saw about 100 MB/s usable (§7.3): it used short requests one at a time.
+- **The port itself streams 709–719 MB/s,** 89–90% of the 800 MB/s peak, so it is not the
+  limit for R67's 307–354 MB/s.
+- **Latency is better than R67 assumed.** R67 modelled 13–30 cycles; the average is 15. At
+  13 cycles, R67 has VF3 nearest at 32 KiB at 70.0% of a frame.
+- **Fills of 32-byte lines need several in flight.** One at a time gives 158 MB/s, under
+  VF3's need. Three or more in flight cover it, if the bridge accepts them.
+
+**At 125 MHz** (the core's clock option, set in the OSD; sequential, 128 words): 871 MB/s, 87% of the 1,000 MB/s peak. Latency there is 15 cycles at best, 17.5 typical and 98 worst. So latency is about 135–140 ns in real time at either clock, and a faster port clock helps long bursts but not short fills. 140 ns is at the best end of R67's 130–300 ns range, and about what Model 2's SDRAM controller takes for one 32-byte line (19–24 cycles).
+
+Random reads at 125 MHz, 128 words, read off the screen on the board: 860 MB/s, against 871 sequential. With long bursts, random addressing costs almost nothing.
+
+**Writes at 125 MHz** (set in the OSD; the core always writes one 64-bit word per command): 749 MB/s. That is 93.7 M writes a second, so the port accepted a write on 75% of cycles. The wait from command to acceptance was 0.72 cycles on average and 76 at worst. Writes are posted, with no wait for completion, and the port takes them back to back with only `BUSY` back-pressure. So the bridge does queue commands, which supports, but does not prove, several reads in flight. For the layer and store writes it means writing costs port slots, not latency.
+
+Whether it does accept them is still unmeasured; the DDR3 probe core does that next. The
+fallback, if it doesn't, is longer lines: 64-byte lines one at a time give 260 MB/s, at the
+cost of more bytes per miss, which the fill tool can price.
+
+**R70 — CPU timing pass: the spike gains 2–8 MHz, but only 3 of 6 full builds close 100 MHz.**
+CPI and function are unchanged: bench cycle totals are identical across 16 regressions, and
+both board-harness reports match R63 to the byte. The changes:
+- predecode tables (`ppc_pdec.sv`);
+- the FP route from predecode, with a stored not-single bit per FPR;
+- the registered FP wait;
+- register compares made early, with the holds choosing last;
+- a pop split into copies, and fetch queue entries 2–3 as a ring;
+- per-candidate micro-TLB and DBAT compares, the latter carry-free;
+- sfma stage moves;
+- the branch decision taken last;
+- a redirect copy for fetch.
+
+**Spike, 8.333 ns, seeds 1 / 2 / 3:**
+- R63: 100.6 / 101.1 / 106.3 MHz;
+- now: **108.3 / 108.6 / 110.1 MHz**, at 11,086–11,090 ALM (+219 to +250).
+
+**Full builds, release form, 100 MHz** (slack, ns, seeds 1 / 2 / 3):
+
+| Build | Seed 1 | Seed 2 | Seed 3 | RBF kept |
+|---|---|---|---|---|
+| No cache | **+0.147** | −0.286 | −0.512 | `tq_full_s1` (af42b94c…) |
+| Cached | −0.303 | **+0.115** | **+0.075** | `tq_fullc_s2` (3b533c98…), `tq_fullc_s3` (cf2dee96…) |
+
+R63 had 2 of 6 closing. The full builds swing about ±0.4 ns from fit to fit, more than any
+single fix. Area is no cache 16.75K ALM (+27 to +50) and cached 18.07–18.14K ALM (−11 to −162),
+because the predecode tables let Quartus trim the second decoder instance.
+
+**The remaining failures are mostly at the core's edges:**
+- the fetch-queue head copied into an SPR-MLAB address register, −0.51;
+- register file → `op_x`, −0.29;
+- the harness monitor input, −0.30;
+- D-cache `wk_act` → `redir_a_q`, −0.30;
+- the harness ROM address through the fetch IBAT compare, −0.1 to −0.36.
+
+Two of these are test-harness paths that the real core does not have.
+
+**Planted faults:** 75 of 84 caught. One generator gap is new: the bench never hits a DBAT with
+BL ≠ 0. A DBAT unit test, 20M cases, catches it.
+
+**Wrong turns:**
+- `op_x`/`op_y` translation copies made the EX forward worse, so they were reverted.
+- A D-cache compare split and `d_req`-last made the cached builds worse by 0.9–1.2 ns, so they
+  were reverted too.
+- The monitor's CRC loop was built as a 7-LUT chain until written as a flat XOR matrix.
+- Spike gains often did not carry into the full builds.
+
+**On the board,** 2026-11-01 at 00:24:
+- **no cache, seed 1** (af42b94c…): 1,394 of 1,394 reports identical to R63's capture (P00 000011EA, P09 0CA977DF);
+- **cached, seed 2** (3b533c98…): 1,391 of 1,391 identical (P00 00001E5E).
+
+**R71 — A DDR3 client must not start at PLL lock: Main releases the FPGA-to-SDRAM ports only
+after the core is running.** The first DDR3 probe builds hung on the board, 2026-11-01. Four
+diagnostic loads of `fit_s11` (8284efe3…) showed where:
+
+| Load | Result |
+|---|---|
+| Default | The 8 MiB pattern write appears to complete; the first read is taken and never answered |
+| Init skipped (no writes at all) | The first read is still never answered |
+| Single-beat init | Six writes are taken, then `BUSY` stays high for ever |
+| Reads through `m2_ddr3`'s path | Never answered |
+
+So the probe's burst handshake was not the cause. The port was not being serviced.
+
+**The cause is in Main's load order** (`fpga_io.cpp` 378–400 and 480–497):
+1. `do_bridge(0)` writes 0 to the SDRAM controller's `fpgaportrst` (0x5080), which holds every
+   FPGA port in reset.
+2. Main configures the FPGA; the core starts and its PLL locks.
+3. Only then does `do_bridge(1)` release the ports.
+
+The emu's `RESET` (sysmem `reset_out`) does not include `fpgaportrst`, so the fabric cannot see
+it. A core that touches `DDRAM_*` within microseconds of lock talks to a port held in reset, and
+the commands taken then wedge it.
+
+The M2.5 viewer worked because its first DDR3 access came seconds later, after Main had loaded
+files. Peip's tester waits for its hps_io reset/pause first.
+
+**Rule:** every DDR3 client, in the probe, the viewer and the core, waits for hps_io's first
+command, which Main sends after `do_bridge(1)`, plus a margin, before its first access.
+
+**R72 — A wedged DDR3 port survives core reloads. Every probe result after the first hang
+was taken on a dead port.** On 2026-11-01 at 01:47 I loaded Peip's DDR3Test again. It had read
+158 MB/s at 4 words random at 23:37 the night before (R69). Now it showed 0 transfers, minimum
+delay 65535 and 0 bytes/s.
+
+`fit_s18`, gated on hps_io and on `RESET` low for 100 ms, showed:
+- `RESET` low at the take;
+- its read taken on the first cycle and never answered;
+- four stray beats arriving before its first read, left from an earlier core's outstanding read.
+
+**The sequence, most likely:**
+1. The first probe builds (`fit_s4`/`s5`, 00:04) accessed DDR3 at PLL lock, before Main's
+   `do_bridge(1)` (R71). That wedged the HPS SDRAM controller's FPGA port.
+2. Main's `do_bridge(0)`/`(1)` on each later core load does not clear it.
+3. Every board run since then, all four diagnostics included, ran on a wedged port. So their
+   conclusions are void:
+   - R71's diagnosis of the "first read never answered";
+   - the "owner misroute";
+   - the theory that both masters saw the take late.
+
+**What stands:**
+- R71's rule still stands as a hypothesis for how the port got wedged.
+- The `RESET` and hps_io gates stay in every DDR3 client.
+
+**What is not yet shown:** that the gated builds work, and whether a power cycle clears the
+port. Both wait for a board power cycle.
+
+**Rule:** a core that wedges the DDR3 port takes the board out of DDR3 testing until a power
+cycle. After any DDR3 hang, run Peip's tester before drawing a conclusion from the next build.
+
+**R73 — The geometry started a new model with the old model's read still waiting. Two
+late-acknowledge bugs are fixed, and the geometry is now benched behind slow memories.**
+The M2.5 viewer bench found it: on VF3 frame 1800, with polygon RAM data late, the geometry
+emitted 7,613 of 7,621 triangles. One 16-polygon model was never decoded, and the records
+after it shifted.
+
+A per-cycle port trace from the viewer, replayed into `tb_r3d_geo`, put the cause inside the
+geometry, and showed it depends only on port timing.
+
+**Bug 1, `r3d_mstream`.** I believed the drain after `stop` covered every read of an abandoned
+model. It covered only acknowledged bursts. A burst requested but not yet acknowledged survived
+`stop`, and when its acknowledge came late it did one of three things:
+- **Acknowledged in the cycle the decoder tested `ready_start`:** the start was ignored, and the
+  geometry hung.
+- **Acknowledged in the start cycle:** the new model streamed from the old model's next address.
+  This is frame 1800's case.
+- **Acknowledged after the start:** the old model's 8 words led the new model's FIFO.
+
+Fix: `ready_start` also waits for no request pending.
+
+**Bug 2, `r3d_geo` `M_END`.** `busy` fell while the stream's last prefetch of the frame was still
+waiting at its port. An owner that hands the port on at `!busy` never answers it, and the next
+frame hangs. The viewer kept its ports across frames, so it never saw this. Fix: `M_END` waits
+for `ms_ready`.
+
+**What triggers them is a late acknowledge (100–400 cycles), not long latency.** Every earlier
+bench acknowledged in 1–3 cycles, so none could see it. The new bench, `tb_r3d_geo --hostile`
+(`make test_real3d_geo_timing`), sets per-port acknowledge delay, BUSY, gaps, reads held and
+output stall. A frame fails if `busy` falls with a port still open.
+
+**Checks after both fixes:**
+- **Default bench:** cycles identical on all 1,200 frames (VF3, Bass Fishing, Daytona 2).
+- **Hostile profiles:** 1,200 of 1,200 frames exact under each of six, with acknowledges up to
+  400 cycles, latency up to 200, BUSY up to 60%, output stall up to 90%; 6.57 M triangles each.
+- **Viewer:** exact in 9 cases (1–8 reads held, BUSY 30%, latency 30–120), and on five frames at
+  BUSY 40%.
+- **Planted faults:** T1 and T2 re-create the two bugs.
+
+**Planted faults:** 82 run, 75 caught, including T1 and T2. Nothing changed from R68's results. The seven misses are R60's six (N2, N4, N6, G5, G8, G11) and L8, the emitter's wait for the LOD word: that word is always ready long before the record leaves, so the wait never holds.
+
+**Fit, 10 ns, three seeds:** 7,582 / 7,565 / 7,571 ALM without pins, 32 M10K, 11 DSP. These builds also carry the LOD word logic, off by default. Fmax by seed:
+
+| Seed | Slow 100C | Slow −40C |
+|---|---|---|
+| 1 | 107.6 MHz | 103.6 MHz |
+| 2 | 107.0 MHz | 106.8 MHz |
+| 3 | 101.2 MHz | **97.9 MHz** |
+
+Seed 3 misses 100 MHz at −40C. (I first wrote seed 1 here; that was a misreading of the report order.)
+
+**Correction to R68: D-32's builds do not close at −40C.** R68 read the slow 100C corner only:
+
+| Build | Slow 100C | Slow −40C |
+|---|---|---|
+| R68, `d32` seeds 1 / 2 / 3 | 103.1 / 104.0 / 106.3 MHz | **97.2 / 96.5 / 99.7 MHz** (all three miss 10 ns) |
+| R65, `face3`, before D-32 | 105.6–112.6 MHz | 103.4–109.5 MHz (all three meet) |
+
+Moving the output buffer and side memories into M10K cost the cold corner its margin. That matches R68's note that the worst path moved to the decoder's normal conversion. With the late-acknowledge terms added, two of three seeds meet both corners, which is seed variation, not a fix. The −40C path needs finding. From now on, every fit reports both slow corners.
+
+**Wrong turns:**
+- My first hostile profiles varied latency and per-port limits, but acknowledged quickly, and
+  never triggered it.
+- I called the fix done after the viewer passed; the sweep then found bug 2.
+
+**R74 — The textured viewer is bit-exact in simulation and closes timing; the DDR3 probe
+builds wait for the board.**
+
+**The viewer now uses the real rasteriser blocks:**
+- interpolants with the reciprocal, texel address and filter, colour, and band;
+- the 32 KiB texture cache, on `m3_ddr3p`'s second pipelined port;
+- texture RAM in DDR3, tiled, at word 0xC00000 + 0x100000·k.
+
+The temporary shader, band and second Z walk are gone; removing them freed 714 ALM, 13 M10K and
+11 DSP. Textures are level 0. There is no fog yet, because the bench frames carry no viewport
+records.
+
+**Checks:**
+- All 5 frames match `render_d25` with textures under four slow-DDR3 profiles (BUSY up to 50%,
+  latency up to 120, 16-read bridge). Frame 7860 equals `f007860_d25tex.png`.
+- Planted faults: 18 of 19 caught; S2 is equivalent on these frames.
+
+**Fit, release form, with both DDR3 gates (R71):**
+
+| Seed | Fmax | Slack (setup) | ALM |
+|---|---|---|---|
+| 1 | 104.5 MHz | +0.43 ns | 26,276 |
+| 2 | 101.9 MHz | +0.18 ns | 26,331 |
+| 3 | 103.2 MHz | +0.31 ns | 26,308 |
+
+All three seeds use 183 M10K and 79 DSP, with no critical warnings.
+
+**The viewer's rasteriser in total:** 6,379–6,397 ALM, 91 M10K, 40 DSP. The large blocks:
+
+| Block | ALM | M10K | DSP |
+|---|---|---|---|
+| Interpolants | about 1,150 | — | 15 |
+| Texture cache | about 865 | 42 | — |
+| Texel filter | about 425 | — | 12 |
+| Band | 259 | 20 | 2 |
+| `m3_ddr3p` | about 625 | — | — |
+
+**DDR3 probe builds for the board, after a power cycle (R72):**
+- `m3_ddr3p` with caps of 1, 2, 4, 8 and 16 reads in flight (`fit_s18`, `fit_s20`–`s23`);
+- an `m2_ddr3` control (`fit_s19`);
+- a variable-clock build (62.5–125 MHz, cap 32, `fit_s25`), which closes the DDR3 domain at
+  125 MHz with +0.59 ns.
+
+Each builds a register read-owner queue, and every DDR3 client has both gates.
+
+**Timing finding:** a late port signal (`DOUT_READY`) through a 64:1 read mux missed 125 MHz by
+0.39 ns. Choosing late between two registered head candidates (rq[rp], rq[rp+1]) fixed it.
+
+**Bandwidth:** the framework's scaler (ascal) takes about 90 MB/s at 496×384 and 60 Hz, on its
+own f2sdram port.
+
+**Wrong turns:** the read-owner queue was chased three times and the f2sdram terminator once,
+all on a port wedged since the first probe build (R72). The changes are kept, because each
+removes a real hazard.
+
+**R75 — Nearest-level mip sampling built, and R67's texture fills were far too pessimistic.**
+D-33's nearest level is built end to end, behind parameters that default off:
+- **Geometry:** `LOD_WORD` adds B to the record, which becomes 5 + 6n words.
+- **Rasteriser:** `MIP` in the intake, interpolants and texel path.
+
+**B is formed as built:**
+- −cota·kz² is formed once per viewport: no product at all with Supermodel's frustum (kz = 1), and
+  the idle face unit forms it with MAME's.
+- B = d·(NP·C).
+- `r3d_face`'s d has the model's scale: |d/dv − 1| is 5.6e-8 at p50 over 3.37 M polygons, and
+  nothing sits at a factor of 2.
+
+**Checks:**
+- **Geometry, `LOD_WORD` = 1:** bit-exact on 1,200 frames, plus five other builds; +0.13% p99
+  cycles.
+- **Rasteriser, mip 1 / lod 1:** bit-exact against `render_d25` on every block and on the cache's
+  fill sequence.
+- **Planted faults:** 12 of 12 caught in the rasteriser and 9 of 10 in the geometry. The miss is
+  a safety interlock that never holds.
+
+**Area, 10 ns, three seeds, all closing:**
+
+| Unit | ALM | M10K | DSP |
+|---|---|---|---|
+| Geometry LOD word | about +31 (7,597–7,616 in all) | 0 | 0 |
+| Texel | +189 to +192 | 0 | 0 |
+| Interpolants | +46 to +49 | 0 | 0 |
+| Intake | +27 to +32 | 0 | 0 |
+
+The rasteriser side totals +263 to +273 ALM, against the 160–230 estimated. With the LOD word on,
+the geometry sits at its 7,600 target, up to 16 over.
+
+**Shortcuts and a side fix:**
+- The mip texel is exact only for size codes up to 5 and levels up to 9. That covers everything the
+  geometry can send, and narrowing it saved 34 ALM.
+- The face unit's adder zero-select was a slot late, and worked only because an unwritten MLAB word
+  reads as zero. It is fixed in the default build too: cycles are unchanged and every frame is exact.
+
+**The main finding: R67's fills came from MAME's lists, which draw a back-facing double-sided polygon
+once, with its own normal.** Its B is then negative, so it samples level 0. The geometry, like
+Supermodel, sends the inverted copy, whose B is positive, so it gets a real level.
+
+Fills at p99 with the geometry's own B:
+
+| | VF3, 32 / 64 KiB | Bass Fishing, 32 / 64 KiB |
+|---|---|---|
+| R67's figures | 192,391 / 166,758 | 58,200 / 49,545 |
+| **Geometry's B** | **53,790 / 47,015** | **41,569 / 33,831** |
+| DDR3, latency 30 | 56.5% / 55.7% | 31.4% / 29.7% |
+| One 16-bit SDRAM, textures only | 77.5% / 71.1% | 58.3% / 50.7% |
+
+The image does not move against Supermodel's grabs: 0.00 dB on VF3, −0.01 dB on Bass Fishing.
+
+**Wrong turns:**
+- A hand-typed log2 table was about a third wrong; it is now generated from the formula.
+- A shared global matrix stack corrupted the multi-threaded fill runs; it is now `thread_local`.
+- Two of my hand-computed constant-fold values were wrong. Quartus was right.
+
+**This reopens D-33.** On these figures a 16-bit SDRAM of its own can carry VF3's textures at p99,
+which R67 ruled out. DDR3 has about 44% of a frame to spare. The choice between DDR3 and the second
+SDRAM, and the cache size, should be re-weighed once the DDR3 probe has board numbers (R72).
+
+**R76 — Set-up on the geometry pool is built (D-28 a, `SETUP_OUT`), and the geometry now meets
+both slow corners.** It matches `rtl_tri::setup` word for word on 6.57 M records over 1,200
+frames (VF3, Bass Fishing, Daytona 2). It is also exact under the hostile timing profiles, and
+the default build is unchanged cycle for cycle.
+
+**How the inputs arrive.** There is no port load, unlike R65's model.
+- A port gathers each triangle's sorted inputs into the projection queue's unused upper half of
+  M10K.
+- The kernel reads them through the side port. One micro-op writes both the register copy and the
+  record's x/y words.
+- SETUP4 is 73 ops / 110 cycles, against the model's 115; SETUP2 is 47 ops / 104 cycles.
+
+**Frame load, p99:**
+
+| Build | VF3 | Bass Fishing | Daytona 2 |
+|---|---|---|---|
+| Built (`SETUP_OUT = 1`) | 76.9% | 71.3% | 117.6% |
+| R65's model | 78.7% | 73.2% | 120.7% |
+
+Daytona 2 still needs D-10's reduced rate, or a set-up unit in the rasteriser.
+
+**Fit, 10 ns, ALM without pins:**
+
+| Build | ALM | M10K | DSP | Slow 100C | Slow −40C |
+|---|---|---|---|---|---|
+| `SETUP_OUT = 1` | 7,860–7,868 | 43 | 11 | 109.6–111.8 MHz | 104.9–110.6 MHz |
+| Default | 7,505–7,526 | 32 | 11 | 108.0–116.9 MHz | 105.2–111.2 MHz |
+
+The set-up costs +347 ALM and +11 M10K. That is 50 ALM over R60's estimate, and inside
+7,600 + 300. It replaces the viewer's 1,780-ALM, 7-DSP temporary set-up.
+
+**The −40C misses (R73) were three logic paths that the fitter placed worse after D-32.** None was
+M10K-bound. Each is fixed exactly, bit- and cycle-identical:
+- **The decoder's k255:** −(2b+1) = {~b, 1}, so an XOR instead of a subtract. The ambient byte
+  gets its own register.
+- **The pool's post-op clamp:** its flags are registered beside the raw result.
+- **The facing unit's integer-to-float:** sign and magnitude are formed in the read cycle, −54 ALM.
+
+**Planted faults:** 88 of 97 caught. The misses are R60's six, L8, and two new ones that need a
+non-finite triangle or d exactly 0, which these frames do not contain.
+
+**Wrong turns:**
+- A cold-corner script named the corner wrongly; the database was gone before the paths were
+  read, which cost one refit.
+- A sort compared a y word straight off M10K (−0.37 ns at −40C); it is now registered first.
+- A first post-op fix cost +120 ALM; it was narrowed to the paths that need it.
+
+**R77 — M0-E done: the tile generator is exact on 389 frames, 553–560 ALM and 54 M10K. MAME and
+Supermodel disagree on the stencil.**
+
+**What I believed:**
+- the tile generator would cost 1,100–2,000 ALM (§8.1);
+- the palette would cost 32 M10K;
+- MAME's `draw_layer` would be the reference (M0-E).
+
+**What is now known:**
+- **Area:** standalone, 10 ns, three seeds: 553–560 ALM without pins, 54 M10K, 0 DSP, at
+  130.8–135.4 MHz (slow 100C) and 124.3–135.5 MHz (slow −40C).
+- **The palette needs 52 M10K,** not 32. Its 524,288 bits cannot fit in 32 blocks.
+- **One fetch engine serves all four layers** (299 ALM), on an `m2_sdram`-contract port, with two
+  512×18 line buffers and 3 clocks a tile. It saves about 900 ALM against four engines.
+- **Line timing:** at 14-clock memory latency the slowest line uses 64% of its 4,100-clock time. It
+  holds without overruns up to about 22 clocks.
+- **Nothing from Model 2 is copied.** Its tile chip is System 24's: a priority bit per tile,
+  4 bpp only, a different row mask. Only the structure carried over: an engine fetching ahead of an
+  emitter, line banks, and R906's skip of hidden columns.
+
+**The two emulators differ at seven points** over the dumps:
+
+| Point | MAME | Supermodel | Pixels |
+|---|---|---|---|
+| Stencil | map space, bit 0 leftmost, each layer masked separately | screen space, bit 15 leftmost, one layer of each pair per pixel | 1,792,811 in 29 frames |
+| Line scroll | always applied | only when register bit 15 is set | 0 (unused) |
+| Line-scroll word for line y | 2y | 2(y^1) | 0 |
+| Tile pair straddling a stencil change | normal | uses the pair 16 px to the left | 1,692–3,445 |
+| Pattern codes past 0xF8000 | wrap | read directly | 0 |
+| 5→8-bit colour | pal5bit | ×255/31 | 51.6 M (±1 step) |
+| Colour offset (F1180040/44) | unused | applied | 760,256 (Bass Fishing fades) |
+
+Following D-19, the core defaults to Supermodel's behaviour, with MAME's as a compile-time option.
+Supermodel's notes say the tile RAM fetches one layer of each pair per 16 pixels, which supports its
+screen-space stencil. The colour offset is hardware behaviour, not a PC addition: Bass Fishing uses
+it for fades, so it is built (about 40 ALM).
+
+**Still open:** the stencil's bit order. On VF3's attract-mode portrait wipes the two emulators show
+mirror-image splits. This needs cabinet footage.
+
+**How it was established:**
+- Dumps of tile RAM, palette and registers came from patched emulator copies:
+  - MAME: 255 VF3 frames;
+  - Supermodel: 56 VF3 and 78 Bass Fishing frames;
+  - the patches are in `tools/mame-census/`.
+- Literal re-implementations match each emulator's own output with 0 differing pixels.
+- The RTL is exact against both builds on 714 and 765 frames. It stays exact behind hostile memory
+  (acknowledges up to 800 clocks late) and recovers from overrun.
+- 20 of 20 planted faults are caught. Line scroll and stencil variety needed synthetic register
+  sets, because no dumped game uses them; Scud Race or Lost World dumps would test line scroll for
+  real.
+
+**Wrong turns:**
+- Stock MAME Lua could not read the scroll registers, and its 64-bit write tap aborts on bit 63.
+- `busy` fell before the emitter finished.
+- A first FSM spent 7 clocks a tile (125 overruns).
+- The palette took 60 M10K before the 2 K × 5-bit banking.
+
+**R78 — D-30 built: BTB, two-word fetch and the 603e's branch look-ahead. 360 frames lost
+becomes 15, for about 1,060 ALM; the two-word fetch is the overrun.** All three additions sit
+behind parameters (`BTB`, `FETCH2`, `LA`). With all three off, R70's bench cycle totals come
+back exactly.
+
+**What was built:**
+- **BTB design C**, 64 entries in 2 M10K, looked up a request ahead. Beyond R61, it is also
+  looked up for fetch-side redirect targets, which takes VF3 from 13 to 4 frames lost in the
+  model. Predictions are checked on arrival, and register targets are checked in EX and
+  refetched from MEM. The y bit is honoured.
+- **Two-word fetch:** even/odd data banks in the same 16 M10K, pairs only on the cache's fast
+  path, and a second predecoder.
+- **Direction:** the 603e's rule from the manual (§2.3.4.4). A bc, bclr or bcctr is resolved from
+  the committed CR/CTR when nothing in flight writes them; otherwise the y bit decides
+  (PEM 4.2.4.2).
+
+**Frames lost** (CPI model `lv6_`, 18,900 frames per title at 100 MHz, against `ref66_dual_ic`):
+
+| Step | Singles at 4 | Built fast path at 6 |
+|---|---|---|
+| Before D-30 | 360 | 373 |
+| + BTB | 22 | 42 |
+| + two-word | 17 | 37 |
+| + direction | **15** (VF3 3 / Daytona 2 6 / Bass Fishing 6) | **34** |
+
+At 110 MHz this becomes 0 / 3.
+
+R61 predicted 3. Its model left out costs the built core pays:
+- 64 entries under the y rule;
+- a single-word first request after a redirect;
+- refetching ops (rfi, sc, isync, mtmsr, MMU writes);
+- the real line-crossing cost.
+
+CPI as built is 1.757 / 2.100 / 2.031.
+
+**Area, about +1,060 ALM and +2 M10K against D-30's 750:**
+
+| Addition | Core | Cache | M10K |
+|---|---|---|---|
+| BTB with pre-read port | ±0 | +139 | +2 |
+| Two-word fetch | about +730 | +153 | 0 |
+| Direction | about +35 | 0 | 0 |
+
+The two-word fetch is the overrun; R61 estimated about 350 for it. Full builds are now 19.2K ALM
+cached and 17.2K uncached.
+
+**Timing:**
+- **Spike:** 105.8 / 108.5 / 108.0 MHz, against R70's 108.3 / 108.6 / 110.1. The set costs 1.5 MHz
+  net, after R70's MLAB address patch.
+- **Full builds at 100 MHz:** one uncached seed in three closes (+0.017 ns). The others fail only on
+  the harness ROM's path through fetch translation, which the real core does not have. One cached
+  seed in eleven closes (+0.196 ns), over four rounds, with seeds swinging ±0.5 ns.
+
+**Planted faults:** BTB 16 of 24, two-word 17 of 19, direction 9 of 10, existing set 75 of 84 (as R70).
+
+**On the board,** 2026-11-01 at 06:52, the round-1 and round-2 RTL:
+- **no cache** (3aaaa6ac…): 1,394 of 1,394 reports identical, P00 000011DA;
+- **cached** (a1fe9f93…): 1,392 of 1,392 identical, P00 00001E34.
+
+P01 00000661 and P09 0CA977DF are unchanged. The board program is straight-line code, so the BTB
+cannot show a gain there; P00's drop comes from the two-word fetch and the look-ahead.
+
+**Wrong turns:**
+- A failed check in the same cycle as a hard redirect retired the wrong PC.
+- Grouping changed under the BTB keys: 4,150 failed checks before the key request's size was
+  stored in the entry.
+- Two-word pairs crossed a page.
+- The soft allocation key was read a cycle late (+1.9% cycles).
+- A CPI model option (`lv5_` cx) never applied; it was rerun as `lv6_`.
+
+**Open:** the two-word fetch costs about 880 ALM for 2–5 frames lost, against a CPU over its D-27
+budget. Whether to keep it is a budget decision.
+
+**R79 — The viewer now runs on the geometry's own set-up and on the nearest mip level: exact, and
+about 1,030–1,120 ALM smaller. Every project times one corner only.**
+
+**The changes:**
+- `r3d_geo` runs with `SETUP_OUT` and `LOD_WORD` on, and `MIP = 1` is on in the intake,
+  interpolants and both texel instances.
+- `m3v_setup` is deleted. The store now builds its own row word. With `LOD_WORD` the header is
+  5 words, so y1 and y3 are words 6 and 10, and nw is 24 or 18.
+
+**Checks:**
+- **Both parameters together**, never benched before: the geometry is exact on 1,200 frames. The
+  p99 loads are 77.0% / 71.4% / 117.7% (VF3, Bass Fishing, Daytona 2), about 0.1 point above R76.
+- **All 5 frames** match `render_d25` (mip 1, lod 1) under 7 DDR3 profiles, including late
+  acknowledges up to 400 cycles. 0 of 190,464 pixels differ on each.
+- **Planted faults:** 27 of 28 caught. The miss is equivalent: the texel's mip form only ever reads
+  u, v [20:0], so a 69-bit ring A is exact (−1 M10K, not yet built). Rule: read a block's bit needs
+  from its masks, not from its port widths.
+
+**Speed:** on frame 7860 the geometry phase drops from 65.3 to 18.7 ms. A frame takes 0.23–0.29 s,
+still bound by the unbinned store's replay (D-20, block 8 in progress).
+
+**Area:**
+- **Set-up move:** −1,393 to −1,405 ALM, −7 DSP, +11 M10K, as expected.
+- **Mip:** +390 to +419 ALM and +2 M10K.
+
+**Fit, at 100 MHz:**
+
+| Seed | ALM | M10K | DSP | Slow 100C | Slow −40C | Note |
+|---|---|---|---|---|---|---|
+| 1 | 25,245 | 196 | 72 | 101.6 MHz | 100.7 MHz | hold −0.012 ns at −40C |
+| 2 | 25,209 | 196 | 72 | **99.9 MHz** | **98.3 MHz** | misses |
+| 3 | 25,226 | 196 | 72 | 102.2 MHz | 104.7 MHz | closes at both corners; the board build (md5 2aba8ce6…) |
+
+Seed 2's failing path is an unregistered ready chain: zband `a_y` → zspan's output enable. It needs
+a skid stage.
+
+**The finding:** `Model3.qsf`, the viewer and probe projects, and Model 2's qsf all set
+`TIMEQUEST_MULTICORNER_ANALYSIS OFF`, as the MiSTer template does. The fitter then optimises and
+times the slow 100C model only, and never repairs setup or hold at the −40C corner. That is how R68
+missed −40C unseen, and how viewer seed 1 carries a −40C hold violation. Every fit now reports both
+corners. Whether to turn multicorner analysis on for release builds is open: it means longer
+compiles, and the fitter would then repair both corners.
+
+**R80 — M0-F done: the 53C810 as Model 3 uses it is one opcode, single-stepped. No VF3 quirk; 260
+ALM.**
+
+**What I believed** (§5.2):
+- VF3 writes DSP, which auto-starts SCRIPTS, and then single-steps, so the core needs a quirk.
+- SCRIPTS needs block move, JUMP, CALL, RETURN and register reads and writes.
+
+**What the captures show.** VF3, VF3 Team Battle and Bass Fishing (`bassdx`) were captured in
+Supermodel and MAME: 615,501 steps, about 1.33 GB moved. All of them run one Sega driver:
+- **DMODE.MAN (manual start) is set at boot,** so no DSP write ever starts SCRIPTS: 0 automatic
+  starts in five captures, in both emulators.
+- **Each memory move is run as one single step** (DCNTL = SSM|STD) from the interrupt routine, the
+  manual's own single-step procedure (p. 5-46). The closing INT 0x98080000 is read by the CPU as
+  data and never executed.
+- **The only opcode ever executed is MMOV** (DCMD 0xC0). Every move is word-aligned with a length
+  that is a multiple of 4.
+- **The register window is the game's BAR1 write:** C0000000 for VF3, F9000000 for Bass Fishing.
+
+**Built, `rtl/io/m3_scripts.sv`:**
+- MMOV, honouring MAN, one instruction per step with DSP advanced past it;
+- interrupts: SSI → DIP → IRQ, with a DSTAT read clearing them;
+- INT behind a parameter;
+- an illegal-instruction interrupt for everything else.
+
+Its memory port is the CPU bus protocol with 8-word line bursts. The bursts are required: single
+words take 20.3 ms of DMA in VF3's largest frame, against a 17.4 ms frame.
+
+**Where MAME and Supermodel disagree on what the games read.** I followed the manual:
+
+| What | MAME | Supermodel | Built (manual) |
+|---|---|---|---|
+| ISTAT after a step | 0x03, then SIP stuck | 0x01 | 0x01 |
+| DSTAT read | 0x08, never cleared | 0x88, clears | 0x88, clears |
+| Interrupt released by | ISTAT read | DSTAT read | DSTAT read |
+| DCNTL.STD after a step | stays set | stays set | clears |
+
+The interrupt goes the same way in effect in both: unmaskable by the board, on the 603e's external
+interrupt.
+
+**Checks:**
+- A three-form C++ reference (manual, Supermodel, MAME) replays each emulator's captures with
+  0 mismatches in 9.45 M register accesses.
+- The RTL matches the manual's form on every capture chain, behind hostile memories (acknowledges up
+  to 400 cycles late, BUSY up to 60%).
+- 40 of 40 planted faults are caught.
+
+**Fit:** 258–260 ALM, 0 M10K, 0 DSP, at 156–164 MHz (slow 100C) and 162–169 MHz (−40C). That
+compares with D-27's 500–1,500 for I/O and SCRIPTS together.
+
+**Area notes:** the FIFO in MLAB saved 174 ALM. A shared adder measured 16 ALM larger than three
+incrementers, so it is not used.
+
+**DMA rate:** 85.8 MB/s with line bursts. VF3's p99 frame moves in 1.97 ms. The hardware's PCI
+memory-to-memory rate is estimated at about 40 MB/s, with 66 MB/s the ceiling.
+
+**Not covered:** Lost World (C1000000) and Get Bass proper are not on disk, and Scud Race's auto-start
+is untested (Step 1.5).
+
+**Wrong turns:**
+- I first planned a special case for the quirk.
+- Supermodel's PCI log folds dwords, so its writes were mapped by value.
+- Editing CRLF sources produced a 9,736-line patch at first; it is now 263 lines.
+- Bench memory carried across capture files and gave 46 false failures.
+- Two original faults hit logic that never mattered, and that logic was removed.
+
+**R81 — Whole-core ALM projection after the night of 2026-10-31: about 41.4K with two-word fetch,
+about 40.6K without.** Measured where a block exists, and estimated where marked:
+
+| Block | ALM | Basis |
+|---|---|---|
+| Framework (release form, with `hps_io`) | 6,141 | R57, measured |
+| CPU, cached, with BTB, look-ahead and two-word fetch | about 12,440 | R78's cached full build (19.2K) less R63's framework and harness share |
+| — without two-word fetch | about 11,560 | less about 880 (R78) |
+| Geometry, set-up on the pool and LOD word | about 7,700 | R79, in the viewer's fit |
+| Rasteriser | about 7,900 | R79's chain at 6,680–6,710, plus the binned store and top level, estimated at 1,050–1,250 (blocks 8–9 in progress) |
+| Sound: 68000, both SCSPs on one engine, glue | about 4,360 | fx68k 1,859 + R59's 2,148 + 357 |
+| Everything else | about 2,900 | measured: tile generator 560 (R77), SCRIPTS 260 (R80), `m2_sdram` 331, `m3_ddr3p` about 625; estimated: bridge, I/O, NVRAM, RTC, compositor about 1,100 |
+| **Total with two-word fetch** | **about 41,440** | over the 41,000 working ceiling |
+| **Total without** | **about 40,560** | under it, with about 440 to spare |
+
+Hence D-36.
+
+**Against D-27's per-block budgets:**
+- Geometry: about 850 under its 8,550.
+- Rasteriser: at its 8,000.
+- Everything else: about 600 under its 3,500.
+- Sound: over its 3,000 by about 1,360. That was already known (R59), and FM stays (D-29).
+- CPU: about 900 over its share with two-word fetch, and on budget without it.
+
+**M10K projection:** about 380–400 of 553, with the palette at 52 (R77) and the geometry at 43.
+
+**R82 — After a power cycle, DDR3 works with several reads in flight: 794 MB/s at 16, and both
+viewers are bit-exact on the board.** Run on 2026-11-01 after Ben power-cycled the MiSTer.
+
+**Peip's tester first, the R69 setting:** 158.4 MB/s, latency 12 min / 15 average / 105 max. The
+port was back.
+
+**The probe**, 32-byte random reads in an 8 MiB region, at 100 MHz, scaler live. Every case ran
+with 0 pattern errors over 3–7 passes.
+
+| Reads in flight | No background | Layer 22+22 MB/s | Layer + store, 143 MB/s |
+|---|---|---|---|
+| 1 (`m2_ddr3`) | 142.5 MB/s, median 17 | 131.7 | 103.7 |
+| 1 (`m3_ddr3p`) | 149.7 MB/s, median 14 | 140.3 | 112.8 |
+| 2 | 296.7 | 284.9 | 254.4 |
+| 4 | 581.2 | 553.0 | 486.3 |
+| 8 | 773.0, median 26 | 737.9 | 642.9 |
+| 16 | 794.5, median 58 | 771.9 | 672.5 |
+| 16, sequential | 798.1 | — | — |
+
+- **Latency:** min 12–15 cycles in every case. The worst seen was 100–136 cycles.
+- **What the probe confirmed:**
+  - the bridge holds at least 16 reads (AC = 16);
+  - throughput scales almost linearly to 4 in flight;
+  - at 16 in flight it reaches 99% of the port's 800 MB/s peak.
+- **Sharing costs little:** the frame buffer and polygon store take 7–17% of what the textures get.
+- **D-33 is confirmed.** R75's VF3 p99 fill rate, about 99 MB/s (53,790 fills × 32 B × 57.5 Hz), is
+  under a sixth of what 4 in flight delivers alongside the other traffic.
+- **D-34:** there is no case on these numbers for moving the frame buffer or the store off DDR3.
+- **R72 is confirmed:** the wedge was cleared by the power cycle, and with both gates (R71) no build
+  wedged it again over eight core loads.
+
+**Viewers on the board** (MGL load, screenshot):
+- **Textured viewer, R74, seed 1** (382c2b86…): frame 7860 matches `render_d25` with textures on every
+  pixel outside the overlay. This is the planks-over-water image.
+- **Viewer v3, R79, seed 3** (2aba8ce6…): geometry set-up and nearest mip. It matches the bench's mip
+  reference (`png_mip/f007860_rtl.png`) on every pixel outside the overlay. It differs from level 0 on
+  51,299 pixels, as mip should.

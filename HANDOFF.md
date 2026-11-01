@@ -1,39 +1,53 @@
 # Handoff
 
-## Current state (2026-10-31, evening)
+## Current state (2026-11-01)
 
-Committed this evening in four commits, from verified snapshots (see the log). The
-study's §15 R26–R63 and D-17–D-31 carry every finding and decision; this is the summary.
+Committed today from a verified snapshot (see the log). The study's §15 R64–R82 and
+D-32–D-36 carry every finding and decision; this is the summary.
 
 - **CPU** (`rtl/cpu`):
-  - 603e integer core, MMU and interrupts (R31).
-  - FPU: double FMA plus a fast single path at latency 6 and a pipelined frsqrte
-    estimate (R53, R63).
-  - 16 KiB I and D caches, connected, with pipelined loads (R36, R44).
-  - On the board at 100 MHz with and without caches, every report identical to the
-    simulation (R63, 19:07). Full-build closure holds on one fitter seed in three, so a
-    timing pass is under way.
-  - Next: BTB (64, look-ahead), dynamic branch direction and 2-word fetch (D-30), then
-    about 110 MHz (R58).
-- **Framework:** release form. Dual SDRAM (no analog board), plus the NN, ADAPTIVE, YC
-  and ALSA switches. The audio filter and `vga_osd` stay, for direct video (D-26, R57).
-- **Real3D geometry** (`rtl/real3d`): about 7,170 ALM, 100 MHz, bit-exact on 800 frames,
-  Supermodel rows per D-19/D-25 (R60).
-- **Rasteriser:** 100 MHz half width (D-28). Front, intake and Z span are built:
-  2,439 of 8,000 ALM (R62). Translucency is the plain blend (D-29).
-- **Sound:** both SCSPs on one engine, bit-identical to two, 2,148 ALM. It runs at
-  80 MHz with FM kept (R59, D-29). Not yet in a top level.
-- **Budget** (D-27, R54): framework + CPU about 11.4K + 6.2K, geometry about 7.5K,
-  rasteriser about 7K, sound about 4.4K, everything else 3.5K. About 40.7K against
-  41K usable, with no slack: every new block needs §8.4 sharing from the start.
+  - Timing pass: the spike runs at 108–110 MHz (R70).
+  - D-30 built: a 64-entry BTB looked up a request ahead, two-word fetch, and the 603e's
+    own branch look-ahead (R78). Frames lost in the CPI model: 360 → 15.
+  - On the board: every report identical to the simulation, P00 000011DA uncached and
+    00001E34 cached, P09 unchanged.
+  - Two-word fetch costs about 880 ALM for 5 frames lost. D-36 turns it off once the
+    regression passes with `FETCH2 = 0`; the default in the tree is still on.
+  - Full-build closure at 100 MHz holds on one seed in three per form. Most failing paths
+    are test-harness paths.
+- **Geometry** (`rtl/real3d`):
+  - D-32's M10K trade (R68).
+  - Two late-acknowledge bugs fixed (R73), with a hostile-timing bench to catch that kind.
+  - Set-up on the pool (`SETUP_OUT`, R76): 77% / 71% p99 for VF3 / Bass Fishing. Daytona 2
+    is at 118%.
+  - The LOD word for nearest mip (R75).
+  - Default build 7,505–7,526 ALM, meeting 100 MHz at both slow corners.
+- **Rasteriser:**
+  - Blocks 1–7 are built and exact: Z band, interpolants, fog depth, colour, texel,
+    texture cache at 100 MHz, band buffers (R66, R67).
+  - Nearest mip is built (R75).
+  - Blocks 8–9 (binned store, top level) are in progress and not in this commit.
+- **DDR3:**
+  - A pipelined master `m3_ddr3p`. On the board after a power cycle it reaches 794 MB/s at
+    16 reads in flight, and 486 MB/s at 4 with the frame-buffer and store traffic (R82).
+  - Every DDR3 client waits for hps_io and `RESET` low for 100 ms (R71). An early access
+    wedged the port until a power cycle (R72).
+  - Textures stay in DDR3 (D-33); the frame buffer stays too (D-34).
+- **M2.5 viewer** (`quartus/m3_viewer`): VF3 frame 7860, from a dump, on the MiSTer.
+  - Untextured (R64), textured (R74), and with the geometry's set-up and nearest mip (R79).
+  - All three are bit-exact against the simulation on the board.
+  - A frame still takes about 0.25 s, waiting for the binned store.
+- **Tile generator** (M0-E, R77): 553–560 ALM, 54 M10K, exact against both emulators.
+  Supermodel is the default. The stencil's bit order needs cabinet footage.
+- **53C810** (M0-F, R80): one opcode (MMOV), single-stepped, no VF3 quirk. 260 ALM.
+- **Builds:**
+  - Multicorner timing is on (D-35); the −40C corner had been hiding misses.
+  - Projection (R81): about 40.6K ALM without two-word fetch, against 41K usable.
 
 ### In progress (uncommitted, in the working tree)
-- CPU timing pass to robust 100 MHz (`rtl/cpu`).
-- Rasteriser: the Z band block and onwards.
-- Geometry: a normal-based facing test, Daytona 2, and the record fields the
-  rasteriser asked for.
-- M2.5 (D-31): one VF3 frame drawn on the MiSTer from a dump, in its own project
-  (`quartus/m3_viewer`).
+- Rasteriser blocks 8–9: `r3d_rast_store`, `r3d_rast`, `r3d_rast_fogvp`, their benches and
+  the Makefile and `faults_rast.py` hunks.
+- D-36: the CPU regression with `FETCH2 = 0` before the default changes.
 
 ## State on 2026-10-30
 
@@ -112,10 +126,27 @@ second SDRAM).
   techniques; SloPPC603 at `tools/sloppc603-ref` as a reference only.
 - Daytona 2 in gameplay (input injection in Supermodel), and the Step 2.x deltas (D-10).
 - Dual-SDRAM memory map once the modules arrive (D-11).
-- M0-D (sound), M0-E (tile generator), M0-F (53C810 SCRIPTS).
+- M0-D (sound) into a top level. M0-E and M0-F are done standalone (R77, R80).
+- Rasteriser blocks 8–9 finished; the viewer moved onto `r3d_rast`; the frame in real time.
+- M1: the CPU, the bridge, board RAM, SCRIPTS and the tile generator in one top level.
+- The tile stencil's bit order, from cabinet footage of VF3's portrait wipes.
 
 ## Findings this session, including the wrong turns
 
+- 2026-11-01: the first DDR3 probe builds touched the port at PLL lock, before Main releases
+  the FPGA ports. That wedged the port across core reloads until a power cycle. Four rounds of
+  diagnosis (owner queue, terminator, late take) ran on a dead port and were wrong (R71, R72).
+- 2026-11-01: every project timed the slow 100C corner only. D-32's geometry builds missed
+  100 MHz at −40C unseen (R73, R79); fixed exactly in R76.
+- 2026-11-01: R67's texture fills came from MAME's lists, which draw back-facing
+  double-sided polygons at level 0. With the geometry's own LOD, fills are about a third
+  (R75).
+- 2026-11-01: the geometry dropped a model when a memory acknowledge came late. Every
+  earlier bench acknowledged within 3 cycles (R73).
+- 2026-11-01: the tile palette needs 52 M10K, not 32 (R77).
+- 2026-11-01: VF3 never auto-starts SCRIPTS (R80).
+- 2026-11-01: D-30's direction rule follows the 603e manual. R61's direction from the BTB
+  entry is not the chip's behaviour (R78).
 - Paper budget was 8K–23K ALM too pessimistic (R10).
 - ROMs in DDR3 was proposed and rejected (R5, D-4).
 - Real3D RAMs measured at 3 MiB of 7–10 MiB of windows; VF3 then fits SDRAM exactly.
@@ -129,7 +160,7 @@ second SDRAM).
 - 2026-10-31: the standalone spike hides memory paths. Both the instruction side (R28)
   and the data side (R32) missed in the full build through the harness's M10K. The
   caches confirm it from the inside (tag M10K output about 2.3 ns late, R36).
-- 2026-10-31: the FPU agent's −200 ALM estimate for one subtract order measured −22 ALM
+- 2026-10-31: my first −200 ALM estimate for one subtract order measured −22 ALM
   and cost 1 ns (R33).
 - 2026-10-31: I briefly believed MAME draws VF3 2× magnified. Supermodel frame grabs
   refuted it (R35).

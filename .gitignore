@@ -99,3 +99,7 @@ quartus/cpu_spike/worst_paths.txt
 # Must stay last: the blanket *.rbf above would otherwise swallow the release.
 !/releases/
 !/releases/*.rbf
+
+# M2.5 viewer load files (tools/viewer/m3v_pack.py): ROM-derived
+*.v3v
+*.v3f

@@ -147,3 +147,69 @@ Supermodel (GPL-3.0-or-later) is instrumented only, through
   the first drives the 68000's interrupts and the MIDI link (`scsp2` has neither
   callback); the 68000's map adds a sample-ROM bank latch at 0x400000. The chip,
   its clock (22.5792 MHz) and its DSP are the same.
+
+## Model 2 core: memory and video for the M2.5 viewer (same author)
+
+- Source: https://github.com/alphanu1/sega-model2-mister (local clone
+  `/home/ben/source/sega-model2-mister`)
+- Commit: `47edd9dc00647e850ea10f4bc2691f4f668c22d0`
+- Licence: GPL-3.0-or-later.
+- Taken unchanged: `rtl/mem/m2_sdram.sv` (CAS 2, the 128 MB module's dual-chip
+  handling R891, eight-word reads R787), `rtl/mem/m2_ddr3.sv` (the DDRAM master),
+  `rtl/video/m2_fb_read.sv` (the 3D layer's line scan-out from DDR3) and
+  `rtl/video/m2_video_timing.sv` (MAME's 656 x 424 / 496 x 384 raster at 16 MHz),
+  into `rtl/mem/` and `rtl/video/`; `sim/mem/sdram_model.sv` into `sim/viewer/`
+  (kept for protocol checks; the viewer's bench models the SDRAM in C++).
+- Followed, not copied: `m2_ddr3_arb.sv`'s grant rules (`rtl/viewer/m3v_ddr_arb.sv`
+  generalises them to five masters), `m2_rom_loader.sv`'s FIFO and `ioctl_wait`
+  gating (`rtl/viewer/m3v_loader.sv`), `m2_raster3d.sv`'s line look-ahead and
+  `Model2.sv`'s pixel enable, SDRAM pin wiring and PLL phase (`rtl/viewer/m3v_core.sv`,
+  `rtl/viewer/m3_viewer.sv`); `m2_ddr3.sv`'s consumer contract and its R362, R660
+  and R661 rules (`rtl/mem/m3_ddr3p.sv`, the pipelined DDR3 master, new code,
+  which the viewer and the DDR3 probe core use in place of `m2_ddr3.sv`).
+
+## MiSTer framework PLL, for the M2.5 viewer
+
+- From this repository's own copy of Template_MiSTer `0874acd` (`rtl/pll.v`,
+  `rtl/pll.qip`, `rtl/pll/`), into `rtl/viewer/pll/`.
+- Changed: `outclk_0` 100 MHz and `outclk_1` 100 MHz at 5000 ps (SDRAM_CLK,
+  Model 2's arrangement), in `pll_0002.v` and the wizard's retrieval comments in
+  `pll.v`.
+
+## MiSTerDDR3Test (Robert Peip): the DDR3 probe core's variable clock
+
+- Source: https://github.com/RobertPeip/MiSTerDDR3Test
+- Commit: `1a11970d7befa7cf12f08bef422555958fe23f60` (2024-09-23)
+- Licence: GPL-3.0 (the repository's `LICENSE`), compatible with GPL-3.0-or-later.
+- Taken: `rtl/pll.v` and `rtl/pll/pll_0002.v` (the reconfigurable 125 MHz
+  Altera PLL) as `rtl/probe/pll_var.v` and `rtl/probe/pll_var/pll_var_0002.v`,
+  and the PLL rewrite sequence of `DDR3Test.sv` (M, C0 and K through the
+  framework's `pll_cfg`: 125, 100, 85 and 62.5 MHz) into `rtl/probe/ddr3_probe.sv`.
+- Changed: the modules renamed `pll_var` / `pll_var_0002`; the top brings
+  `locked` out; a new minimal `rtl/probe/pll_var.qip`; the rewrite is started by
+  a toggle from the probe (`cfg_tgl`, synchronised to CLK_50M) rather than by a
+  status change, and the clock settings are reordered (0 = 100 MHz).
+
+## Tile generator (M0-E): MAME and Supermodel behaviour, Model 2's design
+
+- MAME 0.289 (https://github.com/mamedev/mame, tag `mame0289`, `f34f0250`,
+  BSD-3-Clause, copyright-holders R. Belmont, Ville Linde): `src/mame/sega/model3_v.cpp`
+  `draw_layer`, `screen_update_model3`, `MODEL3_TILE_INFO4/8`, `model3_palette_w`, the
+  `char4_layout` / `char8_layout` decodes; and `src/emu/drawgfx.cpp`
+  `gfx_element::decode`, `src/emu/tilemap.h` (code modulo the element count).
+  Re-expressed statement by statement in `sim/tilegen/tg_ref.h` (`mame_literal`) and as
+  switches of its `param` model; no MAME code is copied verbatim. The dump
+  instrumentation is `tools/mame-census/mame0289-tilegen-dump.patch`.
+- Supermodel (https://github.com/trzy/supermodel, `036af1c`, GPL-3.0-or-later):
+  `Src/Model3/TileGen.cpp` `DrawLine`, `Draw4BitTilePair`, `Draw8BitTilePair`,
+  `GetColour32` and the register accessors, `TileGen.h`'s `ColourOffsetRegister`, and
+  the hardware notes in `Src/Graphics/Render2D.cpp` and `TileGen.h`. Re-expressed in
+  `sim/tilegen/tg_ref.h` (`sm_literal`, `param`); behaviour only, no code. The dump
+  instrumentation is `tools/mame-census/supermodel-tilegen-dump.patch`.
+- Model 2 core (https://github.com/alphanu1/sega-model2-mister, `47edd9dc00`,
+  GPL-3.0-or-later, same author): `rtl/video/m2_tile_fetch.sv`, `m2_tile_decode.sv`,
+  `m2_tile_mixer.sv`, `m2_palette.sv`, `m2_char_cache.sv` read for their design (a
+  fetch engine ahead of an emitter, line banks, skipping masked columns, R823, R906);
+  nothing copied, because Model 3's tile generator is a different chip (see
+  `sim/tilegen/notes.md`). `rtl/real3d/r3d_ram.sv` (this project) is reused for every
+  memory.
