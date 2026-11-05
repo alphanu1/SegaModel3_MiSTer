@@ -453,7 +453,7 @@ module ppc_core
   logic        redirect;                               // hard, decided this cycle
   logic        redirect_c;                             // ... all but a mispredicted branch
   logic        br_go;                                  // a branch leaving EX
-  logic [31:0] redirect_pc;
+  wire  [31:0] redirect_pc;
   logic        redir_q, redir_hard_q;
   logic [31:0] redir_pc_q;
   // A redirect's address is chosen a cycle late from two registered candidates,
@@ -771,15 +771,15 @@ module ppc_core
     end else begin
       // (a failed check made in the cycle of a hard redirect is dropped here,
       // a cycle on, so EX's late decision does not reach bmis_q)
-      redir_q      <= m_z ? (rdf_z1 || f_soft || (bmis_q && !redir_hard_q)) : (rdf_z0 || f_soft || (bmis_q && !redir_hard_q));
-      redir_hard_q <= m_z ? rdf_z1 : rdf_z0;
+      redir_q      <= rdf_x || f_soft || (bmis_q && !redir_hard_q);
+      redir_hard_q <= rdf_x;
       // the candidates load every cycle; only the 2-bit choice waits on the
       // redirect decision (R23 timing). A failed BTB check's redirect is a
       // soft one, its address loaded from a register (cr_tgt_q).
       redir_a_q    <= redirect_pc;
       redir_b_q    <= redirect_pc_b;
       redir_s_q    <= bmis_q ? {cr_tgt_q, 2'b00} : (pw_pred || !FETCH2) ? pw_tgt : pw2_tgt;
-      redir_k_q    <= m_z ? (!rdf_z1 ? 2'd2 : redirect_sel ? 2'd0 : 2'd1) : (!rdf_z0 ? 2'd2 : redirect_sel ? 2'd0 : 2'd1);
+      redir_k_q    <= rdk_x;
       if (f_issue)      f_pc <= fetch_pc + (i_w2 ? 32'd8 : 32'd4);
       else if (redir_q) f_pc <= redir_pc_q;
       else if (s_ok)    f_pc <= f_rsp_pc;              // fetch it again, now translated
@@ -886,13 +886,24 @@ module ppc_core
                        f_issue ? fetch_pc[31:2] + (i_w2 ? 30'd2 : 30'd1) : redir_q ? redir_pc_q[31:2] :
                        s_ok ? f_rsp_pc[31:2] : f_pc[31:2];
   assign ev_btb = {bw_al, rt_q && redir_hard_q, bmis_q, t_go};
+  genvar bce;
   generate
     if (BTB) begin : g_btb
-      ppc_btb #(.N (BTB_N), .XW (24), .STYLE (0), .CURPC (1'b1), .TD (2)) u_btb (
+      // the request's address against the lookup's (the BTB's CURPC compare), made for each of fetch's
+      // five candidates and chosen by f_sel as the address is: redir_a_q through fetch_pc's mux and the
+      // 30-bit compare into the prediction's enables was -0.57 ns at 100 MHz (study R104)
+      logic [31:2] bt_rdq;
+      always_ff @(posedge clk) bt_rdq <= bt_rd;
+      // (kept: without it synthesis shared one compare behind the candidates' mux again)
+      (* keep = 1 *) wire [4:0] bt_ceq;
+      for (bce = 0; bce < 5; bce++) begin : g_bceq
+        assign bt_ceq[bce] = fc_pc[bce][31:2] == bt_rdq;
+      end
+      ppc_btb #(.N (BTB_N), .XW (24), .STYLE (0), .CURPC (1'b1), .CUREQ (1'b1), .TD (2)) u_btb (
         .clk (clk), .rst (rst),
         .rd_pc (bt_rd),
         .ctx ({f_ir, f_pr}),
-        .cap (f_issue), .cur_pc (fetch_pc[31:2]),
+        .cap (f_issue), .cur_pc (fetch_pc[31:2]), .cur_eq (bt_ceq[f_sel]),
         .p_v (bt_pv), .p_tgt (bt_tgt), .p_reg (bt_preg), .p_x (bt_x),
         .p_take (t_go), .kill (bt_kill),
         .w_en (bw_al || bw_inv), .w_v (bw_al), .w_pc (bw_key), .w_ctx ({f_ir, f_pr}), .w_reg (al_reg),
@@ -1080,11 +1091,24 @@ module ppc_core
   // access), so EX always holds its step 0 as it leaves ID. From predecode
   // flops already in the queue: no register of its own.
   wire id_xuea    = id_s1 && q_pd.crack == 2'd1 && !q_pd.fdx && !q_pd.fpw && !q_pd.ifault;
-  wire load_use   = !id_xuea &&
-                    ((ex_is_load && ex_u.rd_we && lu_q(qe_e, q_pd.ua, q_pd.ub, q_pd.us)) ||
-                     (m_ldw && lu_q(qe_m, q_pd.ua, q_pd.ub, q_pd.us)) ||
-                     (wb_ldw && lu_q(qe_w, q_pd.ua, q_pd.ub, q_pd.us)) ||
-                     hash_wait);
+  // formed for both values of d_valid and chosen by it last (timing, study R104: the D-cache's
+  // d_valid through wb_ldw and the hazard terms into the queue's pop and its 60-bit head was the 100 MHz
+  // system build's worst path, six LUTs; now d_valid is one LUT from load_use)
+  wire lu_rest    = (ex_is_load && ex_u.rd_we && lu_q(qe_e, q_pd.ua, q_pd.ub, q_pd.us)) ||
+                    (m_ldw && lu_q(qe_m, q_pd.ua, q_pd.ub, q_pd.us)) || hash_wait;
+  wire lu_wb      = wb_valid && wb_live_q && wb_rd_we && lu_q(qe_w, q_pd.ua, q_pd.ub, q_pd.us);
+  (* keep = 1 *) wire load_use_d0 = !id_xuea && (lu_rest || lu_wb);
+  (* keep = 1 *) wire load_use_d1 = !id_xuea && (lu_rest || (lu_wb && wb_sp1));
+  wire load_use   = d_valid ? load_use_d1 : load_use_d0;
+`ifdef R104_CHECK
+  // (the equivalence checks of the R104 restructuring: off in the planted-fault runs, which would
+  // otherwise be caught here rather than by the benches)
+  always_ff @(posedge clk)
+    if (!rst && load_use != (!id_xuea && (hash_wait || (lu_q(qe_e, q_pd.ua, q_pd.ub, q_pd.us) && ex_is_load && ex_u.rd_we) ||
+                                          (lu_q(qe_m, q_pd.ua, q_pd.ub, q_pd.us) && m_ldw) ||
+                                          (lu_q(qe_w, q_pd.ua, q_pd.ub, q_pd.us) && wb_ldw))))
+      $fatal(1, "load_use by d_valid");
+`endif
 
   // the uop that finishes the instruction: on a first uop from the predecode;
   // after it from a flag registered as the step advances (an update form's
@@ -2138,7 +2162,18 @@ module ppc_core
   wire         m_kill   = m_kp && !wb_hold;
   // (where EX advances, MEM does too, so WB is not holding: there m_kill is
   // m_kp, which is formed from registers alone and not behind WB's wait)
-  wire         irq_req  = msr_q[MSR_EE] && (int_q || dec_pend);
+  // MSR[EE] registered for the request (timing, study R104: msr_q through the request, EX's exception
+  // and the redirect into fetch's registers was -1.11 ns at 100 MHz). Every MSR write redirects, so no
+  // instruction reaches EX in the clock where the copy lags an EE change. The sources stay live: a first
+  // version registered the whole request, and an interrupt line that dropped while EE was 1 was then
+  // still seen for a clock, taken with int_q low, as a decrementer interrupt (0x900); Daytona 2 hung on
+  // its warning screen with it (study R104).
+  logic        ee_q;
+  always_ff @(posedge clk) ee_q <= !rst && msr_q[MSR_EE];
+  wire         irq_req  = ee_q && (int_q || dec_pend);
+`ifdef R104_CHECK
+  always_ff @(posedge clk) if (!rst && ex_valid && ee_q != msr_q[MSR_EE]) $fatal(1, "EE copy behind EX");
+`endif
 
   // EX holds for multiply/divide, for a load or store the memory side cannot
   // take (d_rdy), and whenever MEM holds.
@@ -3056,7 +3091,6 @@ module ppc_core
     exc_vec = msr_q[MSR_IP] ? 32'hFFF0_0000 : 32'd0;
     redirect_c    = 1'b0;
     br_go         = 1'b0;
-    redirect_pc   = 32'd0;
     // b: a branch that falls through, or a redirect from MEM or WB. Which
     // one is chosen by registers: MEM can kill (m_kp) only where EX cannot
     // redirect (if MEM does not advance, EX holds), and a fired trap reaches
@@ -3069,25 +3103,24 @@ module ppc_core
     if (ex_adv) begin
       case (ex_u.op)
         OP_BRANCH:  begin
-                      redirect_pc  = br_target;          // not behind the taken decision
                       redirect_sel = br_taken;
                       br_go        = 1'b1;          // redirects on a mispredict (below)
                     end
-        OP_SC:      begin redirect_c = 1'b1; redirect_pc = exc_vec | 32'h0C00; end
-        OP_ILLEGAL: begin redirect_c = 1'b1; redirect_pc = exc_vec | 32'h0700; end
+        OP_SC:      redirect_c = 1'b1;
+        OP_ILLEGAL: redirect_c = 1'b1;
         // A trap redirects to the next instruction from EX, decided by the
         // opcode alone; if it fired, MEM redirects again to the vector one cycle
         // later (below). The operand compare is then off the fetch path entirely
         // (R23 timing). Nothing younger can be in EX or ID by then: the first
         // redirect flushed them. Traps do not appear in VF3's census (R12).
-        OP_TRAP:    begin redirect_c = 1'b1; redirect_pc = ex_u.pc + 32'd4; end
-        OP_RFI:     begin redirect_c = 1'b1; redirect_pc = {srr0_in[31:2], 2'b00}; end
+        OP_TRAP:    redirect_c = 1'b1;
+        OP_RFI:     redirect_c = 1'b1;
         OP_MTMSR, OP_ISYNC:
-                    begin redirect_c = 1'b1; redirect_pc = ex_u.pc + 32'd4; end
+                    redirect_c = 1'b1;
         default: ;
       endcase
       if (ex_xcm) begin                                // (a kill from MEM overrides it below)
-        redirect_c = 1'b1; redirect_pc = exc_vec | {19'd0, mx.xvec}; redirect_sel = 1'b1;
+        redirect_c = 1'b1; redirect_sel = 1'b1;
       end
     end
     // from MEM: a data translation fault, one cycle on, or the refetch after
@@ -3098,6 +3131,40 @@ module ppc_core
       redirect_sel = 1'b0;                             // redirect_pc_b
     end
   end
+
+  // EX's redirect address, without ex_adv: redir_a_q (its only reader) is chosen only when EX
+  // advanced (redir_k_q = 0 needs a redirect with redirect_sel set, which only an advancing EX makes),
+  // so its value in any other cycle is never used. ex_valid -> ex_adv -> the 32-bit mux into
+  // redir_a_q was a 110 MHz system build's worst core path (timing, study R104)
+  // The exception's vector is formed here for both values of ex_s0ok (it decides only the
+  // interrupt, xc_irq) and chosen by it last, so the register is one LUT from the 32-bit mux
+  // (the 100 MHz build's ex_s0ok -> redir_a_q, -0.62 ns). The vectors are mx.xvec's (checked below).
+  logic [31:0] rp_case;
+  always_comb
+    case (ex_u.op)
+      OP_BRANCH:          rp_case = br_target;
+      OP_SC:              rp_case = exc_vec | 32'h0C00;
+      OP_ILLEGAL:         rp_case = exc_vec | 32'h0700;
+      OP_TRAP:            rp_case = ex_u.pc + 32'd4;
+      OP_RFI:             rp_case = {srr0_in[31:2], 2'b00};
+      OP_MTMSR, OP_ISYNC: rp_case = ex_u.pc + 32'd4;
+      default:            rp_case = 32'd0;
+    endcase
+  wire        xc_noirq = ex_ifault || xc_fpx || ex_fpun;           // ex_xcm without the interrupt
+  wire        xc_irq0  = irq_req && ex_first;                      // xc_irq where ex_s0ok = 0
+  wire [12:0] xv_noirq = xc_fpx ? 13'h0700 : (ex_ifault && ifl_miss) ? 13'h1000 : ex_ifault ? 13'h0400 : 13'h0800;
+  wire [12:0] xv_s0    = xc_fpx ? 13'h0700 : xc_irq0 ? (int_q ? 13'h0500 : 13'h0900) : xv_noirq;
+  (* keep = 1 *) wire [31:0] rp_s1 = xc_noirq ? (exc_vec | {19'd0, xv_noirq}) : rp_case;
+  (* keep = 1 *) wire [31:0] rp_s0 = (xc_noirq || xc_irq0) ? (exc_vec | {19'd0, xv_s0}) : rp_case;
+  assign redirect_pc = ex_s0ok ? rp_s1 : rp_s0;
+`ifdef R104_CHECK
+  always_ff @(posedge clk)
+    if (!rst && redirect_pc != (ex_xcm ? (exc_vec | {19'd0, mx.xvec}) : rp_case)) $fatal(1, "redirect_pc by ex_s0ok");
+  always_ff @(posedge clk)
+    if (!rst && redir_q && redir_k_q == 2'd0 && !ra_adv_q) $fatal(1, "redir_a_q chosen without EX advancing");
+  logic ra_adv_q;
+  always_ff @(posedge clk) ra_adv_q <= ex_adv;
+`endif
 
   // A mispredict from both values of MEM's zero detect, chosen by it last
   // (br_tk above); the redirect for fetch's registers is a copy of its own
@@ -3121,6 +3188,36 @@ module ppc_core
   (* keep = 1 *) wire rdf_z1 = redirect_c || (br_go && (brt_z1 != ex_pred));
 `ifdef VERILATOR
   always_ff @(posedge clk) if (!rst && (m_z ? rdf_z1 : rdf_z0) != redirect) $fatal(1, "redirect by m_z");
+`endif
+  // fetch's three registers again, now formed for both values of EX's advance as well and chosen by
+  // it (ex_valid && !ex_hold) and m_z last: WB's wb_got through ex_hold, the redirect and the choice
+  // into redir_k_q was a 100 MHz system build's worst path, -1.11 ns (study R104). Where EX does not
+  // advance only MEM's kill or a fired trap redirects (to redirect_pc_b).
+  logic rc_a, bg_a, sl_a;
+  always_comb begin
+    rc_a = 1'b0; bg_a = 1'b0; sl_a = 1'b1;
+    case (ex_u.op)
+      OP_BRANCH: bg_a = 1'b1;
+      OP_SC, OP_ILLEGAL, OP_TRAP, OP_RFI, OP_MTMSR, OP_ISYNC: rc_a = 1'b1;
+      default: ;
+    endcase
+    if (ex_xcm) rc_a = 1'b1;
+    if (m_kill || wb_trap) begin rc_a = 1'b1; sl_a = 1'b0; end
+  end
+  wire              rd_kn   = m_kill || wb_trap;
+  (* keep = 1 *) wire       rdfa_z0 = rc_a || (bg_a && (brt_z0 != ex_pred));
+  (* keep = 1 *) wire       rdfa_z1 = rc_a || (bg_a && (brt_z1 != ex_pred));
+  // redirect_sel: a branch's taken bit (by m_z), else 1, with MEM's kill choosing b
+  (* keep = 1 *) wire [1:0] rdka_z0 = !rdfa_z0 ? 2'd2 : (sl_a && (!bg_a || ex_xcm || brt_z0)) ? 2'd0 : 2'd1;
+  (* keep = 1 *) wire [1:0] rdka_z1 = !rdfa_z1 ? 2'd2 : (sl_a && (!bg_a || ex_xcm || brt_z1)) ? 2'd0 : 2'd1;
+  wire              ex_advx = ex_valid && !ex_hold;
+  wire              rdf_x   = ex_advx ? (m_z ? rdfa_z1 : rdfa_z0) : rd_kn;
+  wire [1:0]        rdk_x   = ex_advx ? (m_z ? rdka_z1 : rdka_z0) : (rd_kn ? 2'd1 : 2'd2);
+`ifdef R104_CHECK
+  always_ff @(posedge clk)
+    if (!rst && (rdf_x != (m_z ? rdf_z1 : rdf_z0) ||
+                 rdk_x != (m_z ? (!rdf_z1 ? 2'd2 : redirect_sel ? 2'd0 : 2'd1) : (!rdf_z0 ? 2'd2 : redirect_sel ? 2'd0 : 2'd1))))
+      $fatal(1, "fetch's redirect registers by ex_adv");
 `endif
 
   // the MSR that fetch continues under, loaded with every redirect (a trap's

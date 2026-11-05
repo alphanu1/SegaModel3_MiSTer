@@ -282,6 +282,12 @@ module ppc_icache
 `endif
   wire         p_ui     = p_unc || (pend_new && (wi_q || pa[31:12] == RSV_TAG));
   wire         chk      = pend && !p_ui && !p_line && ta_v && !ta_look && ta_idx == pa[11:5] && !t_haz && !wk_act;
+  // p_ui without pa's reserved-page compare, for the data read address only (timing, study R104: pa ->
+  // the 16 data RAMs' address was the system's worst I-cache path). The two differ only in a request's
+  // first pending cycle for the reserved page, which is a single read: it never uses the data RAMs, and
+  // p_unc holds it from the next cycle, so a read of pa + 1 there is never answered.
+  wire         p_ui_a   = p_unc || (pend_new && wi_q);
+  wire         chk_a    = pend && !p_ui_a && !p_line && ta_v && !ta_look && ta_idx == pa[11:5] && !t_haz && !wk_act;
   wire         look     = !pend && ta_v && ta_look && kl_v && ta_idx == kl[11:5] + 7'd1 && ta_exp == kl[31:12] &&
                           !t_haz && !wk_act;
   wire         fast     = i_req && i_seq && fs_q && !pend;
@@ -315,20 +321,34 @@ module ppc_icache
   logic        serve_r;                         // ... decided from registers (no compare)
   logic [1:0]  src;                             // 0 kl_way, 1 mru, 2 m_rdata, 3 fb_d
   logic        start_fill, to_unc, chk_hit;
+  // (src with p_ui_a too: where it differs from p_ui nothing is answered, so i_data, which is read
+  // only beside i_valid, may take the MRU way's word there; R104)
   always_comb begin
-    serve_r = 1'b0; src = 2'd0;
+    src = 2'd0;
     if (pend && !wk_act) begin
-      if (p_ui) begin
-        src = 2'd2;
-        serve_r = (mp == MP_SRD) && m_rvalid;
-      end else if (p_line) begin
-        if (pfw_q) begin                        // the word is still on its way
-          src     = m_rvalid ? 2'd2 : 2'd3;
-          serve_r = m_rvalid ? (beat && bw == pa[4:2]) : (fb_v && fb_w == pa[4:2]);
-        end else serve_r = da == pa[11:2] && da_av;
+      if (p_ui_a) src = 2'd2;
+      else if (p_line) begin
+        if (pfw_q) src = m_rvalid ? 2'd2 : 2'd3;   // the word is still on its way
       end else src = 2'd1;
     end
   end
+  // serve_r with p_ui_a: where p_ui and p_ui_a differ (a first pending cycle) p_line is clear and no
+  // single read is out, so serve_r is 0 either way (asserted below)
+  always_comb begin
+    serve_r = 1'b0;
+    if (pend && !wk_act) begin
+      if (p_ui_a) serve_r = (mp == MP_SRD) && m_rvalid;
+      else if (p_line) begin
+        if (pfw_q) serve_r = m_rvalid ? (beat && bw == pa[4:2]) : (fb_v && fb_w == pa[4:2]);
+        else serve_r = da == pa[11:2] && da_av;
+      end
+    end
+  end
+`ifdef R104_CHECK
+  always_ff @(posedge clk)
+    if (!rst && pend && !wk_act && p_ui != p_ui_a && (p_line || (mp == MP_SRD && m_rvalid)))
+      $fatal(1, "icache p_ui against p_ui_a");
+`endif
   always_comb begin
     serve = serve_r; start_fill = 1'b0; to_unc = 1'b0; chk_hit = 1'b0;
     if (chk) begin
@@ -359,7 +379,7 @@ module ppc_icache
     else if (pfast)          rd_a = i_addr[11:2] + 10'd1;   // a miss is then served a cycle later
     else if (fast)           rd_a = nxn[11:2];
     else if (i_req && !pend) rd_a = i_addr[11:2];
-    else if (pend)           rd_a = (serve_r || (chk && WAYPRED)) ? pa1[11:2] : pa[11:2];
+    else if (pend)           rd_a = (serve_r || (chk_a && WAYPRED)) ? pa1[11:2] : pa[11:2];
     else                     rd_a = nx[11:2];
   end
 

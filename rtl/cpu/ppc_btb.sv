@@ -158,6 +158,7 @@ module ppc_btb #(
   parameter int XW    = 0,                   // extra payload bits
   parameter int STYLE = 0,                   // 0 M10K, 1 MLAB
   parameter bit CURPC = 1'b0,                // the hit also compares cur_pc (above)
+  parameter bit CUREQ = 1'b0,                // ... with that compare made by the caller (cur_eq; study R104)
   parameter int TD    = 0                    // tag bits PC[29 -: TD] left out (below)
 )(
   input  logic          clk,
@@ -167,6 +168,7 @@ module ppc_btb #(
   input  logic [1:0]    ctx,
   input  logic          cap,
   input  logic [31:2]   cur_pc,
+  input  logic          cur_eq,             // CUREQ: cur_pc == rd_pc of the last edge
 
   output logic          p_v,
   output logic [31:2]   p_tgt,
@@ -268,7 +270,10 @@ module ppc_btb #(
   wire          e_reg = q[EW-4-TW];
   wire [31:2]   e_tgt = q[XW+29 -: 30];
   wire          hit   = e_v && e_tag == tag_of(rpc_q) && e_ctx == ctx && !rdw_q &&   // (a sweep clears p_v below)
-                        (!CURPC || cur_pc == rpc_q);
+                        (!CURPC || (CUREQ ? cur_eq : cur_pc == rpc_q));
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && CURPC && CUREQ && cur_eq != (cur_pc == rpc_q)) $fatal(1, "btb cur_eq");
+`endif
 
   // the payload loads on a capture whatever the kill (p_v alone says it is
   // live), so the core's late kill drives one flip-flop, not the payload's

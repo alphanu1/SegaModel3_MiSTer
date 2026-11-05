@@ -410,23 +410,35 @@ module ppc_fpu_fma
   // bit then at V[161 - sh], sh = ep0 - eb + 160. Addend-anchored E0 = eb - 160.
   // fctiw: V[161] weighs 2^52, so the integer's LSB lands on the double LSB.
   exp_t e0;
-  logic [7:0] sh;
+  logic [7:0] sh, sh_o;
   wire spc1 = special;
   always_comb begin
     if (kq.cvt) begin
       e0 = exp_t'(-108);
-      sh = (r1a_q.sh_cvt > exp_t'(255)) ? 8'd255 : r1a_q.sh_cvt[7:0];
+      sh_o = (r1a_q.sh_cvt > exp_t'(255)) ? 8'd255 : r1a_q.sh_cvt[7:0];
     end else if (spc1 || !prod_live) begin
       e0 = ebn - exp_t'(160);
-      sh = 8'd0;
+      sh_o = 8'd0;
     end else if (!add_on || sh_raw < 0) begin
       e0 = add_on ? (ebn - exp_t'(160)) : ep0;
-      sh = add_on ? 8'd0 : 8'd255;
+      sh_o = add_on ? 8'd0 : 8'd255;
     end else begin
       e0 = ep0;
-      sh = (sh_raw > exp_t'(255)) ? 8'd255 : sh_raw[7:0];
+      sh_o = (sh_raw > exp_t'(255)) ? 8'd255 : sh_raw[7:0];
     end
   end
+  // sh as above with the special-operand decision last (timing, study R104: kq's classes through
+  // imz, pinf, isi and special into the coarse shift copies was a 110 MHz system build's FPU path).
+  // Where special is clear, prod_live is has_a & ~a_zero & ~c_zero and add_on is has_b & ~b_zero.
+  wire       pl_ns = kq.has_a & ~kq.a_zero & ~kq.c_zero;
+  wire       ab_ns = kq.has_b & ~kq.b_zero;
+  wire [7:0] sh_ns = !pl_ns ? 8'd0 : !ab_ns ? 8'd255 : (sh_raw < 0) ? 8'd0 :
+                     (sh_raw > exp_t'(255)) ? 8'd255 : sh_raw[7:0];
+  wire [7:0] sh_cv = (r1a_q.sh_cvt > exp_t'(255)) ? 8'd255 : r1a_q.sh_cvt[7:0];
+  assign sh = kq.cvt ? sh_cv : (sh_ns & {8{~special}});
+`ifdef R104_CHECK
+  always_ff @(posedge clk) if (!rst && r1a_v && sh != sh_o) $fatal(1, "fma sh restructured");
+`endif
 
   // a NaN operand quieted, the default QNaN, or zero (infinity)
   logic [51:0] sp_frac;

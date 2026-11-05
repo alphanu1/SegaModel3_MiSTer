@@ -132,6 +132,7 @@ bool g_board = false;
 bool g_mis = false;                           // --mis: misaligned accesses (mis_mem)
 bool g_alias = false;                         // --alias: overlapping registers in update forms (alias_mem)
 bool g_loops = false;
+uint32_t g_intdrop = 40000;   // the interrupt line drops before it is taken, 1 in N clocks (--intdrop, study R104)
 int g_snoop = 0;                              // --snoop n (PPC_CPU only)                         // --loops: backward branches, calls and (real mode) rewritten code                         // --emit: the board harness without caches cannot dcbz       // fixed data / fetch wait (0: random), % of cycles with d_rdy low
 
 // ---------------------------------------------------------------- memory
@@ -1384,7 +1385,7 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
     // inputs for this cycle
     bool tick = irq_mode && (cycles % uint64_t(tick_div)) == 0;
     if (irq_mode && !int_drv && irng() % int_rate == 0) int_drv = true;
-    else if (int_drv && irng() % 40000 == 0) int_drv = false;              // dropped before it is taken
+    else if (int_drv && irng() % g_intdrop == 0) int_drv = false;          // dropped before it is taken (--intdrop N: 1 in N clocks)
     top.tb_tick = tick;
     top.ext_int = int_drv;
     int_h[hist(0)] = int_drv;
@@ -1780,6 +1781,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--ilat") && i + 1 < argc) g_ilat = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--rdy") && i + 1 < argc) g_rdy = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--loops")) g_loops = true;
+    else if (!strcmp(argv[i], "--intdrop") && i + 1 < argc) g_intdrop = uint32_t(atoi(argv[++i]));   // study R104
     else if (!strcmp(argv[i], "--mis")) g_mis = true;
     else if (!strcmp(argv[i], "--alias")) g_alias = true;
     else if (!strcmp(argv[i], "--snoop") && i + 1 < argc) g_snoop = atoi(argv[++i]);

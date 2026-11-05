@@ -65,9 +65,10 @@ FAULTS = [
    "      mx.rd_we = 1'b0;                                   // (an update store writes rA from the second)", "", ['corem']),
   ('mis_qfmx', 'ppc_core.sv',
    "!is_ld && !mis_hold && !algn;", "!is_ld && !algn;", ['corem']),
-  ('mis_ldw', 'ppc_core.sv',
-   "  wire wb_ldw     = wb_valid && wb_live_q && wb_rd_we && (!d_valid || wb_sp1);",
-   "  wire wb_ldw     = wb_valid && wb_live_q && wb_rd_we && !d_valid;", ['corem']),
+  ('mis_ldw', 'ppc_core.sv',                           # (load_use by d_valid, study R104: WB's load
+   # forwards on its answer alone, wb_sp1 ignored)
+   "(* keep = 1 *) wire load_use_d1 = !id_xuea && (lu_rest || (lu_wb && wb_sp1));",
+   "(* keep = 1 *) wire load_use_d1 = !id_xuea && lu_rest;", ['corem']),
   ('mis_half3', 'ppc_core.sv',
    "ex_msh && boff == 2'd3;", "1'b0;", ['corem']),
   ('mis_half1', 'ppc_core.sv',
@@ -92,7 +93,7 @@ FAULTS = [
   ('load_use_mem', 'ppc_core.sv',
    "(m_ldw && lu_q(qe_m,", "(1'b0 && lu_q(qe_m,", ['core']),
   ('wb_fwd_early', 'ppc_core.sv',
-   "(wb_ldw && lu_q(qe_w,", "(1'b0 && lu_q(qe_w,", ['core']),
+   "wire lu_wb      = wb_valid && wb_live_q && wb_rd_we && lu_q(qe_w,", "wire lu_wb      = 1'b0 && lu_q(qe_w,", ['core']),
   ('answer_order', 'ppc_core.sv',
    "wire ans_wb = d_valid && wb_out;\n  wire ans_m  = d_valid && !wb_out && m_out;",
    "wire ans_wb = d_valid && wb_out && !m_out;\n  wire ans_m  = d_valid && m_out;", ['core']),
@@ -449,8 +450,16 @@ FAULTS = [
    ["  wire id_xuea    = id_s1 && q_pd.crack == 2'd1 && !q_pd.fdx && !q_pd.fpw && !q_pd.ifault;",
     '      $fatal(1, "update load kind of %08X (step 1 %b) against the raw word", q_hi, id_s1);\n'],
    ["  wire id_xuea    = 1'b0;", "      ;\n"], ['corea', 'suba']),
+  # study R104's restructured paths: the interrupt's vector chosen by ex_s0ok, the FMA's shift
+  # with the special-operand decision last
+  # study R104: the whole interrupt request registered (the Daytona 2 hang): caught only with --intdrop
+  ('r104_irq_reg', 'ppc_core.sv', "  wire         irq_req  = ee_q && (int_q || dec_pend);",
+   "  logic irq_req; always_ff @(posedge clk) irq_req <= !rst && ee_q && (int_q || dec_pend);", ['corei']),
+  ('r103_irq_vec', 'ppc_core.sv', "  assign redirect_pc = ex_s0ok ? rp_s1 : rp_s0;", "  assign redirect_pc = rp_s1;", ['core']),
+  ('r103_fma_spc', 'ppc_fpu_fma.sv', "assign sh = kq.cvt ? sh_cv : (sh_ns & {8{~special}});", "assign sh = kq.cvt ? sh_cv : sh_ns;", ['core']),
   ('upd_luse', 'ppc_core.sv',                          # step 1 waits on its own load: its EA has left EX
-   "  wire load_use   = !id_xuea &&", "  wire load_use   =", ['corea']),
+   ["wire load_use_d0 = !id_xuea && (", "wire load_use_d1 = !id_xuea && ("],
+   ["wire load_use_d0 = (", "wire load_use_d1 = ("], ['corea']),
   ('upd_imm', 'ppc_core.sv',                           # y left at the form's immediate (d, or fimm_q's 4)
    "    if (id_xuea) id_imm = 32'd0;", "", ['corea']),
   ('upd_yreg', 'ppc_core.sv',                          # y from rB, as before
@@ -464,8 +473,8 @@ VFLAGS = ['--cc', '--exe', '--build', '-j', '8', '-O3', '-Wno-fatal', '-Wno-UNUS
 def build_run(d, bench, drop=''):
     rtl = [os.path.join(d, 'rtl', 'cpu', f + '.sv') for f in CPU_RTL]
     sim = os.path.join(ROOT, 'sim')
-    if bench in ('core', 'sub', 'corel', 'subl', 'corem', 'subm', 'subs', 'corea', 'suba'):
-        top = 'ppc_core' if bench in ('core', 'corel', 'corem', 'corea') else 'ppc_cpu'
+    if bench in ('core', 'sub', 'corel', 'subl', 'corem', 'subm', 'subs', 'corea', 'suba', 'corei'):
+        top = 'ppc_core' if bench in ('core', 'corel', 'corem', 'corea', 'corei') else 'ppc_cpu'
         defs = '' if top == 'ppc_core' else ' -DPPC_CPU'
         obj = os.path.join(d, 'obj_' + bench)
         cmd = ['verilator'] + VFLAGS + ['--top-module', top]
@@ -481,6 +490,7 @@ def build_run(d, bench, drop=''):
                 'corel': [[exe, '300', '30001', '1500', '4', '--loops'], [exe, '150', '31001', '1500', '9', '--loops', '--rdy', '25']],
                 'subl':  [[exe, '100', '33001', '1500', '6', '--loops'], [exe, '100', '34001', '1500', '80', '--loops']],
                 # misaligned accesses
+                'corei': [[exe, '200', '1', '1500', '4', '--intdrop', '300'], [exe, '150', '40001', '1500', '4', '--mis', '--intdrop', '100']],
                 'corem': [[exe, '200', '40001', '1500', '4', '--mis'], [exe, '150', '41001', '1500', '9', '--mis', '--rdy', '25'],
                           [exe, '150', '42001', '1500', '4', '--mis', '--dlat', '1']],
                 'subm':  [[exe, '100', '53001', '1500', '80', '--mis'], [exe, '60', '54001', '1500', '6', '--mis']],

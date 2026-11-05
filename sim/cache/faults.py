@@ -17,6 +17,13 @@ OPS = 100000
 
 FAULTS = [
   # name, cache, what it breaks, file, old, new
+  # study R104: a load to the filling line answered from the fill's words
+  ('d_fh_early', 'd', 'fill hit: answered before its word arrives',
+   'ppc_dcache.sv', "fav[x_a[4:2]] && !mq_v", "1'b1 && !mq_v"),
+  ('d_fh_store', 'd', 'fill hit: during a store miss fill (its merge not seen)',
+   'ppc_dcache.sv', "f_act && f_k != K_ST &&", "f_act &&"),
+  ('d_fh_word', 'd', 'fill hit: the word one on',
+   'ppc_dcache.sv', "fh ? fbuf[x_a[4:2]][31-8*l -: 8]", "fh ? fbuf[3'(x_a[4:2] + 3'd1)][31-8*l -: 8]"),
   ('d_repl_invalid', 'd', 'replacement: victim ignores invalid ways',
    'ppc_dcache.sv', "wire  [1:0]  d_vic    = d_ff[2] ? d_ff[1:0] : plru_victim(dq_st[2:0]);",
    "wire  [1:0]  d_vic    = plru_victim(dq_st[2:0]);"),
@@ -99,7 +106,7 @@ FAULTS = [
    'ppc_icache.sv', "m_addr <= {pa, 2'd0}; m_be <= 4'hF; m_cmd <= start_fill ? MC_LINE_RD : MC_RD;",
    "m_addr <= start_fill ? {pa[31:5], 5'd0} : {pa, 2'd0}; m_be <= 4'hF; m_cmd <= start_fill ? MC_LINE_RD : MC_RD;"),
   ('i_stale_fill', 'i', 'stale read: a word read on the edge it was written is served',
-   'ppc_icache.sv', "end else serve_r = da == pa[11:2] && da_av;", "end else serve_r = da == pa[11:2];"),
+   'ppc_icache.sv', "        else serve_r = da == pa[11:2] && da_av;", "        else serve_r = da == pa[11:2];"),
   ('i_stale_tag', 'i', 'stale read: tags written on the read edge are trusted',
    'ppc_icache.sv', "wire         t_haz = (tw_en_q != 2'd0 && tw_set_q == ta_idx) || (tw_last && tw_lset == ta_idx) ||",
    "wire         t_haz = (tw_en_q != 2'd0 && tw_set_q == ta_idx) ||"),

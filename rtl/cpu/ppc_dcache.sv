@@ -558,6 +558,15 @@ module ppc_dcache
   wire [31:0]  fs_wd    = fs_mq ? mq_wd    : dq_wd;
   wire beat     = (mp == MP_FILL) && m_rvalid;
   wire er_ans   = beat && f_cnt == 3'd0 && f_k == K_LD;      // the critical word, as it arrives
+  // A load to the line being filled, held in X by the set's block, is answered from the fill's own
+  // copy of the words (fbuf) as soon as its word has arrived, not when the fill ends (study R104).
+  // Not for a store miss's fill (its store is merged at the end), nor with a miss, decision or single
+  // access waiting, nor in a retry phase; stores to the line, and every other access to the set, still
+  // wait for the fill to end. The fill wrote the tags at its start, so the line is resident.
+  logic [31:0] fbuf [8];
+  logic [7:0]  fav;
+  wire fh = x_v && x_k == K_LD && !x_byp && x_ph == 2'd0 && f_act && f_k != K_ST && x_a[31:5] == f_a[31:5] &&
+            fav[x_a[4:2]] && !mq_v && !dq_v && !uq_v;
   wire srd_ans  = (mp == MP_SRD) && m_rvalid;
   wire cp_rd    = cp_act && !cp_cnt[3];
   wire z_wr     = z_act && !z_wcp && !z_cnt[3];
@@ -609,21 +618,21 @@ module ppc_dcache
   logic [31:0] ld_word;
   always_comb
     for (int l = 0; l < 4; l++) begin
-      if (er_ans || srd_ans)         ld_word[31-8*l -: 8] = m_rdata[31-8*l -: 8];
+      if (er_ans || srd_ans || fh)   ld_word[31-8*l -: 8] = fh ? fbuf[x_a[4:2]][31-8*l -: 8] : m_rdata[31-8*l -: 8];
       else if (sb_m  && sb_be[3-l])  ld_word[31-8*l -: 8] = sb_wd[31-8*l -: 8];
       else if (sbl_m && sbl_be[3-l]) ld_word[31-8*l -: 8] = sbl_wd[31-8*l -: 8];
       else                           ld_word[31-8*l -: 8] = dq[pw][31-8*l -: 8];
     end
 
   always_ff @(posedge clk) begin
-    d_valid <= !rst && (post || (l_ans && !l_post) || er_ans || srd_ans);
+    d_valid <= !rst && (post || (l_ans && !l_post) || er_ans || srd_ans || fh);
     d_rdata <= ld_word;
   end
 
   // ============================================================ R, X
   // Only the valid bits (and X's phase and known way) wait on the compare.
   wire l_end  = (lk && l_ans) || l_post;        // the lookup ends its request
-  wire x_end  = x_v && ((lx && lk && l_ans) || er_ans || srd_ans);
+  wire x_end  = x_v && ((lx && lk && l_ans) || er_ans || srd_ans || fh);
   wire x_take = lr && !l_end;                   // R's lookup did not end it: to X
   wire r_v_n     = d_req || (r_v && !lr);
   wire r_fresh_n = d_req ? rd_sel == RD_NEW : rd_sel == RD_R;
@@ -769,7 +778,7 @@ module ppc_dcache
       // ---- FU
       if (fill_go) begin
         if (fs_mq) mq_v <= 1'b0;
-        f_act <= 1'b1; f_ph <= 2'd0; f_cnt <= 3'd0;
+        f_act <= 1'b1; f_ph <= 2'd0; f_cnt <= 3'd0; fav <= 8'd0;
         f_k   <= fs_k; f_a <= fs_a; f_be <= fs_be; f_wd <= fs_wd; f_way <= fs_way; f_wb <= fs_vd;
         tw_en_q  <= fs_way[1] ? 2'b10 : 2'b01;
         tw_set_q <= fs_a[11:5];
@@ -777,6 +786,7 @@ module ppc_dcache
       end else if (f_act) begin
         if (beat) begin
           fb_v <= 1'b1; fb_w <= f_a[4:2] + f_cnt; fb_d <= m_rdata;
+          fbuf[f_a[4:2] + f_cnt] <= m_rdata; fav[f_a[4:2] + f_cnt] <= 1'b1;
           f_cnt <= f_cnt + 3'd1;
           if (f_cnt == 3'd7) f_ph <= 2'd1;
         end else if (f_ph != 2'd0) begin
