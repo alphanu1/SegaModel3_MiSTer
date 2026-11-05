@@ -1,0 +1,108 @@
+<misterromdescription>
+    <!--
+      Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1
+      SPDX-License-Identifier: GPL-3.0-or-later
+
+      Daytona USA 2 - Battle on the Edge (Japan, Revision A). Step 2.1 (study R100): attract mode, no sound, I/O stubbed (D-37).
+      From MAME 0.289 model3.cpp ROM_START(daytona2); sim/system/m3_mra.py writes it,
+      and packs the same images for the system bench. One download per index
+      (rtl/sys/m3_loader.sv):
+        4  the game configuration: step, flags, CROM bank map, idle inputs
+        1  VROM, 64 MiB, in the extra memory (DDR3 byte 0x38000000)
+        3  fixed CROM, 8 MiB, SDRAM 0x7300000 (FF800000-FFFFFFFF)
+        0  banked CROM, 96 MiB in 12 slots of 8 MiB from SDRAM 0; backup RAM
+           at 0x6200000, 128 KiB of 00; last, so its end releases the reset
+        2  <nvram>: config/nvram/<this file>.nvm, if present: backup RAM, then
+           the 93C46. The game needs its link setting at Single, or it stops
+           at "NETWORK BOARD NOT PRESENT"; m3_mra.py nvram converts a
+           Supermodel NVRAM file. No NVRAM data is in this repository.
+      Word form: the PowerPC's 32-bit word at A is the little-endian word at
+      the memory's A. The sound ROMs are not loaded (D-8).
+    -->
+    <name>Daytona USA 2 - Battle on the Edge (Japan, Revision A)</name>
+    <setname>daytona2</setname>
+    <rbf>Model3</rbf>
+    <mameversion>0289</mameversion>
+    <year>1998</year>
+    <manufacturer>Sega</manufacturer>
+    <category>Driving</category>
+
+    <!-- game configuration: step 21, flags 07 (VROM in the extra memory, fixed CROM 8 MiB, VROM 64 MiB), bank map, idle ports C and D -->
+    <rom index="4" md5="none">
+        <part>21 07 00 01 02 03 04 05 06 07 08 09 80 80 0A 0B 80 80 AF FF</part>
+    </rom>
+    <rom index="1" zip="daytona2.zip" md5="none">
+        <!-- 0x0000000  VROM block 0, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-20870.26" crc="7c9e573d" map="00000021"/>
+            <part name="mpr-20871.27" crc="47a1b789" map="00002100"/>
+            <part name="mpr-20872.28" crc="2f55b423" map="00210000"/>
+            <part name="mpr-20873.29" crc="c9000e48" map="21000000"/>
+        </interleave>
+        <!-- 0x1000000  VROM block 1, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-20874.30" crc="26a9cca2" map="00000021"/>
+            <part name="mpr-20875.31" crc="bfefd21e" map="00002100"/>
+            <part name="mpr-20876.32" crc="fa701b87" map="00210000"/>
+            <part name="mpr-20877.33" crc="2cd072f1" map="21000000"/>
+        </interleave>
+        <!-- 0x2000000  VROM block 2, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-20878.34" crc="e6d5bc01" map="00000021"/>
+            <part name="mpr-20879.35" crc="f1d727ec" map="00002100"/>
+            <part name="mpr-20880.36" crc="8b370602" map="00210000"/>
+            <part name="mpr-20881.37" crc="397322e7" map="21000000"/>
+        </interleave>
+        <!-- 0x3000000  VROM block 3, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-20882.38" crc="9185be51" map="00000021"/>
+            <part name="mpr-20883.39" crc="d1e39e83" map="00002100"/>
+            <part name="mpr-20884.40" crc="63c4639a" map="00210000"/>
+            <part name="mpr-20885.41" crc="61c292ca" map="21000000"/>
+        </interleave>
+    </rom>
+    <rom index="3" zip="daytona2.zip" md5="none">
+        <!-- fixed CROM, 8 MiB (FF800000-FFFFFFFF) -->
+        <interleave output="64">
+            <part name="epr-20862a.18" crc="e1b2ca61" map="21000000"/>
+            <part name="epr-20861a.17" crc="89ba8e78" map="00210000"/>
+            <part name="epr-20864a.20" crc="5250f3a8" map="00002100"/>
+            <part name="epr-20863a.19" crc="1deb4686" map="00000021"/>
+        </interleave>
+    </rom>
+    <rom index="0" zip="daytona2.zip" md5="none">
+        <!-- 0x0000000  CROM0, 32 MiB (banks 0, 1, 2, 3) -->
+        <interleave output="64">
+            <part name="mpr-20846.2" crc="f44c5c7a" map="21000000"/>
+            <part name="mpr-20845.1" crc="6037712c" map="00210000"/>
+            <part name="mpr-20848.4" crc="5b6c8b7d" map="00002100"/>
+            <part name="mpr-20847.3" crc="eda966ee" map="00000021"/>
+        </interleave>
+        <!-- 0x2000000  CROM1, 32 MiB (banks 4, 5, 6, 7) -->
+        <interleave output="64">
+            <part name="mpr-20850.6" crc="cb73758a" map="21000000"/>
+            <part name="mpr-20849.5" crc="50dee4af" map="00210000"/>
+            <part name="mpr-20852.8" crc="d606ad38" map="00002100"/>
+            <part name="mpr-20851.7" crc="6e7a64b7" map="00000021"/>
+        </interleave>
+        <!-- 0x4000000  CROM2, 16 MiB (banks 8, 9) -->
+        <interleave output="64">
+            <part name="mpr-20854.10" crc="68d94cdf" map="21000000"/>
+            <part name="mpr-20853.9" crc="3245ee68" map="00210000"/>
+            <part name="mpr-20856.12" crc="0367a242" map="00002100"/>
+            <part name="mpr-20855.11" crc="f1ff0794" map="00000021"/>
+        </interleave>
+        <!-- 0x5000000  CROM3, 16 MiB (banks 12, 13) -->
+        <interleave output="64">
+            <part name="mpr-20858.14" crc="407fbad5" map="21000000"/>
+            <part name="mpr-20857.13" crc="1eab9c62" map="00210000"/>
+            <part name="mpr-20860.16" crc="e5ce2939" map="00002100"/>
+            <part name="mpr-20859.15" crc="e14f5c46" map="00000021"/>
+        </interleave>
+        <!-- 0x6000000  (the Step 1.0 fixed CROM's place, unused here), 2 MiB of 00 -->
+        <part repeat="0x200000">00</part>
+        <!-- 0x6200000  backup RAM, 128 KiB of 00 (Supermodel's fresh state); the NVRAM file overwrites it -->
+        <part repeat="0x20000">00</part>
+    </rom>
+    <nvram index="2" size="131200"/>
+</misterromdescription>

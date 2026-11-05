@@ -1,6 +1,33 @@
 # Handoff
 
-## Current state (2026-11-01, night)
+## Current state (2026-11-05)
+
+The study's §15 R95–R104 and D-43 carry every finding; this is the summary. The tree is build `t100d8`'s RTL
+(RBF b8b6effd), the first build that runs both games from one `Model3.rbf`.
+
+- **Board, `t100d8` (100 MHz, setup -1.71 ns, hold positive):** VF3 attract clean, 27-30 fps; Daytona 2 attract
+  runs with the cars, road and buildings correct. Daytona's car shadows and skid marks draw as bright blue noisy
+  shapes (translucent/shadow polygons, untriaged).
+- **What got VF3 from 14.5 to ~28 fps:** PVR 0x00060103 with the D-cache snoop (copy-back RAM, D-41, R101);
+  SDRAM write bursts; every SDRAM pin packed in I/O cells (the `sd_a` setting in `Model3.qsf`; without it boards
+  corrupted SDRAM by placement luck, R101); VROM in DDR3 (`VROM_LOC`, R100, R102); 100 MHz (R104); the critical-pair
+  line fill and D-cache fill-line hits; the tile generator's name-row buffer (39% fewer SDRAM requests, R103).
+- **Why VF3 sits at ~28 fps:** it shows a frame when the CPU's work is done, and about 94% of frames need just over
+  one vblank. The CPU is the limit (CPI ~2.2-3.2 at 100 MHz). Row 7's frame-busy histogram measures how far over.
+- **Daytona 2 (Step 2.1, R100):** Step 2 bus map, 315-5881 security, JTAG, the Real3D DMA front end, the Step 2
+  texture port, VROM in DDR3 at byte 0x38000000. The loader bug that sent Daytona's CROM slots 8-11 to DDR3 is fixed
+  (`m3_loader`, R100); before the fix the newer builds only ran after `dt2fit90` had loaded the memories.
+- **Area: 41,386 ALM (99%), 324 M10K.** CPI_MON is off in `Model3.sv` to make room for Step 2. Not in the tree:
+  the FPU area changes (divider, frsqrte table, -331 ALM, `sm3-builds/area104/handoff`) and the frame-busy
+  vblank-only measure (`sm3-builds/pre_commit_keep`).
+
+### Next
+- Free a lot of ALM, then 110 MHz: CPU core and cache area (split `ppc_core`), the FPU handoff, timing fixes.
+- Daytona's shadows and skid marks.
+- Frame-busy histogram in its vblank-only form, then read it on VF3 to see how much speed-up flips frames.
+- The second SDRAM for VROM when the board has it (`VROM_LOC = 2`).
+
+## State on 2026-11-01 (night)
 
 The study's §15 R83–R94 and D-37–D-42 carry every finding and decision; this is the summary.
 
@@ -124,6 +151,15 @@ second SDRAM).
 
 ## Findings this session, including the wrong turns
 
+- 2026-11-05: Daytona 2 hung at the warning screen on every build from the Step 2 merge after a power cycle.
+  Bisecting the CPU, cache, tile and Real3D changes on the board found nothing; the cause was the loader routing
+  index 0's 0x4000000-0x5FFFFFF to DDR3 for every game (R100). The benches preloaded memory and never ran the loader.
+- 2026-11-05: registering the whole interrupt request (R104 fix 18) took a phantom decrementer interrupt; only
+  MSR[EE] is registered now. It was a real bug but not the Daytona hang.
+- 2026-11-03: the corrupt textures and boot failures of the first PVR 1.3 builds were nine SDRAM address pins left
+  out of the I/O cells, not copy-back, the snoop or the bursts (R101). My first reading, a hold miss, was wrong.
+- 2026-11-02: the bench warned VROM in DDR3 would be slower; on the board it was faster, because VROM had been
+  queuing behind the CPU on the shared SDRAM (R100, R102).
 - 2026-11-01 (night): VF3 crashed twice on CPU gaps that the core benches never generated: a misaligned word load
   (R85), and lbzux with rD = rB (R91). Both were found from the board overlay plus the system bench; the
   decrementer interrupt seen before the second crash was a red herring.

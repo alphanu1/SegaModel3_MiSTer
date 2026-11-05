@@ -99,6 +99,22 @@ Bass Fishing Deluxe `79D30-79D38,79CB8-79CC0,79C64-79C6C,79CC4-79CCC,88A9C-88AA0
 (vblank-flag polls, a decrementer poll, a timebase poll and two count-down loops, from a
 6,000-frame attract run's hottest-PC table).
 
+What each loop polls, from the code (study R104; VF3 from a RAM dump at frame 1302, Daytona 2 from its fixed CROM,
+which holds the RAM image at 0x600000):
+
+| Game | Window | Polls | Kind |
+|---|---|---|---|
+| VF3 | `1E928-1E930` | byte r13+0x8034 until it changes, then clears it | vblank (the 0x500 handler's tile-generator path at 0x1ADC counts it up, reloads DEC and acknowledges at F1180010) |
+| VF3 | `1E97C-1E984` | the same byte, when DEC has run out | vblank |
+| VF3 | `1E9DC-1E9E4` | `mfdec` until DEC >= 0 | decrementer wait |
+| VF3 | `1E9FC-1EA04` | byte r13+0x8037 until it changes (then compared with 2) | the decrementer handler's count (0x900 -> 0x1A28) |
+| VF3 | `2518-251C` | `addic.` / `bne` | count-down |
+| Daytona 2 | `4C6CC-4C6D4` | byte 0x100030 until it changes, then clears it | vblank (VF3's 0x8034 pattern) |
+| Daytona 2 | `4C73C-4C744` | `mfdec` | decrementer wait |
+| Daytona 2 | `4C754-4C760` | byte 0x100033 until it changes (then compared with 2) | as VF3's 0x8037 |
+
+Only the vblank polls end a frame for the overlay's per-frame CPU time (`rtl/dbg/m3_frame_busy.sv`).
+
 `M3SHOT_DIR` (with `M3SHOT_EVERY`, or `M3SHOT_LIST` for a comma-separated list of frame
 numbers) saves numbered framebuffer grabs. They are taken
 before the 3D is drawn, so they show the 2D layers only. Supermodel's BMP header has a

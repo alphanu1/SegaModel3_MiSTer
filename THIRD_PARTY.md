@@ -233,3 +233,17 @@ Supermodel (GPL-3.0-or-later) is instrumented only, through
   nothing copied, because Model 3's tile generator is a different chip (see
   `sim/tilegen/notes.md`). `rtl/real3d/r3d_ram.sv` (this project) is reused for every
   memory.
+
+## MAME 0.289, the 315-5881 security chip's cipher (tables taken, study R100)
+
+- Source: MAME 0.289, `src/mame/sega/315-5881_crypt.cpp` (the same code is Supermodel's
+  `Src/Model3/Crypto.cpp`).
+- Licence: BSD-3-Clause (copyright-holders: Andreas Naive, Olivier Galibert, David Haywood),
+  compatible with GPL-3.0-or-later.
+- Taken: the S-box tables, the key schedules and the cipher's structure (`block_decrypt`),
+  read from the file by `sim/system/gen_m3_5881.py`, which writes `rtl/sys/m3_5881.sv` (marked
+  generated, with MAME's notice). The stream around it (`rtl/sys/m3_sec.sv`: the header,
+  the word history, the block length) is written for this core from Supermodel's
+  `ReadSecurity` / `WriteSecurity` and `CCrypto::Decrypt`; checked against Supermodel's
+  bus trace of Daytona 2 (253,386 reads, `make -f sim/system/system.mk test_sec`).
+- Changed: logic instead of loops; the compressed-stream mode is not built.
