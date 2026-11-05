@@ -11,6 +11,24 @@
 //              [--ppm DIR] [--ppm-at F,F..] [--window BYTES] [--quiet] [--tb-fast]
 //              [--save FILE] [--restore FILE] [--r3d DIR --r3d-at F,F..]
 //              [--ddr-busy PCT] [--ddr-lat LO HI]
+//              [--cfg FILE] [--xmem FILE] [--fix8 FILE] [--nvram FILE] [--prof-vrom FILE]   (study R100)
+//
+// --prof-vrom appends a line a frame: frame, cycles the geometry was busy, VROM
+// requests, VROM words, cycles a VROM request was waiting (raised to its last word).
+//
+// VROM placement (R100, m3_system VROM_LOC): a VF3-size image's VROM (bytes
+// 0x4000000-0x5FFFFFF) is also put into the DDR3 model's extra memory, and a
+// --window of it goes through ioctl and is found in SDRAM or DDR3, as the build
+// places it. --vrom-x N sets the game configuration's flag bit 0 after loading or
+// restoring: with a VROM_LOC 0 build, the readers then use SDRAM (0) or DDR3 (1),
+// so one checkpoint measures both.
+//
+// The other MRA indexes (m3_loader.sv; m3_mra.py pack writes them as
+// IMG.iN.bin): --cfg the game configuration (index 4, all through ioctl),
+// --xmem the extra memory's image (index 1: a --window through ioctl into the
+// DDR3 model at beat 0x1000000, the rest straight in), --fix8 a Step 2 set's
+// fixed CROM (index 3, likewise, SDRAM 0x7300000), --nvram the NVRAM file
+// (index 2, all through ioctl, after index 0 as Main sends it).
 //
 // --save writes a checkpoint when the run ends (the model, built --savable,
 // and the bench's own state: the SDRAM, the tile state, the cycle count);
@@ -65,7 +83,7 @@ static uint64_t cyc;
 
 // DDR3 at the framework's DDRAM pins (64-bit words from the core's base)
 struct ddr_dev {
-  static constexpr uint64_t BASE = 0x06000000, SIZE = 0xD00000;
+  static constexpr uint64_t BASE = 0x06000000, SIZE = 0x1800000;   // to the end of the extra memory (R100)
   std::vector<uint64_t> m = std::vector<uint64_t>(SIZE);
   int busy_pct = 10, lat_lo = 12, lat_hi = 40;
   uint32_t wr_left = 0; uint64_t wr_addr = 0;
@@ -87,16 +105,24 @@ int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
   bool prof = false, pf_req = false;
   uint32_t pf_last = 0;
-  uint64_t pf_cyc = 0, pf_ins = 0, pf_w[256] = {}, pf_n[256][4] = {};
-  std::string img_fn, trace_fn, dump_dir, ppm_dir, save_fn, restore_fn;
+  uint64_t pf_cyc = 0, pf_ins = 0, pf_w[256] = {}, pf_n[256][4] = {}, pf_inf[6] = {}, pf_infw[6] = {}, pf_pndw[6] = {};
+  std::string img_fn, trace_fn, dump_dir, ppm_dir, save_fn, restore_fn, cfg_fn, xmem_fn, fix8_fn, nvram_fn, pv_fn;
   long nframes = 10, window = 0x10000;
   std::set<long> dump_at, ppm_at, r3d_at;
   std::string r3d_dir;
   bool quiet = false, tb_fast = false, fatal_stop = true;
+  uint32_t tb_pc = 0xFFF00198;          // where --tb-fast ends (0: the first instruction in RAM)
+  int vrom_x = -1;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto nx = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
     if (a == "--image") img_fn = nx();
+    else if (a == "--cfg") cfg_fn = nx();
+    else if (a == "--xmem") xmem_fn = nx();
+    else if (a == "--fix8") fix8_fn = nx();
+    else if (a == "--nvram") nvram_fn = nx();
+    else if (a == "--prof-vrom") pv_fn = nx();
+    else if (a == "--vrom-x") vrom_x = std::atoi(nx().c_str());
     else if (a == "--frames") nframes = std::atol(nx().c_str());
     else if (a == "--trace") trace_fn = nx();
     else if (a == "--dump") dump_dir = nx();
@@ -107,6 +133,7 @@ int main(int argc, char **argv) {
     else if (a == "--quiet") quiet = true;
     else if (a == "--prof") prof = true;
     else if (a == "--tb-fast") tb_fast = true;
+    else if (a == "--tb-fast-pc") tb_pc = uint32_t(std::strtoul(nx().c_str(), nullptr, 16));
     else if (a == "--no-fatal-stop") fatal_stop = false;
     else if (a == "--save") save_fn = nx();
     else if (a == "--restore") restore_fn = nx();
@@ -123,6 +150,17 @@ int main(int argc, char **argv) {
     if (std::fread(img.data(), 1, img.size(), f) != img.size()) return 2;
     std::fclose(f);
   }
+  auto slurp = [](const std::string &fn) {
+    std::vector<uint8_t> v;
+    if (fn.empty()) return v;
+    std::FILE *f = std::fopen(fn.c_str(), "rb");
+    if (!f) { std::fprintf(stderr, "cannot read %s\n", fn.c_str()); std::exit(2); }
+    std::fseek(f, 0, SEEK_END); v.resize(size_t(std::ftell(f))); std::fseek(f, 0, SEEK_SET);
+    if (std::fread(v.data(), 1, v.size(), f) != v.size()) std::exit(2);
+    std::fclose(f);
+    return v;
+  };
+  std::vector<uint8_t> cfg_img = slurp(cfg_fn), xmem_img = slurp(xmem_fn), fix8_img = slurp(fix8_fn), nvram_img = slurp(nvram_fn);
   std::FILE *trf = trace_fn.empty() ? nullptr : std::fopen(trace_fn.c_str(), restore_fn.empty() ? "wb" : "ab");
 
   t = new Vm3_system;
@@ -162,6 +200,14 @@ int main(int argc, char **argv) {
       uint8_t const e = q->m3_system__DOT__g_mon__DOT__u_mon__DOT__ev_q;
       pf_cyc++; if (e & 1) pf_ins++;
       if (e & 0x20) pf_w[pf_last >> 24]++;
+      // SDRAM ports (0 CPU bus, 1 tiles, 2 m3v_sdr_rd, 3 VROM geometry, 4 r3d_mem, 5 r3d_texup):
+      // transfers in flight, and in flight or waiting while the CPU waits on data
+      uint8_t const inf = q->m3_system__DOT__u_sdram__DOT__inflight, pnd = q->m3_system__DOT__u_sdram__DOT__pend;
+      for (int k = 0; k < 6; k++) {
+        if ((inf >> k) & 1) pf_inf[k]++;
+        if ((e & 0x20) && ((inf >> k) & 1)) pf_infw[k]++;
+        if ((e & 0x20) && ((pnd >> k) & 1)) pf_pndw[k]++;
+      }
     }
   };
 
@@ -193,6 +239,70 @@ int main(int argc, char **argv) {
     is.close();
     std::printf("restored %s: frame %u, cycle %" PRIu64 "\n", restore_fn.c_str(), t->frame, cyc);
   } else {
+  // 0. the other indexes, in the MRA's order (R100): the configuration, the
+  // extra memory, the fixed CROM; each a window through ioctl, checked, and the
+  // rest put straight into the model
+  auto download = [&](int index, const std::vector<uint8_t> &d, size_t n) {
+    t->ioctl_index = uint16_t(index); t->ioctl_download = 1;
+    for (size_t a = 0; a < n; a += 2) {
+      while (t->ioctl_wait) tick();
+      t->ioctl_wr = 1; t->ioctl_addr = uint32_t(a); t->ioctl_dout = uint16_t(d[a] | (a + 1 < d.size() ? d[a + 1] << 8 : 0));
+      tick();
+      t->ioctl_wr = 0;
+      for (int k = 0; k < 3; k++) tick();
+    }
+    t->ioctl_download = 0;
+    for (int k = 0; k < 4; k++) tick();
+    long g = 0;
+    while (t->rootp->m3_system__DOT__loader_busy && g++ < 4000000) tick();
+    t->ioctl_index = 0;
+  };
+  if (!cfg_img.empty()) {
+    download(4, cfg_img, cfg_img.size());
+    std::printf("loader: configuration, step %02X flags %02X, idle inputs %02X %02X, banks", t->rootp->m3_system__DOT__cfg_step,
+                t->rootp->m3_system__DOT__cfg_flags, t->rootp->m3_system__DOT__cfg_in2, t->rootp->m3_system__DOT__cfg_in3);
+    for (int b = 0; b < 16; b++) {
+      auto const &cb = t->rootp->m3_system__DOT__cfg_bank;
+      uint64_t const v = (uint64_t(cb[(5 * b) / 32 + 1 < 3 ? (5 * b) / 32 + 1 : 2]) << 32) | cb[(5 * b) / 32];
+      std::printf(" %02X", unsigned((v >> ((5 * b) % 32)) & 31));
+    }
+    std::printf("\n");
+  }
+  if (!xmem_img.empty()) {
+    size_t const n = std::min(size_t(window), xmem_img.size());
+    // windows at the start, the middle and the end of the region (R100: the second 32 MiB too)
+    std::vector<size_t> at = {0};
+    if (xmem_img.size() >= 2 * n) { at.push_back(xmem_img.size() / 2); at.push_back(xmem_img.size() - n); }
+    for (size_t o : at) for (size_t b = 0; b < n / 8; b++) dd.m[0x1000000 + o / 8 + b] = 0xA55AA55AA55AA55Aull;
+    t->ioctl_index = 1; t->ioctl_download = 1;
+    for (size_t o : at)
+      for (size_t a = o; a < o + n; a += 2) {
+        while (t->ioctl_wait) tick();
+        t->ioctl_wr = 1; t->ioctl_addr = uint32_t(a); t->ioctl_dout = uint16_t(xmem_img[a] | (xmem_img[a + 1] << 8));
+        tick(); t->ioctl_wr = 0;
+        for (int k = 0; k < 3; k++) tick();
+      }
+    t->ioctl_download = 0;
+    for (int k = 0; k < 4; k++) tick();
+    { long g = 0; while (t->rootp->m3_system__DOT__loader_busy && g++ < 4000000) tick(); }
+    t->ioctl_index = 0;
+    long bad = 0;
+    for (size_t o : at)
+      for (size_t b = 0; b < n / 8; b++) { uint64_t v; std::memcpy(&v, &xmem_img[o + 8 * b], 8); if (dd.m[0x1000000 + o / 8 + b] != v) bad++; }
+    std::printf("loader: extra memory, %zu windows of %zu bytes through ioctl, %ld beats wrong\n", at.size(), n, bad);
+    if (bad) { std::printf("FAIL\n"); return 1; }
+    for (size_t b = 0; b < xmem_img.size() / 8; b++) std::memcpy(&dd.m[0x1000000 + b], &xmem_img[8 * b], 8);
+  }
+  if (!fix8_img.empty()) {
+    size_t const n = std::min(size_t(window), fix8_img.size());
+    for (size_t a = 0; a < n; a += 2) sd.m[(0x7300000 + a) >> 1] = 0xA55A;
+    download(3, fix8_img, n);
+    long bad = 0;
+    for (size_t a = 0; a < n; a += 2) if (sd.m[(0x7300000 + a) >> 1] != uint16_t(fix8_img[a] | (fix8_img[a + 1] << 8))) bad++;
+    std::printf("loader: fixed CROM, %zu bytes through ioctl, %ld words wrong\n", n, bad);
+    if (bad) { std::printf("FAIL\n"); return 1; }
+    for (size_t a = 0; a + 1 < fix8_img.size(); a += 2) sd.m[(0x7300000 + a) >> 1] = uint16_t(fix8_img[a] | (fix8_img[a + 1] << 8));
+  }
   // 1. the loader: a window of the image through ioctl
   for (size_t a = 0; a < img.size(); a += 2) sd.m[a >> 1] = uint16_t(0xA55A);   // not the image: the window must be written
   t->ioctl_download = 1;
@@ -203,9 +313,40 @@ int main(int argc, char **argv) {
     t->ioctl_wr = 0;
     for (int k = 0; k < 3; k++) tick();        // the HPS's pace, roughly
   }
+  bool const vf3_vrom = img.size() >= 0x6000000 && xmem_img.empty();
+  bool const vr_win = img.size() >= 0x4000000 + size_t(window);   // the window at 0x4000000: VROM (Step 1.x) or CROM (Step 2)
+  if (vr_win) {
+    if (xmem_img.empty()) for (long b = 0; b < window / 8; b++) dd.m[0x1000000 + b] = 0xA55AA55AA55AA55Aull;
+    for (long a = 0x4000000; a < 0x4000000 + window; a += 2) {
+      while (t->ioctl_wait) tick();
+      t->ioctl_wr = 1; t->ioctl_addr = uint32_t(a); t->ioctl_dout = uint16_t(img[a] | (img[a + 1] << 8));
+      tick();
+      t->ioctl_wr = 0;
+      for (int k = 0; k < 3; k++) tick();
+    }
+  }
   t->ioctl_download = 0;
   long guard = 0;
   while (!t->rom_loaded && guard++ < 2000000) tick();
+  if (vr_win) {
+    long in_sdr = 0, in_ddr = 0;
+    for (long a = 0; a < window; a += 8) {
+      uint64_t v; std::memcpy(&v, &img[0x4000000 + a], 8);
+      if (dd.m[0x1000000 + a / 8] == v) in_ddr++;
+      bool ok = true;
+      for (int k = 0; k < 4; k++) if (sd.m[(0x4000000 + a) / 2 + k] != uint16_t(img[0x4000000 + a + 2 * k] | (img[0x4000000 + a + 2 * k + 1] << 8))) ok = false;
+      if (ok) in_sdr++;
+    }
+    std::printf("loader: the window of %ld bytes at 0x4000000 (%s): %ld beats in DDR3, %ld in SDRAM\n", window,
+                xmem_img.empty() ? "VROM" : "banked CROM", in_ddr, in_sdr);
+    // a Step 2 set's banked CROM there must be in SDRAM, and its VROM in DDR3 untouched (R100: the merged
+    // builds sent CROM slots 8-11 over VROM)
+    long clob = 0;
+    if (!xmem_img.empty())
+      for (long b = 0; b < window / 8; b++) { uint64_t v; std::memcpy(&v, &xmem_img[8 * b], 8); if (dd.m[0x1000000 + b] != v) clob++; }
+    if (!xmem_img.empty()) std::printf("loader: VROM beats overwritten in DDR3: %ld\n", clob);
+    if ((!xmem_img.empty() && (in_sdr != window / 8 || clob)) || (in_ddr != window / 8 && in_sdr != window / 8)) { std::printf("FAIL\n"); return 1; }
+  }
   long ld_bad = 0;
   for (long a = 0; a < window; a += 2)
     if (sd.m[a >> 1] != uint16_t(img[a] | (img[a + 1] << 8))) ld_bad++;
@@ -218,8 +359,19 @@ int main(int argc, char **argv) {
   // it shifts frame numbers by about 48 against Supermodel's.
   t->tb_fast = tb_fast;
   if (const char *e = std::getenv("M3_LOGW")) sd.log_writes = std::atol(e);
-  // 2. the rest straight into the model (the game is still in reset this cycle)
+  // 2. the rest straight into the model (the game is still in reset this cycle); a VF3-size
+  // image's VROM into both memories (the build or --vrom-x picks the one read)
   for (size_t a = 0; a + 1 < img.size(); a += 2) sd.m[a >> 1] = uint16_t(img[a] | (img[a + 1] << 8));
+  if (vf3_vrom) for (size_t b = 0; b < 0x2000000 / 8; b++) std::memcpy(&dd.m[0x1000000 + b], &img[0x4000000 + 8 * b], 8);
+  // 3. the NVRAM file (index 2), all through ioctl: the game is held in reset again meanwhile
+  if (!nvram_img.empty()) {
+    download(2, nvram_img, nvram_img.size());
+    long bad = 0;
+    for (size_t a = 0; a < 0x20000 && a + 1 < nvram_img.size(); a += 2)
+      if (sd.m[(0x6200000 + a) >> 1] != uint16_t(nvram_img[a] | (nvram_img[a + 1] << 8))) bad++;
+    std::printf("loader: NVRAM, %zu bytes through ioctl, %ld backup RAM words wrong, rom_loaded %d\n", nvram_img.size(), bad, int(t->rom_loaded));
+    if (bad) { std::printf("FAIL\n"); return 1; }
+  }
   }
 
   // the tile generator's state as written (CPU byte order), for --dump: pal, regs
@@ -258,11 +410,33 @@ int main(int argc, char **argv) {
   auto t0 = std::chrono::steady_clock::now();
   uint64_t c0 = cyc;
 
+  if (vrom_x >= 0) {
+    t->rootp->m3_system__DOT__cfg_flags = uint8_t((t->rootp->m3_system__DOT__cfg_flags & ~1u) | unsigned(vrom_x & 1));
+    std::printf("VROM readers: flag bit 0 set to %d\n", vrom_x & 1);
+  }
+  std::FILE *pvf = pv_fn.empty() ? nullptr : std::fopen(pv_fn.c_str(), "a");
+  uint64_t pv_busy = 0, pv_req = 0, pv_words = 0, pv_wait = 0;
+  int pv_left = 0; bool pv_on = false; uint32_t pv_frame = t->frame;
   while (t->frame < uint32_t(nframes)) {
     tick();
+    if (pvf) {
+      auto *q = t->rootp;
+      if (q->m3_system__DOT__geo_busy) pv_busy++;
+      if (q->m3_system__DOT__vr_req && !pv_on) { pv_on = true; pv_left = -1; }
+      if (pv_on) pv_wait++;
+      if (q->m3_system__DOT__vr_ack && pv_left < 0) { pv_left = q->m3_system__DOT__vr_len + 1; pv_req++; }
+      if (q->m3_system__DOT__vr_rv && pv_on) { pv_words++; if (pv_left > 0 && --pv_left == 0) pv_on = false; }
+      if (t->frame != pv_frame) {
+        std::fprintf(pvf, "%u %llu %llu %llu %llu\n", pv_frame, (unsigned long long)pv_busy, (unsigned long long)pv_req,
+                     (unsigned long long)pv_words, (unsigned long long)pv_wait);
+        pv_busy = pv_req = pv_words = pv_wait = 0; pv_frame = t->frame;
+      }
+    }
     if (t->rt_valid_o) {
       last_pc = t->rt_pc_o;
-      if (t->tb_fast && last_pc == 0xFFF00198) { t->tb_fast = 0; std::printf("frame %u: boot wait left at cycle %" PRIu64 "\n", t->frame, cyc); }
+      // VF3's wait loop left (FFF00198), or with --tb-fast-pc 0 (R100: Daytona 2's boot ROM also runs FFF00198)
+      // the boot ROM's first instruction in RAM
+      if (t->tb_fast && (tb_pc ? last_pc == tb_pc : (last_pc >= 0x100 && last_pc < 0x00800000))) { t->tb_fast = 0; std::printf("frame %u: boot wait left at cycle %" PRIu64 ", pc %08X\n", t->frame, cyc, last_pc); }
       uint32_t const in = t->rt_insn_o;
       // mtspr to the BATs, SDR1 or HID0: the value from the shadow GPRs
       if ((in >> 26) == 31 && ((in >> 1) & 0x3FF) == 467) {
@@ -456,7 +630,12 @@ int main(int argc, char **argv) {
         for (int r = 0; r < 256; r++) if (pf_w[r] * 200 >= pf_cyc || pf_n[r][0] + pf_n[r][1] + pf_n[r][2] + pf_n[r][3] >= 1000)
           std::printf(" %02X: %.1f%% (cmd0 %" PRIu64 " cmd1 %" PRIu64 " cmd2 %" PRIu64 " cmd3 %" PRIu64 ")", r, 100.0 * double(pf_w[r]) / double(pf_cyc),
                       pf_n[r][0], pf_n[r][1], pf_n[r][2], pf_n[r][3]);
+        std::printf("\n  sdram in flight / in flight in CPU wait / waiting in CPU wait (%% of cycles):");
+        for (int k = 0; k < 6; k++)
+          std::printf(" p%d %.1f/%.1f/%.1f", k, 100.0 * double(pf_inf[k]) / double(pf_cyc), 100.0 * double(pf_infw[k]) / double(pf_cyc),
+                      100.0 * double(pf_pndw[k]) / double(pf_cyc));
         std::printf("\n"); std::fflush(stdout);
+        for (int k = 0; k < 6; k++) pf_inf[k] = pf_infw[k] = pf_pndw[k] = 0;
         pf_cyc = pf_ins = 0; for (auto &w : pf_w) w = 0; for (auto &n : pf_n) for (auto &c : n) c = 0;
       }
       if (!quiet && (frame_seen % 10 == 0 || frame_seen < 5)) {

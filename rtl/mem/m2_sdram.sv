@@ -148,7 +148,16 @@ module m2_sdram #(
   // A[12:11], a READ 00; the top level drives the DQM pins from A[12:11] too,
   // so a module wired either way sees the mask. Needs COL_BITS <= 10 (A11 free
   // in the column phase). 0: as it was (the mask on sd_dqm only).
-  parameter bit            MASK_ON_A = 1'b0
+  parameter bit            MASK_ON_A = 1'b0,
+  // WRITE BURSTS (Model 3, sim/system/notes.md "posted writes"). A port set in
+  // WB writes two columns a request, or eight with p_long, from one ACTIVATE
+  // and one dispatch. Column 0 is p_din / p_be, latched with the request as
+  // for any write; column k + 1's word and mask are read from wb_din / wb_be
+  // while S_WR issues column k (wb_col = k + 1), so the requester keeps the
+  // words and presents the one wb_col names. The address must not cross a row
+  // (two columns: 32-bit aligned; eight: 16-byte aligned). Default none: the
+  // controller exactly as it was.
+  parameter logic [NP-1:0] WB        = '0
 ) (
   input  logic                 clk,
   input  logic                 rst_n,
@@ -207,6 +216,10 @@ module m2_sdram #(
   // texel cache's miss ports use it (Model2.sv); tie to 0 elsewhere.
   input  logic [NP-1:0]        p_long,
   output logic [NP-1:0]        p_lo,
+  // WB ports' write data, column by column (above)
+  output logic [3:0]           wb_col,
+  input  logic [15:0]          wb_din,
+  input  logic [1:0]           wb_be,
 
   // Telemetry taps for bw_monitor. `dbg_req` is the latched pending state
   // rather than the raw input, because demand is "asking and not yet served",
@@ -738,6 +751,11 @@ module m2_sdram #(
   logic [15:0]             din_r;
   logic [1:0]              be_r;
   logic [15:0]             cap_buf [4];
+  // WB: column 0 of a burst write is p_din / p_be as for any write; columns
+  // 1 on are read from wb_din / wb_be into din_r / be_r while S_WR issues the
+  // column before (wb_col = the column after this one; writes have no read
+  // tags, so rd_issued is free to count them)
+  assign wb_col = rd_issued + 4'd1;
 
   // ------------------------------------------- the prefetch handoff (R387)
   // One transaction deep. The front stage fills it, the back stage drains it.
@@ -750,6 +768,11 @@ module m2_sdram #(
   logic [15:0]             nxt_din;
   logic [1:0]              nxt_be;
   logic [3:0]              nxt_total;
+  // R104: an eight-column read by a WB port (the bus's line fill, m3_sdr_port) wraps inside its
+  // 16-column line, so it may start at the critical word's pair: rd_wrap holds the column increment
+  // to the low four bits. Every other read walks the row as before (they start eight-aligned, where
+  // the two are the same).
+  logic                    nxt_wrap, rd_wrap;
   logic                    nxt_is_write;
   // HOW LONG THE DEDICATED WRITE PORT HAS BEEN WAITING. See the prefetch
   // block: it buys the write a bounded wait without handing it the bus.
@@ -1224,7 +1247,9 @@ module m2_sdram #(
           // re-arbitrating; inflight[] stops it being selected twice.
           nxt_grant          <= rr_grant;
           nxt_is_write       <= we_gr;                                              // R959
-          nxt_total          <= we_gr ? 4'd1 : long_gr ? 4'd8 : blen_gr;   // R787 (R959: blen_gr)
+          nxt_total          <= we_gr ? ((|(arb_sel & WB)) ? (long_gr ? 4'd8 : 4'd2) : 4'd1)   // WB: write bursts
+                                      : long_gr ? 4'd8 : blen_gr;   // R787 (R959: blen_gr)
+          nxt_wrap           <= !we_gr && long_gr && (|(arb_sel & WB));                    // R104
           for (int g = 0; g < NP; g++) if (arb_sel[g]) inflight[g] <= 1'b1;   // R959: inflight[rr_grant]
           // R574: a priority grant leaves the rotation where it was, so the
           // other ports keep their order; it counts toward the cap only while
@@ -1267,6 +1292,7 @@ module m2_sdram #(
               wr_inflight <= 1'b1;
               is_write    <= 1'b1;
               rd_total    <= 4'd1;
+              rd_wrap     <= 1'b0;
               rd_issued   <= '0;
               rd_captured <= '0;
               state       <= S_SEL;
@@ -1281,6 +1307,7 @@ module m2_sdram #(
               grant_is_wr <= 1'b0;
               is_write    <= nxt_is_write;
               rd_total    <= nxt_total;
+              rd_wrap     <= nxt_wrap;
               xfer_addr   <= nxt_addr;
               din_r       <= nxt_din;
               be_r        <= nxt_be;
@@ -1311,6 +1338,7 @@ module m2_sdram #(
               grant_is_wr <= 1'b0;
               is_write    <= nxt_is_write;
               rd_total    <= nxt_total;
+              rd_wrap     <= nxt_wrap;
               xfer_addr   <= pf_addr;
               din_r       <= pf_din;
               be_r        <= pf_be;
@@ -1447,14 +1475,27 @@ module m2_sdram #(
             sd_a     <= col_a(xfer_addr);   // A10 low inside col_a: keep row open
             // R891: the mask on A12:A11, where the module's DQM are wired
             if (MASK_ON_A) sd_a[12:11] <= ~be_r;
+            // sd_dq_o's D input stays the plain din_r: a mux in front of it
+            // becomes a synchronous load, and a register with a clear and a
+            // load cannot pack into the I/O cell (R101: the write data then
+            // reached the pins late and the board's ROM image was corrupt)
             sd_dq_o  <= din_r;
             sd_dq_oe <= 1'b1;
             sd_dqm   <= ~be_r;
-            // Hold past tWR and tRAS before anything can precharge this row.
-            // The row is left open on purpose: a download write stream is
-            // sequential and the next word usually hits the same row.
-            wait_cnt <= 4'((T_WR > T_RAS - T_RCD) ? T_WR : T_RAS - T_RCD);
-            state    <= S_WRRC;
+            if (rd_issued + 1'b1 == rd_total) begin
+              // Hold past tWR and tRAS before anything can precharge this row.
+              // The row is left open on purpose: a download write stream is
+              // sequential and the next word usually hits the same row.
+              wait_cnt <= 4'((T_WR > T_RAS - T_RCD) ? T_WR : T_RAS - T_RCD);
+              state    <= S_WRRC;
+            end else begin
+              // WB: the next column, in the open row (as S_RD walks it); its
+              // word and mask come from the port into din_r / be_r
+              rd_issued <= rd_issued + 1'b1;
+              xfer_addr[COL_BITS:1] <= xfer_addr[COL_BITS:1] + 1'b1;
+              din_r <= wb_din;
+              be_r  <= wb_be;
+            end
           end
 
           S_WRRC: begin
@@ -1541,7 +1582,8 @@ module m2_sdram #(
               // the xfer_addr load above -- the incremented value was never
               // read by anything, and leaving both assignments live would make
               // the burst address depend on statement order in this block.
-              xfer_addr[COL_BITS:1] <= xfer_addr[COL_BITS:1] + 1'b1;
+              if (rd_wrap) xfer_addr[4:1] <= xfer_addr[4:1] + 1'b1;          // R104: inside the line
+              else         xfer_addr[COL_BITS:1] <= xfer_addr[COL_BITS:1] + 1'b1;
             end
           end
 

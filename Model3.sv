@@ -169,7 +169,7 @@ always @(posedge clk_sys) begin
 	end
 end
 
-m3_system #(.CLK_HZ(SYS_HZ)) sys3
+m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0)) sys3
 (
 	.clk(clk_sys), .mem_rst_n(mem_rst_n), .reset(RESET | status[0] | buttons[1]),
 	.ioctl_download(ioctl_download), .ioctl_index(ioctl_index), .ioctl_wr(ioctl_wr),

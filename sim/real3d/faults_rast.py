@@ -121,8 +121,8 @@ FAULTS = {
     "N4_u_shift":     ("interp", "rtl/real3d/r3d_rast_interp.sv", "shu2 <= 10'(n1) + 10'sd24", "shu2 <= 10'(n1) + 10'sd23"),
     "N5_sat_at_32":   ("interp", "rtl/real3d/r3d_rast_interp.sv", "(top >= 11'sd31)", "(top >= 11'sd32)"),
     "N6_dx_even":     ("interp", "rtl/real3d/r3d_rast_interp.sv", "a = dx[17:0]; b = dy[17:0]; kx = {x, 1'b1};", "a = dx[17:0]; b = dy[17:0]; kx = {x, 1'b0};"),
-    "F1_sh_bias":     ("fogp", "rtl/real3d/r3d_rast_fogp.sv", "- 11'sd123;", "- 11'sd122;"),
-    "F2_sat_early":   ("fogp", "rtl/real3d/r3d_rast_fogp.sv", "else if (sh >= -11'sd34)", "else if (sh >= -11'sd35)"),
+    "F1_sh_bias":     ("fogp", "rtl/real3d/r3d_rast_fogp.sv", "+ 11'sd123 -", "+ 11'sd122 -"),
+    "F2_sat_early":   ("fogp", "rtl/real3d/r3d_rast_fogp.sv", "else if (nsh <= 11'sd34)", "else if (nsh <= 11'sd35)"),
     "F3_no_neg_k":    ("fogp", "rtl/real3d/r3d_rast_fogp.sv", "kz = i_k[31] ||", "kz = 1'b0 &&"),
     "C1_no_wrap":     ("colour", "rtl/real3d/r3d_rast_colour.sv", "q = lo2[c][31:0] + {hi2[c], 27'd0};",
                        "q = lo2[c][31:0];"),
@@ -211,6 +211,10 @@ FAULTS = {
     "R11_vp_number":     ("rast", "rtl/real3d/r3d_rast.sv", "fv_vp <= vpn[5:0]; cur_vp <= vpn[5:0];", "fv_vp <= vpn[5:0]; cur_vp <= vpn[5:0] + 6'd1;"),
     "R13_eob_no_room":   ("rast", "rtl/real3d/r3d_rast.sv", "if (idle && bq_n < 6'd31) begin eob <= 1'b1;", "if (idle) begin eob <= 1'b1;"),
     "R12_ring_d1_late":  ("rast", "rtl/real3d/r3d_rast.sv", "if (f1_v) ring_d1[f1_n] <= tf_q[37:0];", "if (f2_v) ring_d1[f2_n] <= tf_q[37:0];"),
+    # study R104: rings D1 / D2 read a cycle early at the filter's next tag; the texel delay line read a cycle early
+    "R14_d2_late":       ("rast", "rtl/real3d/r3d_rast.sv", "rq_d2m <= ring_d2[tb_ne];", "rq_d2m <= ring_d2[tb_n];"),
+    "R15_d1_late":       ("rast", "rtl/real3d/r3d_rast.sv", "rq_d1m <= ring_d1[tb_ne];", "rq_d1m <= ring_d1[tb_n];"),
+    "R16_wdl_late":      ("rast", "rtl/real3d/r3d_rast.sv", "wq_m <= wdl[3'(wdp - 3'd2)];", "wq_m <= wdl[3'(wdp - 3'd3)];"),
     # the viewport fog unit (r3d_rast_fogvp.sv)
     "V1_no_round":       ("fogvp", "rtl/real3d/r3d_rast_fogvp.sv", "up = g && (st || q[0]);", "up = 1'b0;"),
     "V2_start_shift":    ("fogvp", "rtl/real3d/r3d_rast_fogvp.sv", "(32'(st16) <<< 6)", "(32'(st16) <<< 5)"),

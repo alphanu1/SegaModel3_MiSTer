@@ -222,11 +222,16 @@ module r3d_rast_zband #(
   wire [23:0] r0 = (w1v0 && c_m10) ? w1d0 : (w2v0 && c_m20) ? w2d0 : c_qv0 ? c_q0 : ZCLR;
   wire [23:0] r1 = (w1v1 && c_m11) ? w1d1 : (w2v1 && c_m21) ? w2d1 : c_qv1 ? c_q1 : ZCLR;
   // the bank's own lane
+  // (the lane select is made as C loads, from B's x: c_x[0] through it into the compare and the
+  // M10K's write enable was -0.79 ns at 100 MHz; study R104)
   wire        cx0 = c_x[0];
-  wire [23:0] cz_b0 = cx0 ? c_z1 : c_z0;
-  wire [23:0] cz_b1 = cx0 ? c_z0 : c_z1;
-  wire        con_b0 = cx0 ? c_on[1] : c_on[0];
-  wire        con_b1 = cx0 ? c_on[0] : c_on[1];
+  logic [23:0] cz_b0, cz_b1;
+  logic        con_b0, con_b1;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && c_v && {cz_b0, cz_b1, con_b0, con_b1} != {cx0 ? c_z1 : c_z0, cx0 ? c_z0 : c_z1, cx0 ? c_on[1] : c_on[0], cx0 ? c_on[0] : c_on[1]})
+      $fatal(1, "zband: the lane select registered");
+`endif
   wire        n0 = OOW ? (cz_b0 >= r0) : (cz_b0 <= r0);
   wire        n1 = OOW ? (cz_b1 >= r1) : (cz_b1 <= r1);
   wire        pb0 = c_v && con_b0 && n0;
@@ -300,6 +305,8 @@ module r3d_rast_zband #(
         c_v <= b_v;
         c_y <= b_y; c_x <= b_x; c_on <= b_on; c_zk <= b_zk;
         c_z0 <= b_z0; c_z1 <= b_z1; c_p0 <= b_p0; c_p1 <= b_p1; c_tag <= b_tag;
+        cz_b0 <= b_x[0] ? b_z1 : b_z0;    cz_b1 <= b_x[0] ? b_z0 : b_z1;
+        con_b0 <= b_x[0] ? b_on[1] : b_on[0]; con_b1 <= b_x[0] ? b_on[0] : b_on[1];
         c_a0 <= b_a0; c_a1 <= b_a1; c_q0 <= q0[23:0]; c_q1 <= q1[23:0];
         c_qv0 <= q0[29:24] == gen; c_qv1 <= q1[29:24] == gen;
         c_m10 <= b_a0 == c_a0; c_m20 <= b_a0 == w1a0;

@@ -48,7 +48,8 @@
 
 module r3d_face #(
   parameter bit          LOD = 1'b0,
-  parameter logic [31:0] KZ2 = 32'h3f80_0000
+  parameter logic [31:0] KZ2 = 32'h3f80_0000,
+  parameter bit          FP_DSP = 1'b0   // the adder's shifts in DSP blocks (study R98)
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -248,7 +249,7 @@ module r3d_face #(
   r3d_fp_mul #(.SUBNORM(1'b0)) u_mul (
     .clk, .rst_n(!rst), .in_valid(1'b1), .a(opa), .b(opb),
     .out_valid(), .result(prod), .overflow(), .underflow(), .invalid());
-  r3d_fp_add #(.SUBNORM(1'b0), .PIPE_A2(1'b1)) u_add (
+  r3d_fp_add #(.SUBNORM(1'b0), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP)) u_add (
     .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(c0_d[5] ? 32'h8000_0000 : sd2), .sub(1'b0),
     .out_valid(), .result(sum), .overflow(), .underflow(), .invalid());
 

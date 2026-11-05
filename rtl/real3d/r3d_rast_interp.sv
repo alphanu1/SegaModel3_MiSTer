@@ -216,23 +216,28 @@ module r3d_rast_interp #(
   localparam int DB = TW + 9 + 9 + 1 + 42 + 42 + 42 + 9 + 10 + 10 + 9 + 6 + 1 + 1 + 1;
   localparam int DW = DB + (MIP ? 4 : 0);
   localparam int LAG = 11;
-  (* ramstyle = "MLAB, no_rw_check" *) logic [DW-1:0] dl [16];
+  // the line in M10K (study R98: -110 ALM of MLAB for 6 M10K). Read registered
+  // at the address dwp will hold next cycle, less LAG: never the address
+  // written at the same edge (dwp), so the word is the MLAB form's dl[dwp - LAG]
+  (* ramstyle = "M10K, no_rw_check" *) logic [DW-1:0] dl [16];
   logic [3:0] dwp;
   logic [10:0] vsr;   // valid bits along the line
   logic [DW-1:0] dl_d;
+  logic [DW-1:0] dq;
   generate if (MIP) begin : g_dlm
     assign dl_d = {tag2, x2, y2, tex2, s2, u2, w2, se2, shu2, shv2, eo2, n2, neg2, pos2, v2, lv2};
   end else begin : g_dl
     assign dl_d = {tag2, x2, y2, tex2, s2, u2, w2, se2, shu2, shv2, eo2, n2, neg2, pos2, v2};
   end endgenerate
+  wire [3:0] dwp_n = (rst ? 4'd0 : en ? dwp + 4'd1 : dwp) - 4'(LAG);
   always_ff @(posedge clk) begin
     if (en) dl[dwp] <= dl_d;
+    dq <= dl[dwp_n];
   end
   always_ff @(posedge clk) begin
     if (rst) begin dwp <= 4'd0; vsr <= '0; end
     else if (en) begin dwp <= dwp + 4'd1; vsr <= {vsr[9:0], v2}; end
   end
-  wire [DW-1:0] dq = dl[4'(dwp - 4'(LAG))];
 
   // ---- S13: the line's output and r, registered --------------------------------------
   logic               v13;

@@ -13,9 +13,10 @@
 // The viewer's status overlay: NR rows of four 32-bit values as hex digits,
 // top left. A value is eight 8-pixel cells and a blank one; a row is 9
 // pixels. The 5 x 7 glyphs sit in the cells' top-left corner, on a dark box.
-// The value under the beam is asked for on idx (row x 4 + column) and must
-// come back on val the next cycle (m3v_core reads it from its registers or
-// from the probe's MLAB).
+// The value under the beam is asked for on idx (row x 4 + column, registered)
+// and must come back on val the next cycle (m3v_core reads it from its
+// registers or from the probe's MLAB). x and y must hold for at least four
+// clocks: box and ink follow them by three.
 
 module m3v_overlay #(
   parameter int NR = 4
@@ -75,15 +76,18 @@ module m3v_overlay #(
     row = '0; ly = 4'(ry);
     for (int k = 1; k < NR; k++) if (ry >= 10'(9 * k)) begin row = 4'(k); ly = 4'(ry - 10'(9 * k)); end
   end
-  assign idx = {row, col};
-
-  // registered once: the value and nibble, then the glyph bit
-  logic [3:0]  dig_q, ly_q;
-  logic [2:0]  px_q;
-  logic        in_q;
+  // idx is registered (timing, study R104: y through the row compares into the caller's value mux was
+  // a 110 MHz system build's path), so the cell's fields wait a second cycle beside it. x and y move
+  // with the pixel enable, six clocks or more apart, so the extra cycle is inside one pixel.
+  logic [3:0]  dig_p, ly_p, dig_q, ly_q;
+  logic [2:0]  px_p, px_q;
+  logic        in_p, in_q;
   always_ff @(posedge clk) begin
-    dig_q <= dig; ly_q <= ly; px_q <= rx[2:0];
-    in_q  <= en && in_x && in_y;
+    idx   <= {row, col};
+    dig_p <= dig; ly_p <= ly; px_p <= rx[2:0];
+    in_p  <= en && in_x && in_y;
+    dig_q <= dig_p; ly_q <= ly_p; px_q <= px_p;
+    in_q  <= in_p;
   end
   wire [3:0] nib = val[31 - 4 * dig_q[2:0] -: 4];
   wire [4:0] grow = glyph(nib, ly_q[2:0]);

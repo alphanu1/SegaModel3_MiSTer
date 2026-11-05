@@ -35,7 +35,7 @@ module r3d_rast_fogp (
 );
 
   logic [48:0] pr;
-  logic signed [10:0] sh;
+  logic signed [10:0] nsh;                      // -sh: the right shift (formed negated in stage 1, R104)
   logic        sat, zero;
   logic [12:0] p2;
 
@@ -44,16 +44,16 @@ module r3d_rast_fogp (
     // 1: the product, the shift, the special cases
     kz = i_k[31] || i_k[30:23] == 8'd0 || (i_k[30:23] == 8'hff && i_k[22:0] != 23'd0);
     pr <= 49'(i_r) * 49'({1'b1, i_k[22:0]});
-    sh <= {3'd0, i_k[30:23]} - {{2{i_eo[8]}}, i_eo} - {5'd0, i_n} - 11'sd123;
+    nsh <= {{2{i_eo[8]}}, i_eo} + {5'd0, i_n} + 11'sd123 - {3'd0, i_k[30:23]};
     sat  <= !i_pos;
     zero <= i_pos && kz;
     // 2: the shift and the clamp
     if (sat) p2 <= 13'd4096;
-    else if (zero || sh <= -11'sd50) p2 <= 13'd0;
-    else if (sh >= -11'sd34) p2 <= 13'd4096;
+    else if (zero || nsh >= 11'sd50) p2 <= 13'd0;
+    else if (nsh <= 11'sd34) p2 <= 13'd4096;
     else begin
       logic [48:0] q;
-      q = pr >> 6'(-sh);
+      q = pr >> 6'(nsh);
       p2 <= (q[48:12] != 37'd0) ? 13'd4096 : q[12:0];
     end
     // 3: out

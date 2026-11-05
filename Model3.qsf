@@ -267,6 +267,10 @@ set_hps_location_assignment HPSINTERFACEPERIPHERALI2C_X52_Y60_N111 -to hdmi_i2c
 set_hps_location_assignment HPSINTERFACEPERIPHERALSPIMASTER_X52_Y72_N111 -to spi
 set_hps_location_assignment HPSINTERFACEPERIPHERALUART_X52_Y67_N111 -to uart
 set_instance_assignment -name ALLOW_SYNCH_CTRL_USAGE OFF -to *|SDRAM_*
+# m2_sdram's address register, which that pattern does not name: without it, sd_a's constant loads become a
+# synchronous clear and load, SDRAM_A[0-4] and [6-9] cannot pack into the I/O cells, and the board corrupts SDRAM
+# (study R101). Only sd_a: on the whole controller it unpacks the DQ input registers instead.
+set_instance_assignment -name ALLOW_SYNCH_CTRL_USAGE OFF -to "*|m3_system:sys3|m2_sdram:u_sdram|sd_a[*]"
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to ADC_CONVST
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to ADC_SCK
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to ADC_SDI
@@ -312,3 +316,6 @@ set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to SDIO_DAT[*]
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to SD_SPI*
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to USER_IO[*]
 set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to VGA_EN
+# Step 2 (Daytona 2) bus map and texture-upload port (study R100)
+set_global_assignment -name VERILOG_MACRO "M3_STEP2_BUS=1"
+set_global_assignment -name VERILOG_MACRO "M3_STEP2_TEX=1"

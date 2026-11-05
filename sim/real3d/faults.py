@@ -95,6 +95,9 @@ FAULTS = {
  'FA14_reused_v0':  ('r3d_geo.sv', "(SM_CULL && (dst == D_HDR || dst == D_CHK)) ? {fk, pmap[v0src]}", "(SM_CULL && (dst == D_HDR || dst == D_CHK)) ? {fk, pmap[2'(v0src + 2'd1)]}"),
  'N7_div_lane':     ('r3d_vpu.sv', "for (int k = 1; k < 4; k++) begin dq_x[k] <= opA[k]; dq_a[k] <= opB[k]; end",
                                    "for (int k = 1; k < 4; k++) begin dq_x[k] <= opA[k]; dq_a[k] <= opB[4 - k]; end"),
+ # study R104: the divide's lane shift register, the reciprocal's exponent correction a stage on
+ 'N10_div_shift':   ('r3d_vpu.sv', "dq_x[2] <= dq_x[3]; dq_a[2] <= dq_a[3];", "dq_a[2] <= dq_a[3];"),
+ 'N11_recip_ge':    ('r3d_recip.sv', "c1.re <= c0.re - {9'd0, !c0.ge};", "c1.re <= c0.re;"),
  # study D-32: the output buffer and the side memories in M10K by default, their read timing
  'FO1_out_noahead': ('r3d_geo.sv', "    if (OUT_M10K) begin\n      if (est != E_OUT || !e_vtx)", "    if (1'b0) begin\n      if (est != E_OUT || !e_vtx)"),
  'FO2_out_stall':   ('r3d_geo.sv', "      else if (out_go) begin\n        if (e_c == 3'd5) begin q = e_q + 4'd1; c = 3'd0; end",

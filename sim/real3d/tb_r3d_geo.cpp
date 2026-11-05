@@ -200,8 +200,8 @@ int main(int argc, char **argv) {
   bool prof = std::getenv("R3D_PROF") != nullptr;
   uint64_t const prof_min = std::getenv("R3D_PROF_MIN") ? std::strtoull(std::getenv("R3D_PROF_MIN"), nullptr, 10) : 0;
   std::map<int, uint64_t> fh;
-  uint32_t subn_last = 0, iss_last = 0, lop_last = 0;
-  std::vector<uint64_t> iss_f, lop_f;
+  uint32_t subn_last = 0, iss_last = 0, lop_last = 0, hi_last = 0;
+  std::vector<uint64_t> iss_f, lop_f, hi_f;
   uint64_t subn_frames = 0, subn_total = 0;
 
   for (size_t fi = 0; fi < files.size(); fi++) {
@@ -495,10 +495,10 @@ int main(int argc, char **argv) {
           st_ = 2;
           auto bank = [&](int b, int e) -> uint32_t {
             switch (b) {
-              case 0: return rp->r3d_geo__DOT__u_vpu__DOT__g_bank__BRA__0__KET____DOT__u_m0__DOT__g_mlab_sync__DOT__m[e];
-              case 1: return rp->r3d_geo__DOT__u_vpu__DOT__g_bank__BRA__1__KET____DOT__u_m0__DOT__g_mlab_sync__DOT__m[e];
-              case 2: return rp->r3d_geo__DOT__u_vpu__DOT__g_bank__BRA__2__KET____DOT__u_m0__DOT__g_mlab_sync__DOT__m[e];
-              default: return rp->r3d_geo__DOT__u_vpu__DOT__g_bank__BRA__3__KET____DOT__u_m0__DOT__g_mlab_sync__DOT__m[e];
+              case 0: return rp->r3d_geo__DOT__u_vpu__DOT__g_bank__BRA__0__KET____DOT__u_m0__DOT__g_m10k__DOT__m[e];
+              case 1: return rp->r3d_geo__DOT__u_vpu__DOT__g_bank__BRA__1__KET____DOT__u_m0__DOT__g_m10k__DOT__m[e];
+              case 2: return rp->r3d_geo__DOT__u_vpu__DOT__g_bank__BRA__2__KET____DOT__u_m0__DOT__g_m10k__DOT__m[e];
+              default: return rp->r3d_geo__DOT__u_vpu__DOT__g_bank__BRA__3__KET____DOT__u_m0__DOT__g_m10k__DOT__m[e];
             }
           };
           auto reg = [&](int l, int r) -> uint32_t {
@@ -553,6 +553,8 @@ int main(int argc, char **argv) {
     {
       uint32_t const is = t->rootp->r3d_geo__DOT__u_vpu__DOT__iss_cnt, lo = t->rootp->r3d_geo__DOT__u_vpu__DOT__lop_cnt;
       iss_f.push_back(is - iss_last); lop_f.push_back(lo - lop_last); iss_last = is; lop_last = lo;
+      uint32_t const hi = t->rootp->r3d_geo__DOT__u_vpu__DOT__hi_cnt;
+      hi_f.push_back(hi - hi_last); hi_last = hi;
     }
     if (std::getenv("R3D_FRAME_LOG")) std::printf("frame %s cycles %" PRIu64 "\n", fs::path(files[fi]).filename().c_str(), cyc);
     if (cyc >= prof_min) for (auto const &kv : fh) st_hist[kv.first] += kv.second;
@@ -650,6 +652,14 @@ int main(int argc, char **argv) {
     std::printf("pool, p99 frame (%" PRIu64 " cycles): %" PRIu64 " instructions issued (%.1f%% of its cycles, %.1f%% of a 100 MHz frame), "
                 "lane operations %.1f%% of 4 a cycle\n", cycles[k], iss_f[k], 100.0 * iss_f[k] / cycles[k], 100.0 * iss_f[k] / 1738530,
                 100.0 * lop_f[k] / (4.0 * cycles[k]));
+  }
+  {
+    // study R99: a two-lane pool, each MAC word on lanes 2-3 a second cycle, nothing rescheduled
+    std::vector<uint64_t> c2(cycles.size());
+    for (size_t i = 0; i < c2.size(); i++) c2[i] = cycles[i] + hi_f[i];
+    std::printf("two-lane estimate: MAC words on lanes 2-3 p99 %.0f; frame cycles p50 %.0f p99 %.0f max %.0f "
+                "(p99 = %.1f%% of a 57.52 Hz frame at 120 MHz; four lanes %.1f%%)\n", pct(hi_f, .99), pct(c2, .5), pct(c2, .99), pct(c2, 1),
+                100.0 * pct(c2, .99) / (120e6 / 57.52), 100.0 * pct(cycles, .99) / (120e6 / 57.52));
   }
   static char const *pn[] = {"culling", "polygon RAM", "VROM"};
   for (int pi = 0; pi < 3; pi++)

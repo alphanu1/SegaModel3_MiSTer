@@ -388,7 +388,7 @@ module m3v_raster (
     .i_tw(a_tw), .i_th(a_th), .i_mu(a_mu), .i_mv(a_mv), .i_fmt(a_fmt), .i_lv(r_lv),
     .m_a0(fa0), .m_a1(fa1), .m_a2(fa2), .m_a3(fa3), .m_re(),
     .m_q0(16'd0), .m_q1(16'd0), .m_q2(16'd0), .m_q3(16'd0),
-    .o_valid(), .o_tag(), .o_texel());
+    .o_valid(), .o_tag(), .o_tag_e(), .o_texel());
   // its two stages' valid, pixel number and texture flag, alongside
   logic       f1_v, f2_v, f1_t, f2_t;
   logic [6:0] f1_n, f2_n;
@@ -454,7 +454,7 @@ module m3v_raster (
     .i_mu(rq_a[4]), .i_mv(rq_a[3]), .i_fmt(rq_a[2:0]), .i_lv(b_lv),
     .m_a0(), .m_a1(), .m_a2(), .m_a3(), .m_re(),
     .m_q0(wq[15:0]), .m_q1(wq[31:16]), .m_q2(wq[47:32]), .m_q3(wq[63:48]),
-    .o_valid(tb_valid), .o_tag(tb_n), .o_texel(tb_texel));
+    .o_valid(tb_valid), .o_tag(tb_n), .o_tag_e(), .o_texel(tb_texel));
 
   // the colour's inputs from ring B, a cycle on
   assign ra_b = tb_n;

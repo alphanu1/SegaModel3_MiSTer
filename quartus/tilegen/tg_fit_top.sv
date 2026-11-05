@@ -34,8 +34,11 @@ module tg_fit_top #(
   output logic [7:0]    o_b,
   output logic          p_req,
   output logic [25:1]   p_addr,
+  output logic          p_long,
   input  logic [63:0]   p_dout,
+  input  logic          p_lo,
   input  logic          p_ack,
+  input  logic          name_inv,
   output logic [15:0]   st_cycles,
   output logic [15:0]   st_reqs
 );

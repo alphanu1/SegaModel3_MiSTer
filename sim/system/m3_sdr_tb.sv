@@ -36,20 +36,23 @@ module m3_sdr_tb (
   logic [26:1] p_addr;
   logic [15:0] p_din;
   logic [1:0]  p_be;
+  logic [3:0]  wb_col;
+  logic [15:0] wb_din;
+  logic [1:0]  wb_be;
   logic [1:0]  ack, lo;
   logic [1:0][63:0] dout;
 
   m3_sdr_port #(.AW(26)) u_port (
     .clk, .rst(!rst_n),
     .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
-    .p_req, .p_we, .p_addr, .p_din, .p_be, .p_long, .p_dout(dout[0]), .p_lo(lo[0]), .p_ack(ack[0]));
+    .p_req, .p_we, .p_addr, .p_din, .p_be, .p_long, .p_dout(dout[0]), .p_lo(lo[0]), .p_ack(ack[0]), .wb_col, .wb_din, .wb_be);
 
-  m2_sdram #(.COL_BITS(10), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(1'b1), .MASK_ON_A(1'b1), .INIT_NOP(200)) u_sdram (
+  m2_sdram #(.COL_BITS(10), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(1'b1), .MASK_ON_A(1'b1), .INIT_NOP(200), .WB(2'b01)) u_sdram (
     .clk, .rst_n, .ready, .rd_lat_sel(3'd2),
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm(), .sd_dq_o, .sd_dq_oe(), .sd_dq_i,
     .wr_req(1'b0), .wr_addr('0), .wr_din('0), .wr_be('0), .wr_ack(),
     .p_req({q_req, p_req}), .p_we({1'b0, p_we}), .p_addr({q_addr, p_addr}), .p_din({16'd0, p_din}), .p_be({2'b00, p_be}),
-    .p_dout(dout), .p_ack(ack), .p_long({1'b0, p_long}), .p_lo(lo), .dbg_req(), .dbg_grant());
+    .p_dout(dout), .p_ack(ack), .p_long({1'b0, p_long}), .p_lo(lo), .wb_col, .wb_din, .wb_be, .dbg_req(), .dbg_grant());
   assign q_ack = ack[1];
   assign q_dout = dout[1];
 endmodule

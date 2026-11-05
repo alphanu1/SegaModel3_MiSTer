@@ -59,6 +59,21 @@
 // that texture (Supermodel reads past its FIFO then, and its loop ends).
 // Ports: SDRAM m2_sdram's p_ contract (VROM reads); DDR3 m2_ddr3's contract
 // with byte enables.
+//
+// STEP2_PORT (study R100; run time: step2): the Step 2.x texture port. There
+// the VROM port takes two words, a VROM word address and a header, and the
+// texture is uploaded from VROM with that header (Supermodel's
+// WriteTexturePort, MAME's real3d_vrom_texture_dma; no size word in VROM). It
+// goes into the ring as a FIFO texture would: a size word made for it, the
+// header, and its texel words copied from VROM. The texel words are counted
+// from the header as the decode below consumes them: a level is
+// 2^(lw + lh - 1) words at 16 bits a texel and 2^(lw + lh - 2) at 8, the
+// levels those of its type (0: all, from level 0 while a level's size is above
+// 1 x 1; 1: level 0; 2: from level 1; others none, and the decode skips it).
+// The size word is 8 (n + 2) - 4, so the next texture starts n + 2 words on.
+// A texture of 2^19 words or more is cut there (the ring is 2^18). VROM word
+// addresses are 24 bits (64 MiB; four 16 MiB blocks). Supermodel's polygon-RAM
+// source (addresses below 0x100000, Daytona 2 Power Edition only) is not built.
 
 `timescale 1ns/1ps
 
@@ -68,10 +83,12 @@ module r3d_texup #(
   parameter logic [24:0] DDR_STG  = 25'h20_0000,   // the ring, 2^(RW-1) beats
   parameter logic [24:0] DDR_TEX  = 25'hC0_0000,
   parameter int          RW       = 18,            // log2 ring words (2^18: the FIFO's 1 MiB)
-  parameter int          FB       = 4              // log2 beats a ring read burst
+  parameter int          FB       = 4,             // log2 beats a ring read burst
+  parameter bit          STEP2_PORT = 1'b0         // the Step 2.x texture port (step2)
 ) (
   input  logic          clk,
   input  logic          rst,
+  input  logic          step2,           // run time: the VROM port is Step 2.x's (STEP2_PORT)
 
   // words in: t_vrom 0 the FIFO (94), 1 the VROM port (90)
   input  logic          t_valid,
@@ -122,10 +139,22 @@ module r3d_texup #(
 
   // the VROM port's block: one SDRAM read a word
   logic          v_on, v_first, v_sgap;
-  logic [22:0]   v_a;                    // the next VROM word
+  logic [23:0]   v_a;                    // the next VROM word
   logic [18:0]   v_n;                    // words left
 
-  assign t_ready = !a_v && !v_on;
+  // the Step 2.x port (STEP2_PORT): address, then header; then the size word and
+  // the header into the ring, then the copy
+  wire           s2p = STEP2_PORT && step2;
+  logic          p2_a;                   // the address word has come
+  logic [2:0]    p2_st;                  // 0 idle, 1 counting, 2 the size word, 3 the header, 4 the copy
+  logic [23:0]   p2_addr;
+  logic [31:0]   p2_hdr;
+  logic [19:0]   p2_n;                   // texel words
+  logic [3:0]    p2_lv, p2_last;
+  logic [4:0]    p2_m;                   // log2 words of level 0
+  wire           p2_busy = s2p && (p2_st != 3'd0);
+
+  assign t_ready = !a_v && !v_on && !p2_busy;
 
   // ===========================================================================
   // the decode's state
@@ -231,6 +260,7 @@ module r3d_texup #(
       wp <= '0; fp <= '0; fp_m <= '0; rp <= '0; a_v <= 1'b0; v_on <= 1'b0; s_req <= 1'b0; v_sgap <= 1'b0;
       us <= U_IDLE; busy <= 1'b0; d_req <= 1'b0; d_busy <= 1'b0; f_on <= 1'b0; fbp <= '0; have <= '0;
       wr_v <= 1'b0; n_tex <= '0; n_skip <= '0; own <= 2'd0;
+      p2_a <= 1'b0; p2_st <= 3'd0;
     end else begin
       logic        f_done, rs;            // a burst has landed; a restart
       logic [PW-1:0] rsa;                 // ... at this word
@@ -240,8 +270,44 @@ module r3d_texup #(
 
       // ---- in: a FIFO word, or a VROM port write; the flush; the mark
       if (t_valid && t_ready) begin
-        if (t_vrom) begin v_on <= 1'b1; v_first <= 1'b1; v_a <= t_data[22:0]; end
+        if (t_vrom && s2p) begin
+          if (!p2_a) begin p2_a <= 1'b1; p2_addr <= t_data[23:0]; end
+          else begin
+            logic [3:0] lw0_, lh0_, mn;
+            p2_a <= 1'b0; p2_hdr <= t_data;
+            lw0_ = 4'd5 + {1'b0, t_data[16:14]}; lh0_ = 4'd5 + {1'b0, t_data[19:17]};
+            mn = (lw0_ < lh0_) ? lw0_ : lh0_;
+            p2_m  <= 5'({1'b0, lw0_} + {1'b0, lh0_}) - 5'd1 - {4'd0, !t_data[23]};
+            p2_n  <= '0;
+            p2_lv   <= (t_data[31:24] == 8'h02) ? 4'd1 : 4'd0;
+            p2_last <= (t_data[31:24] == 8'h01) ? 4'd0 : mn - 4'd1;
+            p2_st <= (t_data[31:24] <= 8'h02) ? 3'd1 : 3'd2;
+          end
+        end else if (t_vrom) begin v_on <= 1'b1; v_first <= 1'b1; v_a <= {1'b0, t_data[22:0]}; end
         else begin a_v <= 1'b1; a_d <= t_data; end
+      end
+      // the Step 2.x port's texture: count its words, then the two ring words, then the copy
+      if (s2p) begin
+        case (p2_st)
+          3'd1: begin
+            p2_n <= p2_n + (20'd1 << (p2_m - {p2_lv, 1'b0}));
+            if (p2_lv >= p2_last) p2_st <= 3'd2;
+            p2_lv <= p2_lv + 4'd1;
+          end
+          3'd2: if (!a_v) begin
+            logic [18:0] n;
+            n = (p2_n >= 20'h7FFFD) ? 19'h7FFFD : p2_n[18:0];
+            p2_n <= {1'b0, n};
+            a_v <= 1'b1; a_d <= {10'd0, 22'(({3'd0, n} + 22'd2) << 3) - 22'd4};
+            p2_st <= 3'd3;
+          end
+          3'd3: if (!a_v) begin a_v <= 1'b1; a_d <= p2_hdr; p2_st <= 3'd4; end
+          3'd4: if (!a_v) begin
+            if (p2_n != 20'd0) begin v_on <= 1'b1; v_first <= 1'b0; v_a <= p2_addr; v_n <= p2_n[18:0]; end
+            p2_st <= 3'd0;
+          end
+          default: ;
+        endcase
       end
       if (t_flush) fp <= wp;
       if (mark) fp_m <= t_flush ? wp : fp;
@@ -251,7 +317,8 @@ module r3d_texup #(
       if (v_on && !a_v) begin
         if (!s_req && !v_sgap && !s_ack) begin
           s_req <= 1'b1;
-          s_addr <= AW'(SDR_VROM[26:1]) + AW'({v_a[2:1], v_a[22:3], 2'b00});
+          // (Step 2.x: 24-bit word addresses, 16 MiB blocks)
+          s_addr <= AW'(SDR_VROM[26:1]) + (s2p ? AW'({v_a[2:1], v_a[23:3], 2'b00}) : AW'({v_a[2:1], v_a[22:3], 2'b00}));
         end
         if (s_ack) begin
           logic [31:0] w;
@@ -265,7 +332,7 @@ module r3d_texup #(
             if (w[31:2] == 30'd0) v_on <= 1'b0;
           end else begin
             a_v <= 1'b1; a_d <= w;
-            v_a <= v_a + 23'd1;
+            v_a <= v_a + 24'd1;
             v_n <= v_n - 19'd1;
             if (v_n == 19'd1) v_on <= 1'b0;
           end

@@ -91,7 +91,11 @@ module r3d_geo
   // ALM and M10K trades (m2-notes section 14). SIDE_M10K on by default
   // (study D-32), BC_M10K off
   parameter bit SIDE_M10K  = 1'b1,
-  parameter bit BC_M10K    = 1'b0,
+  parameter bit BC_M10K    = 1'b1,   // on since study R98 (-140 ALM, +8 M10K)
+  // FP_DSP: the pool's and the facing test's FP adders shift in DSP blocks
+  // (r3d_fp_add DSP_SHIFT, study R98: -316 ALM, +10 DSP, Fmax 111.7 -> 103.5
+  // MHz standalone; 0 for a 110 MHz build)
+  parameter bit FP_DSP     = 1'b0,
   parameter bit SETUP_LOAD = 1'b0,
   // with SETUP_LOAD (m2-notes section 14): SETUP_3R the engine's third
   // register read (the set-up kernels built with gen_ucode.py --3r). With
@@ -376,7 +380,7 @@ module r3d_geo
   logic [3:0]  sw_we;
 
   r3d_vpu #(.SUBNORM(SUBNORM), .SM_LIGHT(SM_LIGHT), .SETUP_3R(SETUP_3R || SETUP_OUT), .BC_M10K(BC_M10K),
-            .SU_ROM(SETUP_OUT)) u_vpu (
+            .SU_ROM(SETUP_OUT), .FP_DSP(FP_DSP)) u_vpu (
     .clk, .rst, .start(vk_start), .entry(vk_entry), .sp_a(vk_spa), .sp_d(vk_spd), .busy(vk_busy),
     .ext_we(xw_we), .ext_waddr(xw_addr), .ext_wdata(xw_data),
     .ext_bwe(xb_we), .ext_bbank(xb_bank), .ext_baddr(xb_addr), .ext_bdata(xb_data),
@@ -545,7 +549,7 @@ module r3d_geo
   // kz^2: 1 with Supermodel's frustum, else MAME's constant kz = -F_P23 squared (FP32)
   localparam logic [31:0] F_KZ2 = FRUSTUM_SM ? 32'h3f80_0000 : 32'h4080_00a8;
   generate if (SM_CULL) begin : g_face
-    r3d_face #(.LOD(LOD_WORD), .KZ2(F_KZ2)) u_face (.clk, .rst, .step15,
+    r3d_face #(.LOD(LOD_WORD), .KZ2(F_KZ2), .FP_DSP(FP_DSP)) u_face (.clk, .rst, .step15,
       .t_we(f_twe), .t_buf(tbuf_m), .t_row(ft_row), .t_col(ft_col), .t_d(x_rdata[ft_col]), .t_hold(f_thold),
       .t_clr(f_tclr), .t_set(f_tset), .mb_busy(f_mbbusy),
       .in_ready(f_ready), .in_hold(f_hold), .in_we(f_we), .in_word(f_word), .in_d(f_d),
@@ -693,7 +697,10 @@ module r3d_geo
   // level -> slot: a pushed level without a matrix of its own shares the slot below
   logic        lv_we;
   logic [4:0]  lv_wa, lv_wd, lv_ra, lv_q;
-  r3d_ram #(.W(5), .A(5)) u_lvl (.clk, .we(lv_we), .wa(lv_wa), .wd(lv_wd), .ra(lv_ra), .rq(lv_q));
+  // the MLAB's write address through a LUT of its own (keep), as the core's SPR array: straight from
+  // lv_wa it missed hold by 0.08-0.10 ns at both slow corners in a 100 MHz build (study R104, t100d3)
+  (* keep = 1 *) wire [4:0] lv_wa_k = lv_wa;
+  r3d_ram #(.W(5), .A(5)) u_lvl (.clk, .we(lv_we), .wa(lv_wa_k), .wd(lv_wd), .ra(lv_ra), .rq(lv_q));
   assign lv_ra = sp - 5'd1;
   logic [15:0] cu_r;
   logic        m_drain;
@@ -2213,8 +2220,18 @@ module r3d_geo
   logic        tc_v;              // the conversion's second step
   logic [1:0]  tc_lane, tc_sel;
   logic [4:0]  tc_wa;
-  logic [31:0] tc_wp, tc_nw;
+  logic [31:0] tc_nw;
+  // the position word's conversion in two halves (timing, study R104: the negate, the leading-one
+  // search and the shift in one cycle were -0.81 ns at 100 MHz): the magnitude and its leading one
+  // here, the shift and the exponent as the word is written (ts_wp), where only a register moved
+  logic        tc_ps, tc_pz;      // sign; the word is 0 (the F word, or a zero magnitude)
+  logic [23:0] tc_pm;             // the magnitude
+  logic [4:0]  tc_pmsb;           // its leading one
+  logic [7:0]  tc_peb;            // the exponent base
   logic [37:0] tc_k;
+`ifdef VERILATOR
+  logic [31:0] tc_wpc;            // the one-cycle conversion, for the check
+`endif
   logic [31:0] tc_kq;             // k255b(tc_k): the staged normal or fixed shade, or the ambient
   assign tc_kq = k255b(tc_k);
   // vertex slots by reference: eight raw-word entries, MAME's prev[k] is entry
@@ -2323,14 +2340,33 @@ module r3d_geo
         else tc_k <= k255a(kb[7], {kb[6:0] ^ {7{kb[7]}}, 1'b1});
       end
       if (tq_v) begin
-        tc_wp <= tq_fw ? 32'd0 : itof24(tq_w[31], tq_w[31] ? (~tq_w[31:8] + 24'd1) : tq_w[31:8], step15 ? 8'd116 : 8'd120);
+        begin
+          logic [23:0] mg;
+          logic [4:0]  ms;
+          logic        nzm;
+          mg = tq_w[31] ? (~tq_w[31:8] + 24'd1) : tq_w[31:8];
+          ms = 5'd0; nzm = 1'b0;
+          for (int i = 0; i < 24; i++) if (mg[i]) begin ms = 5'(i); nzm = 1'b1; end
+          tc_ps <= tq_w[31]; tc_pm <= mg; tc_pmsb <= ms; tc_pz <= tq_fw || !nzm;
+          tc_peb <= step15 ? 8'd116 : 8'd120;
+`ifdef VERILATOR
+          tc_wpc <= tq_fw ? 32'd0 : itof24(tq_w[31], mg, step15 ? 8'd116 : 8'd120);
+`endif
+        end
         tc_lane <= tq_lane; tc_wa <= tq_wa;
         tc_sel <= tq_fw ? (tq_fix ? 2'd1 : 2'd2) : tq_nz ? 2'd3 : 2'd0;   // 0 normal, 1 product, 2 -0, 3 zero
         if (!SM_FLAT) tc_nw <= ntab(tq_w[7:0]);
       end
       if (tc_v) begin
         ts_we <= 4'(1 << tc_lane); ts_wa <= tc_wa;
-        ts_wp <= tc_wp;
+        begin
+          logic [23:0] m;
+          m = tc_pm << (5'd23 - tc_pmsb);
+          ts_wp <= tc_pz ? 32'd0 : {tc_ps, tc_peb + {3'd0, tc_pmsb}, m[22:0]};
+`ifdef VERILATOR
+          if ((tc_pz ? 32'd0 : {tc_ps, tc_peb + {3'd0, tc_pmsb}, m[22:0]}) != tc_wpc) $fatal(1, "geo: itof24 in two halves");
+`endif
+        end
         case (tc_sel)
           2'd0: ts_wn <= SM_FLAT ? tc_kq : tc_nw;
           2'd1: ts_wn <= tc_kq;

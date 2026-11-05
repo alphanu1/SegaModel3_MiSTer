@@ -33,14 +33,49 @@ R3D_SYS = rtl/real3d/r3d_ucode_pkg.sv rtl/real3d/r3d_fp_add.sv rtl/real3d/r3d_fp
           rtl/real3d/r3d_rast_interp.sv rtl/real3d/r3d_rast_fogp.sv rtl/real3d/r3d_rast_texel.sv rtl/real3d/r3d_rast_tcache.sv \
           rtl/real3d/r3d_rast_colour.sv rtl/real3d/r3d_rast_band.sv rtl/real3d/r3d_rast_fogvp.sv \
           rtl/real3d/r3d_rast_store.sv rtl/real3d/r3d_rast.sv \
-          rtl/real3d/r3d_cmd.sv rtl/real3d/r3d_mem.sv rtl/real3d/r3d_texup.sv rtl/real3d/r3d_vrom_rd.sv \
+          rtl/real3d/r3d_cmd.sv rtl/real3d/r3d_mem.sv $(TEXUP_RTL) rtl/real3d/r3d_vrom_rd.sv \
           rtl/mem/m3_ddr_arb.sv rtl/mem/m3_ddr3p.sv rtl/video/m2_fb_read.sv rtl/video/m3_compose.sv \
           rtl/viewer/m3v_sdr_rd.sv rtl/viewer/m3v_ddr_rd.sv
-SYS_RTL = $(R3D_SYS) rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/sys/m3_jtag.sv rtl/io/m3_93c46.sv rtl/io/m3_io.sv rtl/sys/m3_sdr_port.sv rtl/sys/m3_bus.sv \
+# R100: BUS_RTL lets a bench build take a patched m3_bus (Daytona 2's Step 2 map,
+# sm3-builds/dt2/m3_bus_step2.patch) with SYS_DEFS = +define+M3_STEP2_BUS
+BUS_RTL  ?= rtl/sys/m3_bus.sv
+TEXUP_RTL ?= rtl/real3d/r3d_texup.sv    # R100: with M3_STEP2_TEX, sm3-builds/dt2/handoff2/rtl/r3d_texup.sv
+SYS_DEFS ?= +define+M3_STEP2_BUS=1 +define+M3_STEP2_TEX=1
+SYS_RTL = $(R3D_SYS) rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/sys/m3_jtag.sv rtl/io/m3_93c46.sv rtl/io/m3_io.sv rtl/sys/m3_sdr_port.sv $(BUS_RTL) \
           rtl/io/m3_scripts.sv rtl/mem/m2_sdram.sv rtl/video/m2_video_timing.sv rtl/viewer/m3v_overlay.sv \
-          rtl/sys/m3_loader.sv rtl/sys/m3_system.sv
+          rtl/dbg/m3_frame_busy.sv rtl/sys/m3_xmem.sv rtl/sys/m3_5881.sv rtl/sys/m3_sec.sv rtl/sys/m3_loader.sv rtl/sys/m3_system.sv
 
-.PHONY: test_jtag test_jtag_fault lint_sys test_io test_sdr_port test_bus system
+.PHONY: test_jtag test_jtag_fault lint_sys test_io test_sdr_port test_bus system test_xmem test_sec test_texup2
+
+# r3d_texup's Step 2.x texture port (R100) against its FIFO path. TEXUP2_RTL: the
+# r3d_texup carrying STEP2_PORT (held outside the tree: sm3-builds/dt2/handoff2)
+TEXUP2_RTL ?= sm3-builds/dt2/handoff2/rtl/r3d_texup.sv
+$(SYS_OBJ)/texup2/Vr3d_texup: $(TEXUP2_RTL) sim/system/tb_r3d_texup2.cpp
+	@$(VERILATOR) $(VFLAGS) --public-flat-rw -GSTEP2_PORT=1 --top-module r3d_texup -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/texup2 $(TEXUP2_RTL) sim/system/tb_r3d_texup2.cpp >/dev/null
+
+test_texup2: $(SYS_OBJ)/texup2/Vr3d_texup
+	@echo "== r3d_texup: the Step 2.x texture port against the FIFO"
+	./$(SYS_OBJ)/texup2/Vr3d_texup 300 1
+	./$(SYS_OBJ)/texup2/Vr3d_texup 300 2
+
+# m3_sec (the 315-5881, study R100) against Daytona 2's Supermodel trace
+SEC_TRACE ?= sm3-builds/dt2/sec_dt2.bin
+$(SYS_OBJ)/sec/Vm3_sec: rtl/sys/m3_sec.sv rtl/sys/m3_5881.sv sim/system/tb_m3_sec.cpp
+	@$(VERILATOR) $(VFLAGS) --top-module m3_sec -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/sec rtl/sys/m3_sec.sv rtl/sys/m3_5881.sv sim/system/tb_m3_sec.cpp >/dev/null
+
+test_sec: $(SYS_OBJ)/sec/Vm3_sec
+	@echo "== m3_sec: the security board against Daytona 2's trace"
+	./$(SYS_OBJ)/sec/Vm3_sec $(SEC_TRACE) 29250e16
+	! ./$(SYS_OBJ)/sec/Vm3_sec $(SEC_TRACE) 29250e16 --fault > /dev/null
+
+# m3_xmem (study R100): VROM in the extra memory, against a reference
+$(SYS_OBJ)/xmem/Vm3_xmem: rtl/sys/m3_xmem.sv sim/system/tb_m3_xmem.cpp
+	@$(VERILATOR) $(VFLAGS) --top-module m3_xmem -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/xmem rtl/sys/m3_xmem.sv sim/system/tb_m3_xmem.cpp >/dev/null
+
+test_xmem: $(SYS_OBJ)/xmem/Vm3_xmem
+	@echo "== m3_xmem: geometry and texture VROM reads on a pipelined port"
+	./$(SYS_OBJ)/xmem/Vm3_xmem 200000 1
+	./$(SYS_OBJ)/xmem/Vm3_xmem 200000 2
 
 $(SYS_OBJ)/jtag/Vm3_jtag: rtl/sys/m3_jtag.sv sim/system/tb_m3_jtag.cpp
 	@$(VERILATOR) $(VFLAGS) --top-module m3_jtag -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/jtag rtl/sys/m3_jtag.sv sim/system/tb_m3_jtag.cpp >/dev/null
@@ -71,7 +106,7 @@ test_sdr_port: $(SYS_OBJ)/sdr/Vm3_sdr_tb
 lint_sys:
 	@echo "== lint m3_system"
 	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-PINCONNECTEMPTY -Wno-UNUSEDPARAM -Wno-TIMESCALEMOD \
-	  --top-module m3_system $(CPU_RTL) $(TG_RTL) $(SYS_RTL)
+	  $(SYS_DEFS) --top-module m3_system $(CPU_RTL) $(TG_RTL) $(SYS_RTL)
 	@echo "  clean"
 
 SYS_THREADS ?= 1
@@ -79,7 +114,7 @@ SYS_THREADS ?= 1
 # time), as the board's ALLOW_POWER_UP_DONT_CARE lets them; default fast (zeros)
 SYS_X ?= fast
 $(SYS_OBJ)/system/Vm3_system: $(CPU_SIM) $(TG_RTL) $(SYS_RTL) sim/system/tb_m3_system.cpp sim/system/sdram_dev.h
-	@$(VERILATOR) $(VFLAGS) --x-assign $(SYS_X) --x-initial $(SYS_X) --savable --threads $(SYS_THREADS) --top-module m3_system -CFLAGS "$(CFLAGS_SYS) -I$(PWD)/sim/tilegen" \
+	@$(VERILATOR) $(VFLAGS) $(SYS_DEFS) --x-assign $(SYS_X) --x-initial $(SYS_X) --savable --threads $(SYS_THREADS) --top-module m3_system -CFLAGS "$(CFLAGS_SYS) -I$(PWD)/sim/tilegen" \
 	  -LDFLAGS "-lz" --Mdir $(SYS_OBJ)/system $(CPU_SIM) $(TG_RTL) $(SYS_RTL) sim/system/tb_m3_system.cpp >/dev/null
 
 system: $(SYS_OBJ)/system/Vm3_system

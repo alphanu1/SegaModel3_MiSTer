@@ -29,17 +29,26 @@
 // Transactions (s_sa is the SDRAM byte address of the access, or of the
 // critical word for a line fill):
 //   MC_RD       one 4-word burst at the 8-byte-aligned address, half chosen
-//   MC_WR       one or two single-word writes (the halves with lanes set);
-//               acknowledged at once, written after (posted, in order)
-//   MC_LINE_RD  two 8-word bursts, the half with the critical word first;
-//               beats go out critical word first, wrapping, as each arrives
-//   MC_LINE_WR  eight beats taken one per s_wnext, sixteen single writes
+//   MC_WR       one two-column write burst (m2_sdram WB); acknowledged at
+//               once, written after (posted, in order)
+//   MC_LINE_RD  two 8-word bursts, the first from the critical word's pair
+//               (s_sa[4:3]), the second from four words on, each wrapping in
+//               the line (m2_sdram's WB-port wrap, study R104); beats go out
+//               critical word first, wrapping, as each arrives
+//   MC_LINE_WR  eight beats taken one per s_wnext, a beat every four clocks,
+//               into the line buffer, then two eight-column write bursts: the
+//               first once beats 0-3 are in, the second after the last beat.
+//               The bus is free after the eighth beat; the bursts are posted
 // s_zero answers reads with zeros without touching SDRAM (an absent CROM
 // bank). One transaction at a time; a new one is taken only when the last
-// is done, so reads see earlier writes.
+// is done, so reads see earlier writes: a posted write is drained before the
+// next transaction of either master, and nothing passes it.
 //
-// Cost (sim/system/notes.md): m2_sdram writes one 16-bit word a request, so
-// a cast-out is 16 requests. A burst write path is stage B work.
+// Writes are m2_sdram write bursts (its WB parameter must name this port):
+// column 0 goes with the request on p_din / p_be, and the port reads column
+// wb_col's word and lanes from wb_din / wb_be as it goes. Before,
+// every 16-bit word was a request of its own: a store two, a cast-out
+// sixteen (sim/system/notes.md, "posted writes").
 
 module m3_sdr_port
   import ppc_cache_pkg::*;
@@ -70,7 +79,10 @@ module m3_sdr_port
   output logic          p_long,
   input  logic [63:0]   p_dout,
   input  logic          p_lo,
-  input  logic          p_ack
+  input  logic          p_ack,
+  input  logic [3:0]    wb_col,
+  output logic [15:0]   wb_din,
+  output logic [1:0]    wb_be
 );
 
   function automatic logic [31:0] bswap(input logic [31:0] v);
@@ -90,31 +102,33 @@ module m3_sdr_port
   // keeps it low for a cycle before the next.
   logic         gap;
   logic         half;            // T_LR: the burst in flight is the second half
-  logic         wsel;            // T_WR / T_LW: the high 16-bit word next
-  logic [2:0]   wbeat;           // T_LW: the beat
-  logic         wbeat_v;         // T_LW: wd holds beat wbeat
+  logic [2:0]   wbeat;           // T_LW: beats taken
+  logic         wfull;           // T_LW: all eight beats taken
+  logic [1:0]   wph;             // T_LW: the beat clock (one s_wnext in four)
   logic [7:0]   bv;              // T_LR / T_ZERO: beats arrived
   logic [7:0][31:0] bd;
   logic [2:0]   ek;              // beats sent
   logic [2:0]   crit;
 
-  // the 16-bit word and lanes of wd for this write (wsel: the high word)
-  logic [15:0]  w16;
-  logic [1:0]   w_be;
-  always_comb begin
-    if (!swap) begin
-      w16  = wsel ? wd[31:16] : wd[15:0];
-      w_be = wsel ? be[3:2]   : be[1:0];
-    end else begin
-      // byte form: CPU byte k (bits 31-8k) at SDRAM byte A + k
-      w16  = wsel ? {wd[7:0], wd[15:8]} : {wd[23:16], wd[31:24]};
-      w_be = wsel ? {be[0], be[1]}      : {be[2], be[3]};
-    end
-  end
+  // A write column's 16-bit word and lanes ({lanes, word}): the low word
+  // (A/2) of a 32-bit beat, or with hi the high (A/2 + 1).
+  function automatic logic [17:0] col16(input logic [31:0] w, input logic [3:0] b, input logic sw, input logic hi);
+    if (!sw) col16 = hi ? {b[3:2], w[31:16]} : {b[1:0], w[15:0]};
+    // byte form: CPU byte k (bits 31-8k) at SDRAM byte A + k
+    else     col16 = hi ? {b[0], b[1], w[7:0], w[15:8]} : {b[2], b[3], w[23:16], w[31:24]};
+  endfunction
+  // Column 0 goes with the request (p_din / p_be); column wb_col (1 on) is
+  // read while the column before it is written. A line's columns are beat
+  // {half, col[2:1]}, a single write's are wd.
+  wire          lw = (st == T_LW);
+  assign {p_be, p_din}   = col16(lw ? bd[{half, 2'b00}] : wd, lw ? 4'hF : be, swap, 1'b0);
+  assign {wb_be, wb_din} = col16(lw ? bd[{half, wb_col[2:1]}] : wd, lw ? 4'hF : be, swap, wb_col[0]);
 
   wire [2:0] enext = crit + ek;    // the beat to send next
   // T_LR: the second half has arrived (no more requests)
-  wire       half_done = half && bv[{!crit[2], 2'd3}];
+  wire       half_done = half && bv[3'({crit[2:1], 1'b0} + 3'd7)];
+  // the line word of a burst's beat j (0-3): the bursts start at the critical pair and its +4, wrapping
+  wire [2:0] lw0 = {crit[2:1], 1'b0} + {half, 2'b00};
 
   always_ff @(posedge clk) begin
     s_ack <= 1'b0; s_wnext <= 1'b0; s_rvalid <= 1'b0;
@@ -126,7 +140,7 @@ module m3_sdr_port
         T_IDLE: if (s_req && !s_ack) begin
           cmd <= s_cmd; sa <= s_sa; swap <= s_swap; be <= s_be; wd <= s_wdata;
           crit <= (s_cmd == MC_LINE_RD) ? s_sa[4:2] : 3'd0;
-          bv <= '0; ek <= '0; half <= 1'b0; wsel <= 1'b0; wbeat <= '0; wbeat_v <= 1'b0;
+          bv <= '0; ek <= '0; half <= 1'b0; wbeat <= '0; wfull <= 1'b0; wph <= '0;
           s_ack <= 1'b1;
           if (s_zero && !s_cmd[0]) begin
             st <= T_ZERO; bv <= (s_cmd == MC_RD) ? 8'h01 : 8'hFF; bd <= '0;
@@ -137,7 +151,7 @@ module m3_sdr_port
             end
             MC_LINE_RD: begin
               st <= T_LR; p_req <= !gap; p_we <= 1'b0; p_long <= 1'b1;
-              p_addr <= {s_sa[AW:5], s_sa[4], 3'b000};
+              p_addr <= {s_sa[AW:5], s_sa[4:3], 2'b00};   // R104: from the critical word's pair, wrapping in the line
             end
             MC_WR: st <= T_WR;
             default: st <= T_LW;     // MC_LINE_WR
@@ -164,20 +178,20 @@ module m3_sdr_port
 
         T_LR: begin
           if (!p_req && !gap && !p_ack && !half_done) p_req <= 1'b1;
-          // arrivals: the half in flight is crit[2] ^ half
+          // arrivals: words lw0 .. lw0 + 3 of the line (R104: from the critical pair, wrapping)
           if (p_lo) begin
-            bd[{crit[2] ^ half, 2'd0}] <= swap ? bswap(p_dout[31:0])  : p_dout[31:0];
-            bd[{crit[2] ^ half, 2'd1}] <= swap ? bswap(p_dout[63:32]) : p_dout[63:32];
-            bv[{crit[2] ^ half, 2'd0}] <= 1'b1; bv[{crit[2] ^ half, 2'd1}] <= 1'b1;
+            bd[lw0]         <= swap ? bswap(p_dout[31:0])  : p_dout[31:0];
+            bd[lw0 + 3'd1]  <= swap ? bswap(p_dout[63:32]) : p_dout[63:32];
+            bv[lw0] <= 1'b1; bv[lw0 + 3'd1] <= 1'b1;
           end
           if (p_ack) begin
-            bd[{crit[2] ^ half, 2'd2}] <= swap ? bswap(p_dout[31:0])  : p_dout[31:0];
-            bd[{crit[2] ^ half, 2'd3}] <= swap ? bswap(p_dout[63:32]) : p_dout[63:32];
-            bv[{crit[2] ^ half, 2'd2}] <= 1'b1; bv[{crit[2] ^ half, 2'd3}] <= 1'b1;
+            bd[lw0 + 3'd2]  <= swap ? bswap(p_dout[31:0])  : p_dout[31:0];
+            bd[lw0 + 3'd3]  <= swap ? bswap(p_dout[63:32]) : p_dout[63:32];
+            bv[lw0 + 3'd2] <= 1'b1; bv[lw0 + 3'd3] <= 1'b1;
             p_req <= 1'b0; gap <= 1'b1;
             if (!half) begin
               half <= 1'b1;
-              p_addr <= {sa[AW:5], !crit[2], 3'b000};
+              p_addr <= {sa[AW:5], !sa[4], sa[3], 2'b00};
             end
           end
           // out, critical word first
@@ -188,41 +202,31 @@ module m3_sdr_port
         end
 
         T_WR: begin
-          // the halves with lanes: low word (A/2) then high word (A/2 + 1)
-          if (!p_req && !gap && !p_ack) begin
-            if (w_be == 2'b00) begin
-              if (wsel) st <= T_IDLE;
-              wsel <= 1'b1;
-            end else begin
-              p_req <= 1'b1; p_we <= 1'b1; p_long <= 1'b0;
-              p_addr <= {sa[AW:2], wsel}; p_din <= w16; p_be <= w_be;
-            end
+          // one two-column burst: the low word (A/2), then the high (A/2 + 1)
+          if (!p_req && !gap && !p_ack && !half) begin
+            p_req <= 1'b1; p_we <= 1'b1; p_long <= 1'b0; p_addr <= {sa[AW:2], 1'b0}; half <= 1'b1;
           end
-          if (p_ack) begin
-            p_req <= 1'b0; gap <= 1'b1;
-            if (wsel) st <= T_IDLE;
-            wsel <= 1'b1;
-          end
+          if (p_ack) begin p_req <= 1'b0; gap <= 1'b1; st <= T_IDLE; end
         end
 
         T_LW: begin
-          // take beat wbeat, then write its two halves
-          if (!wbeat_v) begin
-            if (!s_wnext) begin s_wnext <= 1'b1; end
-            else begin wd <= s_wdata; wbeat_v <= 1'b1; be <= 4'hF; wsel <= 1'b0; end
-          end else begin
-            if (!p_req && !gap && !p_ack) begin
-              p_req <= 1'b1; p_we <= 1'b1; p_long <= 1'b0;
-              p_addr <= {sa[AW:5], wbeat, wsel}; p_din <= w16; p_be <= w_be;
-            end
-            if (p_ack) begin
-              p_req <= 1'b0; gap <= 1'b1;
-              if (wsel) begin
-                wbeat_v <= 1'b0; wbeat <= wbeat + 3'd1;
-                if (wbeat == 3'd7) st <= T_IDLE;
-              end
-              wsel <= !wsel;
-            end
+          // the beats, one s_wnext every four clocks: the bus passes it on a
+          // clock later and the master shows the next beat the clock after
+          // that, as for the bus's own line writes (B_BEAT, three clocks)
+          wph <= wph + 2'd1;
+          if (wph == 2'd0 && !wfull) s_wnext <= 1'b1;
+          if (s_wnext) begin
+            bd[wbeat] <= s_wdata; wbeat <= wbeat + 3'd1;
+            if (wbeat == 3'd7) wfull <= 1'b1;
+          end
+          // the halves: the first once beats 0-3 are in, the second once all are
+          if (!p_req && !gap && !p_ack && (half ? wfull : (wbeat[2] || wfull))) begin
+            p_req <= 1'b1; p_we <= 1'b1; p_long <= 1'b1; p_addr <= {sa[AW:5], half, 3'b000};
+          end
+          if (p_ack) begin
+            p_req <= 1'b0; gap <= 1'b1;
+            if (half) st <= T_IDLE;
+            half <= 1'b1;
           end
         end
 

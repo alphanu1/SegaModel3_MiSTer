@@ -78,7 +78,9 @@ module r3d_vpu
   parameter bit BC_M10K  = 1'b0,
   // the ROM with the set-up kernels (r3d_ucode_su: the default ROM's kernels at
   // the same addresses, then SETUP4 and SETUP2; r3d_geo SETUP_OUT)
-  parameter bit SU_ROM   = 1'b0
+  parameter bit SU_ROM   = 1'b0,
+  // the adders' shifts in DSP blocks (r3d_fp_add DSP_SHIFT, study R98)
+  parameter bit FP_DSP   = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -277,6 +279,9 @@ module r3d_vpu
     end else if (dq_v != '0) begin
       dq_v <= {1'b0, dq_v[3:1]};
       dlane <= dlane + 2'd1;
+      // lanes 2 and 3 move down, so the unit's input is always dq_[1] (timing, study R104)
+      dq_x[1] <= dq_x[2]; dq_a[1] <= dq_a[2];
+      dq_x[2] <= dq_x[3]; dq_a[2] <= dq_a[3];
     end
   end
   always_ff @(posedge clk) begin
@@ -298,7 +303,7 @@ module r3d_vpu
 
   always_comb begin
     if (div_go) begin d_v = 1'b1; d_x = opA[0]; d_a = opB[0]; end
-    else begin d_v = dq_v[1]; d_x = dq_x[dlane == 2'd0 ? 2'd1 : dlane]; d_a = dq_a[dlane == 2'd0 ? 2'd1 : dlane]; end
+    else begin d_v = dq_v[1]; d_x = dq_x[1]; d_a = dq_a[1]; end
   end
 
   r3d_recip i_div (.clk, .in_valid(d_v), .div(1'b1), .a(d_a), .x(d_x), .out_valid(d_ov), .result(d_out), .tiny(d_tiny));
@@ -366,7 +371,7 @@ module r3d_vpu
       .out_valid(pv), .result(prod), .overflow(), .underflow(p_unf), .invalid());
     logic [31:0] sum;
     logic        sv;
-    r3d_fp_add #(.SUBNORM(SUBNORM), .PIPE_A2(1'b1)) u_add (
+    r3d_fp_add #(.SUBNORM(SUBNORM), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP)) u_add (
       .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(c_d[4]), .sub(1'b0),
       .out_valid(sv), .result(sum), .overflow(), .underflow(s_unf), .invalid());
 
@@ -467,6 +472,12 @@ module r3d_vpu
   // pool occupancy: instructions issued, and lane operations (issue x lanes)
   logic [31:0] iss_cnt /* verilator public_flat_rd */;
   logic [31:0] lop_cnt /* verilator public_flat_rd */;
+  // study R99: MAC words using lane 2 or 3 (a second pass on a two-lane pool)
+  logic [31:0] hi_cnt /* verilator public_flat_rd */;
+  always_ff @(posedge clk) begin
+    if (rst) hi_cnt <= '0;
+    else if (u_valid && !u_div && (u_lanes[3:2] != 2'b00)) hi_cnt <= hi_cnt + 32'd1;
+  end
   always_ff @(posedge clk) begin
     if (rst) begin iss_cnt <= '0; lop_cnt <= '0; end
     else if (u_valid) begin

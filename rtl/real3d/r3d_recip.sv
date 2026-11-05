@@ -207,7 +207,8 @@ module r3d_recip (
     c0.m <= {1'b1, f};
     c0.am <= {1'b1, fa};
     c0.ge <= (fa >= f);
-    c0.re <= {2'b00, ea} - {2'b00, e} + 10'd127 - ((fa >= f) ? 10'd0 : 10'd1);
+    // the A < M correction (- 1) is applied in stage 1, off the compare's path (timing, study R104)
+    c0.re <= {2'b00, ea} - {2'b00, e} + 10'd127;
     c0.tin <= in_valid && ((xz && f != 23'd0) || (az && fa != 23'd0));
     if (xn || an || (xz && az) || (xi && ai)) c0.special <= 2'd3;
     else if (ai || xz) c0.special <= 2'd1;
@@ -220,6 +221,7 @@ module r3d_recip (
   logic [11:0] t1;
   always_ff @(posedge clk) begin
     c1 <= c0;
+    c1.re <= c0.re - {9'd0, !c0.ge};
     t1 <= t0;
     p1 <= c0.m * t0;
   end

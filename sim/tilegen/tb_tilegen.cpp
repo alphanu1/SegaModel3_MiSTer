@@ -38,9 +38,15 @@ static std::vector<uint8_t> mem;          // the 1 MiB VRAM image
 static Rng *rng;
 static int lat_min = 2, lat_max = 2, busy_pct = 0;
 static long proto_err = 0, nreqs = 0;
+// request census (R103): by kind, and how many a line would need with each pattern burst fetched once and the
+// name words in 16-byte (eight-word) bursts
+#include <unordered_set>
+static std::unordered_set<uint32_t> ln_pat, ln_name16;
+static long n_pat = 0, n_name = 0, n_other = 0, u_pat = 0, u_name16 = 0;
+static void census_line() { u_pat += (long)ln_pat.size(); u_name16 += (long)ln_name16.size(); ln_pat.clear(); ln_name16.clear(); }
 
 // memory model state
-static bool m_pend = false, m_prev = false, m_ack_next = false;
+static bool m_pend = false, m_prev = false, m_ack_next = false, m_long = false, m_lo_next = false, m_lo_done = false;
 static uint64_t m_due = 0;
 static uint32_t m_addr = 0;
 
@@ -53,10 +59,16 @@ static uint64_t burst(uint32_t waddr) {
 
 static void tick() {
   // drive this cycle's acknowledge
+  top->p_lo = 0;
   if (m_ack_next) {
     top->p_ack = 1;
-    top->p_dout = burst(m_addr);
+    top->p_dout = burst(m_long ? m_addr + 4 : m_addr);   // an eight-word read: its last four words
     m_ack_next = false;
+  } else if (m_lo_next) {
+    top->p_ack = 0;
+    top->p_lo = 1;                                       // its first four, without an acknowledge
+    top->p_dout = burst(m_addr);
+    m_lo_next = false;
   } else {
     top->p_ack = 0;
     top->p_dout = ((uint64_t)rng->next() << 32) | rng->next();   // garbage outside the acknowledge
@@ -72,20 +84,29 @@ static void tick() {
     if (m_pend) { if (proto_err++ < 5) std::printf("protocol: request while one is pending (cycle %llu)\n", (unsigned long long)cyc); }
     m_pend = true;
     m_addr = (uint32_t)top->p_addr;
+    m_long = top->p_long; m_lo_done = !m_long;
+    if (m_long && (m_addr & 7)) { if (proto_err++ < 5) std::printf("protocol: eight-word read not aligned\n"); }
     int d = lat_min + (int)rng->below((uint32_t)(lat_max - lat_min + 1));
     if (busy_pct && rng->chance(busy_pct)) d += 50 + (int)rng->below(351);
     m_due = cyc + (uint64_t)d;
     nreqs++;
+    {
+      uint32_t const w = m_addr & 0x7FFFF;          // VRAM word address
+      if ((w >> 14) == 0x1F) { n_name++; ln_name16.insert(w >> 3); }
+      else if ((w >> 11) >= 0x7B) n_other++;        // F6000 line scroll, F7000 stencil
+      else { n_pat++; ln_pat.insert(w >> 2); }
+    }
   } else if (m_pend) {
     if (!req) { if (proto_err++ < 5) std::printf("protocol: request dropped before acknowledge (cycle %llu)\n", (unsigned long long)cyc); m_pend = false; }
     else if ((uint32_t)top->p_addr != m_addr) { if (proto_err++ < 5) std::printf("protocol: address moved while pending\n"); }
   }
-  if (m_pend && cyc + 1 >= m_due) { m_pend = false; m_ack_next = true; }
+  if (m_pend && !m_lo_done && cyc + 5 >= m_due) { m_lo_done = true; m_lo_next = true; }
+  else if (m_pend && m_lo_done && !m_lo_next && cyc + 1 >= m_due) { m_pend = false; m_ack_next = true; }
   m_prev = req;
 }
 
 static void idle_inputs() {
-  top->reg_we = 0; top->pal_we = 0; top->swap = 0; top->go = 0; top->sc_rd = 0;
+  top->reg_we = 0; top->pal_we = 0; top->swap = 0; top->go = 0; top->sc_rd = 0; top->name_inv = 0;
 }
 
 // collected pixels
@@ -96,7 +117,7 @@ static void reset_dut() {
   top->rst_n = 0;
   for (int i = 0; i < 4; i++) tick();
   top->rst_n = 1;
-  m_pend = m_ack_next = m_prev = false;
+  m_pend = m_ack_next = m_prev = m_lo_next = false;
   for (int i = 0; i < 600 && !top->ready; i++) tick();
 }
 
@@ -150,13 +171,13 @@ static void run_frame(bool realtime, Stats &st) {
   };
   if (!realtime) {
     // line 0 first
-    top->go = 1; top->go_y = 0; tick(); top->go = 0; out();
+    census_line(); top->go = 1; top->go_y = 0; tick(); top->go = 0; out();
     while (top->busy) { tick(); out(); }
     finish_line_stats();
     for (int y = 0; y < H; y++) {
       top->swap = 1; tick(); top->swap = 0; out();
       y_scan = y;
-      if (y + 1 < H) { top->go = 1; top->go_y = y + 1; tick(); top->go = 0; out(); }
+      if (y + 1 < H) { census_line(); top->go = 1; top->go_y = y + 1; tick(); top->go = 0; out(); }
       // scan line y at one pixel every 6 clocks, building y + 1 meanwhile
       x_next = 0;
       int k = 0;
@@ -178,7 +199,7 @@ static void run_frame(bool realtime, Stats &st) {
         top->swap = 1; tick(); top->swap = 0; out();
       }
       y_scan = yl;
-      if (yl + 1 < H) { top->go = 1; top->go_y = yl + 1; tick(); top->go = 0; out(); }
+      if (yl + 1 < H) { census_line(); top->go = 1; top->go_y = yl + 1; tick(); top->go = 0; out(); }
       x_next = 0;
       long acc = 0;
       for (int c = 2; c < LINE; c++) {
@@ -282,6 +303,9 @@ int main(int argc, char **argv) {
     }
   }
   std::printf("frames %ld, differing %ld (%ld px), protocol errors %ld, requests %ld\n", frames, bad, badpx, proto_err, nreqs);
+  census_line();
+  std::printf("census: pattern %ld (once a line: %ld), name %ld (in 8-word bursts, once a line: %ld), other %ld\n",
+              n_pat, u_pat, n_name, u_name16, n_other);
   std::printf("lines %ld: slowest %d clocks, mean %.0f, most requests %d, overruns %ld\n", st.lines, st.max_cycles,
               st.lines ? (double)st.sum_cycles / st.lines : 0.0, st.max_reqs, st.overruns);
   std::printf("%s\n", (bad || proto_err || (realtime && !recover && st.overruns)) ? "FAIL" : "PASS");

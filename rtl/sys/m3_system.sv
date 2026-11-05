@@ -25,12 +25,23 @@
 //           -> r3d_geo (culling RAM: port 2, VROM: port 3, polygon RAM: DDR3)
 //              -> r3d_rast (MIP; store, layer, texture cache: DDR3)
 //   m3_tilegen (VRAM in SDRAM, port 1) + m3_compose (the layer from DDR3) -> video
-//   m3_loader: the MRA's stream -> SDRAM (download port)
+//   m3_loader: the MRA's downloads -> SDRAM (download port), the extra memory,
+//              the 93C46, the game configuration (study R100)
+//
+// R100 (Daytona 2, Step 2.1): the game configuration (MRA index 4) picks the
+// step at run time; STEP2 builds the Step 2.x hardware (the Real3D DMA front
+// end on m3_scripts, the 17-device JTAG chain, the bank map, the security
+// board m3_sec with SEC5881), XMEM where the MRA's index 1 (VROM) lives:
+// 1 DDR3 (m3_xmem on m3_ddr3p's second pipelined port; the loader on DDR3
+// arbiter port 6), 2 the second SDRAM (not built: its m2_sdram goes in the
+// g_xmem branch). The Step 2 map in m3_bus is a patch held outside the tree
+// while m3_bus is being changed elsewhere; its ports are connected only with
+// M3_STEP2_BUS defined (sm3-builds/dt2/m3_bus_step2.patch).
 //
 // DDR3 (64-bit words from DDR_BASE; sim/system/notes.md, Stage B): layer
 // buffers 0-3 at 0x20000 k, polygon RAM copies at 0x100000 and 0x180000, the
 // texture ring at 0x200000, the rasteriser's store at 0x400000, the texture
-// sheets at 0xC00000. Nothing touches DDR3 before ddr_ok (R71: hps_io's first
+// sheets at 0xC00000, the extra memory (VROM, R100) at 0x1000000 (64 MiB). Nothing touches DDR3 before ddr_ok (R71: hps_io's first
 // command and RESET low for 100 ms): the arbiter's request is gated on it.
 //
 // SDRAM layout (bytes; study 7.3, sim/system/notes.md, the MRA):
@@ -42,6 +53,7 @@
 //   0x6C00000  tile VRAM, 1 MiB
 //   0x6D00000  culling RAM 8C, 4 MiB
 //   0x7100000  8E, two copies of 1 MiB (r3d_mem)
+//   0x7300000  a Step 2 set's fixed CROM, 8 MiB (R100; MRA index 3)
 //
 // Reset: the memories come out of reset on PLL lock and stay out
 // (mem_rst_n); the game (CPU, bus, devices) is held in reset until the ROMs
@@ -60,12 +72,24 @@ module m3_system
   // reported once a second on the debug UART ("P nn value", tools/uart_capture.py)
   // and shown on the overlay with CPI x 256. 0 drops it (the release).
   parameter bit          CPI_MON  = 1'b1,
+  parameter bit          FBUSY    = 1'b1,         // the CPU's busy time per frame on overlay row 7 (study R104)
   parameter int          CLK_HZ   = 100_000_000,
   // D-41: the 603e revision the game reads (Step 1.0: rev 1.3, as MAME). VF3's
   // boot code and TLB-miss handler set W in every BAT and RPA on revisions below
   // 1.3; at 1.3 RAM is copy-back (D-14: per step)
-  parameter logic [31:0] PVR      = 32'h0006_0101,  // 0x00060103 once the D-cache snoops the 53C810 (D-41)
-  parameter logic [28:0] DDR_BASE = 29'h0600_0000   // byte 0x30000000, the cores' DDR3 (Model 2 R654)
+  parameter logic [31:0] PVR      = 32'h0006_0103,  // 603e rev 1.3: RAM copy-back, the D-cache snoops the 53C810 (D-41, R101)
+  parameter logic [28:0] DDR_BASE = 29'h0600_0000,  // byte 0x30000000, the cores' DDR3 (Model 2 R654)
+  // R100 (Daytona 2): Step 2.x, and where the MRA's index 1 (VROM) lives
+  parameter bit          STEP2    = 1'b1,         // the Step 2.x hardware, chosen at run time by the step
+  parameter bit          SEC5881  = 1'b1,         // the security board's 315-5881 (with STEP2)
+  parameter int          XMEM     = 1,            // index 1: 1 DDR3, 2 the second SDRAM (not built), 0 none
+  // ---- R100: where a Step 1.x set's VROM lives (the MRA's index-0 image at 0x4000000):
+  //   0 SDRAM, as before; 1 DDR3 and 2 the second SDRAM, i.e. the extra memory, which
+  //   must then be that memory (VROM_LOC == XMEM). The loader routes that range of
+  //   index 0 there and the VROM readers (geometry, texture upload) read it there.
+  //   A Step 2 set's VROM is always in the extra memory (its index 1).
+  parameter int          VROM_LOC = 1,
+  parameter int          DDR_MAXQ = 8                // m3_ddr3p: DDR3 reads queued or in flight at most (1-32; R101)
 ) (
   input  logic        clk,
   input  logic        mem_rst_n,
@@ -139,15 +163,23 @@ module m3_system
   localparam int MIDI_GAP_C = (MIDI_GAP != 0) ? MIDI_GAP : CLK_HZ / 3125;
   localparam int T_REFI_C   = CLK_MHZ * 77 / 10;
   localparam logic [26:0] SDR_CROM = 27'h000_0000, SDR_FIXED = 27'h600_0000, SDR_BACKUP = 27'h620_0000,
-                          SDR_RAM = 27'h640_0000, SDR_VRAM = 27'h6C0_0000;
+                          SDR_RAM = 27'h640_0000, SDR_VRAM = 27'h6C0_0000, SDR_FIX8 = 27'h730_0000;
 
   // ===========================================================================
   // reset
   // ===========================================================================
-  logic loader_busy;
+  logic loader_busy /* verilator public_flat_rd */;
   logic [2:0] rst_s = 3'b111;
   always_ff @(posedge clk) rst_s <= {rst_s[1:0], reset || !mem_rst_n || !rom_loaded || loader_busy};
   wire rst = rst_s[2];
+  // copies of rst_s[2] for the geometry and the rasteriser, the same function and timing, kept apart
+  // (preserve) so each block's reset fans out from a flip-flop of its own (rst_s[2] into the
+  // rasteriser's registers was -0.52 ns at 100 MHz; study R104)
+  (* preserve *) logic rst_geo = 1'b1, rst_rast = 1'b1;
+  always_ff @(posedge clk) begin
+    rst_geo  <= rst_s[1];
+    rst_rast <= rst_s[1];
+  end
   logic por_n;                       // power-on: the EEPROM and the I/O latches
   always_ff @(posedge clk) por_n <= mem_rst_n;
 
@@ -167,20 +199,48 @@ module m3_system
   logic [NSP-1:0][1:0]     p_be;
   logic [NSP-1:0][63:0]    p_dout;
 
-  m2_sdram #(.COL_BITS(COL_BITS), .NP(NSP), .T_REFI(T_REFI_C), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL)) u_sdram (
+  logic [3:0]  wb_col;
+  logic [15:0] wb_din;
+  logic [1:0]  wb_be;
+  m2_sdram #(.COL_BITS(COL_BITS), .NP(NSP), .T_REFI(T_REFI_C), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL),
+             .WB({{(NSP-1){1'b0}}, 1'b1})) u_sdram (   // port 0 (the bus) writes in bursts (R101)
     .clk, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm, .sd_dq_o, .sd_dq_oe, .sd_dq_i,
     .wr_req(ld_req), .wr_addr(ld_addr), .wr_din(ld_din), .wr_be(ld_be), .wr_ack(ld_ack),
-    .p_req, .p_we, .p_addr, .p_din, .p_be, .p_dout, .p_ack, .p_long, .p_lo,
+    .p_req, .p_we, .p_addr, .p_din, .p_be, .p_dout, .p_ack, .p_long, .p_lo, .wb_col, .wb_din, .wb_be,
     .dbg_req(), .dbg_grant());
 
   logic [26:0] ld_bytes;
   logic        ld_ovf;
-  m3_loader #(.AW(AW)) u_ld (
-    .clk, .rst(!mem_rst_n), .mem_ready,
+  // R100: the extra memory's writes, the 93C46's load, the game configuration
+  logic        lx_req, lx_ack, ee_ld_we;
+  logic [26:1] lx_addr;
+  logic [15:0] lx_din, ee_ld_d;
+  logic [5:0]  ee_ld_a;
+  logic [7:0]  cfg_step /* verilator public_flat_rd */, cfg_flags /* verilator public_flat_rw */;   // (the bench may set bit 0: --vrom-x)
+  logic [15:0][4:0] cfg_bank /* verilator public_flat_rd */;
+  logic [7:0]  cfg_in2 /* verilator public_flat_rd */, cfg_in3 /* verilator public_flat_rd */;
+  m3_loader #(.AW(AW), .BACKUP(SDR_BACKUP), .FIX8(SDR_FIX8),
+              .VROM_X((VROM_LOC != 0) && (VROM_LOC == XMEM)), .VROM_AT(27'h400_0000)) u_ld (   // R100: VROM placement
+    .clk, .rst(!mem_rst_n), .mem_ready, .x_ok(ddr_ok),
     .ioctl_download, .ioctl_index, .ioctl_wr, .ioctl_addr, .ioctl_dout, .ioctl_wait,
     .sdr_wr_req(ld_req), .sdr_wr_addr(ld_addr), .sdr_wr_din(ld_din), .sdr_wr_be(ld_be), .sdr_wr_ack(ld_ack),
+    .x_req(lx_req), .x_addr(lx_addr), .x_din(lx_din), .x_ack(lx_ack),
+    .ee_we(ee_ld_we), .ee_a(ee_ld_a), .ee_d(ee_ld_d),
+    .cfg_step, .cfg_flags, .cfg_bank, .cfg_in2, .cfg_in3,
     .rom_loaded, .busy(loader_busy), .overflow(ld_ovf), .bytes(ld_bytes));
+
+  // R100: the game configuration, static while the game runs (it changes only
+  // during a download, with the game in reset)
+  wire        step2   = STEP2 && cfg_step >= 8'h20;           // the Step 2.x devices
+  wire        step15  = cfg_step >= 8'h15;                    // 13.11 vertices, full culling nodes
+  wire [1:0]  jstep   = {cfg_step >= 8'h20, cfg_step == 8'h15 || cfg_step == 8'h21};
+  // VROM in the extra memory: by placement (VROM_LOC), or by the set (Step 2: flags bit 0)
+  wire        vrom_x  = (XMEM == 1) && (((VROM_LOC != 0) && (VROM_LOC == XMEM)) || cfg_flags[0]);
+  wire        fixed8  = cfg_flags[1];                         // an 8 MiB fixed CROM at SDR_FIX8
+  wire        vrom64  = cfg_flags[2];
+  logic [29:0] sec_key;                                       // the 315-5881 key: configuration bytes 18-21
+  assign sec_key = 30'h2925_0E16;                             // (daytona2; MAME ROM_PARAMETER ":315_5881:key")
 
   // ===========================================================================
   // the CPU
@@ -200,6 +260,8 @@ module m3_system
   logic [1:0][31:0] m_addr, m_wdata;
   logic [1:0][3:0]  m_be;
   logic [31:0]      m_rdata;
+  logic             sn_req, sn_inv, sn_ack;
+  logic [31:5]      sn_addr;
   logic             ext_int;
   logic             rt_valid, rt_gpr_we, rt_gpr_sh;
   logic [4:0]       rt_gpr;
@@ -214,8 +276,8 @@ module m3_system
     .clk, .rst,
     .m_req(m_req[0]), .m_cmd(m_cmd[0]), .m_addr(m_addr[0]), .m_be(m_be[0]), .m_wdata(m_wdata[0]),
     .m_ack(m_ack[0]), .m_wnext(m_wnext[0]), .m_rvalid(m_rvalid[0]), .m_rdata,
-    // the D-cache snoop (D-41): tied off until the 53C810's RAM writes drive it
-    .sn_req(1'b0), .sn_addr(27'd0), .sn_inv(1'b0), .sn_ack(),
+    // the D-cache snoop (D-41): the 53C810's RAM accesses, from m3_bus
+    .sn_req, .sn_addr, .sn_inv, .sn_ack,
     .tb_tick, .ext_int, .ev(cpu_ev), .ev_mmu(cpu_ev_mmu), .ev_btb(),
     .rt_valid, .rt_last(), .rt_pc, .rt_insn(rt_insn_o), .rt_gpr_we, .rt_gpr, .rt_gpr_sh,
     .rt_irq(rt_irq), .rt_gpr_val,
@@ -282,8 +344,8 @@ module m3_system
   logic [31:8] sc_win_base;
   logic [5:0]  cf_idx;
 
-  m3_scripts u_scsi (
-    .clk, .rst,
+  m3_scripts #(.R3DMA(STEP2)) u_scsi (
+    .clk, .rst, .step2,     // R100: Step 2.x, the Real3D DMA device on this move engine
     .c_req(cf_req), .c_we(cf_we), .c_idx(cf_idx), .c_be(cf_be), .c_wdata(cf_wdata), .c_ack(cf_ack), .c_rdata(cf_rdata),
     .win_en(sc_win_en), .win_base(sc_win_base),
     .s_req(sc_req), .s_we(sc_we), .s_addr(sc_addr), .s_be(sc_be), .s_wdata(sc_wdata), .s_ack(sc_ack), .s_rdata(sc_rdata),
@@ -323,10 +385,38 @@ module m3_system
   logic [3:0]  mw_dev;
   logic [31:0] mw_val;
 
+  // R100: the security board, and the bank register's slot from the game's bank map
+  logic        sec_req, sec_we, sec_ack, sec_cmp;
+  logic [17:2] sec_addr;
+  logic [3:0]  sec_be;
+  logic [31:0] sec_wdata, sec_rdata;
+  wire  [4:0]  crom_map = cfg_bank[~crom_bank[3:0]];
+  generate if (STEP2 && SEC5881) begin : g_sec
+    m3_sec u_sec (
+      .clk, .rst, .game_key(sec_key),
+      .req(sec_req), .we(sec_we), .addr(sec_addr), .be(sec_be), .wdata(sec_wdata), .ack(sec_ack), .rdata(sec_rdata),
+      .cmp_seen(sec_cmp));
+  end else begin : g_nosec
+    always_ff @(posedge clk) sec_ack <= sec_req && !sec_ack;
+    assign sec_rdata = 32'hFFFF_FFFF; assign sec_cmp = 1'b0;
+  end endgenerate
+`ifndef M3_STEP2_BUS
+  assign sec_req = 1'b0; assign sec_we = 1'b0; assign sec_addr = '0; assign sec_be = '0; assign sec_wdata = '0;
+`endif
+
   m3_bus #(.AW(AW), .SDR_CROM(SDR_CROM), .SDR_FIXED(SDR_FIXED), .SDR_BACKUP(SDR_BACKUP), .SDR_RAM(SDR_RAM),
-           .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C)) u_bus (
+           .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C)
+`ifdef M3_STEP2_BUS
+           , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ)
+`endif
+           ) u_bus (
     .clk, .rst,
+`ifdef M3_STEP2_BUS
+    .step2, .fixed8, .crom_slot(crom_map[3:0]), .crom_zero(crom_map[4]),
+    .sec_req, .sec_we, .sec_addr, .sec_be, .sec_wdata, .sec_ack, .sec_rdata,
+`endif
     .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
+    .sn_req, .sn_addr, .sn_inv, .sn_ack,
     .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata,
     .sc_req, .sc_we, .sc_addr, .sc_be, .sc_wdata, .sc_ack, .sc_rdata, .sc_win_en, .sc_win_base,
     .cf_req, .cf_we, .cf_idx, .cf_be, .cf_wdata, .cf_ack, .cf_rdata, .scsi_irq,
@@ -344,14 +434,15 @@ module m3_system
     .clk, .rst(!mem_rst_n),
     .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
     .p_req(p_req[0]), .p_we(p_we[0]), .p_addr(p_addr[0]), .p_din(p_din[0]), .p_be(p_be[0]), .p_long(p_long[0]),
-    .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]));
+    .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]), .wb_col, .wb_din, .wb_be);
 
-  m3_io #(.EE_TWP(EE_TWP_C)) u_io (
+  m3_io #(.EE_TWP(EE_TWP_C), .EE_LOAD(1'b1)) u_io (
     .clk, .por_n, .rst_n(!rst), .sel(io_sel), .we(io_we), .off(io_off), .wbyte(io_wbyte), .rbyte(io_rbyte),
-    .in0(8'hFF), .test_b_n(1'b1), .service_b_n(1'b1), .in2(8'hFF), .in3(8'hFF), .pa_q(io_pa));
+    .in0(8'hFF), .test_b_n(1'b1), .service_b_n(1'b1), .in2(cfg_in2), .in3(cfg_in3), .pa_q(io_pa),
+    .ee_ld_we, .ee_ld_a, .ee_ld_d);       // R100: the MRA's <nvram>
 
   m3_jtag u_jtag (
-    .clk, .rst, .wr(jt_wr), .wdata(jt_wdata), .busy(jt_busy), .tdo(jt_tdo),
+    .clk, .rst, .jstep(STEP2 ? jstep : 2'd0), .wr(jt_wr), .wdata(jt_wdata), .busy(jt_busy), .tdo(jt_tdo),
     .cfg0(r3d_cfg0), .cfg1(r3d_cfg1), .cfg2(r3d_cfg2),
     .cfg_we(jt_cfg_we), .cfg0_w(jt_cfg0), .cfg1_w(jt_cfg1), .cfg2_w(jt_cfg2),
     .mw_we, .mw_dev, .mw_val);
@@ -363,10 +454,14 @@ module m3_system
                           D_STORE = 25'h40_0000, D_TEX = 25'hC0_0000;
   localparam logic [26:0] SDR_8C = 27'h6D0_0000, SDR_8E0 = 27'h710_0000, SDR_8E1 = 27'h720_0000, SDR_VROM = 27'h400_0000;
 
-  // ---- DDR3: m3_ddr3p (the texture cache on its pipelined port) behind
-  // m3_ddr_arb: 0 the layer's scan-out, 1 the store, 2 the layer, 3 the
-  // geometry's polygon reads, 4 r3d_mem, 5 r3d_texup
-  localparam int NDP = 6;
+  // ---- DDR3: m3_ddr3p (the texture cache on its pipelined port, R100's
+  // extra memory reads on a second) behind m3_ddr_arb: 0 the layer's
+  // scan-out, 1 the store, 2 the layer, 3 the geometry's polygon reads,
+  // 4 r3d_mem, 5 r3d_texup, 6 the loader's extra-memory writes (R100)
+  localparam int NDP = 7;
+  localparam logic [24:0] D_XMEM = 25'h100_0000;                   // R100: VROM, 64 MiB
+  logic        xp_req, xp_ack, xp_rvalid;
+  logic [24:0] xp_addr;
   logic [NDP-1:0]       d_req, d_we, d_wacc, d_rvalid, d_ack;
   logic [NDP-1:0][24:0] d_addr;
   logic [NDP-1:0][7:0]  d_blen, d_be;
@@ -382,12 +477,12 @@ module m3_system
     .wacc(d_wacc), .rvalid(d_rvalid), .ack(d_ack),
     .m_req(dm_req), .m_we(dm_we), .m_addr(dm_addr), .m_blen(dm_blen), .m_din(dm_din), .m_be(dm_be),
     .m_wacc(dm_wacc), .m_rvalid(dm_rvalid), .m_ack(dm_ack));
-  m3_ddr3p #(.PIPE(1'b1), .NP(1)) u_ddr3 (
+  m3_ddr3p #(.PIPE(1'b1), .NP(2), .MAXQ(DDR_MAXQ)) u_ddr3 (   // R101: reads in flight capped (the probe: 16 or more raise latency)
     .clk, .rst_n(mem_rst_n), .base(DDR_BASE),
     .req(dm_req && ddr_ok), .we(dm_we), .addr(dm_addr), .blen(dm_blen), .din(dm_din), .be(dm_be),
     .wnext(), .wacc(dm_wacc), .rvalid(dm_rvalid), .ack(dm_ack),
-    .p_req(tx_req && ddr_ok), .p_addr(tx_addr), .p_blen(8'd4), .p_we(1'b0), .p_din('0),
-    .p_ack(tx_ack), .p_rvalid(tx_rvalid), .p_wacc(),
+    .p_req({xp_req && ddr_ok, tx_req && ddr_ok}), .p_addr({xp_addr, tx_addr}), .p_blen({8'd1, 8'd4}),
+    .p_we(2'b00), .p_din('0), .p_ack({xp_ack, tx_ack}), .p_rvalid({xp_rvalid, tx_rvalid}), .p_wacc(),
     .dout(dm_dout),
     .DDRAM_CLK, .DDRAM_BUSY, .DDRAM_BURSTCNT, .DDRAM_ADDR, .DDRAM_DIN, .DDRAM_BE,
     .DDRAM_WE, .DDRAM_RD, .DDRAM_DOUT, .DDRAM_DOUT_READY,
@@ -427,25 +522,51 @@ module m3_system
   assign p_long[4] = 1'b0;
 
   // ---- textures
-  r3d_texup #(.AW(AW), .SDR_VROM(SDR_VROM), .DDR_STG(D_STG), .DDR_TEX(D_TEX)) u_r3tex (
-    .clk, .rst, .t_valid(t3_valid), .t_ready(t3_ready), .t_vrom(t3_vrom), .t_data(t3_data), .t_flush(t3_flush),
+  // R100: Step 2's texture port (90) is two words, an address and a header, uploaded
+  // at once (not built in r3d_texup yet): dropped here, so a Step 1.0 decode never
+  // reads them as VROM block addresses. VROM in the extra memory: r3d_texup's VROM
+  // reads go to m3_xmem.
+`ifdef M3_STEP2_TEX
+  // R100: with r3d_texup's STEP2_PORT (sm3-builds/dt2/handoff2) the Step 2 port is uploaded, not dropped
+  wire         t3_drop = 1'b0;
+`else
+  wire         t3_drop = step2 && t3_vrom;
+`endif
+  logic        tu_ready, tu_sreq, tu_sack, xt_ack;
+  logic [AW:1] tu_saddr;
+  logic [63:0] tu_sdout, xt_dout;
+  assign t3_ready = t3_drop || tu_ready;
+  assign p_req[5] = tu_sreq && !vrom_x; assign p_addr[5] = tu_saddr;
+  assign tu_sack  = vrom_x ? xt_ack : p_ack[5];
+  assign tu_sdout = vrom_x ? xt_dout : p_dout[5];
+  r3d_texup #(.AW(AW), .SDR_VROM(SDR_VROM), .DDR_STG(D_STG), .DDR_TEX(D_TEX)
+`ifdef M3_STEP2_TEX
+              , .STEP2_PORT(STEP2)
+`endif
+              ) u_r3tex (
+    .clk, .rst,
+`ifdef M3_STEP2_TEX
+    .step2,
+`endif
+    .t_valid(t3_valid && !t3_drop), .t_ready(tu_ready), .t_vrom(t3_vrom), .t_data(t3_data), .t_flush(t3_flush),
     .t_pend(t3_pend), .mark(t3_mark), .t_mpend(t3_mpend), .go(t3_go), .busy(t3_busy),
-    .s_req(p_req[5]), .s_addr(p_addr[5]), .s_ack(p_ack[5]), .s_dout(p_dout[5]),
+    .s_req(tu_sreq), .s_addr(tu_saddr), .s_ack(tu_sack), .s_dout(tu_sdout),
     .d_req(d_req[5]), .d_we(d_we[5]), .d_addr(d_addr[5]), .d_blen(d_blen[5]), .d_din(d_din[5]), .d_be(d_be[5]),
     .d_wacc(d_wacc[5]), .d_rvalid(d_rvalid[5]), .d_ack(d_ack[5]), .d_dout(dm_dout),
     .n_tex(n_tex_up), .n_skip(n_tex_skip));
   assign p_we[5] = 1'b0; assign p_din[5] = '0; assign p_be[5] = '0; assign p_long[5] = 1'b0;
 
   // ---- the geometry (set-up on its pool, the LOD word: R76, R75)
-  logic        geo_busy, cr_req, cr_ack, cr_rv, pr_req, pr_ack, pr_rv, vr_req, vr_ack, vr_rv;
+  logic        geo_busy /* verilator public_flat_rd */, cr_req, cr_ack, cr_rv, pr_req, pr_ack, pr_rv;
+  logic        vr_req /* verilator public_flat_rd */, vr_ack /* verilator public_flat_rd */, vr_rv /* verilator public_flat_rd */;
   logic [7:0]  geo_err;
   logic [23:0] cr_addr, pr_addr, vr_addr;
-  logic [2:0]  cr_len, pr_len, vr_len;
+  logic [2:0]  cr_len, pr_len, vr_len /* verilator public_flat_rd */;
   logic [31:0] cr_rd, pr_rd, vr_rd;
   logic        gq_valid, gq_ready, gq_last;
   logic [31:0] gq_data;
   r3d_geo #(.SETUP_OUT(1'b1), .LOD_WORD(1'b1)) u_geo (
-    .clk, .rst, .start(g_start), .step15(1'b0), .busy(geo_busy), .err(geo_err),
+    .clk, .rst(rst_geo), .start(g_start), .step15, .busy(geo_busy), .err(geo_err),
     .cull_req(cr_req), .cull_addr(cr_addr), .cull_len(cr_len), .cull_ack(cr_ack), .cull_rvalid(cr_rv), .cull_rdata(cr_rd),
     .pram_req(pr_req), .pram_addr(pr_addr), .pram_len(pr_len), .pram_ack(pr_ack), .pram_rvalid(pr_rv), .pram_rdata(pr_rd),
     .vrom_req(vr_req), .vrom_addr(vr_addr), .vrom_len(vr_len), .vrom_ack(vr_ack), .vrom_rvalid(vr_rv), .vrom_rdata(vr_rd),
@@ -469,11 +590,38 @@ module m3_system
     .blk_addr(cb_addr), .blk_sdr(cb_sdr), .blk_zero(cb_zero),
     .p_req(p_req[2]), .p_addr(p_addr[2]), .p_lo(p_lo[2]), .p_ack(p_ack[2]), .p_dout(p_dout[2]), .n_req());
   assign p_we[2] = 1'b0; assign p_din[2] = '0; assign p_be[2] = '0; assign p_long[2] = 1'b1;
+  logic        vs_ack, vs_rv, xg_ack, xg_rv;
+  logic [31:0] vs_rd, xg_rd;
   r3d_vrom_rd #(.AW(AW), .SDR_VROM(SDR_VROM)) u_vrd (
     .clk, .rst,
-    .g_req(vr_req), .g_addr(vr_addr), .g_len(vr_len), .g_ack(vr_ack), .g_rvalid(vr_rv), .g_rdata(vr_rd),
+    .g_req(vr_req && !vrom_x), .g_addr(vr_addr), .g_len(vr_len), .g_ack(vs_ack), .g_rvalid(vs_rv), .g_rdata(vs_rd),
     .p_req(p_req[3]), .p_addr(p_addr[3]), .p_ack(p_ack[3]), .p_dout(p_dout[3]), .n_req());
   assign p_we[3] = 1'b0; assign p_din[3] = '0; assign p_be[3] = '0; assign p_long[3] = 1'b0;
+  // R100: VROM in the extra memory (m3_xmem), chosen by the game configuration
+  assign vr_ack = vrom_x ? xg_ack : vs_ack;
+  assign vr_rv  = vrom_x ? xg_rv  : vs_rv;
+  assign vr_rd  = vrom_x ? xg_rd  : vs_rd;
+  generate if (XMEM == 1) begin : g_xmem
+    logic [23:0] xb_addr;
+    m3_xmem #(.AW(AW), .SDR_VROM(SDR_VROM)) u_xmem (
+      .clk, .rst, .vrom64,
+      .g_req(vr_req && vrom_x), .g_addr(vr_addr), .g_len(vr_len), .g_ack(xg_ack), .g_rvalid(xg_rv), .g_rdata(xg_rd),
+      .t_req(tu_sreq && vrom_x), .t_addr(tu_saddr), .t_ack(xt_ack), .t_dout(xt_dout),
+      .b_req(xp_req), .b_addr(xb_addr), .b_ack(xp_ack), .b_rvalid(xp_rvalid), .b_dout(dm_dout));
+    assign xp_addr = D_XMEM + 25'(xb_addr);
+    // the loader's writes: one 16-bit word a beat, its lanes enabled
+    assign d_req[6] = lx_req; assign d_we[6] = 1'b1; assign d_addr[6] = D_XMEM + 25'(lx_addr[26:3]);
+    assign d_blen[6] = 8'd1; assign d_din[6] = {4{lx_din}}; assign d_be[6] = 8'b11 << {lx_addr[2:1], 1'b0};
+    assign lx_ack = d_ack[6];
+  end else begin : g_noxmem
+    // XMEM 2, the second SDRAM: its m2_sdram instance (the SDRAM2 pins), a read
+    // port for m3_xmem's b_* (a beat a read) and a write port for lx_*, go here.
+    assign xg_ack = 1'b0; assign xg_rv = 1'b0; assign xg_rd = '0; assign xt_ack = 1'b0; assign xt_dout = '0;
+    assign xp_req = 1'b0; assign xp_addr = '0;
+    assign d_req[6] = 1'b0; assign d_we[6] = 1'b0; assign d_addr[6] = '0; assign d_blen[6] = 8'd1;
+    assign d_din[6] = '0; assign d_be[6] = '0;
+    assign lx_ack = lx_req;
+  end endgenerate
   m3v_ddr_rd u_prd (
     .clk, .rst, .base(m3_bank ? D_POLY1 : D_POLY0),
     .g_req(pr_req), .g_addr(pr_addr), .g_len(pr_len), .g_ack(pr_ack), .g_rvalid(pr_rv), .g_rdata(pr_rd),
@@ -483,7 +631,7 @@ module m3_system
 
   // ---- the rasteriser (nearest mip level, R79/R88); scroll fog off for now
   r3d_rast #(.MIP(1'b1)) u_rast (
-    .clk, .rst,
+    .clk, .rst(rst_rast),
     .i_valid(gq_valid), .i_ready(gq_ready), .i_data(gq_data), .i_last(gq_last),
     .f_ready, .f_binning(), .f_begin, .f_end, .fb_base(25'({f_buf, 17'd0})),
     .sf_x0(9'd0), .sf_x1(9'd0), .sf_y0(9'd0), .sf_y1(9'd0), .sf_col(24'd0), .sf_out(24'd0),
@@ -540,6 +688,8 @@ module m3_system
   logic [15:0] tg_ovr_n;
   always_ff @(posedge clk) if (rst) tg_ovr_n <= '0; else if (tg_swap && tg_busy) tg_ovr_n <= tg_ovr_n + 16'd1;
 
+  logic       t_long, tg_ninv, tg_nw;     // R103: the name row buffer's eight-word reads and its emptying
+  logic [5:0] tg_ncnt;
   m3_tilegen #(.AW(AW), .VBASE(AW'(SDR_VRAM >> 1))) u_tg (
     .clk, .rst_n(!rst), .ready(tg_ready),
     .reg_we(tg_reg_we), .reg_addr(tg_reg_addr), .reg_wdata(tg_reg_wdata),
@@ -547,10 +697,21 @@ module m3_system
     .swap(tg_swap), .go(tg_go), .go_y(tg_go_y), .busy(tg_busy), .overrun(tg_ovr),
     .sc_rd(ce_pix && !hblank && !vblank), .sc_x(hcnt[8:0]),
     .o_v, .o_drawn, .o_above, .o_r, .o_g, .o_b,
-    .p_req(t_req), .p_addr(t_addr), .p_dout(t_dout), .p_ack(t_ack),
+    .p_req(t_req), .p_addr(t_addr), .p_long(t_long), .p_dout(t_dout), .p_lo(p_lo[1]), .p_ack(t_ack),
+    .name_inv(tg_ninv),
     .st_cycles(), .st_reqs());
   assign p_req[1] = t_req; assign p_we[1] = 1'b0; assign p_addr[1] = t_addr; assign p_din[1] = '0;
-  assign p_be[1] = '0; assign p_long[1] = 1'b0; assign t_ack = p_ack[1]; assign t_dout = p_dout[1];
+  assign p_be[1] = '0; assign p_long[1] = t_long; assign t_ack = p_ack[1]; assign t_dout = p_dout[1];
+  // R103: a write to the name tables (F10F8000-F10FFFFF, either master) empties the tile generator's name row
+  // buffer, at the bus's acknowledge and again 64 clocks later, when the posted write has surely reached SDRAM
+  // (a refetch in between could otherwise read the old word and keep it)
+  assign tg_nw = tr_v && tr_we && (tr_addr[31:15] == {12'hF10, 5'h1F});
+  always_ff @(posedge clk) begin
+    if (rst) tg_ncnt <= '0;
+    else if (tg_nw) tg_ncnt <= 6'd63;
+    else if (tg_ncnt != 6'd0) tg_ncnt <= tg_ncnt - 6'd1;
+  end
+  assign tg_ninv = tg_nw || (tg_ncnt == 6'd1);
 
   // ---- the frame count and the bench's events ----
   always_ff @(posedge clk) begin
@@ -562,6 +723,8 @@ module m3_system
 
   // ---- the overlay (hex; rows of four words) ----
   logic [31:0] pc_v, pc_last;
+  logic [15:0] msr_v;                   // (R104) the MSR's low half, and the core's ext_int, at vblank
+  logic        xint_v;
   logic [15:0] n_scsi_irq;
   logic        scsi_irq_d;
   logic [31:0] cpu_wd_cnt, cpu_wd_max;  // the CPU's bus wait: cycles since its request
@@ -569,7 +732,7 @@ module m3_system
   always_ff @(posedge clk) begin
     scsi_irq_d <= scsi_irq;
     if (rt_valid) pc_last <= rt_pc;
-    if (vblank_start) pc_v <= pc_last;
+    if (vblank_start) begin pc_v <= pc_last; msr_v <= rt_msr[15:0]; xint_v <= ext_int; end
     if (rst) begin n_scsi_irq <= '0; cpu_wd_cnt <= '0; cpu_wd_max <= '0; wd_flag <= 1'b0; end
     else begin
       if (scsi_irq && !scsi_irq_d) n_scsi_irq <= n_scsi_irq + 16'd1;
@@ -616,13 +779,25 @@ module m3_system
                   (rt_insn_q[20:17] == 4'b1001) && (rt_insn_q[15:11] == 5'd0);
   wire x_take   = (cpu_ev_mmu[3:0] != 4'd0) || (rt_irq != 2'd0) ||
                   (((rt_srr0 != srr0_prev) || (rt_srr1 != srr1_prev)) && !is_mtsrr);
+  // DAR / DSISR's capture a cycle after the record (its decode was a -0.54 ns path at 100 MHz into the
+  // 64 enables; study R104): the decision is made at the record, with fx_seen as it was then
+  logic        xd_we, xd_dar;
+  logic [31:0] xd_val;
+  always_ff @(posedge clk) begin
+    xd_we  <= !rst && rt_valid && is_mfdx && rt_gpr_we && !fx_seen;
+    xd_dar <= rt_insn_q[16];
+    xd_val <= rt_gpr_val;
+    if (rst) begin x_dar <= '0; x_dsisr <= '0; end
+    else if (xd_we) begin
+      if (xd_dar) x_dar <= xd_val; else x_dsisr <= xd_val;
+    end
+  end
   always_ff @(posedge clk) begin
     if (rst) begin
       ex_seen <= 1'b0; fx_seen <= 1'b0; x_arm <= 1'b0; xn_cnt <= '0;
       ex_vec <= '0; ex_srr0 <= '0; ex_srr1 <= '0; ex_msr <= '0; ex_pc <= '0; ex_ins <= '0;
       lc_vec <= '0; lc_srr0 <= '0; lc_srr1 <= '0; lc_ins <= '0;
       lp_vec <= '0; lp_srr0 <= '0; lp_srr1 <= '0; lp_ins <= '0;
-      x_dar <= '0; x_dsisr <= '0;
       fx_vec <= '0; fx_srr0 <= '0;
       srr0_prev <= '0; srr1_prev <= '0;
     end else if (rt_valid) begin
@@ -641,9 +816,6 @@ module m3_system
           lp_vec <= lc_vec; lp_srr0 <= lc_srr0; lp_srr1 <= lc_srr1; lp_ins <= lc_ins;
           lc_vec <= rt_pc;  lc_srr0 <= x_srr0;  lc_srr1 <= x_srr1;  lc_ins <= x_ins;
         end
-      end
-      if (is_mfdx && rt_gpr_we && !fx_seen) begin
-        if (rt_insn_q[16]) x_dar <= rt_gpr_val; else x_dsisr <= rt_gpr_val;
       end
       if (rt_pc == 32'hFFF0_0000 && !fx_seen && rom_loaded) begin
         fx_seen <= 1'b1; fx_vec <= pc_prev; fx_srr0 <= rt_srr0;
@@ -672,6 +844,15 @@ module m3_system
     .n_late(fb_late));
   assign d_we[0] = 1'b0; assign d_din[0] = '0; assign d_be[0] = 8'hFF;
 
+  // the CPU's busy time per frame (R104): vblank to the first retirement in a wait loop
+  logic [31:0] fb_mm, fb_lo, fb_hi, fb_last;
+  generate if (FBUSY) begin : g_fbusy
+    m3_frame_busy #(.CLK_HZ(CLK_HZ)) u_fbusy (.clk, .rst, .vblank_start, .step2, .rt_valid, .rt_pc,
+      .o_minmax(fb_mm), .o_bins_lo(fb_lo), .o_bins_hi(fb_hi), .o_last(fb_last));
+  end else begin : g_nofbusy
+    assign fb_mm = '0; assign fb_lo = '0; assign fb_hi = '0; assign fb_last = '0;
+  end endgenerate
+
   logic [5:0]  ov_idx;
   logic [31:0] ov_v;
   logic        ov_box, ov_ink;
@@ -694,7 +875,7 @@ module m3_system
         6'd0:  ov_v <= pc_v;
         6'd1:  ov_v <= {irq_state, irq_enable, crom_bank, 7'd0, pingpong};
         6'd2:  ov_v <= frame;
-        6'd3:  ov_v <= {n_scsi_irq, 16'd0};
+        6'd3:  ov_v <= {n_scsi_irq, cfg_step, cfg_flags[6:0], sec_cmp};   // R100: the step and flags
         // row 1: Real3D: frames submitted; frames drawn and dropped; the geometry's
         // error bits, layer lines late, textures uploaded; runs deferred, copies
         6'd4:  ov_v <= {8'h88, n_submit};
@@ -727,10 +908,12 @@ module m3_system
         6'd26: ov_v <= perf[6];
         6'd27: ov_v <= perf[8];
         // row 7: redirects, load-use, mul/div wait, decode starved
-        6'd28: ov_v <= perf[7];
-        6'd29: ov_v <= perf[4];
-        6'd30: ov_v <= perf[5];
-        6'd31: ov_v <= perf[3];
+        // (with FBUSY, R104: the CPU's busy time a frame, the last second: {min, max} and the last frame in
+        // units of 256 clocks; frames by vblanks needed {<0.9, 0.9-1, 1-1.1, 1.1-1.25}, {1.25-1.5, >=1.5, 0, frames})
+        6'd28: ov_v <= FBUSY ? fb_mm : perf[7];
+        6'd29: ov_v <= FBUSY ? fb_lo : perf[4];
+        6'd30: ov_v <= FBUSY ? fb_hi : perf[5];
+        6'd31: ov_v <= FBUSY ? {msr_v, xint_v, fb_last[14:0]} : perf[3];   // {MSR[15:0] at vblank, ext_int, the last frame}
         // row 8: the first exception entry: vector, SRR0, SRR1, MSR after entry
         6'd32: ov_v <= ex_vec;
         6'd33: ov_v <= ex_srr0;
@@ -773,7 +956,8 @@ module m3_system
 
   /* verilator lint_off UNUSEDSIGNAL */
   wire _unused = &{1'b0, tg_ready, tg_ovr, s_idle, scsi_busy, r3d_cfg1, x_d[9], y_d[9], n_cull_lo, n_cull_hi, n_poly,
-                    n_tex_skip, p_lo[5:3], p_lo[1:0], d_wacc[3], d_wacc[0], d_rvalid[2], d_rvalid[5], fb_late[15:8]};
+                    n_tex_skip, p_lo[5:3], p_lo[1:0], d_wacc[3], d_wacc[0], d_rvalid[2], d_rvalid[5], fb_late[15:8],
+                    d_wacc[6], d_rvalid[6], cfg_flags[7], crom_map, fixed8, sec_key};
   /* verilator lint_on UNUSEDSIGNAL */
 
 endmodule

@@ -36,7 +36,8 @@
 
 module m3_io #(
   parameter logic [7:0] DSW = 8'h7F,
-  parameter int         EE_TWP = 200000   // the EEPROM's busy time after a write, clocks (m3_93c46)
+  parameter int         EE_TWP = 200000,  // the EEPROM's busy time after a write, clocks (m3_93c46)
+  parameter bit         EE_LOAD = 1'b0    // the 93C46's load port (the MRA's <nvram>, study R100)
 ) (
   input  logic        clk,
   input  logic        por_n,
@@ -51,7 +52,10 @@ module m3_io #(
   input  logic        service_b_n,
   input  logic [7:0]  in2,          // player 1
   input  logic [7:0]  in3,          // player 2
-  output logic [7:0]  pa_q          // port A's latch (the overlay)
+  output logic [7:0]  pa_q,         // port A's latch (the overlay)
+  input  logic        ee_ld_we,     // the 93C46's load port (EE_LOAD), the game in reset
+  input  logic [5:0]  ee_ld_a,
+  input  logic [15:0] ee_ld_d
 );
 
   logic [7:0] pv [8];
@@ -59,10 +63,10 @@ module m3_io #(
   logic [2:0] an_ch;
 
   wire ee_do;
-  m3_93c46 #(.T_WP(EE_TWP)) u_ee (
+  m3_93c46 #(.T_WP(EE_TWP), .LOAD(EE_LOAD)) u_ee (
     .clk, .rst_n(por_n),
     .cs(pv[0][6]), .sk(pv[0][7]), .di(pv[0][5]), .do_o(ee_do),
-    .ld_we(1'b0), .ld_a(6'd0), .ld_d(16'd0), .dump_a(6'd0), .dump_q()
+    .ld_we(ee_ld_we), .ld_a(ee_ld_a), .ld_d(ee_ld_d), .dump_a(6'd0), .dump_q()
   );
 
   wire [7:0] pb_in = pv[0][0] ? {test_b_n, service_b_n, ee_do, 5'b11111} : in0;

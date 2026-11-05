@@ -48,7 +48,14 @@ module r3d_fp_add #(
   // shift at exponent 1 and packs what is left as a subnormal -- exact, since
   // a sum of numbers on the subnormal grid is on it too. Model 2A's TGP
   // (Virtua Fighter 2 accumulates subnormal products).
-  parameter bit SUBNORM = 1'b0
+  parameter bit SUBNORM = 1'b0,
+  // DSP_SHIFT (Model 3 study R98): both shifts as multiplies by a power of two,
+  // one 27 x 27 DSP each, in place of the soft barrel shifters. Align: p_sh x
+  // 2^(26 - shamt), the quotient bits [52:26] are p_sh >> shamt and the low
+  // 26 bits are the bits shifted out (sticky). Normalise (SUBNORM = 0 only):
+  // s1_sum[26:0] x 2^(lzc - 1), the power formed as the lowest set bit of
+  // s1_sum bit-reversed. Same results; 0 keeps the shifters.
+  parameter bit DSP_SHIFT = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst_n,
@@ -148,8 +155,17 @@ module r3d_fp_add #(
   logic [7:0]  p_exp;
   logic [4:0]  p_shamt;
   logic [26:0] p_big, p_sh, p_b;
+  logic [26:0] p_pow;                // DSP_SHIFT: the align multiplier, decoded before the cut
+  wire  [26:0] pow_n = 27'd1 << (5'd26 - shamt);
   assign small_ext     = p_sh;
-  assign small_aligned = p_swap ? p_b : (p_sh >> p_shamt);
+  logic [53:0] al_prod;
+  generate if (DSP_SHIFT) begin : g_al_dsp
+    assign al_prod = {27'd0, p_sh} * {27'd0, p_pow};     // p_pow = 2^(26 - shamt), shamt <= 26
+    assign small_aligned = p_swap ? p_b : al_prod[52:26];
+  end else begin : g_al_sh
+    assign al_prod = '0;
+    assign small_aligned = p_swap ? p_b : (p_sh >> p_shamt);
+  end endgenerate
   // R512: THE STICKY MASK IS A THERMOMETER, NOT A SHIFT AND A SUBTRACT.
   //
   //   m2_geo_xform|sum_bank -> m2_fp_pool|fp_add|sA_sticky    -0.515 on clk_sys
@@ -173,7 +189,7 @@ module r3d_fp_add #(
     for (int i = 0; i < 27; i++) sticky_mask[i] = (5'(i) < p_shamt);
 
   assign sticky_lost   = p_sat ? (|small_ext)
-                               : (|(small_ext & sticky_mask));
+                               : DSP_SHIFT ? (|al_prod[25:0]) : (|(small_ext & sticky_mask));
 
   logic [26:0] big_ext;
   assign big_ext = {big_sig, 3'b000};
@@ -191,7 +207,7 @@ module r3d_fp_add #(
         p_valid <= in_valid;
         p_sign <= big_sign;  p_exp <= big_exp;  p_big <= big_ext;  p_eff_sub <= eff_sub;
         p_sh <= {sh_sig, 3'b000};  p_b <= {b_sig, 3'b000};  p_swap <= e_eq && sig_ge;
-        p_shamt <= shamt;  p_sat <= shift_saturated;
+        p_shamt <= shamt;  p_sat <= shift_saturated;  p_pow <= pow_n;
         p_nan <= pre_nan;  p_inf <= pre_inf;
         p_both_zero <= a_is_zero & b_is_zero;  p_zero_sign <= a_sign & b_sign;
       end
@@ -200,7 +216,7 @@ module r3d_fp_add #(
     assign p_valid = in_valid;
     assign p_sign = big_sign;  assign p_exp = big_exp;  assign p_big = big_ext;  assign p_eff_sub = eff_sub;
     assign p_sh = {sh_sig, 3'b000};  assign p_b = {b_sig, 3'b000};  assign p_swap = e_eq && sig_ge;
-    assign p_shamt = shamt;  assign p_sat = shift_saturated;
+    assign p_shamt = shamt;  assign p_sat = shift_saturated;  assign p_pow = pow_n;
     assign p_nan = pre_nan;  assign p_inf = pre_inf;
     assign p_both_zero = a_is_zero & b_is_zero;  assign p_zero_sign = a_sign & b_sign;
   end endgenerate
@@ -290,6 +306,16 @@ module r3d_fp_add #(
       if (s1_sum[i]) lzc = 5'(27 - i);
   end
 
+  // DSP_SHIFT: 2^(lzc - 1) is the lowest set bit of s1_sum[26:0] reversed
+  // (0 for a zero sum, whose shift is 0 either way)
+  logic [26:0] nm_rev, nm_pow;
+  logic [53:0] nm_prod;
+  always_comb begin
+    for (int i = 0; i < 27; i++) nm_rev[i] = s1_sum[26 - i];
+    nm_pow  = nm_rev & (~nm_rev + 27'd1);
+    nm_prod = DSP_SHIFT ? {27'd0, s1_sum[26:0]} * {27'd0, nm_pow} : 54'd0;
+  end
+
   always_comb begin
     if (s1_sum[27]) begin
       // Carry out of the significand: shift right one, exponent up one.
@@ -303,6 +329,10 @@ module r3d_fp_add #(
       shifted  = s1_sum << (s1_exp - 8'd1);
       lost_bit = 1'b0;
       exp_adj  = 10'sd1;
+    end else if (DSP_SHIFT && !SUBNORM) begin
+      shifted  = nm_prod[27:0];
+      lost_bit = 1'b0;
+      exp_adj  = $signed({2'b00, s1_exp}) - $signed({5'd0, lzc}) + 10'sd1;
     end else begin
       // lzc == 1 means the leading one already sits at bit 26.
       shifted  = s1_sum << (lzc - 5'd1);

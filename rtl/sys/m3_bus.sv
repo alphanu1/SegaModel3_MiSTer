@@ -35,6 +35,27 @@
 //   FF000000-FF7FFFFF  banked CROM (bank = ~F0100008 & 15)  SDRAM
 //   FF800000-FFFFFFFF  fixed CROM: the low 6 MiB is CROM0 (MAME ROM_COPY), the top 2 MiB the fixed ROMs
 // F0xxxxxx I/O mirrors every 2 MiB up to FExxxxxx (MAME mirror 0x0E000000).
+//
+// Step 2.x (STEP2, selected at run time by step2; study R100, Daytona 2):
+//   FEC00000-FEDFFFFF  MPC106 CONFIG_ADDR; FEE00000-FEEFFFFF CONFIG_DATA (Supermodel's
+//                      decode; the boot ROM uses FEC00CF8 / FEE00CFC); the bridge's ID
+//                      0x00021057 (MPC106), device 13 (the Real3D) 0x178611DB
+//   F0180000-F01BFFFF  the security board (315-5881): RAM 18-19, registers 1A (sec_*)
+//   FF000000-FF7FFFFF  banked CROM: the slot crom_slot (from the game's bank map; the
+//                      caller decodes crom_bank_o), empty banks (crom_zero) read zero
+//   FF800000-FFFFFFFF  with fixed8, all 8 MiB fixed CROM at SDR_FIX8
+//   C2000000-C20000FF  the Real3D DMA device: m3_scripts' window (win_base C20000)
+//   The MPC106's own configuration registers (device 0) are kept: the boot ROM reads
+//   back MCCR1 (F0) and PICR1 (A8) after writing them. Not yet written, a register reads
+//   Supermodel's reset value (CMPC10x::Reset). As Supermodel: a byte read of device 0
+//   reads FF (it has no 8-bit handler there), and device 16 reads 0x182711DB as a
+//   word and 0 in halfwords (CModel3::ReadPCIConfigSpace, "used by Daytona 2").
+//   The RTC 72421 runs: Daytona 2 waits for its seconds to change at boot (Supermodel with
+//   the clock frozen stays on the system program's screen; with the time running and the
+//   date fixed at 2000-01-01, a Saturday, it reaches the attract: study R100). Seconds,
+//   minutes and hours count from 00:00:00 at RTC_HZ clocks a second; the date stays.
+//   Registers D-F read 0 and writes are ignored, as Supermodel's. Step 1.0 keeps the
+//   constant it had (VF3 reads only D and E).
 // Anything else reads FFFFFFFF (Supermodel) and is counted.
 //
 // Interrupts (sim/system/notes.md): IRQ 0x02 at the start of line 383 and
@@ -56,6 +77,16 @@
 // writes are posted there, a read answers on h_rv. The ping-pong bit and its
 // flip line are r3d_cmd's (pingpong_i).
 //
+// Snoop (D-41, study R90/R101): the MPC105 shows a PCI master's cycle to the
+// 603e. Every 53C810 access to work RAM is snooped first, one per access (a
+// line, or the line of a single word): sn_req with the line and sn_inv (a
+// write) is held to sn_ack, and the access is not granted before it. The CPU
+// keeps the bus meanwhile, so the D-cache's push (a cast-out) goes through.
+// After sn_ack the CPU is not granted until the 53C810's access is, so the
+// write that invalidated a line lands before the CPU can fill it again, and
+// a read follows the push. ROM, VRAM and the I/O space are not snooped (the
+// game maps them cache-inhibited). The I-cache is not snooped (603e 3.1).
+//
 // Bench: every access outside RAM and CROM reads is offered on the tr_*
 // port, for the bus trace (sim/system/bustrace.py).
 
@@ -70,10 +101,26 @@ module m3_bus
   parameter logic [26:0] SDR_VRAM   = 27'h6C0_0000,
   parameter logic [4:0]  CROM_BANKS = 5'd8,           // VF3: 64 MiB
   parameter logic [31:0] R3D_ID     = 32'h16C3_11DB,  // 315-5827 (Step 1.x)
-  parameter int          MIDI_GAP   = 32000
+  parameter int          MIDI_GAP   = 32000,
+  parameter bit          STEP2      = 1'b0,           // the Step 2.x map (R100)
+  parameter logic [26:0] SDR_FIX8   = 27'h730_0000,   // a Step 2 set's 8 MiB fixed CROM
+  parameter int          RTC_HZ     = 100_000_000     // clocks a second, for the RTC
 ) (
   input  logic          clk,
   input  logic          rst,
+
+  // Step 2.x (STEP2), run time
+  input  logic              step2,
+  input  logic              fixed8,
+  input  logic [3:0]        crom_slot,      // the bank register's slot (combinational from crom_bank_o)
+  input  logic              crom_zero,
+  output logic              sec_req,        // the security board: one access per request, to sec_ack
+  output logic              sec_we,
+  output logic [17:2]       sec_addr,
+  output logic [3:0]        sec_be,
+  output logic [31:0]       sec_wdata,
+  input  logic              sec_ack,
+  input  logic [31:0]       sec_rdata,
 
   // master 0: the CPU; master 1: the 53C810
   input  logic [1:0]        m_req,
@@ -85,6 +132,12 @@ module m3_bus
   output logic [1:0]        m_wnext,
   output logic [1:0]        m_rvalid,
   output logic [31:0]       m_rdata,
+
+  // the CPU's D-cache snoop (ppc_cpu sn_*), for master 1's RAM accesses
+  output logic              sn_req,
+  output logic [31:5]       sn_addr,
+  output logic              sn_inv,
+  input  logic              sn_ack,
 
   // SDRAM (m3_sdr_port)
   output logic              s_req,
@@ -185,7 +238,7 @@ module m3_bus
   // arbitration and the transaction
   // ===========================================================================
   typedef enum logic [3:0] {
-    B_IDLE, B_DEC, B_SDR, B_INT, B_INTW, B_SCSI, B_CFG, B_JTAG, B_BEAT, B_R3D, B_R3DR
+    B_IDLE, B_DEC, B_SDR, B_INT, B_INTW, B_SCSI, B_CFG, B_JTAG, B_BEAT, B_R3D, B_R3DR, B_SEC
   } bst_t;
   bst_t        bs;
   logic        who;               // the owning master
@@ -200,7 +253,7 @@ module m3_bus
   // target classes, decoded from the registered address in B_DEC
   typedef enum logic [3:0] {
     X_NONE, X_SDR, X_ROM_W, X_R3DH, X_R3D, X_SCSI, X_IO, X_MIDI, X_SYS, X_RTC,
-    X_PCIA, X_PCID, X_PAL, X_TGREG, X_MPC
+    X_PCIA, X_PCID, X_PAL, X_TGREG, X_MPC, X_SEC
   } tgt_t;
   tgt_t        tgt;
   logic [AW:0] dsa;
@@ -212,6 +265,7 @@ module m3_bus
   assign bank_n = ~crom_bank[3:0];
   wire  [7:0]  a_hi = addr[31:24];
   wire         io_win = (a_hi[7:4] == 4'hF) && !a_hi[0];       // F0, F2 ... FE (MPC105's F8FFF0xx decoded first)
+  wire s2 = STEP2 && step2;
   always_comb begin
     tgt = X_NONE; dsa = '0; dswap = 1'b0; dzero = 1'b0;
     if (addr[31:23] == 9'd0) begin
@@ -219,9 +273,15 @@ module m3_bus
     end else if (a_hi == 8'hFF) begin
       tgt = cmd[0] ? X_ROM_W : X_SDR;
       if (!addr[23]) begin
-        dsa = SDR_CROM + {bank_n[2:0], addr[22:0]};
-        dzero = ({1'b0, bank_n} >= CROM_BANKS);
-      end else if (addr[22:21] != 2'b11) dsa = SDR_CROM + {3'd0, addr[22:0]};       // CROM0's first 6 MiB
+        if (STEP2) begin
+          dsa = SDR_CROM + {crom_slot, addr[22:0]};
+          dzero = crom_zero;
+        end else begin
+          dsa = SDR_CROM + {bank_n[2:0], addr[22:0]};
+          dzero = ({1'b0, bank_n} >= CROM_BANKS);
+        end
+      end else if (STEP2 && fixed8) dsa = SDR_FIX8 + {4'd0, addr[22:0]};            // a Step 2 set's 8 MiB
+      else if (addr[22:21] != 2'b11) dsa = SDR_CROM + {3'd0, addr[22:0]};       // CROM0's first 6 MiB
       else dsa = SDR_FIXED + {6'd0, addr[20:0]};
     end else if (addr[31:6] == 26'h210_0000) tgt = X_R3DH;                           // 84000000-3F
     else if (a_hi == 8'h88 || a_hi == 8'h8C || a_hi == 8'h8E || a_hi == 8'h90 || a_hi == 8'h94 ||
@@ -242,6 +302,9 @@ module m3_bus
       else if (addr[23:6] == 18'h0_5000) tgt = X_RTC;                               // xx140000-3F
       else if (a_hi == 8'hF0 && addr[23:3] == 21'h10_019F) tgt = X_PCIA;            // F0800CF8-CFF
       else if (a_hi == 8'hF0 && addr[23:3] == 21'h18_019F) tgt = X_PCID;            // F0C00CF8-CFF
+      else if (s2 && addr[23:18] == 6'b0001_10) tgt = X_SEC;                         // xx180000-xx1BFFFF
+      else if (s2 && a_hi == 8'hFE && addr[23:21] == 3'b110) tgt = X_PCIA;           // FEC00000-FEDFFFFF
+      else if (s2 && a_hi == 8'hFE && addr[23:20] == 4'hE) tgt = X_PCID;             // FEE00000-FEEFFFFF
     end
   end
 
@@ -259,8 +322,77 @@ module m3_bus
   // (VF3 reads F1180000 once, at boot, and gets 0)
   initial for (int i = 0; i < 64; i++) tg_shadow[i] = 32'd0;
 
+  // Step 2: the RTC's time (BCD), the date fixed
+  logic [26:0] rtc_pre;
+  logic [3:0]  rtc_s1, rtc_m1, rtc_h1;
+  logic [2:0]  rtc_s10, rtc_m10;
+  logic [1:0]  rtc_h10;
+  logic [3:0]  rtc_d;
+  always_ff @(posedge clk) begin
+    if (!STEP2 || rst) begin
+      rtc_pre <= '0; rtc_s1 <= '0; rtc_s10 <= '0; rtc_m1 <= '0; rtc_m10 <= '0; rtc_h1 <= '0; rtc_h10 <= '0;
+    end else if (rtc_pre != 27'(RTC_HZ - 1)) rtc_pre <= rtc_pre + 27'd1;
+    else begin
+      rtc_pre <= '0;
+      if (rtc_s1 != 4'd9) rtc_s1 <= rtc_s1 + 4'd1;
+      else begin
+        rtc_s1 <= '0;
+        if (rtc_s10 != 3'd5) rtc_s10 <= rtc_s10 + 3'd1;
+        else begin
+          rtc_s10 <= '0;
+          if (rtc_m1 != 4'd9) rtc_m1 <= rtc_m1 + 4'd1;
+          else begin
+            rtc_m1 <= '0;
+            if (rtc_m10 != 3'd5) rtc_m10 <= rtc_m10 + 3'd1;
+            else begin
+              rtc_m10 <= '0;
+              if (rtc_h10 == 2'd2 && rtc_h1 == 4'd3) begin rtc_h10 <= '0; rtc_h1 <= '0; end
+              else if (rtc_h1 != 4'd9) rtc_h1 <= rtc_h1 + 4'd1;
+              else begin rtc_h1 <= '0; rtc_h10 <= rtc_h10 + 2'd1; end
+            end
+          end
+        end
+      end
+    end
+  end
+  always_comb begin
+    case (addr[5:2])
+      4'h0: rtc_d = rtc_s1;           4'h1: rtc_d = {1'b0, rtc_s10};
+      4'h2: rtc_d = rtc_m1;           4'h3: rtc_d = {1'b0, rtc_m10};
+      4'h4: rtc_d = rtc_h1;           4'h5: rtc_d = {2'b00, rtc_h10};
+      4'h6: rtc_d = 4'd1;             4'h8: rtc_d = 4'd1;              // the 1st of January
+      4'hC: rtc_d = 4'd6;                                              // 2000, a Saturday
+      default: rtc_d = 4'd0;
+    endcase
+  end
+
   wire [4:0]  pci_dev = pci_addr[15:11];
   wire [5:0]  pci_reg = pci_addr[7:2];
+
+  // Step 2: the MPC106's configuration registers (device 0), CPU byte order
+  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] c106 [0:63];
+  logic [63:0] c106_w;               // written since reset
+  logic [31:0] c106_def;
+  always_comb begin
+    case (pci_reg)                   // CMPC10x::Reset, MPC106 (the little-endian values byte-reversed)
+      6'h01: c106_def = bswap(32'h0080_0006);
+      6'h02: c106_def = bswap(32'h0006_0000);
+      6'h03: c106_def = bswap(32'h0000_0800);
+      6'h1C: c106_def = bswap(32'h00CD_0000);
+      6'h2A: c106_def = bswap(32'h0010_FF00);
+      6'h2B: c106_def = bswap(32'h060C_000C);
+      6'h2E: c106_def = bswap(32'h0400_0000);
+      6'h30: c106_def = bswap(32'h0000_0100);
+      6'h38: c106_def = bswap(32'h0042_0FFF);
+      6'h3A: c106_def = bswap(32'h0020_0000);
+      6'h3C: c106_def = bswap(32'h0000_FF02);
+      6'h3D: c106_def = bswap(32'h0003_0000);
+      6'h3F: c106_def = bswap(32'h0000_0010);
+      default: c106_def = 32'd0;
+    endcase
+  end
+  wire [31:0] cq = c106_w[pci_reg] ? c106[pci_reg] : c106_def;
+  wire        be_byte = (be == 4'h8) || (be == 4'h4) || (be == 4'h2) || (be == 4'h1);
 
   // the internal targets' read word (CPU byte order)
   logic [31:0] rd_int;
@@ -278,14 +410,17 @@ module m3_bus
           default: rd_int = 32'hFFFF_FFFF;
         endcase
       end
-      X_RTC:   rd_int = 32'h0003_0000;
+      X_RTC:   rd_int = {4'd0, s2 ? rtc_d : 4'd0, 24'h03_0000};
       X_PCIA:  rd_int = bswap(pci_addr);
-      X_PCID:  rd_int = (pci_dev == 5'd13) ? bswap((pci_reg == 6'd0) ? R3D_ID : 32'd0)
+      X_PCID:  rd_int = (pci_dev == 5'd13) ? bswap((pci_reg == 6'd0) ? (s2 ? 32'h1786_11DB : R3D_ID) : 32'd0)
+                      : (s2 && pci_dev == 5'd0) ? (be_byte ? 32'hFFFF_FFFF : (pci_reg == 6'd0) ? 32'h5710_0200
+                                                   : c106_w[pci_reg] ? c106[pci_reg] : c106_def)
                       : (pci_dev == 5'd0)  ? ((pci_reg == 6'd0) ? 32'h5710_0100 : 32'd0)
+                      : (s2 && pci_dev == 5'd16) ? (((be == 4'hF) && pci_reg == 6'd0) ? bswap(32'h1827_11DB) : 32'd0)
                       : 32'hFFFF_FFFF;                                             // no device: master abort
       X_PAL:   rd_int = 32'd0;
       X_TGREG: rd_int = bswap(tg_sh_q);
-      X_MPC:   rd_int = (addr[7:2] == 6'd0) ? 32'h5710_0100 : 32'd0;
+      X_MPC:   rd_int = (addr[7:2] == 6'd0) ? (s2 ? 32'h5710_0200 : 32'h5710_0100) : 32'd0;
       default: rd_int = 32'hFFFF_FFFF;
     endcase
   end
@@ -303,7 +438,12 @@ module m3_bus
   // its request only then: a request whose acknowledge is out this cycle is
   // the one just served, not a new one (a posted SDRAM write returns to idle
   // at its acknowledge).
-  wire  [1:0]  rq = m_req & ~m_ack;
+  // The snoop: master 1 waits for it (RAM only); the CPU waits from its
+  // acknowledge to master 1's grant.
+  logic        snp_ok;            // master 1's present RAM access has been snooped
+  wire         ram1 = (m_addr[1][31:23] == 9'd0);
+  wire         snp = snp_ok || (sn_req && sn_ack);       // done, or done this cycle
+  wire  [1:0]  rq = m_req & ~m_ack & {!ram1 || snp, !snp};
   wire         g = (rq == 2'b11) ? !last : rq[1];       // the grant: in turn when both ask
   logic        do_w;              // an internal write this cycle (the word wd at addr)
   logic        do_r;              // an internal read: data to the master next cycle
@@ -331,6 +471,7 @@ module m3_bus
       midi_cnt <= '0;
       n_submit <= '0; n_cull_lo <= '0; n_cull_hi <= '0; n_poly <= '0; n_tex <= '0; n_vrom <= '0;
       n_unmapped <= '0; last_unmapped <= '0; r3d_cfg0 <= '0; r3d_cfg1 <= '0; r3d_cfg2 <= '0;
+      c106_w <= '0;
     end else begin
       irq_state <= (irq_state & ~irq_clr) | irq_set;
       if (midi_cnt != 16'd0) midi_cnt <= midi_cnt - 16'd1;
@@ -376,6 +517,7 @@ module m3_bus
             endcase
           end
           X_PCIA: if (be == 4'hF) pci_addr <= bswap(wd);
+          X_PCID: if (s2 && pci_dev == 5'd0) c106_w[pci_reg] <= 1'b1;
           X_PAL:  if (be[3] && be[2]) begin tg_pal_we <= 1'b1; tg_pal_addr <= addr[16:2]; tg_pal_wdata <= {wd[23:16], wd[31:24]}; end
           X_TGREG: begin
             tg_reg_we <= 1'b1; tg_reg_addr <= addr[7:2]; tg_reg_wdata <= wd_le;
@@ -389,6 +531,12 @@ module m3_bus
     end
   end
   always_ff @(posedge clk) if (do_w && tgt == X_TGREG) tg_shadow[addr[7:2]] <= bswap(wd);
+  // the MPC106's registers, each byte lane as written (the first write of a register keeps
+  // its reset value's other lanes, as Supermodel's byte array does)
+  always_ff @(posedge clk) if (STEP2 && do_w && tgt == X_PCID && s2 && pci_dev == 5'd0) begin
+    c106[pci_reg] <= {be[3] ? wd[31:24] : cq[31:24], be[2] ? wd[23:16] : cq[23:16],
+                      be[1] ? wd[15:8] : cq[15:8], be[0] ? wd[7:0] : cq[7:0]};
+  end
   // the I/O chip takes the access the cycle after (its read side effect included)
   always_ff @(posedge clk) begin
     io_we    <= do_w;
@@ -396,16 +544,33 @@ module m3_bus
     io_wbyte <= wd[31:24];
   end
 
+  // ---- the snoop ----
+  // Not started while master 1 owns the bus: its request may still be up
+  // with the access already granted.
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      sn_req <= 1'b0; snp_ok <= 1'b0;
+    end else begin
+      if (sn_req && sn_ack) begin
+        sn_req <= 1'b0; snp_ok <= 1'b1;
+      end else if (!sn_req && !snp_ok && m_req[1] && !m_ack[1] && ram1 && !((bs != B_IDLE) && who)) begin
+        sn_req <= 1'b1; sn_addr <= m_addr[1][31:5]; sn_inv <= m_cmd[1][0];   // LINE_WR, WR
+      end
+      if (bs == B_IDLE && rq != 2'b00 && g) snp_ok <= 1'b0;
+    end
+  end
+
   // ---- the state machine ----
   always_ff @(posedge clk) begin
     m_ack <= '0; m_wnext <= '0; m_rvalid <= '0;
     s_req <= s_req && !s_ack;
     sc_req <= sc_req && !sc_ack;
+    sec_req <= sec_req && !sec_ack;
     cf_req <= cf_req && !cf_ack;
     do_w <= 1'b0; do_r <= 1'b0;
     tr_v <= 1'b0;
     if (rst) begin
-      bs <= B_IDLE; last <= 1'b1; s_req <= 1'b0; sc_req <= 1'b0; cf_req <= 1'b0; r_pend <= 1'b0;
+      bs <= B_IDLE; last <= 1'b1; s_req <= 1'b0; sc_req <= 1'b0; cf_req <= 1'b0; r_pend <= 1'b0; sec_req <= 1'b0;
     end else begin
       case (bs)
         B_IDLE: if (rq != 2'b00) begin
@@ -424,6 +589,7 @@ module m3_bus
             m_ack[who] <= 1'b1;       // internal targets: taken now, beats follow
             addr <= is_line ? {addr[31:5], crit, 2'b00} : addr;
             if (tgt == X_SCSI) bs <= B_SCSI;
+            else if (tgt == X_SEC) bs <= B_SEC;
             else if (tgt == X_PCID && pci_dev == 5'd14) bs <= B_CFG;
             else bs <= B_BEAT;
           end
@@ -519,6 +685,19 @@ module m3_bus
             r_pend <= 1'b0;
             tr_v <= 1'b1; tr_master <= who; tr_we <= cur_w; tr_addr <= addr; tr_be <= be; tr_data <= cur_w ? wd : sc_rdata;
             if (!cur_w) begin m_rvalid[who] <= 1'b1; m_rdata <= sc_rdata; end
+            bs <= B_IDLE;
+          end
+        end
+
+        // the security board: one access (a line's beats are not split; the game uses words)
+        B_SEC: begin
+          if (!sec_req && !r_pend) begin
+            sec_req <= 1'b1; sec_we <= cur_w; sec_addr <= addr[17:2]; sec_be <= be; sec_wdata <= wd; r_pend <= 1'b1;
+          end
+          if (sec_ack) begin
+            r_pend <= 1'b0;
+            tr_v <= 1'b1; tr_master <= who; tr_we <= cur_w; tr_addr <= addr; tr_be <= be; tr_data <= cur_w ? wd : sec_rdata;
+            if (!cur_w) begin m_rvalid[who] <= 1'b1; m_rdata <= sec_rdata; end
             bs <= B_IDLE;
           end
         end

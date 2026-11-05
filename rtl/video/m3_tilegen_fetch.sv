@@ -27,8 +27,18 @@
 // little-endian (word w = bytes 2w, 2w+1), at word address VBASE. Every read is
 // one four-word burst (8 bytes, aligned) on one m2_sdram-contract port: request
 // held to acknowledge, one request at a time, data taken only in the acknowledge
-// cycle. Two one-entry buffers keep the last name burst (four tiles) and the
-// last pattern burst, so a tile split at a stencil boundary is fetched once.
+// cycle. A one-entry buffer keeps the last pattern burst, so a tile split at a
+// stencil boundary is fetched once.
+//
+// Name words (study R103): a layer's map row is 64 names, and eight lines share
+// one row. The names are kept in a row buffer (M10K, 4 layers x 64 names),
+// filled eight names at a time by one eight-word read (p_long: words 0-3 with
+// p_lo, 4-7 with p_ack), with a row tag per layer and a valid bit per group of
+// eight. A line whose row is the one held reads no names at all. The buffer is
+// emptied at the start of each frame (go for line 0) and on `inv` (a write to
+// the name tables), so it never holds a name the CPU has replaced. Before, each
+// group of four names was a request of its own, on every line (about 40% of the
+// tile generator's requests).
 //
 // The switches are compile-time. Their defaults follow Supermodel (D-19); with
 // MASK_SCREEN = SCROLL_SM = RS_SWAP = STALE = 0 and CODE_WRAP = 1 the engine is
@@ -57,8 +67,11 @@ module m3_tilegen_fetch #(
 
   output logic              p_req,
   output logic [AW:1]       p_addr,
+  output logic              p_long,      // an eight-word read (the name row)
   input  logic [63:0]       p_dout,
+  input  logic              p_lo,        // the first four words of an eight-word read
   input  logic              p_ack,
+  input  logic              inv,         // a name table was written: empty the name row buffer
 
   // chunk queue to the emitter
   output logic              q_valid,
@@ -76,7 +89,7 @@ module m3_tilegen_fetch #(
 );
 
   typedef enum logic [3:0] {
-    S_IDLE, S_MREQ, S_SLOT, S_RSREQ, S_SETUP, S_CHUNK, S_NREQ, S_PATA, S_PREQ, S_PUSH, S_DRAIN
+    S_IDLE, S_MREQ, S_SLOT, S_RSREQ, S_SETUP, S_CHUNK, S_NREQ, S_NLK, S_PATA, S_PREQ, S_PUSH, S_DRAIN
   } st_t;
   st_t st;
 
@@ -103,10 +116,20 @@ module m3_tilegen_fetch #(
   logic [3:0]  cn;
   logic [8:0]  csrc;
 
-  // buffers
-  logic [63:0] nbuf;
-  logic [3:0]  ntag;
-  logic        nval;
+  // the name row buffer: entry {layer, srcx[8:5]} holds four names (one 4-word burst's image)
+  (* ramstyle = "M10K" *) logic [63:0] nram [64];
+  logic [5:0]  nra, nra_q;      // read address, registered in the RAM
+  logic [63:0] nbuf;            // the entry read
+  logic        nwe;
+  logic [5:0]  nwa;
+  logic [3:0][5:0] rtag;        // a layer's map row held
+  logic [3:0][7:0] gv;          // its groups of eight names held
+  logic        nf_ok;           // no name table write since this fill was requested
+  always_ff @(posedge clk) begin
+    if (nwe) nram[nwa] <= p_dout;
+    nra_q <= nra;
+  end
+  assign nbuf = nram[nra_q];
   logic [63:0] pbuf;
   logic [16:0] ptag;
   logic        pval;
@@ -210,6 +233,11 @@ module m3_tilegen_fetch #(
   end
   wire [16:0] pa_n   = is4 ? {code4, row[2:1]} : {code8, row};
 
+  // the row buffer's ports: read at the chunk being looked up (S_CHUNK) or the one just filled (S_NLK, from csrc)
+  assign nra = (st == S_CHUNK) ? {ll, srcx[8:5]} : {ll, csrc[8:5]};
+  assign nwe = (st == S_NREQ) && (p_lo || p_ack);
+  assign nwa = {ll, csrc[8:6], p_ack};
+
   // -------------------------------------------------------------- the queue
   localparam int QW = 9 + 4 + 3 + 64 + 11 + 4;
   // Two entries in registers: left to itself Quartus 17 put this 2 x 94 array in 3 M10K (first fit).
@@ -251,12 +279,21 @@ module m3_tilegen_fetch #(
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      st <= S_IDLE; p_req <= 1'b0; p_addr <= '0; go_pend <= 1'b0; go_y <= '0; ly <= '0;
-      qv <= 2'b00; qh <= 1'b0; nval <= 1'b0; pval <= 1'b0; flush <= 1'b0; overrun <= 1'b0; n_req <= '0;
+      st <= S_IDLE; p_req <= 1'b0; p_long <= 1'b0; p_addr <= '0; go_pend <= 1'b0; go_y <= '0; ly <= '0;
+      gv <= '0; rtag <= '0; nf_ok <= 1'b0;
+      qv <= 2'b00; qh <= 1'b0; pval <= 1'b0; flush <= 1'b0; overrun <= 1'b0; n_req <= '0;
       slot <= '0; ll <= '0; x <= '0; cx <= '0; cn <= '0; csrc <= '0;
     end else begin
       flush   <= 1'b0;
       overrun <= 1'b0;
+      // the name row buffer: emptied each frame and on a name table write; a fill's group marked held
+      if (inv) nf_ok <= 1'b0;
+      if (inv || (go && y == 9'd0)) gv <= '0;
+      else if (st == S_NREQ && p_ack && !restart && nf_ok) begin
+        if (rtag[ll] != my[8:3]) gv[ll] <= 8'd1 << csrc[8:6];
+        else gv[ll][csrc[8:6]] <= 1'b1;
+        rtag[ll] <= my[8:3];
+      end
       if (go) begin
         go_y <= y;
         if (busy) begin
@@ -281,6 +318,7 @@ module m3_tilegen_fetch #(
         go_pend <= 1'b0;
         ly      <= go ? y : go_y;
         p_req   <= 1'b0;
+        p_long  <= 1'b0;
         pval    <= 1'b0;
         n_req   <= '0;
         st      <= S_MREQ;
@@ -341,7 +379,6 @@ module m3_tilegen_fetch #(
             above <= pri[ll];
 `endif
             pair  <= ll[1];
-            nval  <= 1'b0;
             if (su_empty) begin
               if (slot == 3'd7) st <= S_DRAIN;
               else begin slot <= slot + 3'd1; st <= S_SLOT; end
@@ -361,10 +398,13 @@ module m3_tilegen_fetch #(
               csrc <= srcx;
               x    <= x + {6'd0, n_ch};
               if (ch_en) begin
-                if (nval && (ntag == srcx[8:5])) st <= S_PATA;
+                // the row buffer is read at {ll, srcx[8:5]} this clock (nra), so a held name is in nbuf in S_PATA
+                if ((rtag[ll] == my[8:3]) && gv[ll][srcx[8:6]] && !inv) st <= S_PATA;
                 else begin
                   p_req  <= 1'b1;
-                  p_addr <= VBASE + wa({5'h1F, ll, my[8:3], srcx[8:5], 2'b00});
+                  p_long <= 1'b1;
+                  nf_ok  <= !inv;
+                  p_addr <= VBASE + wa({5'h1F, ll, my[8:3], srcx[8:6], 3'b000});
                   n_req  <= n_req + 16'd1;
                   st     <= S_NREQ;
                 end
@@ -372,15 +412,17 @@ module m3_tilegen_fetch #(
             end
           end
 
+          // an eight-word name read: words 0-3 (p_lo) and 4-7 (p_ack) go into the row buffer (nwe)
           S_NREQ: begin
             if (p_ack) begin
-              p_req <= 1'b0;
-              nbuf  <= p_dout;
-              ntag  <= csrc[8:5];
-              nval  <= 1'b1;
-              st    <= S_PATA;
+              p_req  <= 1'b0;
+              p_long <= 1'b0;
+              st     <= S_NLK;
             end
           end
+
+          // the chunk's entry is read from the row buffer (nra), for S_PATA
+          S_NLK: st <= S_PATA;
 
           S_PATA: begin
             tw    <= t_sel;

@@ -537,7 +537,7 @@ module r3d_rast #(
     .i_tw(a_tw), .i_th(a_th), .i_mu(a_mu), .i_mv(a_mv), .i_fmt(a_fmt), .i_lv(r_lv),
     .m_a0(fa0), .m_a1(fa1), .m_a2(fa2), .m_a3(fa3), .m_re(),
     .m_q0(16'd0), .m_q1(16'd0), .m_q2(16'd0), .m_q3(16'd0),
-    .o_valid(), .o_tag(), .o_texel());
+    .o_valid(), .o_tag(), .o_tag_e(), .o_texel());
   // its two stages' valid, pixel number and texture flag; F1 also holds fog's inputs
   logic       f1_v, f2_v, f1_t, f2_t, f1_pos;
   logic [6:0] f1_n, f2_n;
@@ -569,14 +569,22 @@ module r3d_rast #(
     fd1_n <= f1_n; fd2_n <= fd1_n; fd3_n <= fd2_n;
   end
   (* ramstyle = "M10K, no_rw_check" *) logic [37:0] ring_d1 [128];
-  (* ramstyle = "MLAB, no_rw_check" *) logic [12:0] ring_d2 [128];
-  logic [37:0] rq_d1;
-  logic [12:0] rq_d2;
+  // ring_d2 in M10K, old data on a read of the entry written (study R98: -40 ALM
+  // of MLAB, +1 M10K)
+  (* ramstyle = "M10K" *) logic [12:0] ring_d2 [128];
+  // D1 and D2 are read a cycle early, at the filter's next tag (tb_ne), and registered again, so the
+  // M10Ks' outputs do not run into the colour stage's fog sum (timing, study R104). The entries were
+  // written long before (at the texel fetch), so the earlier read sees the same words.
+  logic [37:0] rq_d1, rq_d1m;
+  logic [12:0] rq_d2, rq_d2m;
+  logic [6:0]  tb_ne;
   always_ff @(posedge clk) begin
     if (f1_v) ring_d1[f1_n] <= tf_q[37:0];
     if (fd3_v) ring_d2[fd3_n] <= fp_p;
-    rq_d1 <= ring_d1[ra_b];
-    rq_d2 <= ring_d2[ra_b];
+    rq_d1m <= ring_d1[tb_ne];
+    rq_d2m <= ring_d2[tb_ne];
+    rq_d1 <= rq_d1m;
+    rq_d2 <= rq_d2m;
   end
 
   // ===========================================================================
@@ -603,14 +611,18 @@ module r3d_rast #(
   wire tc_pop = tc_ovalid && tc_oready;
   assign ra_a = tc_pay;
   // the cache's words wait four cycles for the filter's stage 3 (an MLAB line,
-  // read synchronously: the word written four cycles ago, registered)
-  (* ramstyle = "MLAB, no_rw_check" *) logic [63:0] wdl [8];
+  // read synchronously: the word written four cycles ago, registered; in M10K,
+  // study R98: -40 ALM of MLAB, +2 M10K; the read is never at the written address)
+  (* ramstyle = "M10K, no_rw_check" *) logic [63:0] wdl [8];
   logic [2:0]  wdp;
-  logic [63:0] wq;
+  // (read a cycle earlier and registered once more, so the M10K's output does not run into the
+  // filter's decode and differences: timing, study R104)
+  logic [63:0] wq, wq_m;
   always_ff @(posedge clk) begin
     wdl[wdp] <= {tq3, tq2, tq1, tq0};
     wdp <= wdp + 3'd1;
-    wq <= wdl[3'(wdp - 3'd3)];
+    wq_m <= wdl[3'(wdp - 3'd2)];
+    wq <= wq_m;
   end
 
   logic       b_in_v;
@@ -633,7 +645,7 @@ module r3d_rast #(
     .i_mu(b_t[4]), .i_mv(b_t[3]), .i_fmt(b_t[2:0]), .i_lv(b_lv),
     .m_a0(), .m_a1(), .m_a2(), .m_a3(), .m_re(),
     .m_q0(wq[15:0]), .m_q1(wq[31:16]), .m_q2(wq[47:32]), .m_q3(wq[63:48]),
-    .o_valid(tb_valid), .o_tag(tb_n), .o_texel(tb_texel));
+    .o_valid(tb_valid), .o_tag(tb_n), .o_tag_e(tb_ne), .o_texel(tb_texel));
 
   // the colour's inputs from rings B, D1 and D2, a cycle on
   assign ra_b = tb_n;

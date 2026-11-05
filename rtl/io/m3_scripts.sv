@@ -39,6 +39,23 @@
 //     window). The bridge decodes the window from win_en and win_base: VF3 puts it
 //     at C0000000, Bass Fishing at F9000000.
 //
+// R3DMA (study R100): the Step 2.x Real3D DMA device (PCI 0x178611DB), a register
+// front end on this move engine, selected at run time by step2. Supermodel's
+// Real3D.cpp (DMACopy, Read/WriteDMARegister) and MAME's real3d_dma_r/w agree:
+//   C2000000 source, C2000004 destination (little-endian values), C2000008 the
+//   length in words: written, the move starts (no SCRIPTS fetch). Byte E is the
+//   configuration (bit 7: each word byte-reversed; bit 0: interrupt at the end),
+//   byte C the status (bit 7 busy, MAME's m_dma_busy; bit 0 the interrupt), a
+//   write of bit 0 to byte D acknowledges. C2000010 is a command: bit 29 the ID
+//   (Supermodel's 0x16C311DB: "games requesting the PCI ID via the DMA device
+//   expect 0x16C311DB, even on Step 2.x"), bit 31 a Real3D register read
+//   (84000000 + bits 5:2, read over the bus as the CPU would); C2000014 reads the
+//   result, and a write there sets it to FFFFFFFF. The interrupt is the 53C810's
+//   line (non-maskable, both emulators). Supermodel's move is instant; here it
+//   runs on the bus as a 53C810 move does, so the game sees busy meanwhile.
+//   Daytona 2 waits for the interrupt between moves and polls busy before each
+//   command (sim/system/notes.md, Daytona 2).
+//
 // One datapath (study 8.4): the move's source and destination pointers are DSPS
 // and TEMP (the manual's holding registers) and the write count is DBC. Each pointer
 // has its own incrementer: one adder shared through the port's address measured 16
@@ -68,10 +85,12 @@ module m3_scripts
   parameter bit ENABLE = 1'b1,   // D-14: 0 leaves a window that reads 0 and a port that never asks
   parameter bit LINE   = 1'b1,   // eight-word line reads and writes where the alignment allows
   parameter bit INT_OP = 1'b1,   // decode INT (not run by the captured games)
-  parameter bit RD_ALL = 1'b0    // TEMP, DBC/DCMD, DSPS readable
+  parameter bit RD_ALL = 1'b0,   // TEMP, DBC/DCMD, DSPS readable
+  parameter bit R3DMA  = 1'b0    // the Step 2.x Real3D DMA front end (step2)
 )(
   input  logic        clk,
   input  logic        rst,
+  input  logic        step2,     // run time: the Real3D DMA device, not the 53C810
 
   input  logic        c_req,
   input  logic        c_we,
@@ -107,8 +126,8 @@ module m3_scripts
 
   generate
   if (ENABLE) begin : g_on
-    m3_scripts_core #(.LINE(LINE), .INT_OP(INT_OP), .RD_ALL(RD_ALL)) u_core (
-      .clk, .rst,
+    m3_scripts_core #(.LINE(LINE), .INT_OP(INT_OP), .RD_ALL(RD_ALL), .R3DMA(R3DMA)) u_core (
+      .clk, .rst, .step2,
       .c_req, .c_we, .c_idx, .c_be, .c_wdata, .c_ack, .c_rdata, .win_en, .win_base,
       .s_req, .s_we, .s_addr, .s_be, .s_wdata, .s_ack, .s_rdata,
       .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
@@ -141,10 +160,12 @@ module m3_scripts_core
 #(
   parameter bit LINE   = 1'b1,
   parameter bit INT_OP = 1'b1,
-  parameter bit RD_ALL = 1'b0
+  parameter bit RD_ALL = 1'b0,
+  parameter bit R3DMA  = 1'b0
 )(
   input  logic        clk,
   input  logic        rst,
+  input  logic        step2,
   input  logic        c_req,
   input  logic        c_we,
   input  logic [5:0]  c_idx,
@@ -193,6 +214,13 @@ module m3_scripts_core
 
   wire dip = st_ssi | st_sir | st_iid;
 
+  // the Step 2 DMA device (R3DMA)
+  wire         s2 = R3DMA && step2;
+  logic [7:0]  d2_cfg;                  // byte E
+  logic        d2_irq;                  // status bit 0
+  logic [31:0] d2_data;                 // C2000014, CPU byte order
+  logic [5:2]  d2_reg;                  // the Real3D register a command reads
+
   // ------------------------------------------------------------------ FIFO (16 words, MLAB)
   (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] fifo [0:15];
   logic [3:0] wp, rp;
@@ -201,7 +229,7 @@ module m3_scripts_core
   wire        f_push, f_pop;
 
   // ------------------------------------------------------------------ engine and port
-  typedef enum logic [2:0] { E_IDLE, E_F0, E_F1, E_F2, E_CHK, E_MOVE, E_END } est_t;
+  typedef enum logic [2:0] { E_IDLE, E_F0, E_F1, E_F2, E_CHK, E_MOVE, E_END, E_STAT } est_t;
   est_t est;
 
   localparam logic [1:0] K_FETCH = 2'd0, K_RD = 2'd1, K_WR = 2'd2;
@@ -221,7 +249,7 @@ module m3_scripts_core
   assign f_pop  = (p_beat && p_kind == K_WR) || p_wack;
 
   always_ff @(posedge clk) if (f_push) fifo[wp] <= m_rdata;
-  assign m_wdata = fifo_q;
+  assign m_wdata = (s2 && d2_cfg[7]) ? bswap(fifo_q) : fifo_q;
 
   // what the move asks for next (decided with the port idle)
   wire wr_line_ok = LINE && temp[4:2] == 3'd0 && dbc[23:5] != 19'd0;
@@ -242,8 +270,13 @@ module m3_scripts_core
 
   // ------------------------------------------------------------------ CPU accesses
   wire s_go = s_req && !s_ack;
-  wire s_wr = s_go && s_we;
-  wire s_rd = s_go && !s_we;
+  wire s_wr = s_go && s_we && !s2;
+  wire s_rd = s_go && !s_we && !s2;
+  wire d_wr = s_go && s_we && s2;
+  wire d_rd = s_go && !s_we && s2;
+  wire [31:0] d_v = bswap(s_wdata);                       // the register's little-endian value
+  wire d_len  = d_wr && s_addr == 5'h02 && !busy;         // C2000008: the move starts
+  wire d_cmd  = d_wr && s_addr == 5'h04 && !busy;         // C2000010
   wire [4:0] s_w = s_addr;
   wire w_istat = s_wr && s_w == 5'h05 && s_be[3];
   wire w_dsp   = s_wr && s_w == 5'h0B && !busy;
@@ -271,7 +304,7 @@ module m3_scripts_core
         end else begin e_int = 1'b1; e_bits = 4'b0001; end
       end
       E_CHK: if (mov_bad) begin e_int = 1'b1; e_bits = 4'b0001; end
-      E_END: if (dcntl[4]) begin e_int = 1'b1; e_bits = 4'b1000; end
+      E_END: if (dcntl[4] && !s2) begin e_int = 1'b1; e_bits = 4'b1000; end
       default: ;
     endcase
   end
@@ -289,6 +322,22 @@ module m3_scripts_core
         if (c_be[2]) bar1[23:16] <= c_wdata[23:16];
         if (c_be[3]) bar1[31:24] <= c_wdata[31:24];
       end
+    end
+
+    // ---------------- the Step 2 DMA device's registers
+    if (d_wr) begin
+      case (s_addr)
+        5'h00: if (!busy) dsps <= d_v;
+        5'h01: if (!busy) temp <= d_v;
+        5'h02: if (!busy) dbc <= {d_v[21:0], 2'b00};
+        5'h03: begin
+          if (s_be[2] && s_wdata[16]) d2_irq <= 1'b0;                  // byte D: acknowledge
+          if (s_be[1]) d2_cfg <= s_wdata[15:8];                         // byte E
+        end
+        5'h04: if (d_cmd && d_v[29]) d2_data <= 32'hDB11_C316;         // 0x16C311DB, as the CPU reads it
+        5'h05: d2_data <= 32'hFFFF_FFFF;
+        default: ;
+      endcase
     end
 
     // ---------------- CPU writes
@@ -347,7 +396,9 @@ module m3_scripts_core
 
     // ---------------- engine
     case (est)
-      E_IDLE: if (start) est <= E_F0;
+      E_IDLE: if (d_len) est <= E_CHK;
+              else if (d_cmd && d_v[31] && !d_v[29]) begin d2_reg <= d_v[5:2]; est <= E_STAT; end
+              else if (start) est <= E_F0;
       E_F0, E_F1, E_F2: begin
         if (!p_out) begin
           m_req <= 1'b1; m_cmd <= MC_RD; m_addr <= {dsp, 2'b00}; m_be <= 4'hF;
@@ -368,7 +419,8 @@ module m3_scripts_core
       end
       E_CHK: begin
         rd_left <= dbc[23:2];
-        if (mov_bad) est <= E_IDLE;
+        if (s2) est <= (dbc[23:2] == 22'd0) ? E_END : E_MOVE;
+        else if (mov_bad) est <= E_IDLE;
         else est <= E_MOVE;
       end
       E_MOVE: if (!p_out && !p_done) begin
@@ -384,8 +436,17 @@ module m3_scripts_core
           est <= E_END;
         end
       end
-      E_END: if (dcntl[4]) est <= E_IDLE;
+      E_END: if (s2) begin est <= E_IDLE; if (d2_cfg[0]) d2_irq <= 1'b1; end
+             else if (dcntl[4]) est <= E_IDLE;
              else est <= E_F0;
+      // the Step 2 command's Real3D register read, over the bus
+      E_STAT: begin
+        if (!p_out) begin
+          m_req <= 1'b1; m_cmd <= MC_RD; m_addr <= {26'h210_0000, d2_reg, 2'b00}; m_be <= 4'hF;
+          p_out <= 1'b1; p_kind <= K_FETCH; p_line <= 1'b0;
+        end
+        if (p_last) begin d2_data <= m_rdata; est <= E_IDLE; end
+      end
       default: est <= E_IDLE;
     endcase
 
@@ -410,6 +471,7 @@ module m3_scripts_core
       is_srst <= 1'b0; is_sigp <= 1'b0; is_sem <= 1'b0;
       halted <= 1'b0; irq_l <= 1'b0;
       cmd <= 3'd0; lat <= 8'd0; bar1 <= 24'd0;
+      d2_cfg <= 8'd0; d2_irq <= 1'b0; d2_data <= 32'd0; d2_reg <= 4'd0;
     end
   end
 
@@ -429,6 +491,13 @@ module m3_scripts_core
         default: s_rdata <= 32'd0;
       endcase
     end
+    if (d_rd) begin
+      case (s_addr)
+        5'h03: s_rdata <= {busy, 6'd0, d2_irq, 8'd0, d2_cfg, 8'd0};
+        5'h05: s_rdata <= d2_data;
+        default: s_rdata <= 32'd0;
+      endcase
+    end
     if (c_req && !c_ack && !c_we) begin
       case (c_idx)
         6'd0: c_rdata <= 32'h0001_1000;
@@ -440,8 +509,8 @@ module m3_scripts_core
     end
   end
 
-  assign irq      = irq_l && !dcntl[1];                    // DCNTL.IRQD masks the pin, not the interrupt
-  assign win_en   = cmd[1];
-  assign win_base = bar1;
+  assign irq      = s2 ? d2_irq : (irq_l && !dcntl[1]);    // DCNTL.IRQD masks the pin, not the interrupt
+  assign win_en   = s2 || cmd[1];
+  assign win_base = s2 ? 24'hC2_0000 : bar1;
 
 endmodule

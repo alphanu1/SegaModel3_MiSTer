@@ -305,7 +305,7 @@ record.
 **Builds 6 and 7.** Build 6 (e31c24d9: the new latch, build 5's CPU) showed the crash's
 entries on the board: row 10 a DEC at SRR0 0004D0A4 inside the copy loop, row 11 the
 DTLB load miss after it and 0x34DC entries in all. Build 7 (9ae84cd8: build 6's system,
-build 5's CPU and the CPU agent's update-load fix, fix_lux/build5.patch) fitted with
+build 5's CPU and the update-load fix, fix_lux/build5.patch) fitted with
 slow 100C -0.286 / +0.240, slow -40C -0.331 / +0.185, fast 100C +4.044 / +0.128 and fast
 -40C +5.041 / +0.073 (setup / hold, system clock), 22,325 ALM. A Verilator checkpoint
 cannot be restored into a changed model: each one carries a layout check value, and the
@@ -872,6 +872,30 @@ warning and SEGA logo screens, which compose correctly over the 3D.
   The fixed-CPU chain (`chain2.sh`, `run2/`) is rerunning from boot.
 - **Supermodel's 3D first shows at frame 1280** (a wipe through 1290), so
   about bench frame 1255.
+- **The fixed-CPU chain (`run2/`) to frame 1400:** no crash. The 3D
+  layer is exact against `sb_ref` (render_d25) on frames 1272, 1302 and
+  1350: 5,860 triangles, 11 viewports, 0 of 190,464 pixels differ.
+- **The composite does not match Supermodel past frame 1330.** Bench
+  1240-1330 match Supermodel's logo frames (about 91% of pixels equal).
+  From 1340 to 1390 the bench still shows the full SEGA logo on white,
+  with a fight drawn in the 3D layer underneath, so the best match is
+  always Supermodel's logo (frame 1190-1242, the window's edge). The
+  compositor is not at fault: the tile layer covers the 3D because the
+  game has not wiped the logo away. The bus traces show why:
+  - Supermodel writes tile register 0x6C every frame from 1259 (the wipe,
+    changing values) and the priority word 0x20 = EA050000 at 1275.
+  - The bench writes the priority word at 1269, 0x6C twice (1270, 1272),
+    then nothing more to the tile registers through 1400.
+  - Supermodel writes about 19,300 polygon RAM words every frame from
+    before 1240. The bench starts at 1260 and writes about 6,800 a frame
+    (one full set every third frame, R95's rate). Its hot code is
+    different too (0x23Exx, 0x482xx against Supermodel's idle loop at
+    0x19xx).
+  The game runs about a third as fast on the bench, and the logo wipe
+  appears to wait on that. The board (R95) does get past the logo, so
+  this is the slow CPU, not a hang. A frame-by-frame grab comparison
+  past 1280 needs Supermodel run at the bench's game rate, or a check
+  by game frame rather than video frame.
 
 **Fits (one seed, release form, multicorner; the live CPU with R91, PVR
 0x00060101, snoop tied off).**
@@ -909,3 +933,191 @@ warning and SEGA logo screens, which compose correctly over the 3D.
   `m3v_sdr_rd` 370: about 2,370 in all.
 - The two adapters keep word queues and 24-bit range compares in registers,
   and are the cheapest stage B area to win back.
+
+## The D-cache snoop wired, PVR 0x00060103, write bursts (R101, 2026-11-02)
+
+The fix for R95: VF3 at 14.5 fps on the board, half the CPU's cycles waiting on
+data, and in the bench two-thirds of that wait on single write-through stores to
+work RAM (about 25,000 a frame, each two 16-bit SDRAM requests).
+
+**The snoop (D-41, R90's "to finish D-41").** `m3_bus` now drives `ppc_cpu`'s
+`sn_*` port:
+- every 53C810 access to work RAM (00000000-007FFFFF) is snooped first, one snoop
+  an access: sn_addr is its line, sn_inv is 1 for a write (LINE_WR, WR);
+- the access is not granted until sn_ack; the CPU keeps the bus meanwhile, so the
+  D-cache's push (an MC_LINE_WR) goes through;
+- from sn_ack (the same cycle) to the 53C810's grant the CPU is not granted, so a
+  write that invalidated a line lands before the CPU can fill it again, and a read
+  follows the push;
+- no snoop is started while the 53C810 owns the bus (its request can still be up
+  with the access already granted).
+ROM, VRAM and the I/O space are not snooped. `m3_system`'s PVR default is now
+0x00060103: VF3 maps RAM copy-back.
+
+**Write bursts (the pending "`m2_sdram` write burst").**
+- `m2_sdram` has a `WB` port mask (default none: the controller as it was). A WB
+  port's write is a burst of two columns, or eight with p_long, from one dispatch:
+  S_WR walks the columns as S_RD does, and column k's word and mask are read live
+  from `wb_din` / `wb_be` while `wb_col` = k.
+- `m3_sdr_port`: a single write (MC_WR) is one two-column burst instead of two
+  requests. A cast-out (MC_LINE_WR) takes its eight beats into the line buffer
+  (`bd`, shared with fills), one every four clocks, and writes them as two
+  eight-column bursts, the first once beats 0-3 are in. Before, it was sixteen
+  requests, one beat at a time.
+- Posting: a single write was already acknowledged at once (one deep, in order).
+  A cast-out is now posted too: the bus is free after the eighth beat. Nothing
+  passes a posted write: the port takes the next transaction (of either master)
+  only when the last is written, so a read after a write always sees it. I did not
+  let reads pass posted writes; the MPC105's rules for that are not checked.
+- The beat period of four is one clock more than the bus's own line writes
+  (B_BEAT, three): the master sees m_wnext a clock after s_wnext and shows the next
+  beat the clock after that.
+
+**Benches.**
+- `tb_m3_bus` had not run since stage B: the Real3D host port (`h_rdy`) was left
+  unconnected in `m3_bus_tb.sv`, so the first window write hung. The bench top now
+  has a host port that is always ready and answers a status read with FFFFFFFD.
+  Its end-of-run drain also counts the last JTAG, I/O and tile register strobes
+  (two seeds failed on a strobe that came after the main loop).
+- New in `tb_m3_bus`: master 0 keeps a six-line copy-back cache of 32 lines
+  (00012000-000123FF) and answers the snoop as `ppc_dcache` does (quiet first,
+  push a dirty line, then sn_ack; a write snoop invalidates). The 53C810 reads and
+  writes those lines, single and line. After a write snoop the CPU refills the
+  line at once, in the sn_ack cycle, to race the DMA. Checked: no 53C810 write
+  lands while the line is held or being filled; a 53C810 read returns the line as
+  it was at the snoop; every CPU load hit returns the coherent value. Uncached
+  reads follow a write to the same address half the time (about 4,300 a run).
+- 40 seeds x 100,000 transactions pass (each about 22,500 snoops, 1,400 pushes,
+  1,300 invalidates). `tb_m3_sdr_port` passes 5 seeds x 200,000.
+- Planted faults, each caught on three seeds: no snoop at all (about 1,450 stale,
+  3,800 reads before the push); every snoop a read (sn_inv 0: 1,500 stale); the
+  CPU not held after sn_ack (2-3 stale a run, only through the same-cycle refill);
+  a cast-out's first burst started after one beat (10,000 read mismatches). Started
+  after two beats it is not caught and is harmless: `m2_sdram` reaches column 4
+  later than beat 2 arrives. The first-burst rule waits for four.
+- The core (200 seeds), CPU subsystem (200 seeds, latency to 80) and cache
+  benches (8 + 8 seeds) pass; nothing in `rtl/cpu` changed.
+
+**The system bench (`run3`, `chain3.sh`, from boot, built from `sm3-builds/pw/src` = HEAD + these four
+files).** It reaches frame 1,400 with no fault. The 53C810's Real3D streams match the write-through bench
+(`bustrace.py compare run2 run3`): texture FIFO 1,922,706 words, 8C 236,768, 8E all of run2's 689,282; polygon RAM
+to word 861,686 (one word's low 24 bits differ at a different game frame, then agree again). Fight frames 1,210-1,390:
+CPI 4.04-4.08, data wait 40.3-41.1% (all RAM: about 5,850 line fills and 4,390 cast-outs a frame, no single
+writes), 0.5 frames submitted a frame. Study R101 has the table against run2.
+
+**`--prof` additions (C++ only, so the model and the run3 checkpoints are unchanged; in `sm3-builds/pw/src`, and as
+`sm3-builds/pw/tb_m3_system_prof_r101.patch` against the tree's bench, which R100 has changed meanwhile; not yet applied).** Each 10-frame window now
+also prints:
+- the longest CPU bus wait (`m_req[0]` to `m_ack[0]`, the overlay's `cpu_wd`), and a "stall" line with the bus state
+  for any wait over 20,000 clocks;
+- cycles by the last retired PC in VF3's wait loops (1E928, 1E97C, 1E9DC, 1E9FC, 2518) and the rest, with busy
+  instructions a frame;
+- frames submitted and drawn, the geometry's busy share, and the rasteriser's frame cycles (mean and max).
+
+From `run3/c1300`:
+
+| DDR3 model | rasteriser frame (clocks) | submitted / 10 frames | wait loops | busy instructions a frame | longest bus wait |
+|---|---|---|---|---|---|
+| 12-40 clocks, 10% busy (default) | 637,000 | 5 | 3.6% (1E9FC) | 390,000 | 16,500 |
+| `--ddr-lat 40 120 --ddr-busy 30` | 820,000-842,000 | 3-4 | 21% (1E9FC 18.6, 1E9DC 2.6) | 273,000-281,000 | 32,900 |
+
+Frames 0-200, 300-400 and 700-800 had no wait over 20,000 clocks. The board's 353,831 is not reproduced.
+
+**Fits and the board (study R101).** `sysb90pw_s1` booted black on the board: the burst mux on `sd_dq_o` stopped it
+packing into the I/O cells ("cannot simultaneously use clear and load signals"), so the ROM was written corrupt.
+Column data now goes through `din_r`. Then:
+
+| Build | Note | ALM | M10K | Setup (slow 100C / -40C) | Hold (4 corners) |
+|---|---|---|---|---|---|
+| `sysb90pw_s1` | DQ not packed: black on the board | 41,546 | 300 | +0.140 / -0.031 | all positive |
+| `sysb90pw2_s1` | no fit (4,200 of 4,191 LABs) | - | - | - | - |
+| `sysb90pw3_s1` | `CPI_MON` = 0; 20 fps on the board, textures and tiles corrupt | 40,977 | 300 | -0.386 / -0.308 | +0.143 / +0.160 / +0.134 / +0.100 |
+| `sysb90pw4_s1` | with `snap_r98` | 39,180 | 321 | +0.205 / +0.260 | +0.210 / +0.148 / +0.092 / +0.038 |
+| `sysb90pw5_s1` (ccd782df) | with `snap_r98`, overlay rows 12-15, `DDR_MAXQ` 8 | 40,815 | 321 | -0.436 / -0.225 (D-cache `mq_v`) | +0.155 / +0.043 / +0.124 / +0.014 |
+| `sysb90pw6_s1` (530a14f4) | pw4 without the write bursts (HEAD's `m2_sdram`, `m3_sdr_port`), snoop and PVR 1.3 kept | 39,183 | 321 | -0.210 / +0.069 | +0.251 / +0.172 / +0.133 / +0.117 |
+| `sysb90pw6_s2` | the same, seed 2 | 39,164 | 321 | -0.459 / -0.410 | +0.003 / -0.028 / +0.049 / +0.027 |
+| `sysb90pw8a2_s1` (f5864d55) | pw6, `ALLOW_SYNCH_CTRL_USAGE OFF` on `sd_a[*]`: every SDRAM pin packed | 38,972 | 321 | -0.607 / -0.318 | +0.134 / +0.026 / +0.102 / +0.007 |
+| `sysb90pw8b_s1` (5f2fcec3) | pw6 with PVR 0x00060101 (control) | 39,107 | 321 | -0.102 / -0.144 | +0.155 / +0.164 / +0.130 / +0.076 |
+| `sysb90pw9_s1` (11335745) | pw8a2 + write bursts + overlay rows 12-15 + `DDR_MAXQ` 8; every SDRAM pin packed | 40,748 | 321 | -0.270 / -0.460 | +0.124 / +0.102 / +0.122 / +0.078 |
+
+Every fit copy was HEAD plus these four files (`sm3-builds/pw/fit_patch*.sh`). None includes the framework edits
+that were later reverted, or R100's changes; pw4 and pw5 include `snap_r98`.
+
+## Daytona 2 (Step 2.1) on one SDRAM (study R100, 2026-11-02/03)
+
+The census, the placement and the parameter scheme are in the study's R100; this is the
+bench side.
+
+**Files.**
+
+| File | What |
+|---|---|
+| `rtl/sys/m3_loader.sv` | Downloads by ioctl index: 0 SDRAM, 1 the extra memory, 3 SDRAM at 0x7300000, 2 the NVRAM (backup RAM, then the 93C46), 4 the game configuration (step, flags, CROM bank map) |
+| `rtl/sys/m3_xmem.sv` | VROM in the extra memory: the geometry's port (a request's 1-5 beats issued at once on a pipelined port) and r3d_texup's |
+| `rtl/sys/m3_sec.sv`, `rtl/sys/m3_5881.sv` | The security board: RAM, registers, the stream; the 315-5881 cipher, generated by `sim/system/gen_m3_5881.py` from MAME's tables |
+| `rtl/io/m3_scripts.sv` | `R3DMA`: the Step 2 Real3D DMA device as a register front end on the 53C810's move engine |
+| `rtl/sys/m3_jtag.sv` | `jstep`: the Step 1.5 / 2.0 / 2.1 ID codes and the 17-device chain |
+| `rtl/io/m3_io.sv` | `EE_LOAD`: the 93C46's load port for the NVRAM |
+| `sm3-builds/dt2/m3_bus_step2.patch` | The Step 2 map in `m3_bus` (MPC106, the security board, the bank map, 8 MiB fixed CROM), held outside the tree; `m3_system` connects it with `M3_STEP2_BUS` |
+| `sim/system/m3_mra.py` | `daytona2`; `pack` writes every index (`IMG.iN.bin`); `nvram` converts a Supermodel NVRAM file |
+| `mra/Daytona USA 2 - Battle on the Edge (Japan, Revision A).mra` | Indexes 4, 1, 3, 0 and `<nvram index="2">` |
+
+**Benches.**
+
+| Target / run | Result |
+|---|---|
+| `test_xmem` | 2 seeds x 200,000 requests (both VROM sizes, VF3's zero half, texture reads) against the layout rule: 0 wrong. Planted faults (a block bit, a word given before its beat, the zero rule) fail on 17,856 / 40,160 / 18,393 words |
+| `test_sec` | `m3_sec` replaying Supermodel's 3,000 Daytona 2 frames (392,868 accesses): all 253,386 reads identical (128,114 data words). One key bit flipped: fails |
+| `Vm3_jtag ... --step 3` | Daytona 2's 32,215 TCK writes: 16,107 TDO reads identical. With the Step 1.0 chain 3,483 differ; VF3's trace still passes |
+| `make test_scripts` | the 53C810 regression with R3DMA in the RTL (step2 low): PASS |
+| `sm3-builds/dt2/tools/sec_replay.py` | the Python model of the stream (`gen_m3_5881.block_decrypt`) against the same trace: 0 of 128,114 differ |
+
+**The system bench** (`make -f sim/system/system.mk SYS_OBJ=sm3-builds/dt2/sysobj SYS_THREADS=4
+BUS_RTL=sm3-builds/dt2/rtl/m3_bus.sv SYS_DEFS=+define+M3_STEP2_BUS system`; chain
+`sm3-builds/dt2/chain.sh RUN FROM TO`). New options: `--cfg`, `--xmem`, `--fix8`, `--nvram`
+(the other indexes, each a window through ioctl and checked, the rest put in straight), and
+`--tb-fast-pc` (Daytona 2's boot ROM also runs FFF00198, VF3's wait-loop exit, at its first
+PCI probe; with 0 the fast timebase ends at the first instruction in RAM). The DDR3 model now
+covers beat 0x1000000 + 64 MiB (192 MiB of host memory, in the checkpoints).
+
+**Wrong turns.**
+- The boot first stopped at frame 1: it writes MCCR1 (MPC106 register F0) and reads it back
+  to set bit 11. The bus kept no MPC106 registers (VF3 never reads the MPC105's back), so it
+  read 0 and wrote 0x800. Supermodel keeps the bridge's registers as a byte array with reset
+  values; the patch keeps them (an MLAB and a written bit each).
+- `--tb-fast` ended at frame 1 because FFF00198 is VF3's loop exit but Daytona 2's PCI probe.
+- My first Supermodel runs failed: the run directory needs `Assets` (the crosshair bitmap),
+  and two `xvfb-run -a` started together collided on display :99.
+
+**On the board (study R101):** pw4 and pw5 are black too, though pw4 closes every corner. `sysb90_s1` and all of
+these leave `SDRAM_A[0-4]` and `[6-9]` unpacked, with no SDRAM I/O constraints in `Model3.sdc`. Model 2's
+`Model2.sdc` (its R57) constrains that interface; the adapted block is `sm3-builds/pw/Model3_sdram_io.sdc`, not applied.
+pw6 takes the write bursts out to separate that cause from placement.
+
+**The board's corruption was the address pins (R101).** pw8a2 (every SDRAM pin packed, no bursts) runs clean at
+15.3 fps. pw8b (PVR 1.1, address pins unpacked as `sysb90_s1`) is dead at boot. `Model3.qsf` now sets
+`ALLOW_SYNCH_CTRL_USAGE OFF` on `m2_sdram`'s `sd_a[*]` only; on the whole instance it unpacks `dq_r` instead.
+
+**VROM placement (2026-11-04).** `m3_system` `VROM_LOC` (0 SDRAM, 1 DDR3, 2 the second SDRAM, not built; default 1).
+With 1 the loader routes the index-0 image's VROM range (0x4000000, 32 MiB) to the extra memory, and VF3's VROM is
+read through `m3_xmem`, as Daytona 2's. The bench puts a VF3-size image's VROM into both memories and checks that the
+download's VROM window lands where the build places it (`loader: VROM window ... in DDR3 / in SDRAM`). `--vrom-x N`
+sets the readers' choice after a restore with a `VROM_LOC 0` build (`-GVROM_LOC=0` in `SYS_DEFS`), so one checkpoint
+measures both placements: `sm3-builds/dt2/vf3_measure.sh`, results in `sm3-builds/dt2/vf3a/RESULT.txt`.
+
+**Daytona 2 to frame 1,300.** At bench frame 1,304 the composite shows the attract's race demo with textures under
+"INSERT COIN(S)" (`sm3-builds/dt2/shot/f001304.png`); the tile layer matches Supermodel's at 1,100 and 1,300.
+
+**The Step 2 texture port (2026-11-05).** `r3d_texup` `STEP2_PORT` in `sm3-builds/dt2/handoff2` (patch and merge
+note), connected in `m3_system` with `M3_STEP2_TEX`. The system build takes it with
+`TEXUP_RTL=sm3-builds/dt2/handoff2/rtl/r3d_texup.sv`. `make -f sim/system/system.mk test_texup2` uploads random
+textures through the FIFO and through the port into two instances and compares the sheets: 2 x 300 batches, 0 differ.
+The Daytona 2 rerun with the port (`sm3-builds/dt2/run6`) uses the tile generator of the last commit
+(`sm3-builds/dt2/tg_head`): the tree's `m3_tilegen` has gained ports (`p_long`, `p_lo`, `name_inv`, R103) that the
+tree's `m3_system` does not connect yet.
+
+**The loader bug of the VROM placement (2026-11-05).** `VROM_LOC 1` routed index 0's 0x4000000-0x5FFFFFF to DDR3
+for Daytona 2 too, whose index 0 is banked CROM there; CROM slots 8-11 went over VROM blocks 0-1 (board: a hang
+after a power cycle, garbage 3D otherwise). Fixed in `m3_loader` (only without index-1 VROM, flags bit 0);
+`sm3-builds/dt2/handoff3`. The bench now sends index 1 through the loader at three places and index 0's window at
+0x4000000 for every set, and fails if Daytona 2's CROM lands in DDR3 or overwrites VROM.

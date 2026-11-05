@@ -74,8 +74,11 @@ module m3_tilegen #(
 
   output logic          p_req,
   output logic [AW:1]   p_addr,
+  output logic          p_long,       // eight-word reads (the name row buffer, R103)
   input  logic [63:0]   p_dout,
+  input  logic          p_lo,
   input  logic          p_ack,
+  input  logic          name_inv,     // a CPU write to the name tables (F10F8000-FFFFF)
 
   output logic [15:0]   st_cycles,    // clocks the last line took
   output logic [15:0]   st_reqs       // SDRAM requests it made
@@ -118,7 +121,7 @@ module m3_tilegen #(
   ) u_fetch (
     .clk, .rst_n, .go(go && ready), .y(go_y), .busy(f_busy), .overrun,
     .pri, .lreg,
-    .p_req, .p_addr, .p_dout, .p_ack,
+    .p_req, .p_addr, .p_long, .p_dout, .p_lo, .p_ack, .inv(name_inv),
     .q_valid, .q_pop, .q_x, .q_n, .q_col, .q_data, .q_palhi, .q_is4, .q_above, .q_pair,
     .flush, .n_req
   );

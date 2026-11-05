@@ -242,8 +242,9 @@ module r3d_rast_store #(
   logic          wrun_hi;                           // its lane
 
   // the record buffer, two words a beat by parity (MLAB, read a beat ahead)
-  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] rbe [16];
-  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] rbo [16];
+  // in M10K, old data on a read of the word written (study R98: -40 ALM, +2 M10K)
+  (* ramstyle = "M10K" *) logic [31:0] rbe [16];
+  (* ramstyle = "M10K" *) logic [31:0] rbo [16];
   logic [31:0] rqe, rqo;
   wire  [3:0]  rb_ra = (ws != W_WR) ? 4'd0 : w_wacc ? wbt + 4'd1 : wbt;
   always_ff @(posedge clk) begin rqe <= rbe[rb_ra]; rqo <= rbo[rb_ra]; end
@@ -265,6 +266,17 @@ module r3d_rast_store #(
   wire [5:0]  blo_w  = fy0[10] ? 6'd0 : 6'(fy0[8:3]);
   wire [5:0]  bhi_w  = (fy2[9] || fy2[8:0] >= 9'd384) ? 6'd47 : 6'(fy2[8:3]);
   wire        nob    = fy0[9] || fy0[8:0] >= 9'd384 || fy2[10] || fy0[11] || fy2[11] || (blo_w > bhi_w);
+  // nob and the bands registered: fy0 and fy2 are written at words H + 1 and H + 5 and the record's
+  // last word is H + 6 or later, so in W_ADDR they have held a cycle and the registered copies equal
+  // the live ones (checked below). fy2 through bhi_w and nob into the lists' enables was the 100 MHz
+  // system build's worst path, -0.96 ns (study R104).
+  logic       nob_q;
+  logic [5:0] blo_q, bhi_q;
+  always_ff @(posedge clk) begin nob_q <= nob; blo_q <= blo_w; bhi_q <= bhi_w; end
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && ws == W_ADDR && {nob_q, blo_q, bhi_q} != {nob, blo_w, bhi_w}) $fatal(1, "store: nob registered");
+`endif
   wire        walpha = wl[0];
   wire [LB:0] nxl    = nx[wl];
   wire        wfit   = walpha ? (nxl >= (LB+1)'(wnb)) : (nxl + (LB+1)'(wnb) <= (LB+1)'(1 << LB));
@@ -322,12 +334,12 @@ module r3d_rast_store #(
           end
         end
         W_ADDR: begin
-          if (nob) begin n_drop <= n_drop + 16'd1; ws <= W_REC; end
+          if (nob_q) begin n_drop <= n_drop + 16'd1; ws <= W_REC; end
           else if (!wfit) begin n_drop <= n_drop + 16'd1; ovf[1] <= 1'b1; ws <= W_REC; end
           else begin
             wa <= wa_n;
             nx[wl] <= walpha ? (LB+1)'(wa_n) : nxl + (LB+1)'(wnb);
-            bc <= blo_w; bhi <= bhi_w;
+            bc <= blo_q; bhi <= bhi_q;
             wq_req <= 1'b1; wq_we <= 1'b1; wq_be <= 8'hff;
             wq_addr <= 25'(rec_a(wb, wl, wa_n));
             wq_blen <= 8'(wnb);
@@ -406,8 +418,9 @@ module r3d_rast_store #(
   assign t_ra    = (ps == P_TO) ? tidx(pb, {pband, pp, 1'b0}) : (ps == P_TA) ? tidx(pb, {pband, pp, 1'b1}) : tidx(wb, wbin);
 
   // the run buffer: 32 runs, two a beat by parity (MLAB)
-  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] rre [16];
-  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] rro [16];
+  // in M10K, old data on a read of the word written (study R98: -40 ALM, +2 M10K)
+  (* ramstyle = "M10K" *) logic [31:0] rre [16];
+  (* ramstyle = "M10K" *) logic [31:0] rro [16];
   logic [3:0]  rr_wa;
   logic [31:0] rr_q;
   always_ff @(posedge clk) begin

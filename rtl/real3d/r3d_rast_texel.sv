@@ -69,6 +69,7 @@ module r3d_rast_texel #(
 
   output logic               o_valid,
   output logic      [TW-1:0] o_tag,
+  output logic      [TW-1:0] o_tag_e,    // o_tag a cycle early (the tag o_tag takes at the next en)
   output logic        [31:0] o_texel
 );
 
@@ -273,6 +274,8 @@ module r3d_rast_texel #(
       tag6 <= tag5;
     end
   end
+
+  assign o_tag_e = tag6;
 
   // ---- 7: the add, >> 15, out -------------------------------------------------------------------
   always_ff @(posedge clk) begin
