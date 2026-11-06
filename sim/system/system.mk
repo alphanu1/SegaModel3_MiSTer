@@ -103,6 +103,78 @@ test_sdr_port: $(SYS_OBJ)/sdr/Vm3_sdr_tb
 	@echo "== m3_sdr_port on m2_sdram, random transactions against a reference memory"
 	./$(SYS_OBJ)/sdr/Vm3_sdr_tb 200000 1
 
+# R107: the same with the sixteen-column line read (L16) and the bank hash (BXOR), each and both
+SDR_VARIANTS = l16 bx l16bx lw1 pair ra pw pw4 all rel $(R112_VARIANTS)
+SDR_G_l16 = -GL16=1
+SDR_G_bx = -GBXOR=1
+SDR_G_l16bx = -GL16=1 -GBXOR=1
+SDR_G_lw1 = -GLW1=1
+SDR_G_pair = -GL16=1 -GPAIR=1
+SDR_G_ra = -GL16=1 -GPAIR=1 -GRA=1
+SDR_G_pw = -GLW1=1 -GPW=1
+SDR_G_pw4 = -GPW=1
+SDR_G_all = -GL16=1 -GBXOR=1 -GLW1=1 -GPAIR=1 -GRA=1 -GRA_CONF=1 -GPW=1
+# the set Model3.sv builds (study R107)
+SDR_G_rel = -GL16=1 -GBXOR=1 -GLW1=1 -GPAIR=1 -GPW=1
+# R112: the miss path's clocks, each on the release set and all together (FAST is the bus's; the port
+# bench builds it but has no bus); n112: all five; a112: all five with the read-ahead
+R112_VARIANTS = fwd freq fdsp hitrd fast n112 a112 d112 r3p b112
+SDR_G_fwd = $(SDR_G_rel) -GFWD=1
+SDR_G_freq = $(SDR_G_rel) -GFREQ=1
+SDR_G_fdsp = $(SDR_G_rel) -GFDSP=1
+SDR_G_hitrd = $(SDR_G_rel) -GHITRD=1
+SDR_G_fast = $(SDR_G_rel) -GFAST=1
+SDR_G_n112 = $(SDR_G_rel) -GFWD=1 -GFREQ=1 -GFDSP=1 -GHITRD=1 -GFAST=1
+SDR_G_a112 = $(SDR_G_n112) -GRA=1 -GRA_CONF=1
+# d112: n112 with the posted write's bursts held 16 clocks (PW_DLY)
+SDR_G_d112 = $(SDR_G_n112) -GPW_DLY=16
+# r3p: the release set with the bus's Real3D post buffer (R3P)
+SDR_G_r3p = $(SDR_G_rel) -GR3P=1
+# b112: the set Model3.sv builds (R112's six, HITRD off)
+SDR_G_b112 = $(SDR_G_rel) -GFWD=1 -GFREQ=1 -GFDSP=1 -GFAST=1 -GPW_DLY=8 -GR3P=1
+$(SYS_OBJ)/sdr_%/Vm3_sdr_tb: rtl/sys/m3_sdr_port.sv rtl/mem/m2_sdram.sv sim/system/m3_sdr_tb.sv sim/system/tb_m3_sdr_port.cpp rtl/cpu/ppc_cache_pkg.sv
+	@$(VERILATOR) $(VFLAGS) $(SDR_G_$*) --top-module m3_sdr_tb -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/sdr_$* \
+	  rtl/cpu/ppc_cache_pkg.sv rtl/mem/m2_sdram.sv rtl/sys/m3_sdr_port.sv sim/system/m3_sdr_tb.sv sim/system/tb_m3_sdr_port.cpp >/dev/null
+
+test_sdr_port_r107: $(foreach v,$(SDR_VARIANTS),$(SYS_OBJ)/sdr_$(v)/Vm3_sdr_tb)
+	@echo "== m3_sdr_port, L16 / BXOR variants"
+	./$(SYS_OBJ)/sdr_l16/Vm3_sdr_tb 200000 1
+	./$(SYS_OBJ)/sdr_bx/Vm3_sdr_tb 200000 2 --bxor
+	./$(SYS_OBJ)/sdr_l16bx/Vm3_sdr_tb 200000 3 --bxor
+	./$(SYS_OBJ)/sdr_lw1/Vm3_sdr_tb 200000 4 --lw1
+	./$(SYS_OBJ)/sdr_pair/Vm3_sdr_tb 200000 6
+	./$(SYS_OBJ)/sdr_ra/Vm3_sdr_tb 200000 7 --seq
+	./$(SYS_OBJ)/sdr_ra/Vm3_sdr_tb 200000 8
+	./$(SYS_OBJ)/sdr_ra/Vm3_sdr_tb 200000 10 --seq --idle 40
+	./$(SYS_OBJ)/sdr_ra/Vm3_sdr_tb 200000 11 --seq --idle 12
+	./$(SYS_OBJ)/sdr_pw/Vm3_sdr_tb 200000 12 --lw1
+	./$(SYS_OBJ)/sdr_pw/Vm3_sdr_tb 200000 13 --lw1 --idle 12
+	./$(SYS_OBJ)/sdr_pw4/Vm3_sdr_tb 200000 14
+	./$(SYS_OBJ)/sdr_pw/Vm3_sdr_tb 200000 15 --lw1 --nowait
+	./$(SYS_OBJ)/sdr_pw4/Vm3_sdr_tb 200000 16 --nowait
+	./$(SYS_OBJ)/sdr_all/Vm3_sdr_tb 200000 17 --bxor --lw1 --seq --nowait --idle 20
+	./$(SYS_OBJ)/sdr/Vm3_sdr_tb 200000 18 --nowait
+	./$(SYS_OBJ)/sdr_all/Vm3_sdr_tb 200000 5 --bxor --lw1
+	./$(SYS_OBJ)/sdr_all/Vm3_sdr_tb 200000 9 --bxor --lw1 --seq
+	./$(SYS_OBJ)/sdr_rel/Vm3_sdr_tb 200000 19 --bxor --lw1
+	./$(SYS_OBJ)/sdr_rel/Vm3_sdr_tb 200000 20 --bxor --lw1 --nowait --idle 12
+	./$(SYS_OBJ)/sdr_fwd/Vm3_sdr_tb 200000 21 --bxor --lw1 --nowait
+	./$(SYS_OBJ)/sdr_freq/Vm3_sdr_tb 200000 22 --bxor --lw1 --nowait
+	./$(SYS_OBJ)/sdr_fdsp/Vm3_sdr_tb 200000 23 --bxor --lw1 --nowait --idle 12
+	./$(SYS_OBJ)/sdr_hitrd/Vm3_sdr_tb 200000 24 --bxor --lw1 --nowait
+	./$(SYS_OBJ)/sdr_n112/Vm3_sdr_tb 200000 25 --bxor --lw1 --nowait
+	./$(SYS_OBJ)/sdr_n112/Vm3_sdr_tb 200000 26 --bxor --lw1 --idle 12
+	./$(SYS_OBJ)/sdr_n112/Vm3_sdr_tb 200000 27 --bxor --lw1
+	./$(SYS_OBJ)/sdr_a112/Vm3_sdr_tb 200000 28 --bxor --lw1 --seq --nowait --idle 20
+	./$(SYS_OBJ)/sdr_a112/Vm3_sdr_tb 200000 29 --bxor --lw1 --seq --idle 40
+	./$(SYS_OBJ)/sdr_d112/Vm3_sdr_tb 200000 30 --bxor --lw1 --nowait
+	./$(SYS_OBJ)/sdr_d112/Vm3_sdr_tb 200000 31 --bxor --lw1 --idle 12
+	./$(SYS_OBJ)/sdr_d112/Vm3_sdr_tb 200000 32 --bxor --lw1 --nowait --idle 40
+	./$(SYS_OBJ)/sdr_b112/Vm3_sdr_tb 200000 33 --bxor --lw1
+	./$(SYS_OBJ)/sdr_b112/Vm3_sdr_tb 200000 34 --bxor --lw1 --nowait
+	./$(SYS_OBJ)/sdr_b112/Vm3_sdr_tb 200000 35 --bxor --lw1 --idle 12
+	./$(SYS_OBJ)/sdr_b112/Vm3_sdr_tb 200000 36 --bxor --lw1 --nowait --idle 40
+
 lint_sys:
 	@echo "== lint m3_system"
 	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-PINCONNECTEMPTY -Wno-UNUSEDPARAM -Wno-TIMESCALEMOD \
@@ -126,3 +198,41 @@ $(SYS_OBJ)/bus/Vm3_bus_tb: rtl/sys/m3_bus.sv rtl/sys/m3_sdr_port.sv rtl/mem/m2_s
 test_bus: $(SYS_OBJ)/bus/Vm3_bus_tb
 	@echo "== m3_bus with its SDRAM target: two masters against a reference"
 	./$(SYS_OBJ)/bus/Vm3_bus_tb 100000 1
+
+# R107: the bus with the port's L16 / BXOR / LW1 (the SDR_VARIANTS above)
+$(SYS_OBJ)/bus_%/Vm3_bus_tb: rtl/sys/m3_bus.sv rtl/sys/m3_sdr_port.sv rtl/mem/m2_sdram.sv sim/system/m3_bus_tb.sv sim/system/tb_m3_bus.cpp
+	@mkdir -p $(SYS_OBJ)/bus_$*
+	@$(VERILATOR) $(VFLAGS) $(SDR_G_$*) --top-module m3_bus_tb -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/bus_$* \
+	  rtl/cpu/ppc_cache_pkg.sv rtl/mem/m2_sdram.sv rtl/sys/m3_sdr_port.sv rtl/sys/m3_bus.sv sim/system/m3_bus_tb.sv sim/system/tb_m3_bus.cpp >/dev/null
+
+test_bus_r107: $(foreach v,$(SDR_VARIANTS),$(SYS_OBJ)/bus_$(v)/Vm3_bus_tb)
+	@echo "== m3_bus, L16 / BXOR / LW1 variants"
+	./$(SYS_OBJ)/bus_l16/Vm3_bus_tb 100000 11
+	./$(SYS_OBJ)/bus_bx/Vm3_bus_tb 100000 12 --bxor
+	./$(SYS_OBJ)/bus_l16bx/Vm3_bus_tb 100000 13 --bxor
+	./$(SYS_OBJ)/bus_lw1/Vm3_bus_tb 100000 14
+	./$(SYS_OBJ)/bus_pair/Vm3_bus_tb 100000 16
+	./$(SYS_OBJ)/bus_ra/Vm3_bus_tb 100000 17
+	./$(SYS_OBJ)/bus_pw/Vm3_bus_tb 100000 18
+	./$(SYS_OBJ)/bus_pw4/Vm3_bus_tb 100000 19
+	./$(SYS_OBJ)/bus_all/Vm3_bus_tb 100000 15 --bxor
+	./$(SYS_OBJ)/bus_rel/Vm3_bus_tb 100000 20 --bxor
+	./$(SYS_OBJ)/bus_fwd/Vm3_bus_tb 100000 21 --bxor
+	./$(SYS_OBJ)/bus_freq/Vm3_bus_tb 100000 22 --bxor
+	./$(SYS_OBJ)/bus_fdsp/Vm3_bus_tb 100000 23 --bxor
+	./$(SYS_OBJ)/bus_hitrd/Vm3_bus_tb 100000 24 --bxor
+	./$(SYS_OBJ)/bus_fast/Vm3_bus_tb 100000 25 --bxor
+	./$(SYS_OBJ)/bus_n112/Vm3_bus_tb 100000 26 --bxor
+	./$(SYS_OBJ)/bus_n112/Vm3_bus_tb 100000 27 --bxor
+	./$(SYS_OBJ)/bus_a112/Vm3_bus_tb 100000 28 --bxor
+	./$(SYS_OBJ)/bus_d112/Vm3_bus_tb 100000 29 --bxor
+	./$(SYS_OBJ)/bus_d112/Vm3_bus_tb 100000 30 --bxor
+	./$(SYS_OBJ)/bus_rel/Vm3_bus_tb 100000 31 --bxor --r3stall
+	./$(SYS_OBJ)/bus_r3p/Vm3_bus_tb 100000 32 --bxor
+	./$(SYS_OBJ)/bus_r3p/Vm3_bus_tb 100000 33 --bxor --r3stall
+	./$(SYS_OBJ)/bus_r3p/Vm3_bus_tb 100000 34 --bxor --r3slow
+	./$(SYS_OBJ)/bus_rel/Vm3_bus_tb 100000 35 --bxor --r3slow
+	./$(SYS_OBJ)/bus_b112/Vm3_bus_tb 100000 36 --bxor
+	./$(SYS_OBJ)/bus_b112/Vm3_bus_tb 100000 37 --bxor --r3stall
+	./$(SYS_OBJ)/bus_b112/Vm3_bus_tb 100000 38 --bxor --r3slow
+	./$(SYS_OBJ)/bus_b112/Vm3_bus_tb 100000 39 --bxor

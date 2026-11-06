@@ -17,7 +17,9 @@
 // the set-up and the walker once a (triangle, band) pair; this chain is their
 // bench and fit together.
 
-module r3d_rast_front (
+module r3d_rast_front #(
+  parameter bit PRE_DIV = 1'b0    // r3d_rast_div's PRE: the triangle holds a cycle before t_valid
+) (
   input  logic               clk,
   input  logic               rst,
 
@@ -47,7 +49,7 @@ module r3d_rast_front (
       d_b1 <= t_b1;
     end
 
-  r3d_rast_div u_div (
+  r3d_rast_div #(.PRE(PRE_DIV)) u_div (
     .clk, .rst,
     .i_valid(t_valid), .i_ready(t_ready),
     .i_x1(t_x1), .i_y1(t_y1), .i_x2(t_x2), .i_y2(t_y2), .i_x3(t_x3), .i_y3(t_y3),

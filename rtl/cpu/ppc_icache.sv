@@ -382,6 +382,35 @@ module ppc_icache
     else if (pend)           rd_a = (serve_r || (chk_a && WAYPRED)) ? pa1[11:2] : pa[11:2];
     else                     rd_a = nx[11:2];
   end
+  // da_av's next value for each candidate read address, chosen as rd_a is: through rd_a the
+  // select (pfast from ta_idx's hazard compares) was in front of the fill-line compare and the
+  // word's availability (the 110 MHz build's ta_idx into da_av, eight levels)
+  // (the candidates; av() takes every input as an argument: Quartus 17 does not read a module's
+  // signals inside a function)
+  wire [9:0] ip1_a = i_addr[11:2] + 10'd1;
+  wire [9:0] pidx_a = i_pidx;
+  wire [9:0] nxn_a = nxn[11:2], ia_a = i_addr[11:2], pa1_a = pa1[11:2], pa_a = pa[11:2], nx_a = nx[11:2];
+  (* keep = 1 *) wire av_pidx = av({f_line[31:12], pidx_a[9:3]}, pidx_a[2:0], f_act, f_line, avail);
+  (* keep = 1 *) wire av_ip1  = av({f_line[31:12], ip1_a[9:3]},  ip1_a[2:0],  f_act, f_line, avail);
+  (* keep = 1 *) wire av_nxn  = av({f_line[31:12], nxn_a[9:3]},  nxn_a[2:0],  f_act, f_line, avail);
+  (* keep = 1 *) wire av_ia   = av({f_line[31:12], ia_a[9:3]},   ia_a[2:0],   f_act, f_line, avail);
+  (* keep = 1 *) wire av_pa1  = av({f_line[31:12], pa1_a[9:3]},  pa1_a[2:0],  f_act, f_line, avail);
+  (* keep = 1 *) wire av_pa   = av({f_line[31:12], pa_a[9:3]},   pa_a[2:0],   f_act, f_line, avail);
+  (* keep = 1 *) wire av_nx   = av({f_line[31:12], nx_a[9:3]},   nx_a[2:0],   f_act, f_line, avail);
+  logic da_av_n;
+  always_comb begin
+    if (pre_take)            da_av_n = av_pidx;
+    else if (pfast)          da_av_n = av_ip1;
+    else if (fast)           da_av_n = av_nxn;
+    else if (i_req && !pend) da_av_n = av_ia;
+    else if (pend)           da_av_n = (serve_r || (chk_a && WAYPRED)) ? av_pa1 : av_pa;
+    else                     da_av_n = av_nx;
+  end
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && da_av_n != av({f_line[31:12], rd_a[9:3]}, rd_a[2:0], f_act, f_line, avail))
+      $fatal(1, "icache da_av by candidate");
+`endif
 
   logic ta_k_look, ta_k_v;
   always_comb begin
@@ -423,7 +452,7 @@ module ppc_icache
     // translation into pa led two round-1 cached full builds (p_tgt -> pa)
     if (!pend) pa <= i_addr[31:2];
     da       <= rd_a;
-    da_av    <= av({f_line[31:12], rd_a[9:3]}, rd_a[2:0], f_act, f_line, avail);
+    da_av    <= da_av_n;
     ta_idx   <= ta_rd;
     ta_look  <= ta_k_look;
     ta_v     <= ta_k_v;

@@ -281,7 +281,9 @@ module r3d_geo
     logic [31:0] p;
     logic [3:0]  sh;
     begin
-      p = {1'b0, m, 23'd0} + {9'd0, m, 15'd0} + {17'd0, m, 7'd0} + {24'd0, m};
+      // m (2^23 + 2^15 + 2^7 + 1): the first three copies do not overlap, so one add (study R109; it was a
+      // four-operand sum on the tq_w -> tc_k path)
+      p = {1'b0, m, m, m, 7'd0} + {24'd0, m};
       // the product's leading one is m's, one place up only for m = 255
       // (checked for every m), so it does not wait for the sum
       sh = 4'd0;
@@ -491,11 +493,14 @@ module r3d_geo
 
     logic vs_w;
     assign vs_w = sw_we[gl] && e_cls == 2'd1;
-    r3d_ram #(.W(32), .A(5)) u_vsa (.clk, .we(vs_w && sw_addr[2:1] == 2'd0), .wa({e_ring, sw_addr[4:3], sw_addr[0]}),
+    // the vertex store's write address through a LUT of its own (keep), as u_lvl's (R104 fix 21): straight
+    // from sw_addr it missed hold by 0.030 / 0.059 ns at the slow corners in a standalone fit (study R109)
+    (* keep = 1 *) wire [4:0] vs_wa = {e_ring, sw_addr[4:3], sw_addr[0]};
+    r3d_ram #(.W(32), .A(5)) u_vsa (.clk, .we(vs_w && sw_addr[2:1] == 2'd0), .wa(vs_wa),
       .wd(sw_data[gl]), .ra(vs_ra), .rq(vsa_q[gl]));
-    r3d_ram #(.W(32), .A(5)) u_vsb (.clk, .we(vs_w && sw_addr[2:1] == 2'd1), .wa({e_ring, sw_addr[4:3], sw_addr[0]}),
+    r3d_ram #(.W(32), .A(5)) u_vsb (.clk, .we(vs_w && sw_addr[2:1] == 2'd1), .wa(vs_wa),
       .wd(sw_data[gl]), .ra(vs_ra), .rq(vsb_q[gl]));
-    r3d_ram #(.W(32), .A(5)) u_vsc (.clk, .we(vs_w && sw_addr[2]), .wa({e_ring, sw_addr[4:3], sw_addr[0]}),
+    r3d_ram #(.W(32), .A(5)) u_vsc (.clk, .we(vs_w && sw_addr[2]), .wa(vs_wa),
       .wd(sw_data[gl]), .ra(vs_ra), .rq(vsc_q[gl]));
     r3d_ram #(.W(32), .A(6), .SYNC(OUT_M10K), .BLOCK(OUT_M10K)) u_po (.clk, .we(sw_we[gl] && e_cls == 2'd2), .wa({e_pbuf, sw_addr[4:0]}),
       .wd(sw_data[gl]), .ra(po_ra), .rq(po_q[gl]));
@@ -826,7 +831,7 @@ module r3d_geo
   logic [5:0]  cp, pc_end;
   logic [1:0]  pc_ring;
   logic [2:0]  as_i, a_nv, a_wi;
-  logic [31:0] ax, ay, az, aw, ash, ash2, au;   // the vertex being assembled / a new clip vertex
+  logic [31:0] ax, ay, az, aw, ash, ash2;       // the vertex being assembled / a new clip vertex
   logic        acc;
   logic [6:0]  cur_and, cur_or, nxt_and, nxt_or;
   logic        cb_cur, src_buf, clip_zero, pside;
@@ -846,7 +851,10 @@ module r3d_geo
   // write, not a 263-bit copy
   logic        cba_we, cbb_we;
   logic [4:0]  cb_wa, cb_ra;
-  logic [4:0]  clst [32];        // {list, index} -> entry (flat: Quartus 17 crashes on a 2-D array here)
+  // {list, index} -> entry, in an MLAB (it was 160 flip-flops and a 32-way select): one write and one read
+  // a cycle, each at the address the polygon machine's state names, the read unregistered as before
+  logic        cl_we;
+  logic [4:0]  cl_wa, cl_wd, cl_ra, cl_q;
   logic [4:0]  c_ent;            // next free entry
   // the entries the pool is read at, kept in registers so no list read sits
   // in front of the pool's: vertex ci, vertex ci - 1, the list's last vertex,
@@ -856,6 +864,26 @@ module r3d_geo
   logic [127:0] cbb_wd, cbb_q;
   r3d_ram #(.W(135), .A(5)) u_cba (.clk, .we(cba_we), .wa(cb_wa), .wd(cba_wd), .ra(cb_ra), .rq(cba_q));
   r3d_ram #(.W(128), .A(5)) u_cbb (.clk, .we(cbb_we), .wa(cb_wa), .wd(cbb_wd), .ra(cb_ra), .rq(cbb_q));
+
+  // the clip lists' port: assembly writes list 0 entry a_wi (P_C); a clip appends to the next list (P_CLN
+  // an inside vertex, P_XB a new one); the reads are the current list's first and next entries (P_CL0,
+  // P_CLN) and the queued list's (P_Q0, P_Q1). P_CLN reads list cb_cur and writes !cb_cur.
+  always_comb begin
+    cl_we = 1'b0; cl_wa = {!cb_cur, cb_m[3:0]}; cl_wd = e_cur;
+    case (pst)
+      P_C:   begin cl_we = 1'b1; cl_wa = {2'b00, a_wi}; cl_wd = {2'b00, a_wi}; end
+      P_CLN: cl_we = cba_q[8'd128 + {5'd0, cplane}] && cb_m < 5'd16;
+      P_XB:  begin cl_we = cb_m < 5'd16 && c_ent != 5'd31; cl_wd = c_ent; end
+      default: ;
+    endcase
+    case (pst)
+      P_CLN:   cl_ra = {cb_cur, 4'(ci + 5'd1)};
+      P_Q0:    cl_ra = {src_buf, 4'd0};
+      P_Q1:    cl_ra = {src_buf, 4'(ei + 5'd1)};
+      default: cl_ra = {cb_cur, 4'd0};
+    endcase
+  end
+  r3d_ram #(.W(5), .A(5)) u_clst (.clk, .we(cl_we), .wa(cl_wa), .wd(cl_wd), .ra(cl_ra), .rq(cl_q));
 
   // the polygon machine's record of the polygon it is on
   logic [5:0]  ref_i;             // the vertex being read, registered one step ahead
@@ -976,8 +1004,32 @@ module r3d_geo
   end
   // the rings hold 32 polygons (one MLAB deep; the indices count to 64, the
   // memories take the low five bits): 64 cost 133 ALM more for 0.3% of a frame
-  assign ring_full = 6'(ch_wp - ring_tail) >= 6'd24;
-  assign ring_hi   = 6'(ch_wp - ring_tail) >= 6'd16;
+  // each source's distance tested side by side and the flags chosen by the tail's priority (study R109):
+  // the eight-way select, the subtract and the compares were in series into the polygon machine's state
+  // and the decoder's D_CHK enables. (Registering the flags instead is not safe: the tail is not
+  // monotone, it falls back from the emitter's polygon to its batch's first when the emitter idles.)
+  function automatic logic [1:0] rflags(input logic [5:0] wp, input logic [5:0] t);   // {>= 24, >= 16}
+    logic [5:0] d;
+    d = 6'(wp - t);
+    rflags = {d >= 6'd24, d >= 6'd16};
+  endfunction
+  logic [1:0] rf;
+  always_comb begin
+    if (e_active) rf = rflags(ch_wp, e_poly);
+    else if (SETUP_OUT && (tq_cnt != 5'd0 || tq_we)) rf = (tq_we && tq_cnt == 5'd0) ? rflags(ch_wp, tq_wd[5:0]) : rflags(ch_wp, tq_q[5:0]);
+    else if (eb_cnt != 2'd0) rf = rflags(ch_wp, eb_first[eb_rp]);
+    else if (pq_np != 5'd0) rf = rflags(ch_wp, pq_first);
+    else if (pp_busy) rf = rflags(ch_wp, cp);
+    else if (cq_cnt != 3'd0) rf = rflags(ch_wp, cq_start[cq_rp]);
+    else if (dq_cnt != 2'd0) rf = rflags(ch_wp, dq_start[dq_rp]);
+    else rf = rflags(ch_wp, ch_start);
+  end
+  assign ring_full = rf[1];
+  assign ring_hi   = rf[0];
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && rf != {6'(ch_wp - ring_tail) >= 6'd24, 6'(ch_wp - ring_tail) >= 6'd16}) $fatal(1, "geo: ring flags side by side");
+`endif
 
   // outcodes of ax..aw (assembly and new clip vertices share one set)
   logic [6:0] a_oc;
@@ -1541,9 +1593,9 @@ module r3d_geo
         P_A, P_C: begin
           ax <= vsa_q[ref_i[1:0]]; az <= vsb_q[ref_i[1:0]]; ash <= vsc_q[ref_i[1:0]];
           if (pst == P_C) begin
-            cba_we <= 1'b1; cbb_we <= 1'b1; cb_wa <= {2'b00, a_wi}; clst[{1'b0, 1'b0, a_wi}] <= {2'b00, a_wi};
+            cba_we <= 1'b1; cbb_we <= 1'b1; cb_wa <= {2'b00, a_wi}; 
             cba_wd <= {a_oc, aw, az, ay, ax};
-            cbb_wd <= {ra_q[28] ? F_255 : ash2, ra_q[28] ? F_255 : ash, cv_q, au};
+            cbb_wd <= {ra_q[28] ? F_255 : ash2, ra_q[28] ? F_255 : ash, uv_v, uv_u};
             cur_and <= cur_and & a_oc; cur_or <= cur_or | a_oc;
             if (a_oc != 7'h7f) acc <= 1'b0;
           end
@@ -1557,7 +1609,7 @@ module r3d_geo
         end
         P_B: begin
           ay <= vsa_q[ref_i[1:0]]; aw <= vsb_q[ref_i[1:0]]; ash2 <= vsc_q[ref_i[1:0]];
-          au <= cv_q;                                    // u * 256, or u / 8 * 256
+          // (u * 256, or u / 8 * 256: converted in P_C from pu_qr)
           a_wi <= as_i;
           as_i <= as_i + 3'd1;
           ref_i <= ref_of(ra_q, as_i + 3'd1);
@@ -1586,7 +1638,7 @@ module r3d_geo
             // prev = vertex n-1
             pside <= cba_q[8'd128 + {5'd0, cplane}];
             ci <= '0; cb_m <= '0; nxt_and <= 7'h7f; nxt_or <= 7'h00;
-            e_cur <= clst[{cb_cur, 4'd0}]; e_prev <= e_last;
+            e_cur <= cl_q; e_prev <= e_last;
             pst <= P_CL1;
           end
         end
@@ -1600,14 +1652,14 @@ module r3d_geo
           cs = cba_q[8'd128 + {5'd0, cplane}];
           if (cs) begin
             if (cb_m < 5'd16) begin
-              clst[{!cb_cur, cb_m[3:0]}] <= e_cur; e_nlast <= e_cur;
+              e_nlast <= e_cur;
               nxt_and <= nxt_and & cba_q[134:128]; nxt_or <= nxt_or | cba_q[134:128];
             end else err[2] <= 1'b1;
             cb_m <= cb_m + 5'd1;
           end
           pside <= cs;
           ci <= ci + 5'd1;
-          e_prev <= e_cur; e_cur <= clst[{cb_cur, 4'(ci + 5'd1)}];
+          e_prev <= e_cur; e_cur <= cl_q;
           if (ci + 5'd1 == cb_n) pst <= P_CLA;
           else pst <= P_CL1;
         end
@@ -1669,7 +1721,7 @@ module r3d_geo
         end
         P_XB: begin                                        // set 1; append
           if (cb_m < 5'd16 && c_ent != 5'd31) begin
-            cba_we <= 1'b1; cbb_we <= 1'b1; cb_wa <= c_ent; clst[{!cb_cur, cb_m[3:0]}] <= c_ent; e_nlast <= c_ent; c_ent <= c_ent + 5'd1;
+            cba_we <= 1'b1; cbb_we <= 1'b1; cb_wa <= c_ent; e_nlast <= c_ent; c_ent <= c_ent + 5'd1;
             cba_wd <= {a_oc, aw, az, ay, ax};
             cbb_wd <= {x_rdata[3], x_rdata[2], x_rdata[1], x_rdata[0]};
             nxt_and <= nxt_and & a_oc; nxt_or <= nxt_or | a_oc;
@@ -1702,7 +1754,7 @@ module r3d_geo
             end
             if (pq_np == 5'd0) pq_first <= cp;
             pq_np <= pq_np + 5'd1;
-            ei <= '0; cnt_q <= '0; e_qe <= clst[{src_buf, 4'd0}];
+            ei <= '0; cnt_q <= '0; e_qe <= cl_q;
             pst <= P_Q1;
           end
         end
@@ -1716,7 +1768,7 @@ module r3d_geo
           pq_wb_d <= cbb_q[32 * cnt_q +: 32];
           cnt_q <= cnt_q + 2'd1;
           if (cnt_q == 2'd3) begin
-            ei <= ei + 5'd1; e_qe <= clst[{src_buf, 4'(ei + 5'd1)}];
+            ei <= ei + 5'd1; e_qe <= cl_q;
             if (ei + 5'd1 == src_n) begin pq_n <= pq_n + src_n; cp <= cp + 6'd1; pst <= P_POLY; end
           end
         end
@@ -1901,15 +1953,18 @@ module r3d_geo
     amb_b  <= vw_q[15:8];
   end
   always_comb begin
-    if (cv_vp) begin
-      cv_in = cv_b ? {8'd0, vq_r[15:8]} : cv_lo ? vq_r[15:0] : vq_r[31:16];
-      cv_eb = cv_ebv;
-    end else begin
-      cv_in = (pst == P_B) ? pu_q[31:16] : pu_q[15:0];
-      cv_eb = ra_q[27] ? 8'd135 : 8'd132;
-    end
+    cv_in = cv_b ? {8'd0, vq_r[15:8]} : cv_lo ? vq_r[15:0] : vq_r[31:16];
+    cv_eb = cv_ebv;
   end
   assign cv_q = itof16(cv_in, cv_eb);
+  // the vertex's u/v word (study R109): registered off the block RAM and converted in P_C, both halves
+  // at once, on a converter of their own. It was the block RAM's output through the shared converter's
+  // select and the conversion into au (P_B) and cbb_wd (P_C); the word is the same one in both (the
+  // address is held through P_B), so P_C has it registered. +1 converter, the u register gone.
+  logic [31:0] pu_qr;
+  always_ff @(posedge clk) pu_qr <= pu_q;
+  wire  [7:0]  uv_eb = ra_q[27] ? 8'd135 : 8'd132;
+  wire  [31:0] uv_u = itof16(pu_qr[31:16], uv_eb), uv_v = itof16(pu_qr[15:0], uv_eb);
 
   // ---- memory read addresses of the polygon machine ------------------------
   always_comb begin
@@ -2228,12 +2283,29 @@ module r3d_geo
   logic [23:0] tc_pm;             // the magnitude
   logic [4:0]  tc_pmsb;           // its leading one
   logic [7:0]  tc_peb;            // the exponent base
-  logic [37:0] tc_k;
+  // the byte's 1/255 product as a table of the byte (study R109): k255 is a function of eight bits, so
+  // only the sign and the byte are registered, and the 256 words are constants (folded at synthesis;
+  // kept in logic, not a block RAM). The product's add, the shift, the round and the pack ran tq_w ->
+  // tc_k -> xb_data and ts_wn over two cycles.
+  logic        tc_ks;
+  logic [7:0]  tc_km;
+  (* romstyle = "logic" *) logic [30:0] k255t [256];
+  genvar gk;
+  generate for (gk = 0; gk < 256; gk = gk + 1) begin : g_k255t
+    wire [31:0] kw = k255(1'b0, 8'(gk));
+    assign k255t[gk] = kw[30:0];
+  end endgenerate
 `ifdef VERILATOR
   logic [31:0] tc_wpc;            // the one-cycle conversion, for the check
+  logic [31:0] tc_kchk;           // k255 as functions, for the table's check
+  logic        tc_kv;
+  always_ff @(posedge clk) begin
+    if (rst) tc_kv <= 1'b0; else if (tq_v || amb_ld) tc_kv <= 1'b1;
+    if (!rst && tc_kv && tc_kq != tc_kchk) $fatal(1, "geo: the k255 table");
+  end
 `endif
-  logic [31:0] tc_kq;             // k255b(tc_k): the staged normal or fixed shade, or the ambient
-  assign tc_kq = k255b(tc_k);
+  logic [31:0] tc_kq;             // k255(tc_ks, tc_km): the staged normal or fixed shade, or the ambient
+  assign tc_kq = (tc_km == 8'd0) ? 32'd0 : {tc_ks, k255t[tc_km]};
   // vertex slots by reference: eight raw-word entries, MAME's prev[k] is entry
   // pmap[k] and the polygon's vertex[k] entry cmap[k]. A reuse copies the
   // reference, not the words; a new vertex takes an entry no other cur slot
@@ -2309,6 +2381,29 @@ module r3d_geo
             (SM_CULL && (dst == D_HDR || dst == D_CHK)) ? {fk, pmap[v0src]} : {2'd3, pmap[s]};
   end
 
+  // the vertices a polygon needs transformed: its new ones, and reused ones whose transform is not in the
+  // store (window: this chunk and the one before). Registered (study R109): h0, h1 (p_fixed), vin and vkfix
+  // hold for the header's seven words before D_CHK, and for D_HOLD's two cycles after D_CLOSE moves the
+  // chunk on (vin follows chunk a cycle later), so the registered count is the one D_CHK would compute.
+  // The count, its add and the compare with the chunk's room ran into every nref and dst enable.
+  function automatic logic [4:0] need_of(input logic [9:0] h);
+    logic [2:0] nvv, vii, k_;
+    nvv = h[6] ? 3'd4 : 3'd3;
+    vii = 3'd0;
+    for (int v = 0; v < 4; v++) if (h[v]) vii = vii + 3'd1;
+    need_of = (vii < nvv) ? 5'(nvv - vii) : 5'd0;
+    k_ = 3'd0;
+    for (int v = 0; v < 4; v++) if (h[v]) begin
+      if (k_ < nvv && !reuse_ok(2'(v))) need_of = need_of + 5'd1;
+      k_ = k_ + 3'd1;
+    end
+  endfunction
+  logic [4:0] need_q;
+  always_ff @(posedge clk) need_q <= need_of(h0);
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && dst == D_CHK && need_q != need_of(h0)) $fatal(1, "geo: need registered");
+`endif
+
   always_ff @(posedge clk) begin
     if (rst) begin
       dst <= D_IDLE; d_ack <= 1'b0;
@@ -2336,8 +2431,12 @@ module r3d_geo
         // |2b + 1| of the signed byte b: 2b + 1 is odd, so -(2b + 1) is {~b, 1}
         // in nine bits, and its low eight bits are {~b[6:0], 1}; no subtract
         // (the subtract's carry chain made this the slowest path at -40C)
-        if (amb_ld || (tq_fw && tq_spec)) tc_k <= k255a(1'b0, kb);
-        else tc_k <= k255a(kb[7], {kb[6:0] ^ {7{kb[7]}}, 1'b1});
+        if (amb_ld || (tq_fw && tq_spec)) begin tc_ks <= 1'b0; tc_km <= kb; end
+        else begin tc_ks <= kb[7]; tc_km <= {kb[6:0] ^ {7{kb[7]}}, 1'b1}; end
+`ifdef VERILATOR
+        if (amb_ld || (tq_fw && tq_spec)) tc_kchk <= k255(1'b0, kb);
+        else tc_kchk <= k255(kb[7], {kb[6:0] ^ {7{kb[7]}}, 1'b1});
+`endif
       end
       if (tq_v) begin
         begin
@@ -2407,26 +2506,30 @@ module r3d_geo
           if (hk == 3'd6) begin hk <= '0; dst <= D_CHK; end
         end
         D_CHK: begin
-          logic [2:0] nvv, vii, k_;
+          logic [2:0] nvv, vii;
           logic [4:0] need;
           logic       ok;
           nvv = h0[6] ? 3'd4 : 3'd3;
           vii = 3'd0;
           for (int v = 0; v < 4; v++) if (h0[v]) vii = vii + 3'd1;
-          need = (vii < nvv) ? 5'(nvv - vii) : 5'd0;
-          // reused vertices whose transform is not in the store (window: this
-          // chunk and the one before)
-          k_ = 3'd0;
-          for (int v = 0; v < 4; v++) if (h0[v]) begin
-            if (k_ < nvv && !reuse_ok(2'(v))) need = need + 5'd1;
-            k_ = k_ + 3'd1;
-          end
+          need = need_q;
           ok = 1'b1;
           if (md_first && h0[3:0] != 4'd0) ok = 1'b0;
           // (the facing test's reused vertex 0 is fed during the header; a
           // write held off by the unit can leave a word for here)
           else if (h6 == 32'd0) ok = 1'b0;
           else if (h0[9:8] == 2'b11) ok = 1'b0;
+          // the cur slots loaded every D_CHK cycle (study R109), not only as it moves on: they are copies
+          // of the prev slots and of h0, which hold through D_CHK, and nothing reads them before the next
+          // D_CHK unless it moves on to D_REUSE, D_NEWV or D_INV. Their enables were behind ring_full,
+          // the close test and ok (the ring's distance into some 40 enables).
+          nv <= nvv; nre <= vii; kk <= '0; wk <= 2'd0;
+          for (int i = 0; i < 4; i++) begin
+            nref[i] <= vref[i]; nref_ok[i] <= vref_ok[i]; nref_chunk[i] <= vref_chunk[i]; retx[i] <= 1'b0;
+            nkfix[i] <= vkfix[i]; nspec[i] <= vspec[i];
+          end
+          for (int i = 0; i < 4; i++) cmap[i] <= pmap[i];
+          iv <= (vii < nvv) ? vii : 3'd0;
           if (ring_full || (SM_CULL && h0[3:0] != 4'd0 && fk != 2'd3 && ok)) begin
             // the polygon ring is nearly full: wait for the emitter; or vertex
             // 0's words are not all in the facing test yet
@@ -2436,13 +2539,6 @@ module r3d_geo
             d_after <= D_CHK; dq_wlast <= 1'b0; dst <= D_CLOSE;   // close the chunk, then this polygon
           end else begin
             md_first <= 1'b0;
-            nv <= nvv; nre <= vii; kk <= '0; wk <= 2'd0;
-            for (int i = 0; i < 4; i++) begin
-              nref[i] <= vref[i]; nref_ok[i] <= vref_ok[i]; nref_chunk[i] <= vref_chunk[i]; retx[i] <= 1'b0;
-              nkfix[i] <= vkfix[i]; nspec[i] <= vspec[i];
-            end
-            for (int i = 0; i < 4; i++) cmap[i] <= pmap[i];
-            iv <= (vii < nvv) ? vii : 3'd0;
             dst <= (vii != 3'd0) ? D_REUSE : (vii < nvv) ? D_NEWV : D_INV;
           end
         end
@@ -2513,7 +2609,10 @@ module r3d_geo
         D_COMMIT: begin
           logic ex4, alpha, cm, drop;
           ex4 = h6[10] && (h3[5:3] >= 3'd6 || h3[2:0] >= 3'd6);
-          alpha = h6[0] || !h6[23];
+          // texture alpha: h6[0] on Step 1.0; from Step 1.5 any of h6[2:0] (Supermodel's
+          // TextureAlpha: Daytona 2's smoke sets bit 1 or 2 alone, with formats 1 and 3;
+          // VF3 keeps bit 0, study R100 hand-off 5); or polygon translucency
+          alpha = (step15 ? (|h6[2:0]) : h6[0]) || !h6[23];
           cm = h6[10] && (h6[9:7] != 3'd7) && h3[7];
           drop = SM_TRANS && !h6[23] && h6[22:18] == 5'd0;   // Supermodel: alpha byte 0, not drawn
           ra_we <= 1'b1; ra_wa <= ch_wp;

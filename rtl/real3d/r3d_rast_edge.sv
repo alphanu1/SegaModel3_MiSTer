@@ -167,15 +167,39 @@ module r3d_rast_edge #(
   logic        [8:0]  p1_y;
   wire                adv = !s_valid || s_ready;   // the row pipeline moves
 
+  // w_last as a register (study R109): w_y + 1 >= w_end was an add and a compare in front of m_load,
+  // which loads every walk and product register. Kept as the compare of the registers as they will
+  // stand: the pair's first row on m_load, the next row on a step.
   logic w_last;
-  assign w_last = (w_y + 17'sd1 >= w_end);
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && w_act && w_last != (w_y + 17'sd1 >= w_end)) $fatal(1, "edge: w_last registered");
+`endif
   wire   w_adv  = w_act && adv;
   assign m_load = z_full && !m_busy && (!w_act || (w_adv && w_last));
 
-  wire signed [19:0] lo0 = (p1_rs > p1_re) ? p1_re : p1_rs;
-  wire signed [19:0] hi0 = (p1_rs > p1_re) ? p1_rs : p1_re;
-  wire signed [19:0] lo  = (lo0 < 20'sd0) ? 20'sd0 : lo0;
-  wire signed [19:0] hi  = (hi0 > W20) ? W20 : hi0;
+  // stage B's compares side by side (study R109): the order, both clamps and lo < hi were three 20-bit
+  // compares in series into s_valid. With mn = min(rs, re) and mx = max: lo = max(mn, 0), hi = min(mx, W),
+  // and max(mn, 0) < min(mx, W) is mn < mx, mn < W and mx > 0 (W > 0): rs != re, either below W, either
+  // above 0.
+  wire               rgt = p1_rs > p1_re;
+  wire               rs0 = p1_rs[19], re0 = p1_re[19];          // below 0
+  wire               rsw = p1_rs > W20, rew = p1_re > W20;
+  wire        [8:0]  lo  = rgt ? (re0 ? 9'd0 : p1_re[8:0]) : (rs0 ? 9'd0 : p1_rs[8:0]);
+  wire        [8:0]  hi  = rgt ? (rsw ? W20[8:0] : p1_rs[8:0]) : (rew ? W20[8:0] : p1_re[8:0]);
+  wire               ne  = p1_rs != p1_re;
+  wire               bw  = (p1_rs < W20) || (p1_re < W20);
+  wire               a0  = (p1_rs > 20'sd0) || (p1_re > 20'sd0);
+`ifdef VERILATOR
+  /* verilator lint_off UNUSEDSIGNAL */
+  wire signed [19:0] lo0c = rgt ? p1_re : p1_rs;
+  wire signed [19:0] hi0c = rgt ? p1_rs : p1_re;
+  wire signed [19:0] loc  = (lo0c < 20'sd0) ? 20'sd0 : lo0c;
+  wire signed [19:0] hic  = (hi0c > W20) ? W20 : hi0c;
+  /* verilator lint_on UNUSEDSIGNAL */
+  always_ff @(posedge clk)
+    if (!rst && p1_v && ((loc < hic) != (ne && bw && a0) || ((loc < hic) && (lo != loc[8:0] || hi != hic[8:0]))))
+      $fatal(1, "edge: stage B side by side");
+`endif
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -186,10 +210,10 @@ module r3d_rast_edge #(
     end else begin
       if (adv) begin
         // stage B: order, clamp, test
-        s_valid <= p1_v && (lo < hi);
+        s_valid <= p1_v && ne && bw && a0;
         s_y     <= p1_y;
-        s_x0    <= lo[8:0];
-        s_x1    <= hi[8:0];
+        s_x0    <= lo;
+        s_x1    <= hi;
         // stage A: the rounds of the current row
         p1_v  <= w_act;
         p1_y  <= w_y[8:0];
@@ -198,6 +222,7 @@ module r3d_rast_edge #(
       end
       if (w_adv) begin
         w_y  <= w_y + 17'sd1;
+        w_last <= (w_y + 17'sd2 >= w_end);
         w_up <= (w_y + 17'sd1 < w_r2);
         a13  <= a13 + d13;
         if (w_up) a12 <= a12 + d12;
@@ -232,6 +257,7 @@ module r3d_rast_edge #(
         a13    <= {{(AW-52){z_x1[31]}}, z_x1, 20'd0};
         a23    <= {{(AW-52){z_x2[31]}}, z_x2, 20'd0};
         w_y    <= ys;
+        w_last <= (ys + 17'sd1 >= ye);
         w_up   <= up0;
         w_r2   <= z_r2;
         w_end  <= ye;

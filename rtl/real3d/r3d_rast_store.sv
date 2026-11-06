@@ -233,7 +233,15 @@ module r3d_rast_store #(
   logic [2:0]    wl;                                // the record's list
   logic          wbad;                              // malformed, not a number, faces away
   logic [11:0]   fy0, fy2;
-  logic [LB:0]   nx [8];                            // each list's next beat (opaque) or start (alpha)
+  // each list's next beat (opaque) or start (alpha), in an MLAB read registered: the list wl is set at a
+  // record's first word and read in W_ADDR at least H + 6 words later, and the last write to it was the
+  // record before's W_ADDR, so the registered word is the live one (checked below). It was eight
+  // registers and an 8-way select in front of the fit test and the address.
+  (* ramstyle = "MLAB, no_rw_check" *) logic [LB:0] nx [8];
+  logic [LB:0]   nx_q;
+  logic          nx_we;
+  logic [2:0]    nx_wa;
+  logic [LB:0]   nx_wd;
   logic [LB-1:0] wa;                                // the record's start beat
   logic [3:0]    wnb;                               // its beats
   logic [5:0]    bc, bhi;                           // band in hand, last band
@@ -278,7 +286,7 @@ module r3d_rast_store #(
     if (!rst && ws == W_ADDR && {nob_q, blo_q, bhi_q} != {nob, blo_w, bhi_w}) $fatal(1, "store: nob registered");
 `endif
   wire        walpha = wl[0];
-  wire [LB:0] nxl    = nx[wl];
+  wire [LB:0] nxl    = nx_q;
   wire        wfit   = walpha ? (nxl >= (LB+1)'(wnb)) : (nxl + (LB+1)'(wnb) <= (LB+1)'(1 << LB));
   wire [LB-1:0] wa_n = walpha ? LB'(nxl - (LB+1)'(wnb)) : LB'(nxl);
   wire [8:0]  wbin   = {bc, wl};
@@ -287,23 +295,69 @@ module r3d_rast_store #(
   wire           q_ov = e_ov(t_q);
   wire [LB-1:0]  q_st = e_st(t_q);
   wire [6:0]     q_nb = e_nb(t_q);
-  wire           q_ext = q_ov && (7'(q_nb) + 7'(wnb) <= 7'(RUNMAX)) &&
-                         (walpha ? (wa + LB'(wnb) == q_st) : (q_st + LB'(q_nb) == wa));
+  // q_ext without an adder on the table's output (study R109): q_nb + wnb <= RUNMAX against a registered
+  // RUNMAX - wnb; wa + wnb == q_st against a registered wa + wnb; q_st + q_nb == wa by the carry-save test
+  // (a + b == c iff a ^ b ^ c is the carries (a & b) | ((a | b) & ~c), one place up). wnb is set at a
+  // record's last word and wa in W_ADDR, at least a cycle before W_BQ, so the registers hold them.
+  logic [6:0]    rmw;
+  logic [LB-1:0] wae;
+  always_ff @(posedge clk) begin rmw <= 7'(RUNMAX) - 7'(wnb); wae <= wa + LB'(wnb); end
+  wire  [LB-1:0] q_nbx = LB'(q_nb);
+  wire  [LB-1:0] q_cs  = (q_st & q_nbx) | ((q_st | q_nbx) & ~wa);
+  wire           q_ext = q_ov && (q_nb <= rmw) &&
+                         (walpha ? (wae == q_st) : ((q_st ^ q_nbx ^ wa) == {q_cs[LB-2:0], 1'b0}));
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && ws == W_BQ && q_ext != (q_ov && (7'(q_nb) + 7'(wnb) <= 7'(RUNMAX)) &&
+                                        (walpha ? (wa + LB'(wnb) == q_st) : (q_st + LB'(q_nb) == wa))))
+      $fatal(1, "store: q_ext");
+`endif
+  // W_BQ's table write a cycle later (study R109): the new entry's adds (the run's beats, the closed-run
+  // count) are formed from the registered entry, not from the table's output. The next read of that
+  // entry is the next record's, many cycles later; the next band's (W_BRD) is another entry.
+  logic          bq_v, bq_ext, bq_cl;
+  logic [9:0]    bq_wa;
+  logic [EW-1:0] bq_e;
+`ifdef VERILATOR
+  logic [EW-1:0] bq_chk;
+  always_ff @(posedge clk) if (!rst && t_we && $past(bq_v) && t_wd != bq_chk) $fatal(1, "store: the entry a cycle on");
+`endif
   wire           q_full = q_nr == NRB'(1 << (BB + 1));
+
+  // nx's port: the sweep's first eight cycles set every list's start (odd lists, alpha, at the top);
+  // W_ADDR writes the record's list
+  always_comb begin
+    nx_we = 1'b0; nx_wa = wl; nx_wd = walpha ? (LB+1)'(wa_n) : nxl + (LB+1)'(wnb);
+    if (ws == W_SWEEP && sw < 9'd8) begin
+      nx_we = 1'b1; nx_wa = sw[2:0]; nx_wd = sw[0] ? (LB+1)'(1 << LB) : '0;
+    end else if (ws == W_ADDR && !nob_q && wfit) nx_we = 1'b1;
+  end
+  always_ff @(posedge clk) begin
+    if (nx_we) nx[nx_wa] <= nx_wd;
+    nx_q <= nx[wl];
+  end
+`ifdef VERILATOR
+  logic [LB:0] nx_chk [8];
+  always_ff @(posedge clk) begin
+    if (!rst && ws == W_IDLE && b_begin && bst[wbk] == B_FREE)
+      for (int l = 0; l < 8; l++) nx_chk[l] <= ((l & 1) != 0) ? (LB+1)'(1 << LB) : '0;
+    if (!rst && nx_we && ws == W_ADDR) nx_chk[nx_wa] <= nx_wd;
+    if (!rst && ws == W_ADDR && nx_q != nx_chk[wl]) $fatal(1, "store: nx registered");
+  end
+`endif
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      ws <= W_IDLE; end_pend <= 1'b0; wq_req <= 1'b0; t_we <= 1'b0;
+      ws <= W_IDLE; end_pend <= 1'b0; wq_req <= 1'b0; t_we <= 1'b0; bq_v <= 1'b0;
       bst[0] <= B_FREE; bst[1] <= B_FREE; wbk <= 1'b0;
       n_rec <= '0; n_pair <= '0; n_run <= '0; n_drop <= '0; ovf <= '0;
     end else begin
-      t_we <= 1'b0;
+      t_we <= 1'b0; bq_v <= 1'b0;
       if (b_end) end_pend <= 1'b1;
       case (ws)
         W_IDLE: if (b_begin && bst[wbk] == B_FREE) begin
           wb <= wbk; wbk <= !wbk; bst[wbk] <= B_BIN; sw <= '0; end_pend <= 1'b0;
           n_rec <= '0; n_pair <= '0; n_run <= '0; n_drop <= '0; ovf <= '0;
-          for (int l = 0; l < 8; l++) nx[l] <= ((l & 1) != 0) ? (LB+1)'(1 << LB) : '0;
           ws <= W_SWEEP;
         end
         W_SWEEP: begin
@@ -338,7 +392,6 @@ module r3d_rast_store #(
           else if (!wfit) begin n_drop <= n_drop + 16'd1; ovf[1] <= 1'b1; ws <= W_REC; end
           else begin
             wa <= wa_n;
-            nx[wl] <= walpha ? (LB+1)'(wa_n) : nxl + (LB+1)'(wnb);
             bc <= blo_q; bhi <= bhi_q;
             wq_req <= 1'b1; wq_we <= 1'b1; wq_be <= 8'hff;
             wq_addr <= 25'(rec_a(wb, wl, wa_n));
@@ -361,12 +414,15 @@ module r3d_rast_store #(
           keep  = !(close && q_full);
           ne = t_q;
           if (!keep) ovf[2] <= 1'b1;
-          else begin
+          else n_pair <= n_pair + 18'd1;
+          bq_v <= keep; bq_wa <= tidx(wb, wbin); bq_e <= t_q; bq_ext <= q_ext; bq_cl <= close;
+`ifdef VERILATOR
+          if (keep) begin
             if (q_ext) ne = {q_nr, 1'b1, walpha ? wa : q_st, 7'(q_nb) + 7'(wnb)};
             else       ne = {close ? q_nr + NRB'(1) : q_nr, 1'b1, wa, 7'(wnb)};
-            n_pair <= n_pair + 18'd1;
           end
-          t_we <= keep; t_wa <= tidx(wb, wbin); t_wd <= ne;
+          bq_chk <= ne;
+`endif
           if (close && keep) begin
             // the old open run to the bin's run list, entry q_nr
             wrun <= {7'd0, 18'(q_st), q_nb};
@@ -385,6 +441,12 @@ module r3d_rast_store #(
         end
         default: ws <= W_IDLE;
       endcase
+      // W_BQ's entry, written a cycle on
+      if (bq_v) begin
+        t_we <= 1'b1; t_wa <= bq_wa;
+        if (bq_ext) t_wd <= {e_nr(bq_e), 1'b1, walpha ? wa : e_st(bq_e), 7'(e_nb(bq_e)) + 7'(wnb)};
+        else        t_wd <= {bq_cl ? e_nr(bq_e) + NRB'(1) : e_nr(bq_e), 1'b1, wa, 7'(wnb)};
+      end
       // the replay's bank states
       if (p_take) bst[pbk] <= B_PLAY;
       if (p_rel) bst[pb] <= B_FREE;
@@ -405,6 +467,7 @@ module r3d_rast_store #(
   logic [EW-1:0] eo, ea;
   logic [NRB-1:0] pn;                               // items of the bin left (runs, the open one included)
   logic [NRB-1:0] pr;                               // the DDR3 run in hand
+  logic [NRB-1:0] pnm1, pnm1h;                      // the bin's nr - 1 and (nr - 1) / 2 + 1 (P_BIN)
   logic          popen;                             // the item in hand is the open run
   logic          ck_v;                              // the run buffer holds the chunk of pr
   logic [NRB-1:0] ck_c;                             // that chunk (pr >> 5)
@@ -473,6 +536,8 @@ module r3d_rast_store #(
           pn <= e_nr(ecur) + NRB'(1);
           popen <= pal;                                       // backward: the open run first
           pr <= pal ? e_nr(ecur) - NRB'(1) : '0;
+          pnm1 <= e_nr(ecur) - NRB'(1);
+          pnm1h <= NRB'((e_nr(ecur) - NRB'(1)) >> 1) + NRB'(1);
           ck_v <= 1'b0;
           ps <= P_RE;
         end
@@ -485,12 +550,25 @@ module r3d_rast_store #(
           else if (ck_v && ck_c == (pr >> 5)) ps <= P_CK;    // rr_q valid next cycle
           else begin
             // load the chunk: forward pr .. the chunk's end or the last run; backward its start .. pr
-            logic [NRB-1:0] cs, ce;
+            // (the beats from registers, side by side, study R109: nr - 1, the compare, the select, the
+            // subtract and the add were in series; backward the chunk's beats are pr[4:1] + 1, forward
+            // 16 - pr[4:1] to the chunk's end or (nr - 1) / 2 + 1 - pr / 2 to the last run)
+            logic [NRB-1:0] cs;
+            logic [7:0]     bl;
             cs = pal ? {pr[NRB-1:5], 5'd0} : pr;
-            ce = pal ? pr : ((({pr[NRB-1:5], 5'd31}) < e_nr(ecur) - NRB'(1)) ? {pr[NRB-1:5], 5'd31} : e_nr(ecur) - NRB'(1));
+            if (pal) bl = 8'(pr[4:1]) + 8'd1;
+            else if ({pr[NRB-1:5], 5'd31} < pnm1) bl = 8'd16 - 8'(pr[4:1]);
+            else bl = 8'(pnm1h - pr[NRB-1:1]);
+`ifdef VERILATOR
+            begin
+              logic [NRB-1:0] ce;
+              ce = pal ? pr : ((({pr[NRB-1:5], 5'd31}) < e_nr(ecur) - NRB'(1)) ? {pr[NRB-1:5], 5'd31} : e_nr(ecur) - NRB'(1));
+              if (bl != 8'(ce[NRB-1:1] - cs[NRB-1:1]) + 8'd1 || pnm1 != e_nr(ecur) - NRB'(1)) $fatal(1, "store: the chunk's beats");
+            end
+`endif
             pq_req <= 1'b1;
             pq_addr <= 25'(run_a(pb, pbin, cs[BB:1]));
-            pq_blen <= 8'(ce[NRB-1:1] - cs[NRB-1:1]) + 8'd1;
+            pq_blen <= bl;
             rr_wa <= cs[4:1];
             ck_c <= pr >> 5;
             ps <= P_CKW;

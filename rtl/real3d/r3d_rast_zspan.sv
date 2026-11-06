@@ -88,6 +88,7 @@ module r3d_rast_zspan (
   logic signed [41:0] q_v0, q_v1;
   logic        [6:0]  q_n0, q_n1;   // leading one; 64 when none
   logic signed [8:0]  q_e;
+  logic signed [10:0] q_e86, q_tl, q_th;   // e + 86, and the bounds on n: n <= -(e + 86) gives 0, n >= 255 - (e + 86) all ones
   wire w_lastp  = ({1'b0, w_x} + 10'd2 >= {1'b0, w_x1});
   wire w_take   = n_rdy && (!w_act || (w_adv && w_lastp));
 
@@ -135,8 +136,12 @@ module r3d_rast_zspan (
       if (out_free) begin
         p_valid <= q_valid;
         p_y  <= q_y;  p_x <= q_x;  p_on <= q_on;  p_last <= q_last;
-        p_z0 <= zw2(q_v0, q_n0, q_e);
-        p_z1 <= zw2(q_v1, q_n1, q_e);
+        p_z0 <= zw3(q_v0, q_n0, q_e86, q_tl, q_th);
+        p_z1 <= zw3(q_v1, q_n1, q_e86, q_tl, q_th);
+`ifdef VERILATOR
+        if (q_valid && (zw3(q_v0, q_n0, q_e86, q_tl, q_th) != zw2(q_v0, q_n0, q_e) || zw3(q_v1, q_n1, q_e86, q_tl, q_th) != zw2(q_v1, q_n1, q_e)))
+          $fatal(1, "zspan: the Z word's bounds as compares of n");
+`endif
         p_v0 <= q_v0;
         p_v1 <= q_v1;
         q_valid <= w_act;
@@ -149,6 +154,9 @@ module r3d_rast_zspan (
         q_v0 <= w_l0;  q_n0 <= lead1(w_l0);
         q_v1 <= w_l1;  q_n1 <= lead1(w_l1);
         q_e  <= w_e;
+        q_e86 <= {{2{w_e[8]}}, w_e} + 11'sd86;
+        q_tl  <= 11'sd0 - ({{2{w_e[8]}}, w_e} + 11'sd86);
+        q_th  <= 11'sd255 - ({{2{w_e[8]}}, w_e} + 11'sd86);
         w_l0 <= w_l0 + w_d4;
         w_l1 <= w_l1 + w_d4;
         w_x  <= w_x + 9'd2;
@@ -186,6 +194,19 @@ module r3d_rast_zspan (
     else if (ex <= 11'sd0) zw2 = 24'd0;
     else if (ex >= 11'sd255) zw2 = 24'hffffff;
     else zw2 = {ex[7:0], sh[40:25]};
+  endfunction
+  // the same with the bounds as compares of n against the span's registers, side by side with the add
+  // (study R109: n + e + 86 and its two compares were in series into p_z)
+  function automatic logic [23:0] zw3(input logic signed [41:0] v, input logic [6:0] n, input logic signed [10:0] e86,
+                                      input logic signed [10:0] tl, input logic signed [10:0] th);
+    logic [7:0]  ex;
+    logic [41:0] sh;
+    ex = 8'({2'd0, n[5:0]} + e86[7:0]);
+    sh = 42'(v) << (6'd41 - n[5:0]);
+    if (n[6]) zw3 = 24'd0;
+    else if ($signed({5'd0, n[5:0]}) <= tl) zw3 = 24'd0;
+    else if ($signed({5'd0, n[5:0]}) >= th) zw3 = 24'hffffff;
+    else zw3 = {ex, sh[40:25]};
   endfunction
   /* verilator lint_on UNUSEDSIGNAL */
 

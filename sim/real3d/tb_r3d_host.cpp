@@ -145,6 +145,7 @@ static std::vector<uint8_t> read_file(std::string const &fn, size_t off = 0, siz
   return d;
 }
 
+static bool bx_flag = false;
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
   std::string trace_fn, sdram_fn, dump_dir;
@@ -159,6 +160,7 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto nx = [&]() { return std::string(argv[++i]); };
+    if (a == "--bxor") { bx_flag = true; continue; }   // the build has BXOR (study R107)
     if (a == "--trace") trace_fn = nx();
     else if (a == "--sdram") sdram_fn = nx();
     else if (a == "--dump") dump_dir = nx();
@@ -183,6 +185,7 @@ int main(int argc, char **argv) {
 
   std::mt19937 rng(seed);
   sdram_dev sd; ddr_dev dd;
+  sd.bxor = bx_flag;
   sd.lat = sdlat; dd.busy_pct = busy; dd.lat_lo = lat_lo; dd.lat_hi = lat_hi;
   {   // VROM in the MRA's layout, 0x4000000-0x5FFFFFF
     std::vector<uint8_t> v = read_file(sdram_fn, 0x4000000, 0x2000000);

@@ -68,6 +68,14 @@ int main(int argc, char **argv) {
   long n = argc > 1 ? std::atol(argv[1]) : 20000;
   rng.seed(argc > 2 ? unsigned(std::atoi(argv[2])) : 1);
   bool fault = argc > 3 && !std::strcmp(argv[3], "--fault");
+  bool lw1 = false, seq = false, nowait = false; int idle_max = 3;   // --seq: half the line reads are of the line after the last (the read-ahead, R107)
+  for (int k = 3; k < argc; k++) {
+    if (!std::strcmp(argv[k], "--bxor")) sd.bxor = true;   // the build's BXOR (R107)
+    if (!std::strcmp(argv[k], "--lw1")) lw1 = true;        // the build's LW1 (R107)
+    if (!std::strcmp(argv[k], "--seq")) seq = true;
+    if (!std::strcmp(argv[k], "--nowait")) nowait = true;
+    if (!std::strcmp(argv[k], "--idle") && k + 1 < argc) idle_max = std::atoi(argv[k + 1]);   // longer gaps: a read-ahead completes
+  }
   t = new Vm3_sdr_tb;
   // a small working set (so reads hit earlier writes) spread over both chips
   // and several rows: 4 windows of 16 KiB
@@ -85,7 +93,7 @@ int main(int argc, char **argv) {
   while (!t->ready) tick();
 
   long bad = 0, proto = 0, nrd = 0, nwr = 0, nlr = 0, nlw = 0, nz = 0;
-  uint64_t lat_sum = 0, lat_lr_first = 0;
+  uint64_t lat_sum = 0, lat_lr_first = 0, lat_lr_last = 0, n_fast = 0;   // n_fast: fills whose first beat came in 8 clocks (a read-ahead's)
   for (long i = 0; i < n && bad < 10 && proto < 10; i++) {
     int const kind = int(rng() % 4);
     bool const swap = rng() & 1;
@@ -95,10 +103,18 @@ int main(int argc, char **argv) {
     uint32_t const wv = rng();
     t->s_cmd = kind == 0 ? 2 : kind == 1 ? 3 : kind == 2 ? 0 : 1;     // MC_RD, MC_WR, MC_LINE_RD, MC_LINE_WR
     if (kind == 3) a &= ~31u;
+    static uint32_t last_lr = 0;
+    if (seq && kind == 2) {
+      uint32_t const nx = last_lr + 32;
+      bool in = false; for (int w = 0; w < 4; w++) if (nx >= win[w] && nx + 32 <= win[w] + 0x4000) in = true;
+      if (in && (rng() & 1)) a = nx | (a & 31u);
+      last_lr = a & ~31u;
+    }
     t->s_sa = a; t->s_swap = swap; t->s_zero = zero; t->s_be = be; t->s_wdata = wv;
     // idle gap, sometimes none
-    if (rng() & 1) for (int g = int(rng() % 4); g > 0; g--) tick();
-    while (!t->s_idle) tick();
+    if (rng() & 1) for (int g = int(rng() % unsigned(idle_max + 1)); g > 0; g--) tick();
+    if (!nowait) while (!t->s_idle) tick();   // (--nowait: as the bus does, the request goes up at once and waits for s_ack)
+    while (t->s_ack) tick();                   // (the last acknowledge is not this one's: the bus asks two clocks after)
     t->s_req = 1;
     uint64_t const t0 = cyc;
     long guard = 0;
@@ -110,13 +126,28 @@ int main(int argc, char **argv) {
     } else if (kind == 3) {               // cast-out: beat k is word k
       uint32_t beats[8];
       for (int k = 0; k < 8; k++) beats[k] = rng();
-      int k = 0;
+      // the bus as m3_bus has it (study R107): s_wnext goes on to the master a clock later as
+      // m_wnext, the master shows its next beat in the clock after that, and the bus registers it
+      // into s_wdata, so the beat shown follows each s_wnext by two clocks. A beat is taken when
+      // s_wnext is high: it must be the next beat in order by then.
+      // With --lw1 the port takes each beat two clocks after its s_wnext (m3_sdr_port LW1): the bus
+      // keeps s_wdata following the master for one clock after it has seen the eighth s_wnext,
+      // and then it is the next transaction's (random here).
+      int k = 0, sh = 0, n1 = 0, n2 = 0;   // sh: the beat shown; n1, n2: s_wnext counts one and two clocks back
+      int post = -1;                       // clocks since the eighth s_wnext (lw1)
       t->s_wdata = beats[0];
       guard = 0;
-      while (k < 8) {
+      while (k < 8 || (lw1 && post < 3)) {
         bool const wn = t->s_wnext;      // taken at this edge: the beat shown now
+        if (wn) {
+          if (k >= 8) { proto++; std::printf("a ninth s_wnext\n"); }
+          if (!lw1 && sh != k) { proto++; if (proto < 10) std::printf("cast-out beat %d taken while beat %d is shown\n", k, sh); }
+          ref_write(a + 4 * (k & 7), swap, beats[k & 7], 15); k++;
+        }
         tick();
-        if (wn) { ref_write(a + 4 * k, swap, beats[k], 15); k++; if (k < 8) t->s_wdata = beats[k]; }
+        sh = n2 < 8 ? n2 : 7; n2 = n1; n1 += wn;
+        if (k == 8) post++;
+        t->s_wdata = (lw1 && post >= 2) ? uint32_t(rng()) : beats[sh];
         if (++guard > 100000) { std::printf("cast-out stalls\n"); return 1; }
       }
       nlw++;
@@ -126,7 +157,8 @@ int main(int argc, char **argv) {
       for (int k = 0; k < nb; k++) {
         guard = 0;
         do { tick(); if (++guard > 100000) { std::printf("read stalls\n"); return 1; } } while (!t->s_rvalid);
-        if (k == 0) { lat_sum += cyc - t0; }
+        if (k == 0) { lat_sum += cyc - t0; if (nb == 8) { lat_lr_first += cyc - t0; if (cyc - t0 <= 8) n_fast++; } }
+        if (k == 7) lat_lr_last += cyc - t0;
         uint32_t const wa = kind == 0 ? a : (a & ~31u) + 4 * ((crit + k) & 7);
         uint32_t exp = zero ? 0 : ref_word(wa, swap);
         if (fault && i == n / 2) exp ^= 1;
@@ -150,6 +182,9 @@ int main(int argc, char **argv) {
               nrd, nwr, nlr, nlw, nz, q_n);
   std::printf("  mean first-beat latency %.1f clocks over reads and fills; %ld data mismatches, %ld image bytes wrong, %ld protocol errors\n",
               double(lat_sum) / double(nrd + nlr + nz ? nrd + nlr + nz : 1), bad, img_bad, proto);
+  std::printf("  line fills: %llu with the first beat within 8 clocks\n", (unsigned long long)n_fast);
+  std::printf("  line fills: mean first beat %.1f, last beat %.1f clocks\n", double(lat_lr_first) / double(nlr + (nz ? 0 : 0) ? nlr : 1),
+              double(lat_lr_last) / double(nlr ? nlr : 1));
   bool ok = bad == 0 && img_bad == 0 && proto == 0;
   std::printf("%s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;

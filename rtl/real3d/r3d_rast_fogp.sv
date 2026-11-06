@@ -35,29 +35,34 @@ module r3d_rast_fogp (
 );
 
   logic [48:0] pr;
-  logic signed [10:0] nsh;                      // -sh: the right shift (formed negated in stage 1, R104)
+  logic signed [10:0] ix;                       // 49 - nsh, nsh the right shift: 0..14 in range
   logic        sat, zero;
-  logic [12:0] p2;
+  logic [12:0] qm;                              // stage 2: the shifted product's low 13 bits
+  logic        f4k, f0;                         // stage 2: 4096, 0 (else qm)
+
+  // the right shift nsh = 49 - ix for ix 0..14 (35..49), as a 16-way select of 13 bits
+  function automatic logic [12:0] shr(input logic [48:0] p, input logic [3:0] i);
+    shr = 13'(p >> (6'd49 - {2'd0, i}));
+  endfunction
 
   always_ff @(posedge clk) if (en) begin
     logic kz;
-    // 1: the product, the shift, the special cases
+    // 1: the product, the shift's index, the special cases
     kz = i_k[31] || i_k[30:23] == 8'd0 || (i_k[30:23] == 8'hff && i_k[22:0] != 23'd0);
     pr <= 49'(i_r) * 49'({1'b1, i_k[22:0]});
-    nsh <= {{2{i_eo[8]}}, i_eo} + {5'd0, i_n} + 11'sd123 - {3'd0, i_k[30:23]};
+    ix <= {3'd0, i_k[30:23]} - {{2{i_eo[8]}}, i_eo} - {5'd0, i_n} - 11'sd74;
     sat  <= !i_pos;
     zero <= i_pos && kz;
-    // 2: the shift and the clamp
-    if (sat) p2 <= 13'd4096;
-    else if (zero || nsh >= 11'sd50) p2 <= 13'd0;
-    else if (nsh <= 11'sd34) p2 <= 13'd4096;
-    else begin
-      logic [48:0] q;
-      q = pr >> 6'(nsh);
-      p2 <= (q[48:12] != 37'd0) ? 13'd4096 : q[12:0];
-    end
+    // 2: the shift and the decision (study R109: the clamp's compare is stage 3's select)
+    //    nsh >= 50 (ix < 0): 0; nsh <= 34 (ix > 14): 4096; else q = pr >> nsh, where q[48:12] != 0
+    //    only for nsh 35 (ix 14: pr[48:47]) and 36 (ix 13: pr[48]). It was a 49-bit shift by a 6-bit
+    //    amount and a 37-bit compare in one stage, into p2's clear (R104's fix 6 went a step of it)
+    qm  <= shr(pr, ix[3:0]);
+    f4k <= sat || (!zero && !ix[10] && ix > 11'sd14) ||
+           (!zero && ix == 11'sd14 && pr[48:47] != 2'd0) || (!zero && ix == 11'sd13 && pr[48]);
+    f0  <= zero || ix[10];
     // 3: out
-    o_p <= p2;
+    o_p <= f4k ? 13'd4096 : f0 ? 13'd0 : qm;
   end
 
 endmodule

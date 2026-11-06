@@ -108,6 +108,8 @@ module r3d_rast_intake #(
   logic [2:0]  pnum;          // parameter number
   logic [31:0] pw [3];        // the parameter's words, pdx, pdy, ps
   logic [8:0]  emx;           // running max of E (+9 for the gradients), 0 = none
+  logic signed [8:0] emx_e;   // its e: 2 for none, else emx - 124 (study R109: em_e is chosen, not
+                              // formed after the max; the max's select and its zero test were in series)
 
   // emission: a parameter's four fields go out after its third word
   logic        em_act;
@@ -155,6 +157,7 @@ module r3d_rast_intake #(
       wc      <= 5'd0;
       em_act  <= 1'b0;
       emx     <= 9'd0;
+      emx_e   <= 9'sd2;
       pk      <= 2'd0;
       f_v     <= 1'b0;
       s_v     <= 1'b0;
@@ -194,26 +197,33 @@ module r3d_rast_intake #(
           f_v <= 1'b1; f_tag <= 5'(wc - HW); f_kind <= K_VTX;
         end else if (wc == HW + 5'd6) begin
           f_v <= 1'b1; f_tag <= 5'd6; f_kind <= K_RAW;
-          pk <= 2'd0; pnum <= 3'd0; emx <= 9'd0;
+          pk <= 2'd0; pnum <= 3'd0; emx <= 9'd0; emx_e <= 9'sd2;
         end else begin
           // a coefficient: keep it, fold its exponent in
           logic [8:0] ea, mx;
+          logic signed [8:0] ee;
+          logic       gt;
           ea = eadj(i_data, pk != 2'd2);
-          mx = (ea > emx) ? ea : emx;
+          gt = ea > emx;
+          mx = gt ? ea : emx;
+          ee = gt ? $signed(9'(ea - 9'd124)) : emx_e;          // ea > emx: ea is not 0
+`ifdef VERILATOR
+          if (ee != ((mx == 9'd0) ? 9'sd2 : $signed(9'(mx - 9'd124)))) $fatal(1, "intake: em_e chosen");
+`endif
           pw[pk] <= i_data;
           if (pk == 2'd2) begin
             em_act  <= 1'b1;
             em_k    <= 3'd0;
             em_p    <= pnum;
-            em_e    <= (mx == 9'd0) ? 9'sd2 : $signed(9'(mx - 9'd124));
+            em_e    <= ee;
             em_last <= np_left == 3'd1;
             np_left <= np_left - 3'd1;
             pnum    <= pnum + 3'd1;
             pk      <= 2'd0;
-            emx     <= 9'd0;
+            emx     <= 9'd0; emx_e <= 9'sd2;
           end else begin
             pk  <= pk + 2'd1;
-            emx <= mx;
+            emx <= mx; emx_e <= ee;
           end
         end
       end

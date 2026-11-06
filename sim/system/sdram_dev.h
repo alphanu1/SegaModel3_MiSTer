@@ -21,7 +21,13 @@ struct sdram_dev {
   std::deque<std::pair<uint64_t, uint16_t>> rq;
   uint64_t reads = 0, writes = 0;
   long log_writes = 0;                            // print this many writes (debug)
-  static uint32_t idx(uint32_t chip, uint32_t bank, uint32_t r, uint32_t c) { return (chip << 25) | (bank << 23) | (r << 10) | c; }
+  // m2_sdram BXOR (study R107): the pins' bank is the address's bank XOR row bits 2:1, so the
+  // array, indexed by the address, takes the bank back the same way
+  bool bxor = false;
+  uint32_t idx(uint32_t chip, uint32_t bank, uint32_t r, uint32_t c) const {
+    if (bxor) bank ^= (r >> 1) & 3u;
+    return (chip << 25) | (bank << 23) | (r << 10) | c;
+  }
 
   // the data for the cycle `cyc`, before the clock edge
   uint16_t dq(uint64_t cyc) {

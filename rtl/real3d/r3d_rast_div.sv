@@ -25,7 +25,13 @@
 // The vertices pass through beside the quotients, so this block sits directly
 // in front of the edge walker.
 
-module r3d_rast_div (
+module r3d_rast_div #(
+  // PRE = 1 (study R109; the rasteriser's own instance): the inputs hold for at least a cycle before
+  // they are taken (r3d_rast's triangle registers are written beats before the record ends and hold
+  // until t_go), so the differences' magnitudes and the flags are registered and only taken at go: the
+  // subtract, the negate and the select were in front of the lanes' n_r.
+  parameter bit PRE = 1'b0
+) (
   input  logic               clk,
   input  logic               rst,
 
@@ -81,6 +87,42 @@ module r3d_rast_div (
     end
   end
 
+  // the loads as the lanes take them: straight from the inputs, or (PRE) the same two cycles on
+  logic [53:0] h_n [3];
+  logic [31:0] h_r [3], h_d [3];
+  logic [4:0]  h_k [3];
+  logic [2:0]  h_neg, h_zero;
+  generate if (PRE) begin : g_pre
+    // one registered stage: the magnitudes, the divisors and the flags; the lanes' loads are a 2:1 select
+    // of these at go
+    logic [32:0] q_a [3];
+    logic [31:0] q_dy [3];
+    logic [2:0]  q_neg, q_zero, q_hi;
+    always_ff @(posedge clk)
+      for (int j = 0; j < 3; j++) begin
+        q_a[j] <= dxs[j][32] ? (33'd0 - dxs[j]) : dxs[j];
+        q_dy[j] <= dys[j]; q_neg[j] <= dxs[j][32]; q_zero[j] <= dys[j] == 32'd0; q_hi[j] <= dys[j][31:16] != 16'd0;
+      end
+    always_comb for (int j = 0; j < 3; j++) begin
+      logic [53:0] nn;
+      nn = {1'b0, q_a[j], 20'd0};
+      h_n[j] = q_hi[j] ? {nn[37:0], 16'd0} : nn;
+      h_r[j] = q_hi[j] ? {16'd0, nn[53:38]} : 32'd0;
+      h_k[j] = q_hi[j] ? 5'd19 : q_zero[j] ? 5'd0 : 5'd27;
+      h_d[j] = q_dy[j]; h_neg[j] = q_neg[j]; h_zero[j] = q_zero[j];
+    end
+`ifdef VERILATOR
+    always_ff @(posedge clk)
+      if (!rst && go) for (int j = 0; j < 3; j++)
+        if ({h_n[j], h_r[j], h_k[j], h_d[j], h_neg[j], h_zero[j]} != {g_n[j], g_r[j], g_k[j], dys[j], dxs[j][32], dys[j] == 32'd0})
+          $fatal(1, "rast_div: the inputs did not hold a cycle before go");
+`endif
+  end else begin : g_nopre
+    always_comb for (int j = 0; j < 3; j++) begin
+      h_n[j] = g_n[j]; h_r[j] = g_r[j]; h_k[j] = g_k[j]; h_d[j] = dys[j]; h_neg[j] = dxs[j][32]; h_zero[j] = dys[j] == 32'd0;
+    end
+  end endgenerate
+
   /* verilator lint_off UNUSEDSIGNAL */
   logic [31:0] l_r [3];   // the remainder: the set-up's divides use it
   /* verilator lint_on UNUSEDSIGNAL */
@@ -88,7 +130,7 @@ module r3d_rast_div (
   generate for (gj = 0; gj < 3; gj++) begin : g_lane
     r3d_div_lane u_lane (
       .clk, .rst,
-      .start(go), .n(g_n[gj]), .r0(g_r[gj]), .d(dys[gj]), .nb2(g_k[gj]),
+      .start(go), .n(h_n[gj]), .r0(h_r[gj]), .d(h_d[gj]), .nb2(h_k[gj]),
       .busy(l_busy[gj]), .q(l_q[gj]), .r(l_r[gj])
     );
   end endgenerate
@@ -107,8 +149,8 @@ module r3d_rast_div (
         busy    <= 1'b1;
         o_x1 <= i_x1; o_y1 <= i_y1; o_x2 <= i_x2; o_y2 <= i_y2; o_x3 <= i_x3; o_y3 <= i_y3;
         for (int j = 0; j < 3; j++) begin
-          neg[j]  <= dxs[j][32];
-          zero[j] <= dys[j] == 32'd0;
+          neg[j]  <= h_neg[j];
+          zero[j] <= h_zero[j];
         end
       end else if (busy) begin
         if (l_busy == 3'b000) begin

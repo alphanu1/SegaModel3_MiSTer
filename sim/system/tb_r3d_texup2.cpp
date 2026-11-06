@@ -10,7 +10,8 @@
 //   A  the FIFO (94): for each texture a size word, the header and its texel
 //      words, then words of garbage, so a decode that reads past the words the
 //      port would copy sees different data in A and B
-//   B  the Step 2 port (90): the VROM word address and the header; the texels
+//   B  the Step 2 port (90): the VROM word address, the header and a third word
+//      that starts the upload (any value); the texels
 //      are in VROM (64 MiB, the MRA's four 16 MiB blocks)
 // The size word in A is the one the port makes, plus the garbage; the batch's
 // sheets are compared texel for texel after every upload.
@@ -125,6 +126,7 @@ int main(int argc, char **argv) {
       // B: the Step 2 port
       send(b, mb, true, addr);
       send(b, mb, true, h);
+      send(b, mb, true, rng());           // the third word starts the upload (Daytona 2's DMA writes 90000008)
       ntex++; texels += nw;
     }
     send(a, ma, false, 0); send(a, ma, false, 0); send(a, ma, false, 0);   // a size of 0 ends the list

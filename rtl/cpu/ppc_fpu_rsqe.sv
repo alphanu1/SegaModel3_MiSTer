@@ -42,7 +42,9 @@
 //   E  B * 2^10 - S * dx, result, flags                            -> output register
 // Latency 1 + QA + 1 + QC + 1 + DLY: 5 with QA = QC = 1, DLY = 0.
 
-(* altera_attribute = "-name AUTO_SHIFT_REGISTER_RECOGNITION OFF" *)
+// The table is a 128-entry ROM, below the size Quartus converts unasked: the
+// second setting lets it (study R100).
+(* altera_attribute = "-name AUTO_SHIFT_REGISTER_RECOGNITION OFF; -name ALLOW_ANY_ROM_SIZE_FOR_RECOGNITION ON" *)
 module ppc_fpu_rsqe
   import ppc_fpu_pkg::*;
 #(
@@ -158,10 +160,11 @@ module ppc_fpu_rsqe
   end
 
   // ================================================================== C
-  // the table: {B, S}; logic, not a RAM block (M10K binds as hard as ALM)
-  (* romstyle = "logic" *) logic [34:0] t;
-  always_comb
-    case (rb_q.idx)
+  // the table: {B, S}. In an M10K ROM read in stage C (QC = 1; study R100:
+  // the 128 x 35 table was about 60 ALM of logic), else logic
+  function automatic logic [34:0] rsq_tab(input logic [6:0] i);
+    logic [34:0] t;
+    case (i)
       // BEGIN rsqe table (sim/fpu/gen_rsqe_tab.py)
       7'd0  : t = {22'd4194253, 13'd8097};
       7'd1  : t = {22'd4161866, 13'd7913};
@@ -294,6 +297,9 @@ module ppc_fpu_rsqe
       default: t = '0;
       // END rsqe table
     endcase
+    rsq_tab = t;
+  endfunction
+  logic [34:0] t;
 
   typedef struct packed {
     logic [21:0] b;
@@ -308,12 +314,21 @@ module ppc_fpu_rsqe
     sc_d.b = t[34:13];  sc_d.s = t[12:0];  sc_d.dx = rb_q.dx;  sc_d.rex = rb_q.rex;  sc_d.sd = rb_q.sd;
   end
   generate if (QC) begin : g_rc
+    (* romstyle = "M10K" *) logic [34:0] t_q;
+    always_ff @(posedge clk) t_q <= rsq_tab(rb_q.idx);
+    assign t = rsq_tab(rb_q.idx);                    // (unused here: rc_q's b and s are t_q)
+    rc_t rc_r;
     always_ff @(posedge clk) begin
       if (rst) rc_v <= 1'b0;
       else     rc_v <= rb_v;
-      rc_q <= sc_d;
+      rc_r <= sc_d;
+    end
+    always_comb begin
+      rc_q = rc_r;
+      rc_q.b = t_q[34:13];  rc_q.s = t_q[12:0];
     end
   end else begin : g_cc
+    assign t = rsq_tab(rb_q.idx);
     assign rc_v = rb_v;
     assign rc_q = sc_d;
   end endgenerate

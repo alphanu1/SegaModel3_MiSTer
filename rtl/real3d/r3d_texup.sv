@@ -61,9 +61,12 @@
 // with byte enables.
 //
 // STEP2_PORT (study R100; run time: step2): the Step 2.x texture port. There
-// the VROM port takes two words, a VROM word address and a header, and the
-// texture is uploaded from VROM with that header (Supermodel's
-// WriteTexturePort, MAME's real3d_vrom_texture_dma; no size word in VROM). It
+// the VROM port takes three words, a VROM word address, a header and a third
+// word that starts the upload (Daytona 2 writes all three by DMA, 90000000-08;
+// Supermodel keeps the first two and uploads on the third, discarding it; MAME
+// also takes three), and the texture is uploaded from VROM with that header
+// (Supermodel's WriteTexturePort, MAME's real3d_vrom_texture_dma; no size word
+// in VROM). It
 // goes into the ring as a FIFO texture would: a size word made for it, the
 // header, and its texel words copied from VROM. The texel words are counted
 // from the header as the decode below consumes them: a level is
@@ -145,7 +148,7 @@ module r3d_texup #(
   // the Step 2.x port (STEP2_PORT): address, then header; then the size word and
   // the header into the ring, then the copy
   wire           s2p = STEP2_PORT && step2;
-  logic          p2_a;                   // the address word has come
+  logic [1:0]    p2_w;                   // the port's words come: 0 address, 1 header, 2 the start
   logic [2:0]    p2_st;                  // 0 idle, 1 counting, 2 the size word, 3 the header, 4 the copy
   logic [23:0]   p2_addr;
   logic [31:0]   p2_hdr;
@@ -153,8 +156,6 @@ module r3d_texup #(
   logic [3:0]    p2_lv, p2_last;
   logic [4:0]    p2_m;                   // log2 words of level 0
   wire           p2_busy = s2p && (p2_st != 3'd0);
-
-  assign t_ready = !a_v && !v_on && !p2_busy;
 
   // ===========================================================================
   // the decode's state
@@ -177,6 +178,20 @@ module r3d_texup #(
   logic [63:0]   bacc;
   logic [7:0]    bbe;
   logic          wr_v;                   // the beat waits to be written
+
+  // The ring's fill (R100, hand-off 5). Daytona 2's boot sends about 0.5 M words
+  // of textures, one 256 x 256 (43,692 words) and a flush a frame, while r3d_cmd
+  // holds every upload back (frames in flight). With no limit the appends ran
+  // past rp and wrote over textures not yet uploaded, and the decode then lost
+  // them: ten textures, the skid marks and car shadows on page 1 among them,
+  // never reached the sheets. So: no word goes in while the ring is full of words
+  // not yet decoded (room; words before dp are consumed, the decode only moves
+  // forward), and from half full an upload of everything flushed starts without
+  // waiting for go (ring_hi). In steady running the ring is never half full.
+  wire  [PW-1:0] occ     = wp - (busy ? dp : rp);
+  wire           room    = occ < PW'((1 << RW) - 8);
+  wire           ring_hi = occ >= PW'(1 << (RW - 1));
+  assign t_ready = !a_v && !v_on && !p2_busy && room;
 
   wire  [7:0]  htype = hdr[28:21];
   wire         b16   = hdr[20];
@@ -260,7 +275,7 @@ module r3d_texup #(
       wp <= '0; fp <= '0; fp_m <= '0; rp <= '0; a_v <= 1'b0; v_on <= 1'b0; s_req <= 1'b0; v_sgap <= 1'b0;
       us <= U_IDLE; busy <= 1'b0; d_req <= 1'b0; d_busy <= 1'b0; f_on <= 1'b0; fbp <= '0; have <= '0;
       wr_v <= 1'b0; n_tex <= '0; n_skip <= '0; own <= 2'd0;
-      p2_a <= 1'b0; p2_st <= 3'd0;
+      p2_w <= 2'd0; p2_st <= 3'd0;
     end else begin
       logic        f_done, rs;            // a burst has landed; a restart
       logic [PW-1:0] rsa;                 // ... at this word
@@ -271,17 +286,19 @@ module r3d_texup #(
       // ---- in: a FIFO word, or a VROM port write; the flush; the mark
       if (t_valid && t_ready) begin
         if (t_vrom && s2p) begin
-          if (!p2_a) begin p2_a <= 1'b1; p2_addr <= t_data[23:0]; end
+          if (p2_w == 2'd0) begin p2_w <= 2'd1; p2_addr <= t_data[23:0]; end
+          else if (p2_w == 2'd1) begin p2_w <= 2'd2; p2_hdr <= t_data; end
           else begin
+            // the third word: the upload (its value is not used)
             logic [3:0] lw0_, lh0_, mn;
-            p2_a <= 1'b0; p2_hdr <= t_data;
-            lw0_ = 4'd5 + {1'b0, t_data[16:14]}; lh0_ = 4'd5 + {1'b0, t_data[19:17]};
+            p2_w <= 2'd0;
+            lw0_ = 4'd5 + {1'b0, p2_hdr[16:14]}; lh0_ = 4'd5 + {1'b0, p2_hdr[19:17]};
             mn = (lw0_ < lh0_) ? lw0_ : lh0_;
-            p2_m  <= 5'({1'b0, lw0_} + {1'b0, lh0_}) - 5'd1 - {4'd0, !t_data[23]};
+            p2_m  <= 5'({1'b0, lw0_} + {1'b0, lh0_}) - 5'd1 - {4'd0, !p2_hdr[23]};
             p2_n  <= '0;
-            p2_lv   <= (t_data[31:24] == 8'h02) ? 4'd1 : 4'd0;
-            p2_last <= (t_data[31:24] == 8'h01) ? 4'd0 : mn - 4'd1;
-            p2_st <= (t_data[31:24] <= 8'h02) ? 3'd1 : 3'd2;
+            p2_lv   <= (p2_hdr[31:24] == 8'h02) ? 4'd1 : 4'd0;
+            p2_last <= (p2_hdr[31:24] == 8'h01) ? 4'd0 : mn - 4'd1;
+            p2_st <= (p2_hdr[31:24] <= 8'h02) ? 3'd1 : 3'd2;
           end
         end else if (t_vrom) begin v_on <= 1'b1; v_first <= 1'b1; v_a <= {1'b0, t_data[22:0]}; end
         else begin a_v <= 1'b1; a_d <= t_data; end
@@ -294,14 +311,14 @@ module r3d_texup #(
             if (p2_lv >= p2_last) p2_st <= 3'd2;
             p2_lv <= p2_lv + 4'd1;
           end
-          3'd2: if (!a_v) begin
+          3'd2: if (!a_v && room) begin
             logic [18:0] n;
             n = (p2_n >= 20'h7FFFD) ? 19'h7FFFD : p2_n[18:0];
             p2_n <= {1'b0, n};
             a_v <= 1'b1; a_d <= {10'd0, 22'(({3'd0, n} + 22'd2) << 3) - 22'd4};
             p2_st <= 3'd3;
           end
-          3'd3: if (!a_v) begin a_v <= 1'b1; a_d <= p2_hdr; p2_st <= 3'd4; end
+          3'd3: if (!a_v && room) begin a_v <= 1'b1; a_d <= p2_hdr; p2_st <= 3'd4; end
           3'd4: if (!a_v) begin
             if (p2_n != 20'd0) begin v_on <= 1'b1; v_first <= 1'b0; v_a <= p2_addr; v_n <= p2_n[18:0]; end
             p2_st <= 3'd0;
@@ -311,11 +328,12 @@ module r3d_texup #(
       end
       if (t_flush) fp <= wp;
       if (mark) fp_m <= t_flush ? wp : fp;
+      else if (us == U_IDLE && !f_on && ring_hi && t_pend && !(go && t_mpend)) fp_m <= fp;   // the ring is half full: mark
 
       // ---- the VROM block: its size word, then its words into the ring.
       // VROM word i = {g, b, h} is at SDR_VROM + {b, g, h, 00}
       if (v_on && !a_v) begin
-        if (!s_req && !v_sgap && !s_ack) begin
+        if (!s_req && !v_sgap && !s_ack && room) begin
           s_req <= 1'b1;
           // (Step 2.x: 24-bit word addresses, 16 MiB blocks)
           s_addr <= AW'(SDR_VROM[26:1]) + (s2p ? AW'({v_a[2:1], v_a[23:3], 2'b00}) : AW'({v_a[2:1], v_a[22:3], 2'b00}));
@@ -368,7 +386,7 @@ module r3d_texup #(
       case (us)
         // every upload fetches afresh: beats past the last flush point may
         // have been read before they were written
-        U_IDLE: if (go && t_mpend && !f_on) begin
+        U_IDLE: if (!f_on && ((go && t_mpend) || (ring_hi && t_pend && !mark))) begin
           busy <= 1'b1; dp <= rp;
           rs = 1'b1; rsa = rp;
           us <= U_H0S;

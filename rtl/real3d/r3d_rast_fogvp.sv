@@ -127,18 +127,22 @@ module r3d_rast_fogvp (
         end
         cnt <= cnt + 5'd1;
         if (cnt == 5'd24) begin
-          // q holds 24 bits; this cycle's bit is the last (the guard)
+          // q holds 24 bits; this cycle's bit is the last (the guard). K is formed for both
+          // roundings side by side and chosen by the round-up bit last (study R109): the guard's
+          // compare, the increment and the exponent's range test were in series into o_k.
           logic        g, st, up;
-          logic [24:0] sg;
-          logic signed [9:0] ee;
+          logic [24:0] sg1;
+          logic signed [9:0] ee1;
+          logic [31:0] k0, k1;
           g  = r >= {1'b0, mb};
           st = g ? (r != {1'b0, mb}) : (r != 25'd0);
           up = g && (st || q[0]);
-          sg = {1'b0, q[23:0]} + 25'(up);
-          ee = e;
-          if (sg[24]) begin sg = {2'b01, 23'd0}; ee = ee + 10'sd1; end
-          if (kzero || ee >= 10'sd255 || ee <= 10'sd0) o_k <= 32'd0;
-          else o_k <= {1'b0, ee[7:0], sg[22:0]};
+          k0 = (kzero || e >= 10'sd255 || e <= 10'sd0) ? 32'd0 : {1'b0, e[7:0], q[22:0]};
+          sg1 = {1'b0, q[23:0]} + 25'd1;
+          ee1 = e;
+          if (sg1[24]) begin sg1 = {2'b01, 23'd0}; ee1 = e + 10'sd1; end
+          k1 = (kzero || ee1 >= 10'sd255 || ee1 <= 10'sd0) ? 32'd0 : {1'b0, ee1[7:0], sg1[22:0]};
+          o_k <= up ? k1 : k0;
           o_s <= sclp;
           o_fc <= {fc[23:8], pr[15:8]};       // the last channel, rounded this cycle
           o_valid <= 1'b1;

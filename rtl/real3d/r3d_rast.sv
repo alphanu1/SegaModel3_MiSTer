@@ -220,6 +220,10 @@ module r3d_rast #(
   logic signed [39:0] pc [4], pdx [4], pdy [4];
   assign g_ready = !t_full;
   wire t_go;
+  // the plane's slot: p, except an untextured triangle's shade (p = 1) into slot 3, where table 1's
+  // shade field is read from for both kinds (th0 is the header's word 0, in before the planes)
+  wire [1:0] g_pp = g_tag[3:2] - 2'd2;
+  wire [1:0] g_ps = (!th0[4] && g_pp == 2'd1) ? 2'd3 : g_pp;
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -228,6 +232,12 @@ module r3d_rast #(
       if (g_valid && g_ready) begin
         if (g_tag == 5'd31) begin                     // the header's beats
           if (hk == 3'd0) th0 <= g_data[31:0];
+          // an untextured triangle's u and v planes go into table 1 as zeros: cleared here, before its
+          // planes arrive (its shade plane, plane 1, is written into slot 3, the textured shade's)
+          if (hk == 3'd0 && !g_data[4]) begin
+            pe[1] <= '0; pc[1] <= '0; pdx[1] <= '0; pdy[1] <= '0;
+            pe[2] <= '0; pc[2] <= '0; pdx[2] <= '0; pdy[2] <= '0;
+          end
           if (hk == 3'd1) th1 <= g_data[31:0];
           if (hk == 3'd2) th2 <= g_data[31:0];
           if (hk == 3'd3) th3 <= g_data[31:0];
@@ -236,10 +246,10 @@ module r3d_rast #(
         end else if (g_tag <= 5'd5) tv[g_tag[2:0]] <= g_data[31:0];
         else if (g_tag >= 5'd8) begin                 // tag 8 + 4p + k: k 0 e, 1 c, 2 dx, 3 dy
           case (g_tag[1:0])
-            2'd0: pe[g_tag[3:2] - 2'd2] <= g_data[8:0];
-            2'd1: pc[g_tag[3:2] - 2'd2] <= g_data;
-            2'd2: pdx[g_tag[3:2] - 2'd2] <= g_data;
-            default: pdy[g_tag[3:2] - 2'd2] <= g_data;
+            2'd0: pe[g_ps] <= g_data[8:0];
+            2'd1: pc[g_ps] <= g_data;
+            2'd2: pdx[g_ps] <= g_data;
+            default: pdy[g_ps] <= g_data;
           endcase
         end
         if (g_last) begin t_full <= 1'b1; hk <= 3'd0; end
@@ -254,7 +264,6 @@ module r3d_rast #(
                           : (t_alpha ? K_SOLID_TRANS : K_SOLID);
   wire [1:0] kind_zk = (kind == K_CONTOUR) ? 2'd2 :
                        (kind == K_SOLID || kind == K_TEX || kind == K_TEX_CM) ? 2'd1 : 2'd0;
-  wire [1:0] sp = th0[4] ? 2'd3 : 2'd1;            // the shade's plane
   wire [5:0] t_vp = th3[13:8];
   wire [4:0] t_fogint = th3[4:0];
   wire       t_gen = th3[7];                        // the pass's first record: a new Z generation
@@ -271,7 +280,8 @@ module r3d_rast #(
 
   assign t_go = t_full && f_tready && !f_busy && !f_svalid;
 
-  r3d_rast_front u_front (
+  // the triangle's words are in tv beats before the record ends and hold until t_go (PRE_DIV, study R109)
+  r3d_rast_front #(.PRE_DIV(1'b1)) u_front (
     .clk, .rst,
     .t_valid(t_go), .t_ready(f_tready),
     .t_x1(tv[0]), .t_y1(tv[1]), .t_x2(tv[2]), .t_y2(tv[3]), .t_x3(tv[4]), .t_y3(tv[5]),
@@ -296,9 +306,11 @@ module r3d_rast #(
   logic [T1W-1:0] t1_q, t1_wd;
   logic [T2W-1:0] t2_q;
   always_comb begin
-    t1_wd[T1W-1 -: 343] = {pl(pc[sp], pdx[sp], pdy[sp], pe[sp]),
-                           th0[4] ? pl(pc[1], pdx[1], pdy[1], pe[1]) : 111'd0,
-                           th0[4] ? pl(pc[2], pdx[2], pdy[2], pe[2]) : 111'd0,
+    // the shade from slot 3; u and v from slots 1 and 2, zero for an untextured triangle (cleared at
+    // its header), so no select is built here (it was 222 LUTs)
+    t1_wd[T1W-1 -: 343] = {pl(pc[3], pdx[3], pdy[3], pe[3]),
+                           pl(pc[1], pdx[1], pdy[1], pe[1]),
+                           pl(pc[2], pdx[2], pdy[2], pe[2]),
                            pe[0], th0[4]};
     t1_wd[LW-1:0] = MIP ? LW'(th4) : '0;
   end
@@ -590,7 +602,7 @@ module r3d_rast #(
   // ===========================================================================
   // the texture cache
   // ===========================================================================
-  logic        tc_iready, tc_ovalid, tc_oready;
+  logic        tc_iready /*verilator public_flat_rd*/, tc_ovalid, tc_oready;
   logic [15:0] tq0, tq1, tq2, tq3;
   logic [6:0]  tc_pay;
   logic        tc_freq, inval;
@@ -700,17 +712,22 @@ module r3d_rast #(
   wire        bq_pop = (bq_n != '0) && bd_ready;
   logic [5:0] eob_band;
   wire  [BW-1:0] bq_wd = eob ? {1'b1, eob_band, 3'd0, 9'd0, 1'b0, 8'd0, 24'd0} : {1'b0, cc_y, cc_x, cc_fbv, cc_fb, cc_rgb};
-  wire  [5:0]    bq_rn = bq_rp + 6'(bq_pop);
+  // the next head's index chosen from two registers (study R109; the add after the band's ready ran into
+  // the MLAB's read and bq_h)
+  logic [5:0]    bq_rp1;                   // bq_rp + 1
+  wire  [5:0]    bq_rn = bq_pop ? bq_rp1 : bq_rp;
+  // the write's bypass test for both heads, ahead of the band's ready
+  wire           bq_eq0 = bq_wp[4:0] == bq_rp[4:0], bq_eq1 = bq_wp[4:0] == bq_rp1[4:0];
   logic [BW-1:0] bq_h;
   always_ff @(posedge clk) begin
     if (bq_push) bq[bq_wp[4:0]] <= bq_wd;
-    bq_h <= (bq_push && bq_wp[4:0] == bq_rn[4:0]) ? bq_wd : bq[bq_rn[4:0]];
+    bq_h <= (bq_push && (bq_pop ? bq_eq1 : bq_eq0)) ? bq_wd : bq[bq_rn[4:0]];
   end
   always_ff @(posedge clk) begin
-    if (rst) begin bq_wp <= '0; bq_rp <= '0; bk_n <= '0; n_pix <= '0; end
+    if (rst) begin bq_wp <= '0; bq_rp <= '0; bq_rp1 <= 6'd1; bk_n <= '0; n_pix <= '0; end
     else begin
       if (bq_push) bq_wp <= bq_wp + 6'd1;
-      if (bq_pop) bq_rp <= bq_rp + 6'd1;
+      if (bq_pop) begin bq_rp <= bq_rp1; bq_rp1 <= bq_rp1 + 6'd1; end
       bk_n <= bk_n + 6'(tc_pop) - 6'(cc_v);
       if (cc_v && cc_ok) n_pix <= n_pix + 32'd1;
     end

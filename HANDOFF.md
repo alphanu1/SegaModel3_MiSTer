@@ -1,6 +1,54 @@
 # Handoff
 
-## Current state (2026-11-05)
+## Current state (2026-11-06)
+
+The study's §15 R105–R115 and D-44 carry every finding; this is the summary. The tree is build `r7b2`'s RTL
+(RBF 66e258c3), with the clock at 110 MHz in `rtl/pll/pll_0002.v` and `Model3.sv`. `r7b2` was a release fit: its
+build script turns on the `M3_RELEASE` line that `Model3.qsf` keeps commented out for test builds.
+
+- **Board, `r7b2` (110 MHz, release, setup −1.83 ns, hold positive at every corner):** VF3 runs at 60 fps in some
+  scenes and 30 in others. It is the first build with any scene at 60, but VF3 is not at 60 throughout. Daytona 2
+  runs at 30 fps or over the whole time. Judged by eye; no frame count.
+- **Board, `r7a1` (R111):** Daytona 2 and VF3 both look right. The skid marks, shadows and smoke are correct (R106's
+  texture-ring and three-bit alpha fixes).
+- **Clock: 110 MHz (D-44, superseding D-43's 120).** R113 priced 120 MHz for the CPU at 3-4% more instructions a
+  second at best, and possibly fewer, so the speed now has to come from cycles at 110.
+- **Area (release): 38,870 ALM, 324 M10K.**
+- **In the tree:**
+  - R107's SDRAM options (BXOR, L16, LW1, PAIR, PW).
+  - R108's CPU timing restructurings, cycle-identical.
+  - R109's Real3D pipelining, pixel-identical.
+  - R110's area changes.
+  - R111's SDRAM-port line buffers in MLABs.
+  - R112's six memory options (`BUS_FAST`, `BUS_R3P`, `SDR_FREQ`, `SDR_FWD`, `SDR_FDSP`, `SDR_PW_DLY` 8). On the
+    bench they take busy cycles a frame down 6.3% on VF3 and 12.5% on Daytona 2.
+  - R114's ordering fix: with R3P, every access to a target other than the SDRAM waits for the posted host-port
+    writes, as on the MPC105 (manual 8.1.2.2). It costs 0.2% of VF3's busy CPI.
+- **Wrong turns (recorded in the study):**
+  - R3P as R112 built it let palette, PCI config, I/O, IRQ, 53C810 and tilegen accesses overtake up to 7 posted
+    words. The bus bench's new order check reproduced it, and R114 fixed it.
+  - `r7b1` was launched before that check and was stopped in the fitter.
+- **Not merged: R115's four CPU cycle changes:**
+  - What they are: the FP result bypass, FP load write-back, the targeted TLB flush and dropping the extra FP wait.
+  - Gain: busy CPI −3.1% on VF3 and −1.9% on Daytona 2; work CPI −3.8% and −5.2%.
+  - Cost: +366 ALM, no M10K, CPU spike within seed noise.
+  - Location: they live in `sm3-builds/cpi112`, measured on the R107-era CPU tree.
+- **Poll loops:** VF3 spends 17.1% of its busy cycles in a byte-poll loop at 61DC4–61DD0, outside R104's wait
+  windows; Daytona 2 spends 7.6% at 52A0–52C4. With VF3's loop counted as waiting, a frame every vblank needs a
+  9–18% cycle cut, not 25%.
+
+### Next
+- Make the system bench's checkpoints load into the R108+ CPU (PDW 75→76, new registers). Until then the system
+  bench measures the R107-era CPU, not the one that is built.
+- Merge R115's four changes, bench on the merged tree, then a 110 MHz test fit.
+- Trace what the two poll loops wait for; if it is an interrupt or a DMA, add them to the bench's wait list.
+- Load-use 3→2 through the D-cache answering a cycle earlier (R56 cost 6.9 MHz done in the core), and the earlier
+  redirect.
+- Deferred: the iterative double FMA (about 1,350–1,750 ALM); the five-seed SDRAM spike sweep; frame-busy counts
+  nothing on Daytona 2.
+- Room for sound (about 4,500 ALM) and I/O (about 1,000).
+
+## State on 2026-11-05
 
 The study's §15 R95–R104 and D-43 carry every finding; this is the summary. The tree is build `t100d8`'s RTL
 (RBF b8b6effd), the first build that runs both games from one `Model3.rbf`.

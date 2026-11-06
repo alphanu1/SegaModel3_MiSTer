@@ -338,8 +338,13 @@ module ppc_dcache
     touch = {x[8:5], w, plru_touch(x[2:0], w)};
   endfunction
   wire  [8:0]  s_new = touch(s_st, s_way) | ({8'd0, s_dirty} << (5 + s_way));
-  wire  [8:0]  st_ram = stm[r_set];
-  wire  [8:0]  st     = (s_v && s_set == r_set) ? s_new : st_ram;
+  // The set state is read at the set the arrays were read at, registered beside them (rd_set_q):
+  // wherever there is a lookup (l_v) that is r_set, and with none st is not used. Through r_set
+  // the x_v select was in front of the read (the 110 MHz build's worst path: x_v, some 180 loads,
+  // into the state's read address, then the MRU way and the hit's choice into x_v)
+  logic [6:0]  rd_set_q;
+  wire  [8:0]  st_ram = stm[rd_set_q];
+  wire  [8:0]  st     = (s_v && s_set == rd_set_q) ? s_new : st_ram;
   wire  [1:0]  st_mru = st[4:3];
 
   // Each way's tag is compared with both candidates, X's and R's, and a
@@ -376,10 +381,10 @@ module ppc_dcache
     for (int w = 0; w < 4; w++)
       if (!rst && hv[w] != (tg[w] == r_tag)) $fatal(1, "dcache tag compare per candidate, way %0d", w);
 `endif
-  wire         any    = |hv;
+  (* keep = 1 *) wire any = |hv;
   wire  [1:0]  hw     = enc4(hv);
   wire  [1:0]  pw     = rw_v_l ? x_rw : st_mru; // the way the data output takes
-  wire         hp     = hv[pw];
+  (* keep = 1 *) wire hp  = hv[pw];
   wire         wt     = r_wimg_l[3];
 
   // DQ: a miss or a cache operation, decided the cycle after its lookup
@@ -422,46 +427,70 @@ module ppc_dcache
 `endif
   wire lk      = l_v && r_ph_l == 2'd0 && !blk;
 
-  logic l_ans, l_sb, l_uq, l_dq, l_rw, l_ph1, l_ph2, l_st, l_dirty;
-  always_comb begin
-    l_ans = 1'b0; l_sb = 1'b0; l_uq = 1'b0; l_dq = 1'b0; l_rw = 1'b0; l_ph1 = 1'b0; l_ph2 = 1'b0;
-    l_st = 1'b0; l_dirty = 1'b0;
-    if (lk) begin
-      case (r_k_l)
+  // The lookup's outcome as a function of the compare's two late bits, any and hp (the predicted
+  // way hits), so that the next state of x_v, d_valid and d_rdy can be formed for each of the three
+  // cases (no hit; a hit in another way; the predicted way's) from registers, and the compare
+  // chooses last (below). Every other bit of the outcome is lkf of the actual any and hp.
+  typedef struct packed {
+    logic ans, sb, uq, dq, rw, ph1, ph2, st, dirty;
+  } lk_t;
+  // (every input an argument: Quartus 17 does not read a module's signals inside a function)
+  function automatic lk_t lkf(input logic a_any, input logic a_hp, input logic a_lk, input logic [2:0] a_r_k_l,
+                              input logic a_r_byp_l, input logic a_dq_free, input logic a_wp_free, input logic a_wt,
+                              input logic a_hid_dlock, input logic a_hid_noopti, input logic a_hid_dce,
+                              input logic [3:0] a_r_wimg_l, input logic a_quiet);
+    lkf = '0;
+    if (a_lk) begin
+      case (a_r_k_l)
         K_LD:
-          if (r_byp_l) begin
-            if (dq_free) begin l_uq = 1'b1; l_ph2 = 1'b1; end
-          end else if (any) begin
-            l_st = 1'b1;
-            if (hp) l_ans = 1'b1; else l_rw = 1'b1;
-          end else if (dq_free) begin
-            if (hid_dlock) begin l_uq = 1'b1; l_ph2 = 1'b1; end
-            else           begin l_dq = 1'b1; l_ph1 = 1'b1; end
+          if (a_r_byp_l) begin
+            if (a_dq_free) begin lkf.uq = 1'b1; lkf.ph2 = 1'b1; end
+          end else if (a_any) begin
+            lkf.st = 1'b1;
+            if (a_hp) lkf.ans = 1'b1; else lkf.rw = 1'b1;
+          end else if (a_dq_free) begin
+            if (a_hid_dlock) begin lkf.uq = 1'b1; lkf.ph2 = 1'b1; end
+            else           begin lkf.dq = 1'b1; lkf.ph1 = 1'b1; end
           end
         K_ST:
-          if (r_byp_l) begin
-            if (dq_free) begin l_uq = 1'b1; l_ans = 1'b1; end
-          end else if (any) begin
-            if (wp_free && (!wt || dq_free)) begin
-              l_sb = 1'b1; l_uq = wt; l_ans = 1'b1; l_st = 1'b1; l_dirty = !wt;
+          if (a_r_byp_l) begin
+            if (a_dq_free) begin lkf.uq = 1'b1; lkf.ans = 1'b1; end
+          end else if (a_any) begin
+            if (a_wp_free && (!a_wt || a_dq_free)) begin
+              lkf.sb = 1'b1; lkf.uq = a_wt; lkf.ans = 1'b1; lkf.st = 1'b1; lkf.dirty = !a_wt;
             end
-          end else if (dq_free) begin
-            l_ans = 1'b1;
-            if (wt || hid_dlock) l_uq = 1'b1; else l_dq = 1'b1;
+          end else if (a_dq_free) begin
+            lkf.ans = 1'b1;
+            if (a_wt || a_hid_dlock) lkf.uq = 1'b1; else lkf.dq = 1'b1;
           end
         K_TCH:                                  // 3.2.4, 3.7.2: no-op if locked, disabled, W, I or G
-          if (hid_noopti || !hid_dce || hid_dlock || r_byp_l || r_wimg_l[3] || r_wimg_l[0]) l_ans = 1'b1;
-          else if (any) begin l_st = 1'b1; l_ans = 1'b1; end
-          else if (dq_free) begin l_dq = 1'b1; l_ans = 1'b1; end
+          if (a_hid_noopti || !a_hid_dce || a_hid_dlock || a_r_byp_l || a_r_wimg_l[3] || a_r_wimg_l[0]) lkf.ans = 1'b1;
+          else if (a_any) begin lkf.st = 1'b1; lkf.ans = 1'b1; end
+          else if (a_dq_free) begin lkf.dq = 1'b1; lkf.ans = 1'b1; end
         K_DCBZ:                                 // 3.7.4; I or W is the core's alignment exception
-          if (r_wimg_l[2] || r_wimg_l[3]) l_ans = 1'b1;
-          else if (quiet) begin l_dq = 1'b1; l_ans = 1'b1; end
+          if (a_r_wimg_l[2] || a_r_wimg_l[3]) lkf.ans = 1'b1;
+          else if (a_quiet) begin lkf.dq = 1'b1; lkf.ans = 1'b1; end
         K_DCBST, K_DCBF, K_DCBI:
-          if (quiet) begin l_dq = 1'b1; l_ans = 1'b1; end
-        default: l_ans = 1'b1;
+          if (a_quiet) begin lkf.dq = 1'b1; lkf.ans = 1'b1; end
+        default: lkf.ans = 1'b1;
       endcase
     end
-  end
+  endfunction
+
+
+  lk_t lk00, lk10, lk11, lko;
+  assign lk00 = lkf(1'b0, 1'b0, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet);
+  assign lk10 = lkf(1'b1, 1'b0, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet);
+  assign lk11 = lkf(1'b1, 1'b1, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet);
+  assign lko  = hp ? lk11 : any ? lk10 : lk00;
+  wire l_ans = lko.ans, l_sb = lko.sb, l_uq = lko.uq, l_dq = lko.dq, l_rw = lko.rw, l_ph1 = lko.ph1,
+       l_ph2 = lko.ph2, l_st = lko.st, l_dirty = lko.dirty;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && lko != lkf(any, hp, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet)) $fatal(1, "dcache lookup outcome by case");
+  always_ff @(posedge clk)
+    if (!rst && l_v && rd_set_q != r_set) $fatal(1, "dcache: the registered read set against the lookup's");
+`endif
 
   // ================================================================ snoop decision
   // In SN_C, DQ's address and tags are the snoop's (taken in SN_B, when the
@@ -472,7 +501,8 @@ module ppc_dcache
   // SN_B and SN_C.
   wire  [8:0]  st_sn  = stm[dq_set];
   wire         sn_c   = SNOOP && sn_st == SN_C;
-  wire         sn_hit = (|sn_hv) && hid_dce && dq_a[31:12] != RSV_TAG;
+  (* keep = 1 *) wire sn_ok = (|sn_hv) && dq_a[31:12] != RSV_TAG;   // from registers (R108: HID0[DCE] last)
+  wire         sn_hit = sn_ok && hid_dce;
   wire  [1:0]  sn_hw  = enc4(sn_hv);
   wire         sn_dty = st_sn[5 + sn_hw];
 
@@ -613,8 +643,33 @@ module ppc_dcache
   // ============================================================ output
   // byte sources: the store just written, the store about to be, the word
   // (both candidates compared, x_v choosing last, as for blk)
-  wire sb_m  = sb_v  && (x_v ? sb_a  == x_a : sb_a  == r_a);
-  wire sbl_m = sbl_v && (x_v ? sbl_a == x_a : sbl_a == r_a);
+  // laid out by hand (keep, R108), as the tag compare: three-bit groups against each candidate, five
+  // groups ANDed, then x_v's choice with the valid bit. Left to synthesis the 30-bit compare with the
+  // select in it was five levels from r_a into d_rdata (a CPU subsystem spike's r_a -> d_rdata)
+  (* keep = 1 *) wire [9:0] sbg_x, sbg_r, sblg_x, sblg_r;
+  (* keep = 1 *) wire [1:0] sba_x, sba_r, sbla_x, sbla_r;
+  genvar sbg;
+  generate
+  for (sbg = 0; sbg < 10; sbg = sbg + 1) begin : g_sb
+    assign sbg_x[sbg]  = sb_a[2 + 3*sbg +: 3]  == x_a[2 + 3*sbg +: 3];
+    assign sbg_r[sbg]  = sb_a[2 + 3*sbg +: 3]  == r_a[2 + 3*sbg +: 3];
+    assign sblg_x[sbg] = sbl_a[2 + 3*sbg +: 3] == x_a[2 + 3*sbg +: 3];
+    assign sblg_r[sbg] = sbl_a[2 + 3*sbg +: 3] == r_a[2 + 3*sbg +: 3];
+  end
+  for (sbg = 0; sbg < 2; sbg = sbg + 1) begin : g_sba
+    assign sba_x[sbg]  = &sbg_x[5*sbg +: 5];
+    assign sba_r[sbg]  = &sbg_r[5*sbg +: 5];
+    assign sbla_x[sbg] = &sblg_x[5*sbg +: 5];
+    assign sbla_r[sbg] = &sblg_r[5*sbg +: 5];
+  end
+  endgenerate
+  wire sb_m  = sb_v  && (x_v ? &sba_x  : &sba_r);
+  wire sbl_m = sbl_v && (x_v ? &sbla_x : &sbla_r);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && (sb_m != (sb_v && (x_v ? sb_a == x_a : sb_a == r_a)) || sbl_m != (sbl_v && (x_v ? sbl_a == x_a : sbl_a == r_a))))
+      $fatal(1, "dcache store-buffer address compares laid out");
+`endif
   logic [31:0] ld_word;
   always_comb
     for (int l = 0; l < 4; l++) begin
@@ -624,8 +679,12 @@ module ppc_dcache
       else                           ld_word[31-8*l -: 8] = dq[pw][31-8*l -: 8];
     end
 
+  // (preserve, R108: the release fits retimed d_valid's register back into the D-cache, so every reader
+  // in the core, WB's and MEM's holds and the commit enables behind them, started a LUT after it)
+  (* preserve *) logic d_valid_q;
+  assign d_valid = d_valid_q;
   always_ff @(posedge clk) begin
-    d_valid <= !rst && (post || (l_ans && !l_post) || er_ans || srd_ans || fh);
+    d_valid_q <= !rst && (post || (l_ans && !l_post) || er_ans || srd_ans || fh);
     d_rdata <= ld_word;
   end
 
@@ -637,17 +696,47 @@ module ppc_dcache
   wire r_v_n     = d_req || (r_v && !lr);
   wire r_fresh_n = d_req ? rd_sel == RD_NEW : rd_sel == RD_R;
   wire x_v_n     = x_v ? !x_end : x_take;
+  // x_v's next value, and d_rdy's, for each of the lookup's three cases, from registers and the
+  // request (d_req); the compare (any, hp) chooses last, one level after the tags' hit (the
+  // 100 MHz builds' tag RAM and r_a into x_v: the compare, any, the outcome and x_v's next value
+  // were four levels after the hit)
+  function automatic logic xvn_f(input logic a_la, input logic a_x_v, input logic a_lx, input logic a_lk,
+                                 input logic a_xa, input logic a_lr, input logic a_l_post);   // a_xa: er_ans || srd_ans || fh
+    xvn_f = a_x_v ? !((a_lx && a_lk && a_la) || a_xa) : (a_lr && !((a_lk && a_la) || a_l_post));
+  endfunction
+  function automatic logic rdy_f(input logic a_xvn, input logic a_r_v_n, input logic a_r_fresh_n);
+    rdy_f = !a_r_v_n || (a_r_fresh_n && !a_xvn);
+  endfunction
+  // (an answer from memory for X, xvxa, ends it whatever the compare says: it is taken in at the last
+  // level for x_v and folded into each case's d_rdy, so the port's beat is not in front of the cases;
+  // with it inside them, m_rvalid's owner through the beat into d_rdy was seven levels)
+  wire xa_any = er_ans || srd_ans || fh;
+  (* keep = 1 *) wire xvxa  = x_v && xa_any;
+  (* keep = 1 *) wire xvn00 = xvn_f(lk00.ans, x_v, lx, lk, 1'b0, lr, l_post);
+  (* keep = 1 *) wire xvn10 = xvn_f(lk10.ans, x_v, lx, lk, 1'b0, lr, l_post);
+  (* keep = 1 *) wire xvn11 = xvn_f(lk11.ans, x_v, lx, lk, 1'b0, lr, l_post);
+  wire x_v_c   = !xvxa && (hp ? xvn11 : any ? xvn10 : xvn00);
+  // d_rdy from x_v's next value, so EX's request (d_req, in r_v_n and r_fresh_n) is one level from it:
+  // formed per case beside the compare, the request was three levels deep (R108, cH's release fit:
+  // op_x -> d_rdy_q, -1.55 ns), the compare one level less than this
+  (* keep = 1 *) wire r_hold = r_v && !lr;              // R stays (with no request)
+  wire rdy_c   = !(d_req || r_hold) || ((d_req ? rd_sel == RD_NEW : rd_sel == RD_R) && !x_v_c);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && (x_v_c != x_v_n || rdy_c != (!r_v_n || (r_fresh_n && !x_v_n)))) $fatal(1, "dcache x_v, d_rdy by case");
+`endif
   always_ff @(posedge clk) begin
     l_x <= rd_sel == RD_X;
+    rd_set_q <= rd_a[9:3];
     if (rst) begin
       r_v <= 1'b0; r_fresh <= 1'b0; r_post <= 1'b0; x_v <= 1'b0; x_vc <= 1'b0; d_rdy_q <= 1'b0;
     end else begin
       r_v     <= r_v_n;
       r_fresh <= r_fresh_n;
-      x_v     <= x_v_n;
-      x_vc    <= x_v_n;
+      x_v     <= x_v_c;
+      x_vc    <= x_v_c;
       // the next cycle's d_rdy: R will be free at its end (empty, or looked up)
-      d_rdy_q <= !r_v_n || (r_fresh_n && !x_v_n);
+      d_rdy_q <= rdy_c;
       if (d_req) r_post <= post;
       else if (lr) r_post <= 1'b0;
     end

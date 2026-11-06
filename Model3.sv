@@ -121,8 +121,8 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 ///////////////////////   CLOCKS   ///////////////////////////////
 
 // The PLL is named `pll`: sys_top.sdc's clock groups match it by that name.
-wire clk_sys;        // 100 MHz, everything (outclk_1; outclk_0 is the CPU test's 20 MHz)
-wire clk_sdram_pin;  // 100 MHz at 180 degrees, SDRAM_CLK (Model 2's and the viewer's arrangement)
+wire clk_sys;        // 110 MHz (D-44), everything (outclk_1; outclk_0 is the CPU test's 20 MHz)
+wire clk_sdram_pin;  // 110 MHz at 180 degrees, SDRAM_CLK (Model 2's and the viewer's arrangement)
 wire pll_locked;
 pll pll
 (
@@ -137,7 +137,7 @@ pll pll
 // The system clock (outclk_1). A diagnostic build at another rate changes this
 // and the PLL's outclk_1 / outclk_2 together; m3_system derives every real-time
 // count from it (pixel enable, timebase, SDRAM refresh, EEPROM, MIDI, UART).
-localparam int SYS_HZ = 100_000_000;
+localparam int SYS_HZ = 110_000_000;
 
 // memory: out of reset on PLL lock, and stays out (study rules)
 reg [2:0] mem_rst_s = 3'b000;
@@ -169,7 +169,10 @@ always @(posedge clk_sys) begin
 	end
 end
 
-m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0)) sys3
+m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .SDR_BXOR(1'b1), .SDR_L16(1'b1), .SDR_LW1(1'b1),
+            .SDR_PAIR(1'b1), .SDR_PW(1'b1),
+            .BUS_FAST(1'b1), .BUS_R3P(1'b1), .SDR_FREQ(1'b1), .SDR_FWD(1'b1), .SDR_FDSP(1'b1),
+            .SDR_PW_DLY(8)) sys3
 (
 	.clk(clk_sys), .mem_rst_n(mem_rst_n), .reset(RESET | status[0] | buttons[1]),
 	.ioctl_download(ioctl_download), .ioctl_index(ioctl_index), .ioctl_wr(ioctl_wr),
@@ -259,7 +262,7 @@ pll pll
 wire reset = RESET | status[0] | buttons[1];
 
 // ---------------------------------------------------------------- CPU test
-// 100 MHz (study D-3); the UART divisor follows the clock.
+// 110 MHz (study D-3, D-44); the UART divisor follows the clock.
 localparam int CPU_HZ = 100_000_000;
 
 reg [2:0] cpu_rst_sync = 3'b111;

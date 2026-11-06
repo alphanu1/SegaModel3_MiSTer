@@ -292,6 +292,7 @@ module ppc_pdw
     pd.fck1    = pa_op && (pa_rc || (!pa_a && pa_mcrfs));
     pd.hh      = pd_op == 6'd31 && (pd_x == 10'd339 || pd_x == 10'd371) && (pd_spr == 10'd978 || pd_spr == 10'd979);
     pd.fdx     = pr_fdbl;
+    pd.uea     = pd_crack == 2'd1 && !pr_fdbl && !(pa_w || pr_fpw || pr_fhi) && !mark;
     pd.ra0     = w[20:16] == 5'd0;
     pd.rda     = pr_xs || pd_stu;
     pd.ill     = pr_ill && !pa_op;

@@ -168,10 +168,14 @@ package ppc_pkg;
     // ops, update stores): ID's own rd for the early compares without the
     // decoder in front (ppc_core.sv, id_rdf)
     logic       rda;
+    // an integer update load (cracked, not an FP double, no FPR written, not a fault marker): its
+    // step 1 writes rA from step 0's EA (ppc_core.sv, id_xuea), so ID's operand selects need no
+    // decode of the queue head's fields (R108)
+    logic       uea;
     // last, at bits 2:0, so the fetch queue can copy it beside the register
     // fields for the GPR file's read addresses (ppc_fetchq r_rf)
     logic [2:0] sh;          // rA, rB, rS is a TGPR shadow: MSR[TGPR] and the field < 4
   } pd_t;
-  localparam int PDW = 75;                             // (alu_op_t is 6 bits)
+  localparam int PDW = 76;                             // (alu_op_t is 6 bits)
 
 endpackage

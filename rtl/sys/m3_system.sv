@@ -73,6 +73,22 @@ module m3_system
   // and shown on the overlay with CPI x 256. 0 drops it (the release).
   parameter bit          CPI_MON  = 1'b1,
   parameter bit          FBUSY    = 1'b1,         // the CPU's busy time per frame on overlay row 7 (study R104)
+  // RELEASE = 1 drops every debug block together: the overlay and its capture
+  // logic, CPI_MON's counters and UART, FBUSY (study R105). Release builds
+  // set it with the Verilog macro M3_RELEASE (Model3.qsf); test builds keep
+  // the debug.
+`ifdef M3_RELEASE
+  parameter bit          RELEASE  = 1'b1,
+`else
+  parameter bit          RELEASE  = 1'b0,
+`endif
+  // XCAP = 0 (macro M3_NO_XCAP) leaves the overlay's exception rows 8-11 at zero, so their capture logic
+  // is not built: a smaller test build (study R105)
+`ifdef M3_NO_XCAP
+  parameter bit          XCAP     = 1'b0,
+`else
+  parameter bit          XCAP     = 1'b1,
+`endif
   parameter int          CLK_HZ   = 100_000_000,
   // D-41: the 603e revision the game reads (Step 1.0: rev 1.3, as MAME). VF3's
   // boot code and TLB-miss handler set W in every BAT and RPA on revisions below
@@ -89,7 +105,43 @@ module m3_system
   //   index 0 there and the VROM readers (geometry, texture upload) read it there.
   //   A Step 2 set's VROM is always in the extra memory (its index 1).
   parameter int          VROM_LOC = 1,
-  parameter int          DDR_MAXQ = 8                // m3_ddr3p: DDR3 reads queued or in flight at most (1-32; R101)
+  parameter int          DDR_MAXQ = 8,               // m3_ddr3p: DDR3 reads queued or in flight at most (1-32; R101)
+  // ---- SDRAM scheduling for the CPU (study R107; all 0: m2_sdram as it was)
+  //   SDR_PRI      ports granted ahead of the round-robin (m2_sdram PRI; bit 0 the bus, i.e. the CPU)
+  //   SDR_PRI_CAP  PRI grants in a row while others wait, before one round-robin grant
+  //   SDR_AGE      ports taken into the class after waiting SDR_AGE_T clocks (m2_sdram AGE)
+  //   SDR_BXOR     bank bits XOR the row's low bits (m2_sdram BXOR): each region spread over the four banks
+  //   SDR_L16      the bus's line fill as one 16-column read (m2_sdram L16, m3_sdr_port L16)
+  //   SDR_LW1      a cast-out's beats one a clock into m3_sdr_port, not one in four (m3_sdr_port LW1)
+  //   SDR_PAIR     with SDR_L16: the line fill from its critical word, delivered a 32-bit word at a time (m2_sdram PAIR)
+  //   SDR_RA       with SDR_L16 and SDR_PAIR: m3_sdr_port reads the next line ahead into a two-line buffer (m3_sdr_port RA)
+  //   SDR_PW       m3_sdr_port posts a line write's bursts from a buffer of their own; reads of other lines pass them (PW)
+  parameter logic [5:0]  SDR_PRI     = 6'b000000,
+  parameter int          SDR_PRI_CAP = 2,
+  parameter logic [5:0]  SDR_AGE     = 6'b000000,
+  parameter int          SDR_AGE_T   = 48,
+  parameter bit          SDR_BXOR    = 1'b0,
+  parameter bit          SDR_L16     = 1'b0,
+  parameter bit          SDR_LW1     = 1'b0,
+  parameter bit          SDR_PAIR    = 1'b0,
+  parameter bit          SDR_RA      = 1'b0,
+  parameter bit          SDR_PW      = 1'b0,
+  parameter bit          SDR_RA_CONF = 1'b0,            // SDR_RA: arm only on a stream seen (m3_sdr_port RA_CONF)
+  // ---- the CPU's miss path, clocks taken out (study R112; all 0: as it was)
+  //   BUS_FAST     m3_bus: the CPU's work-RAM reads go to the port from B_IDLE (m3_bus FAST)
+  //   SDR_FREQ     m3_sdr_port: a read's request to m2_sdram in the clock the port takes it (m3_sdr_port FREQ)
+  //   SDR_FWD      with SDR_L16 and SDR_PAIR: each fill beat to the bus as it arrives (m3_sdr_port FWD)
+  //   SDR_FDSP     m2_sdram: the bus port's read straight to S_DISPATCH when the controller is empty (FDSP)
+  //   SDR_HITRD    m2_sdram: a read with its row open issues its first READ from S_DISPATCH (HITRD)
+  parameter bit          BUS_FAST    = 1'b0,
+  parameter bit          SDR_FREQ    = 1'b0,
+  parameter bit          SDR_FWD     = 1'b0,
+  parameter bit          SDR_FDSP    = 1'b0,
+  parameter bit          SDR_HITRD   = 1'b0,
+  //   SDR_PW_DLY   with SDR_PW: a posted line write waits this many clocks before its bursts unless needed (m3_sdr_port PW_DLY)
+  parameter int          SDR_PW_DLY  = 0,
+  //   BUS_R3P      m3_bus: writes to the Real3D's host port posted in an eight-word buffer, the bus freed (m3_bus R3P)
+  parameter bit          BUS_R3P     = 1'b0
 ) (
   input  logic        clk,
   input  logic        mem_rst_n,
@@ -203,7 +255,9 @@ module m3_system
   logic [15:0] wb_din;
   logic [1:0]  wb_be;
   m2_sdram #(.COL_BITS(COL_BITS), .NP(NSP), .T_REFI(T_REFI_C), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL),
-             .WB({{(NSP-1){1'b0}}, 1'b1})) u_sdram (   // port 0 (the bus) writes in bursts (R101)
+             .PRI(SDR_PRI), .PRI_CAP(SDR_PRI_CAP), .AGE(SDR_AGE), .AGE_T(SDR_AGE_T), .BXOR(SDR_BXOR),
+             .L16({{(NSP-1){1'b0}}, SDR_L16}), .PAIR({{(NSP-1){1'b0}}, SDR_PAIR}),
+             .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdram (   // port 0 (the bus) writes in bursts (R101)
     .clk, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm, .sd_dq_o, .sd_dq_oe, .sd_dq_i,
     .wr_req(ld_req), .wr_addr(ld_addr), .wr_din(ld_din), .wr_be(ld_be), .wr_ack(ld_ack),
@@ -272,6 +326,12 @@ module m3_system
   logic [31:0]      rt_lr, rt_msr, rt_srr0, rt_srr1;
   logic [31:0]      rt_pc;
 
+  // the debug blocks as built (RELEASE turns them all off)
+  localparam bit OV_ON  = OVERLAY && !RELEASE;
+  localparam bit MON_ON = CPI_MON && !RELEASE;
+  localparam bit FB_ON  = FBUSY   && !RELEASE;
+  localparam bit XC_ON  = XCAP    && OV_ON;
+
   ppc_cpu #(.PVR(PVR)) u_cpu (
     .clk, .rst,
     .m_req(m_req[0]), .m_cmd(m_cmd[0]), .m_addr(m_addr[0]), .m_be(m_be[0]), .m_wdata(m_wdata[0]),
@@ -293,7 +353,7 @@ module m3_system
   //   05 mul/div wait  06 data memory wait  07 redirects  08 fetch waiting
   logic [8:0][31:0] perf;
   logic [15:0]      cpi_q8;          // CPI x 256 of the last report
-  generate if (CPI_MON) begin : g_mon
+  generate if (MON_ON) begin : g_mon
     logic [31:0] sec;
     logic        rep, clr;
     always_ff @(posedge clk) begin
@@ -405,7 +465,7 @@ module m3_system
 `endif
 
   m3_bus #(.AW(AW), .SDR_CROM(SDR_CROM), .SDR_FIXED(SDR_FIXED), .SDR_BACKUP(SDR_BACKUP), .SDR_RAM(SDR_RAM),
-           .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C)
+           .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P)
 `ifdef M3_STEP2_BUS
            , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ)
 `endif
@@ -430,8 +490,8 @@ module m3_system
     .jt_wr, .jt_wdata, .jt_busy, .jt_tdo, .jt_cfg_we, .jt_cfg0, .jt_cfg1, .jt_cfg2,
     .tr_v, .tr_master, .tr_we, .tr_addr, .tr_be, .tr_data);
 
-  m3_sdr_port #(.AW(AW)) u_sport (
-    .clk, .rst(!mem_rst_n),
+  m3_sdr_port #(.AW(AW), .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .RA(SDR_RA), .RA_TOP(SDR_VRAM), .RA_CONF(SDR_RA_CONF), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ), .PW_DLY(SDR_PW_DLY)) u_sport (
+    .clk, .rst(!mem_rst_n), .ra_clr(rst),
     .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
     .p_req(p_req[0]), .p_we(p_we[0]), .p_addr(p_addr[0]), .p_din(p_din[0]), .p_be(p_be[0]), .p_long(p_long[0]),
     .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]), .wb_col, .wb_din, .wb_be);
@@ -846,7 +906,7 @@ module m3_system
 
   // the CPU's busy time per frame (R104): vblank to the first retirement in a wait loop
   logic [31:0] fb_mm, fb_lo, fb_hi, fb_last;
-  generate if (FBUSY) begin : g_fbusy
+  generate if (FB_ON) begin : g_fbusy
     m3_frame_busy #(.CLK_HZ(CLK_HZ)) u_fbusy (.clk, .rst, .vblank_start, .step2, .rt_valid, .rt_pc,
       .o_minmax(fb_mm), .o_bins_lo(fb_lo), .o_bins_hi(fb_hi), .o_last(fb_last));
   end else begin : g_nofbusy
@@ -856,7 +916,7 @@ module m3_system
   logic [5:0]  ov_idx;
   logic [31:0] ov_v;
   logic        ov_box, ov_ink;
-  generate if (OVERLAY) begin : g_ov
+  generate if (OV_ON) begin : g_ov
     logic [31:0] tgr20, tgr60, tgr64, tgr68, tgr6c, tgr08;
     always_ff @(posedge clk) if (tg_reg_we) begin
       case (tg_reg_addr)
@@ -910,32 +970,32 @@ module m3_system
         // row 7: redirects, load-use, mul/div wait, decode starved
         // (with FBUSY, R104: the CPU's busy time a frame, the last second: {min, max} and the last frame in
         // units of 256 clocks; frames by vblanks needed {<0.9, 0.9-1, 1-1.1, 1.1-1.25}, {1.25-1.5, >=1.5, 0, frames})
-        6'd28: ov_v <= FBUSY ? fb_mm : perf[7];
-        6'd29: ov_v <= FBUSY ? fb_lo : perf[4];
-        6'd30: ov_v <= FBUSY ? fb_hi : perf[5];
-        6'd31: ov_v <= FBUSY ? {msr_v, xint_v, fb_last[14:0]} : perf[3];   // {MSR[15:0] at vblank, ext_int, the last frame}
+        6'd28: ov_v <= FB_ON ? fb_mm : perf[7];
+        6'd29: ov_v <= FB_ON ? fb_lo : perf[4];
+        6'd30: ov_v <= FB_ON ? fb_hi : perf[5];
+        6'd31: ov_v <= FB_ON ? {msr_v, xint_v, fb_last[14:0]} : perf[3];   // {MSR[15:0] at vblank, ext_int, the last frame}
         // row 8: the first exception entry: vector, SRR0, SRR1, MSR after entry
-        6'd32: ov_v <= ex_vec;
-        6'd33: ov_v <= ex_srr0;
-        6'd34: ov_v <= ex_srr1;
-        6'd35: ov_v <= ex_msr;
+        6'd32: ov_v <= XC_ON ? ex_vec : 32'd0;
+        6'd33: ov_v <= XC_ON ? ex_srr0 : 32'd0;
+        6'd34: ov_v <= XC_ON ? ex_srr1 : 32'd0;
+        6'd35: ov_v <= XC_ON ? ex_msr : 32'd0;
         // row 9: its record's PC and instruction; the boot ROM's fatal handler:
         // the PC before FFF00000 (the vector it came from), SRR0 then
-        6'd36: ov_v <= ex_pc;
-        6'd37: ov_v <= ex_ins;
-        6'd38: ov_v <= fx_vec;
-        6'd39: ov_v <= fx_srr0;
+        6'd36: ov_v <= XC_ON ? ex_pc : 32'd0;
+        6'd37: ov_v <= XC_ON ? ex_ins : 32'd0;
+        6'd38: ov_v <= XC_ON ? fx_vec : 32'd0;
+        6'd39: ov_v <= XC_ON ? fx_srr0 : 32'd0;
         // row 10: the entry before the most recent one (frozen at the fatal
         // handler: the last entry before the fatal one): vector, SRR0, SRR1, instruction
-        6'd40: ov_v <= lp_vec;
-        6'd41: ov_v <= lp_srr0;
-        6'd42: ov_v <= lp_srr1;
-        6'd43: ov_v <= lp_ins;
+        6'd40: ov_v <= XC_ON ? lp_vec : 32'd0;
+        6'd41: ov_v <= XC_ON ? lp_srr0 : 32'd0;
+        6'd42: ov_v <= XC_ON ? lp_srr1 : 32'd0;
+        6'd43: ov_v <= XC_ON ? lp_ins : 32'd0;
         // row 11: entries counted; the last DAR and DSISR read by mfspr; the most recent entry's vector
-        6'd44: ov_v <= xn_cnt;
-        6'd45: ov_v <= x_dar;
-        6'd46: ov_v <= x_dsisr;
-        6'd47: ov_v <= lc_vec;
+        6'd44: ov_v <= XC_ON ? xn_cnt : 32'd0;
+        6'd45: ov_v <= XC_ON ? x_dar : 32'd0;
+        6'd46: ov_v <= XC_ON ? x_dsisr : 32'd0;
+        6'd47: ov_v <= XC_ON ? lc_vec : 32'd0;
         default: ov_v <= 32'h3B00_0001;   // stage B, build 1
       endcase
     end

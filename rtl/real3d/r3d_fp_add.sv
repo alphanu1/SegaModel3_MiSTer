@@ -55,7 +55,13 @@ module r3d_fp_add #(
   // 26 bits are the bits shifted out (sticky). Normalise (SUBNORM = 0 only):
   // s1_sum[26:0] x 2^(lzc - 1), the power formed as the lowest set bit of
   // s1_sum bit-reversed. Same results; 0 keeps the shifters.
-  parameter bit DSP_SHIFT = 1'b0
+  parameter bit DSP_SHIFT = 1'b0,
+  // NORM_B (Model 3 study R109; SUBNORM = 0 and DSP_SHIFT = 0 only): the normalise shift split across
+  // B and C. B shifts the sum left by whole bytes (0, 8, 16, 24: as many as its leading zero bits allow)
+  // and takes the bytes off the exponent; C counts the last zero bits (0 to 7) in the top byte and
+  // shifts by those. Same results, same latency; C was the leading-zero count and a 28-bit shift by a
+  // 5-bit amount in one stage.
+  parameter bit NORM_B = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst_n,
@@ -269,6 +275,23 @@ module r3d_fp_add #(
   logic [27:0] s1_sum;
   logic        s1_sticky;
   logic        s1_exact_cancel;
+  localparam bit NB = NORM_B && !SUBNORM && !DSP_SHIFT;
+  // NORM_B: the byte shift (a carry into bit 27 is left to C)
+  logic [27:0] sum_b;
+  logic [1:0]  nb_c;                       // bytes shifted
+  always_comb begin
+    nb_c = 2'd0;
+    if (!sum_raw[27]) begin
+      if (sum_raw[26:3] == 24'd0) nb_c = 2'd3;
+      else if (sum_raw[26:11] == 16'd0) nb_c = 2'd2;
+      else if (sum_raw[26:19] == 8'd0) nb_c = 2'd1;
+    end
+    sum_b = sum_raw << {nb_c, 3'd0};
+  end
+  // B's bytes, for C's exponent (taken off there, beside C's count: in B the select after the sum's zero
+  // tests was the stage's slowest path). A zero sum's exponent differs from the unsplit form's, but a
+  // zero sum packs as zero before the exponent is looked at.
+  logic [1:0]  s1_c;
 
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -277,7 +300,8 @@ module r3d_fp_add #(
       s1_valid        <= sA_valid;
       s1_sign         <= sA_sign;
       s1_exp          <= sA_exp;
-      s1_sum          <= sum_raw;
+      s1_sum          <= NB ? sum_b : sum_raw;
+      s1_c            <= nb_c;
       s1_sticky       <= sA_sticky;
       s1_invalid      <= sA_invalid;
       s1_nan          <= sA_nan;
@@ -304,6 +328,13 @@ module r3d_fp_add #(
     lzc = 5'd27;
     for (int i = 0; i < 27; i++)
       if (s1_sum[i]) lzc = 5'(27 - i);
+  end
+  // NORM_B: C's own count, 1 to 8 (the leading one is in the top byte, or the sum is 0: 1)
+  logic [4:0] lzf;
+  always_comb begin
+    lzf = 5'd1;
+    for (int i = 19; i < 27; i++)
+      if (s1_sum[i]) lzf = 5'(27 - i);
   end
 
   // DSP_SHIFT: 2^(lzc - 1) is the lowest set bit of s1_sum[26:0] reversed
@@ -335,9 +366,11 @@ module r3d_fp_add #(
       exp_adj  = $signed({2'b00, s1_exp}) - $signed({5'd0, lzc}) + 10'sd1;
     end else begin
       // lzc == 1 means the leading one already sits at bit 26.
-      shifted  = s1_sum << (lzc - 5'd1);
+      // (NORM_B: B has shifted by its bytes; a zero sum shifts by nothing more, as it is zero)
+      shifted  = NB ? (s1_sum << (lzf - 5'd1)) : (s1_sum << (lzc - 5'd1));
       lost_bit = 1'b0;
-      exp_adj  = $signed({2'b00, s1_exp}) - $signed({5'd0, lzc}) + 10'sd1;
+      exp_adj  = NB ? $signed({2'b00, s1_exp}) - $signed({5'd0, s1_c, 3'd0}) - $signed({5'd0, lzf}) + 10'sd1
+                    : $signed({2'b00, s1_exp}) - $signed({5'd0, lzc}) + 10'sd1;
     end
   end
 

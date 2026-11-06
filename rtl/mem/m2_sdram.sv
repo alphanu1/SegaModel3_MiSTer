@@ -157,7 +157,32 @@ module m2_sdram #(
   // words and presents the one wb_col names. The address must not cross a row
   // (two columns: 32-bit aligned; eight: 16-byte aligned). Default none: the
   // controller exactly as it was.
-  parameter logic [NP-1:0] WB        = '0
+  parameter logic [NP-1:0] WB        = '0,
+  // BANK HASH (Model 3, study R107). With BXOR the bank bits of every address are XORed with two
+  // row bits (the byte address's bits 13:12 on the module's 10-column rows) as the request is
+  // latched, the write port's too, so each region is spread over the four banks of its chip and
+  // a line and its cast-out victim (same index bits 11:5) usually fall in different banks. It is
+  // a permutation of the device's words, the same for every port, so the memory reads back as
+  // written; only a model that pokes the device's array directly must apply it too (the bench's
+  // sdram_dev, bxor). Needs ROW_BITS >= 3. 0: the controller exactly as it was.
+  parameter bit            BXOR      = 1'b0,
+  // SIXTEEN-COLUMN LINE READS (Model 3, study R107). A port set in L16 (and in WB) reads sixteen
+  // columns on p_long instead of eight, from one dispatch, wrapping inside its 16-column line from
+  // the address given (rd_wrap): four-word groups arrive on p_lo three times, the last with p_ack.
+  // Default none: the controller exactly as it was.
+  parameter logic [NP-1:0] L16       = '0,
+  // PAIRS (Model 3, study R107): a port in PAIR (and in L16 and WB) gets its sixteen-column read two
+  // words at a time, on p_lo seven times and the last pair with p_ack, each pair in p_dout[31:0] as
+  // soon as its second word is in, so the first 32-bit word arrives two clocks sooner. Default none.
+  parameter logic [NP-1:0] PAIR      = '0,
+  // FAST DISPATCH (Model 3, study R112): port 0's read goes from its request straight to S_DISPATCH, in the
+  // clock the request rises, when the controller is empty (S_IDLE, no port pending, nothing selected or
+  // handed off, no refresh or loader write waiting). It is the transaction the arbiter would grant two
+  // clocks later; nothing else is waiting, so no other port is passed. 0: the controller exactly as it was.
+  parameter bit            FDSP      = 1'b0,
+  // READ FROM DISPATCH (Model 3, study R112): a read whose row is open issues its first READ from
+  // S_DISPATCH instead of a clock later from S_RD. 0: the controller exactly as it was.
+  parameter bit            HITRD     = 1'b0
 ) (
   input  logic                 clk,
   input  logic                 rst_n,
@@ -483,6 +508,12 @@ module m2_sdram #(
   logic [15:0]          wr_din_p;
   logic [1:0]           wr_be_p;
 
+  // R107: the bank hash (BXOR above): bank ^= row[2:1]
+  function automatic logic [AW:1] bhash(input logic [AW:1] a);
+    bhash = a;
+    if (BXOR) bhash[AW-CHB:AW-CHB-1] = a[AW-CHB:AW-CHB-1] ^ a[COL_BITS+3:COL_BITS+2];
+  endfunction
+
   logic [NP-1:0] req_d, ack_d;
   logic          wr_req_d, wr_ack_d;
 
@@ -510,7 +541,7 @@ module m2_sdram #(
       for (i = 0; i < NP; i = i + 1) begin
         if (p_req[i] && !req_d[i]) begin
           pend[i]   <= 1'b1;
-          addr_p[i] <= p_addr[i];
+          addr_p[i] <= bhash(p_addr[i]);   // R107 (BXOR)
           din_p[i]  <= p_din[i];
           be_p[i]   <= p_be[i];
           we_p[i]   <= p_we[i];
@@ -519,7 +550,7 @@ module m2_sdram #(
       end
       if (wr_req && !wr_req_d) begin
         wr_pend   <= 1'b1;
-        wr_addr_p <= wr_addr;
+        wr_addr_p <= bhash(wr_addr);       // R107 (BXOR)
         wr_din_p  <= wr_din;
         wr_be_p   <= wr_be;
       end
@@ -773,6 +804,7 @@ module m2_sdram #(
   // to the low four bits. Every other read walks the row as before (they start eight-aligned, where
   // the two are the same).
   logic                    nxt_wrap, rd_wrap;
+  logic                    nxt_pair, rd_pair;   // R107: a PAIR port's sixteen-column read
   logic                    nxt_is_write;
   // HOW LONG THE DEDICATED WRITE PORT HAS BEEN WAITING. See the prefetch
   // block: it buys the write a bounded wait without handing it the bus.
@@ -891,6 +923,7 @@ module m2_sdram #(
   logic [63:0]              dl_data;
   logic                     dl_lo;      // R787: the stage holds an eight-word read's first half
   logic [RD_LAT-1:0]        tag_last;
+  logic [RD_LAT-1:0]        tag_pr;     // R107: the word belongs to a PAIR read
   // ONE SET OF CAPTURE SLOTS, NOT ONE PER PORT, because two ports' words can
   // never interleave in this pipeline and the per-port index was costing both
   // area and the third-worst path on clk_mem.
@@ -1009,6 +1042,11 @@ module m2_sdram #(
   // pipeline for the same DQ reason as wr_ready.
   wire pf_take  = nxt_valid && !ref_pend && !(nxt_is_write && pipe_busy);
 
+  // FDSP (R112): port 0's read, taken from its request in the clock it rises, when nothing else is in the
+  // controller (pend and the handoff empty; S_IDLE's earlier branches, refresh and the loader's write, idle)
+  wire fd_go    = FDSP && (state == S_IDLE) && p_req[0] && !req_d[0] && !p_we[0] && (pend == '0) &&
+                  !nxt_valid && !pf_sel && !ref_pend && !wr_pend;
+
   // THE TEN-WAY MUX, NAMED ONCE. Both readers -- the prefetch register and
   // the S_IDLE bypass -- use these wires and never index the arrays
   // themselves, so the synthesiser cannot build a second copy of the mux that
@@ -1060,7 +1098,7 @@ module m2_sdram #(
       bank_open <= '0;
       for (int b = 0; b < NB; b++) begin bank_row[b] <= '0; ras_cnt[b] <= '0; end
       ras_ok <= '1; rd_ok <= '1;       // R410: idle out of reset
-      tag_v <= '0; tag_p <= '0; tag_w <= '0; tag_last <= '0; cap <= '0;
+      tag_v <= '0; tag_p <= '0; tag_w <= '0; tag_last <= '0; tag_pr <= '0; cap <= '0;
       ack_cnt <= '0; wack_cnt <= '0; inflight <= '0; wr_inflight <= 1'b0;
       for (int b = 0; b < NB; b++) rd_bank_cnt[b] <= '0;
       p_ack <= '0; wr_ack <= 1'b0; p_dout <= '0;
@@ -1159,6 +1197,7 @@ module m2_sdram #(
         tag_p    <= {PW'(0), tag_p[RD_LAT-1:1]};
         tag_w    <= {3'd0, tag_w[RD_LAT-1:1]};
         tag_last <= {1'b0, tag_last[RD_LAT-1:1]};
+        tag_pr   <= {1'b0, tag_pr[RD_LAT-1:1]};
         if (tag_v[0]) begin
           cap[tag_w[0][1:0]] <= dq_r;   // R807: explicit [1:0]; Quartus drops out-of-range writes (words 4-6 of an 8-word burst)
           if (tag_last[0]) begin
@@ -1188,7 +1227,8 @@ module m2_sdram #(
             // R787: index 7 ends an eight-word read; its low two bits are 3,
             // so it takes the four-word arm with words 4-7 (cap is indexed by
             // the low two bits, and words 4-6 land where 0-2 were).
-            case (tag_w[0][1:0])
+            if (tag_pr[0]) dl_data <= {32'd0, dq_r, cap[{tag_w[0][1], 1'b0}]};   // R107: a pair read's last pair
+            else case (tag_w[0][1:0])
               2'd0:    dl_data <= {48'd0, dq_r};
               2'd1:    dl_data <= {32'd0, dq_r, cap[0]};
               default: dl_data <= {dq_r, cap[2], cap[1], cap[0]};
@@ -1196,13 +1236,13 @@ module m2_sdram #(
             dl_p  <= tag_p[0];
             dl_v  <= 1'b1;
             dl_lo <= 1'b0;
-          end else if (tag_w[0] == 3'd3) begin
+          end else if (tag_pr[0] ? tag_w[0][0] : (tag_w[0][1:0] == 2'd3)) begin   // R107: every fourth word of a long read (8 or 16), every second of a pair read
             // R787: WORD 3 OF AN EIGHT-WORD READ (a four-word read's word 3 is
             // its last). Words 0-3 go to the stage now, before words 4-6
             // overwrite cap[0..2]; the stage is free -- the previous burst's
             // last word was at least S_IDLE..S_RD ago -- and the second half
             // reaches it four cycles from now.
-            dl_data <= {dq_r, cap[2], cap[1], cap[0]};
+            dl_data <= tag_pr[0] ? {32'd0, dq_r, cap[{tag_w[0][1], 1'b0}]} : {dq_r, cap[2], cap[1], cap[0]};
             dl_p    <= tag_p[0];
             dl_v    <= 1'b1;
             dl_lo   <= 1'b1;
@@ -1248,8 +1288,9 @@ module m2_sdram #(
           nxt_grant          <= rr_grant;
           nxt_is_write       <= we_gr;                                              // R959
           nxt_total          <= we_gr ? ((|(arb_sel & WB)) ? (long_gr ? 4'd8 : 4'd2) : 4'd1)   // WB: write bursts
-                                      : long_gr ? 4'd8 : blen_gr;   // R787 (R959: blen_gr)
+                                      : long_gr ? ((|(arb_sel & WB & L16)) ? 4'd0 : 4'd8) : blen_gr;   // R787 (R959: blen_gr); R107: 0 is sixteen
           nxt_wrap           <= !we_gr && long_gr && (|(arb_sel & WB));                    // R104
+          nxt_pair           <= !we_gr && long_gr && (|(arb_sel & WB & L16 & PAIR));       // R107
           for (int g = 0; g < NP; g++) if (arb_sel[g]) inflight[g] <= 1'b1;   // R959: inflight[rr_grant]
           // R574: a priority grant leaves the rotation where it was, so the
           // other ports keep their order; it counts toward the cap only while
@@ -1293,6 +1334,7 @@ module m2_sdram #(
               is_write    <= 1'b1;
               rd_total    <= 4'd1;
               rd_wrap     <= 1'b0;
+              rd_pair     <= 1'b0;
               rd_issued   <= '0;
               rd_captured <= '0;
               state       <= S_SEL;
@@ -1308,6 +1350,7 @@ module m2_sdram #(
               is_write    <= nxt_is_write;
               rd_total    <= nxt_total;
               rd_wrap     <= nxt_wrap;
+              rd_pair     <= nxt_pair;
               xfer_addr   <= nxt_addr;
               din_r       <= nxt_din;
               be_r        <= nxt_be;
@@ -1339,6 +1382,7 @@ module m2_sdram #(
               is_write    <= nxt_is_write;
               rd_total    <= nxt_total;
               rd_wrap     <= nxt_wrap;
+              rd_pair     <= nxt_pair;
               xfer_addr   <= pf_addr;
               din_r       <= pf_din;
               be_r        <= pf_be;
@@ -1346,6 +1390,25 @@ module m2_sdram #(
               rd_captured <= '0;
               nxt_valid   <= 1'b0;
               state       <= S_DISPATCH;
+            end else if (FDSP) begin
+              // R112 (FDSP): nothing else starts in this clock, so the fields of a port-0 read are loaded from
+              // its request whether or not it rises (none of them is read in S_IDLE); only the state and the
+              // grant's bookkeeping wait on fd_go, so the request is not in front of the address registers
+              grant       <= '0;
+              grant_is_wr <= 1'b0;
+              is_write    <= 1'b0;
+              rd_total    <= p_long[0] ? ((WB[0] && L16[0]) ? 4'd0 : 4'd8) : blen(0);
+              rd_wrap     <= p_long[0] && WB[0];
+              rd_pair     <= p_long[0] && WB[0] && L16[0] && PAIR[0];
+              xfer_addr   <= bhash(p_addr[0]);
+              rd_issued   <= '0;
+              rd_captured <= '0;
+              if (fd_go) begin
+                inflight[0] <= 1'b1;
+                pri_run     <= '0;
+                if (!PRI[0]) rr_mask <= {{(NP-1){1'b1}}, 1'b0};   // as a round-robin grant of port 0
+                state       <= S_DISPATCH;
+              end
             end
           end
 
@@ -1393,7 +1456,32 @@ module m2_sdram #(
             // went out before S_IDLE), and a chip keeps driving a read burst
             // already in flight when it is deselected.
             cs_sel   <= tbank[BW-1];
-            if (row_hit)                state <= is_write ? S_WR : S_RD;
+            if (HITRD) begin
+              // R112: the READ's address and its tag's fields whatever the row (a NOP ignores them, and the
+              // tag is valid only with tag_v: nothing else is at cap_depth - 1 in S_DISPATCH), so only the
+              // command, tag_v and the counters wait on the row compare
+              sd_ba      <= tba;
+              sd_a       <= col_a(xfer_addr);
+              tag_p[cap_depth-1]    <= PW'(grant);
+              tag_w[cap_depth-1]    <= 3'd0;
+              tag_last[cap_depth-1] <= (rd_total == 4'd1);
+              tag_pr[cap_depth-1]   <= rd_pair;
+            end
+            if (row_hit && HITRD && !is_write) begin
+              // R112: the first READ now (S_RD's first column: rd_issued is 0 here)
+              cmd        <= C_READ;
+              tag_v[cap_depth-1]    <= 1'b1;
+              rd_bank_cnt[tbank]    <= cap_depth;
+              rd_ok[tbank]          <= 1'b0;
+              rd_issued  <= 4'd1;
+              if (rd_total == 4'd1) state <= S_IDLE;
+              else begin
+                state <= S_RD;
+                if (rd_wrap) xfer_addr[4:1] <= xfer_addr[4:1] + 1'b1;
+                else         xfer_addr[COL_BITS:1] <= xfer_addr[COL_BITS:1] + 1'b1;
+              end
+            end
+            else if (row_hit)           state <= is_write ? S_WR : S_RD;
             else if (!bank_open[tbank]) state <= S_ACT;
             else                        state <= S_MISS;
           end
@@ -1482,7 +1570,7 @@ module m2_sdram #(
             sd_dq_o  <= din_r;
             sd_dq_oe <= 1'b1;
             sd_dqm   <= ~be_r;
-            if (rd_issued + 1'b1 == rd_total) begin
+            if (4'(rd_issued + 4'd1) == rd_total) begin   // (rd_total 0: sixteen, R107)
               // Hold past tWR and tRAS before anything can precharge this row.
               // The row is left open on purpose: a download write stream is
               // sequential and the next word usually hits the same row.
@@ -1534,11 +1622,12 @@ module m2_sdram #(
             // assignment that did the truncating.
             tag_p[cap_depth-1]    <= PW'(grant);
             tag_w[cap_depth-1]    <= rd_issued[2:0];   // R787: three bits
-            tag_last[cap_depth-1] <= (rd_issued + 1'b1 == rd_total);
+            tag_last[cap_depth-1] <= (4'(rd_issued + 4'd1) == rd_total);
+            tag_pr[cap_depth-1]   <= rd_pair;
             rd_bank_cnt[tbank]    <= cap_depth;
             rd_ok[tbank]          <= 1'b0;   // R410
             rd_issued  <= rd_issued + 1'b1;
-            if (rd_issued + 1'b1 == rd_total) begin
+            if (4'(rd_issued + 4'd1) == rd_total) begin   // (rd_total 0: sixteen, R107)
               // R387: STRAIGHT INTO THE NEXT TRANSACTION, NOT BACK TO
               // ARBITRATION. The row stays open, the data still in flight is
               // the tag pipeline's problem, and the front stage has already

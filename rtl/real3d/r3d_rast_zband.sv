@@ -159,6 +159,7 @@ module r3d_rast_zband #(
 
   // ---- the scoreboard ----------------------------------------------------------
   logic [6:0] sb_n  [8];
+  logic [7:0] sb_nz;          // sb_n[r] != 0, as registers (study R109)
   // P: a passing contour pair on its way into the FIFO and the scoreboard
   logic        p_v;
   logic [TW-1:0] p_tag;
@@ -182,14 +183,47 @@ module r3d_rast_zband #(
   wire adv      = out_free && !(vport && c_v);
 
   wire [2:0] a_row = a_y[2:0];
-  wire [8:0] a_xh  = a_x + {8'd0, a_on[1]};
-  wire       sb_hit = (sb_n[a_row] != 7'd0) && !(a_xh < sb_lo[a_row] || a_x > sb_hi[a_row]);
-  wire       ctr_bc = (b_v && b_zk == 2'd2 && b_tag != a_tag) || (c_v && c_zk == 2'd2 && c_tag != a_tag) ||
-                      (p_v && p_tag != a_tag);
+  // the scoreboard test's row as a one-hot and A's last x, registered as A loads (study R109): the add
+  // and the row's decode were in front of the compares, and the test is in a_go
+  logic [7:0] a_r1;
+  logic [8:0] a_xh;
+  // each row's test side by side, the row chosen last (the select before the compares was the z band's
+  // slowest path once the add and decode had gone)
+  logic [7:0] sbr;
+  always_comb for (int r = 0; r < 8; r++) sbr[r] = sb_nz[r] && !(a_xh < sb_lo[r] || a_x > sb_hi[r]);
+  wire       sb_hit = |(a_r1 & sbr);
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst) for (int r = 0; r < 8; r++) if (sb_nz[r] != (sb_n[r] != 7'd0)) $fatal(1, "zband: sb_nz");
+`endif
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && a_v && sb_hit != ((sb_n[a_row] != 7'd0) && !(a_x + {8'd0, a_on[1]} < sb_lo[a_row] || a_x > sb_hi[a_row])))
+      $fatal(1, "zband: the scoreboard test registered");
+`endif
+  // A's tag against B's, C's and P's, kept as three registered flags (study R109): the 8-bit compares
+  // were in front of a_go, and a_go fans out into every A, B, C and O enable. Each flag is the compare of
+  // the registers as they will stand, from the compares of the incoming tag (s_tag) against A, B and C
+  // and the flags themselves, chosen by the load and advance.
+  logic      eq_ab, eq_ac, eq_ap;
+  wire       ctr_bc = (b_v && b_zk == 2'd2 && !eq_ab) || (c_v && c_zk == 2'd2 && !eq_ac) || (p_v && !eq_ap);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && a_v && ctr_bc != ((b_v && b_zk == 2'd2 && b_tag != a_tag) || (c_v && c_zk == 2'd2 && c_tag != a_tag) ||
+                                  (p_v && p_tag != a_tag)))
+      $fatal(1, "zband: the tag flags");
+`endif
   wire       pf_full = (a_zk == 2'd2) && (pf_n > (CA+1)'(CD - 4));
   wire       a_gen_wait = a_new && (b_v || c_v || !gen_ok);
   wire       a_go   = a_v && adv && !sw_on && !sb_hit && !ctr_bc && !pf_full && !a_gen_wait;
   assign s_ready = !a_v || a_go;
+  wire       a_ld = s_valid && s_ready;
+  wire       sa = s_tag == a_tag, sb = s_tag == b_tag, sc = s_tag == c_tag;
+  always_ff @(posedge clk) begin
+    // B takes A's tag on a_go, C B's on adv, P C's every cycle
+    eq_ab <= a_ld ? (a_go ? sa : sb) : (a_go || eq_ab);
+    eq_ac <= a_ld ? (adv ? sb : sc) : (adv ? eq_ab : eq_ac);
+    eq_ap <= a_ld ? sc : eq_ac;
+  end
 
   // bank mapping: bank 0 holds the even pixel
   /* verilator lint_off UNUSEDSIGNAL */
@@ -232,8 +266,19 @@ module r3d_rast_zband #(
     if (!rst && c_v && {cz_b0, cz_b1, con_b0, con_b1} != {cx0 ? c_z1 : c_z0, cx0 ? c_z0 : c_z1, cx0 ? c_on[1] : c_on[0], cx0 ? c_on[0] : c_on[1]})
       $fatal(1, "zband: the lane select registered");
 `endif
-  wire        n0 = OOW ? (cz_b0 >= r0) : (cz_b0 <= r0);
-  wire        n1 = OOW ? (cz_b1 >= r1) : (cz_b1 <= r1);
+  // the compare against each source side by side, chosen as r0 / r1 are (study R109: the forward's
+  // select ran into the 24-bit compare and on into the block RAM's write enable)
+  function automatic logic zcmp(input logic [23:0] a, input logic [23:0] b);
+    zcmp = OOW ? (a >= b) : (a <= b);
+  endfunction
+  wire        n0 = (w1v0 && c_m10) ? zcmp(cz_b0, w1d0) : (w2v0 && c_m20) ? zcmp(cz_b0, w2d0) :
+                   c_qv0 ? zcmp(cz_b0, c_q0) : zcmp(cz_b0, ZCLR);
+  wire        n1 = (w1v1 && c_m11) ? zcmp(cz_b1, w1d1) : (w2v1 && c_m21) ? zcmp(cz_b1, w2d1) :
+                   c_qv1 ? zcmp(cz_b1, c_q1) : zcmp(cz_b1, ZCLR);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && c_v && {n0, n1} != {zcmp(cz_b0, r0), zcmp(cz_b1, r1)}) $fatal(1, "zband: the compares side by side");
+`endif
   wire        pb0 = c_v && con_b0 && n0;
   wire        pb1 = c_v && con_b1 && n1;
   wire [1:0]  c_pass = cx0 ? {pb0, pb1} : {pb1, pb0};
@@ -272,6 +317,7 @@ module r3d_rast_zband #(
       pf_wp <= '0; pf_rp <= '0; pf_n <= '0; pf_lane <= 1'b0;
       v_full <= 1'b0; p_v <= 1'b0;
       for (int r = 0; r < 8; r++) sb_n[r] <= 7'd0;
+      sb_nz <= '0;
     end else begin
       // the generation's first pair holds in A (a_gen_wait) until this is done
       // A
@@ -280,6 +326,7 @@ module r3d_rast_zband #(
         a_y <= s_y; a_x <= s_x; a_on <= s_on; a_zk <= s_zk;
         a_z0 <= s_z0; a_z1 <= s_z1; a_p0 <= s_p0; a_p1 <= s_p1; a_tag <= s_tag;
         a_stip <= s_stip; a_pinv <= s_pinv; a_tr <= s_trans;
+        a_r1 <= 8'(1) << s_y[2:0]; a_xh <= s_x + {8'd0, s_on[1]};
         gen_ok <= 1'b0;
       end else if (a_go) a_v <= 1'b0;
       // the generation step: drain, sweep, step
@@ -353,6 +400,7 @@ module r3d_rast_zband #(
         end
         if (sb_dec && v_row == 3'(r)) n = n - 7'd1;
         sb_n[r] <= n;
+        sb_nz[r] <= n != 7'd0;
       end
     end
   end

@@ -55,7 +55,12 @@ module ppc_fpu_div
   parameter int TAGW  = 6,
   // frsqrte here (1), or not built (0: ppc_fpu_fast runs it as a pipelined
   // estimate, ppc_fpu_rsqe, study D-22)
-  parameter bit RSQRT = 1'b1
+  parameter bit RSQRT = 1'b1,
+  // R4 = 1: the divide two quotient bits a cycle on three subtractors (2B, 4B,
+  // 6B). 0 (study R100): one bit a cycle on one, the same restoring digits
+  // (a radix-4 digit is two radix-2 steps), twice the cycles: fdiv 28 -> 56,
+  // fdivs and fres 14 -> 28
+  parameter bit R4    = 1'b0
 ) (
   input  logic            clk,
   input  logic            rst,
@@ -176,7 +181,8 @@ module ppc_fpu_div
   wire [59:0] rq  = {rs[57:0], bx[53:52]};
   wire [59:0] tq  = {2'b00, q, 2'b01};
 
-  wire [60:0] u1 = r_sqrt ? ({1'b0, rq} - {1'b0, tq}) : ({1'b0, r4} - {1'b0, dv1});
+  wire [59:0] r2  = {rs[58:0], 1'b0};                 // radix 2: 2R against 2B
+  wire [60:0] u1 = r_sqrt ? ({1'b0, rq} - {1'b0, tq}) : ({1'b0, R4 ? r4 : r2} - {1'b0, dv1});
   wire [60:0] u2 = {1'b0, r4} - {1'b0, dv2};
   wire [60:0] u3 = {1'b0, r4} - {1'b0, dv3};
   wire ge1 = ~u1[60], ge2 = ~u2[60], ge3 = ~u3[60];
@@ -187,6 +193,9 @@ module ppc_fpu_div
     if (r_sqrt) begin
       dig   = {1'b0, ge1};
       rnext = ge1 ? u1[59:0] : rq;
+    end else if (!R4) begin
+      dig   = {1'b0, ge1};
+      rnext = ge1 ? u1[59:0] : r2;
     end else if (ge3) begin dig = 2'd3; rnext = u3[59:0]; end
     else if (ge2)     begin dig = 2'd2; rnext = u2[59:0]; end
     else if (ge1)     begin dig = 2'd1; rnext = u1[59:0]; end
@@ -195,7 +204,7 @@ module ppc_fpu_div
 
   // last count: 28 bits (single) or 56, two a cycle dividing; 55 root steps
   // after the first, made when the recurrence is loaded
-  wire [5:0] n_iter = r_sqrt ? 6'd55 : (r_sgl ? 6'd13 : 6'd27);
+  wire [5:0] n_iter = r_sqrt ? 6'd55 : !R4 ? (r_sgl ? 6'd27 : 6'd55) : (r_sgl ? 6'd13 : 6'd27);
 
   // frsqrte: the root rounded to double in the current RN (always positive)
   wire        g_rt   = q[2];
@@ -295,6 +304,8 @@ module ppc_fpu_div
           if (r_sqrt) begin
             q  <= {q[54:0], dig[0]};
             bx <= {bx[51:0], 2'd0};
+          end else if (!R4) begin
+            q  <= {q[54:0], dig[0]};
           end else begin
             q  <= {q[53:0], dig};
           end

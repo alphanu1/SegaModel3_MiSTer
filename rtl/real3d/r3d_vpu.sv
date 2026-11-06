@@ -371,7 +371,7 @@ module r3d_vpu
       .out_valid(pv), .result(prod), .overflow(), .underflow(p_unf), .invalid());
     logic [31:0] sum;
     logic        sv;
-    r3d_fp_add #(.SUBNORM(SUBNORM), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP)) u_add (
+    r3d_fp_add #(.SUBNORM(SUBNORM), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP), .NORM_B(1'b1)) u_add (
       .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(c_d[4]), .sub(1'b0),
       .out_valid(sv), .result(sum), .overflow(), .underflow(s_unf), .invalid());
 

@@ -8,6 +8,8 @@
 // 53C810, I/O and JTAG sides and the video line events driven by the C++.
 module m3_bus_tb
   import ppc_cache_pkg::*;
+#(parameter bit L16 = 1'b0, parameter bit BXOR = 1'b0, parameter bit LW1 = 1'b0, parameter bit PAIR = 1'b0, parameter bit RA = 1'b0, parameter bit PW = 1'b0, parameter bit RA_CONF = 1'b0,
+  parameter bit FWD = 1'b0, parameter bit FREQ = 1'b0, parameter bit FDSP = 1'b0, parameter bit HITRD = 1'b0, parameter bit FAST = 1'b0, parameter int PW_DLY = 0, parameter bit R3P = 1'b0)   // m3_sdr_port / m2_sdram (study R107)
 (
   input  logic        clk,
   input  logic        rst_n,
@@ -64,7 +66,11 @@ module m3_bus_tb
   output logic [1:0]  sd_ba,
   output logic [12:0] sd_a,
   output logic [15:0] sd_dq_o,
-  input  logic [15:0] sd_dq_i
+  input  logic [15:0] sd_dq_i,
+  // the Real3D's host port, for the C++ (R112): ready as driven, every strobe seen
+  input  logic        h_rdy_i,
+  output logic        h_go_o, h_we_o,
+  output logic [31:0] h_addr_o, h_wdata_o
 );
   logic        s_req, s_swap, s_zero, s_ack, s_wnext, s_rvalid, s_idle;
   logic [1:0]  s_cmd;
@@ -79,13 +85,14 @@ module m3_bus_tb
   // clock later with FFFFFFFD
   logic        h_go, h_we, h_rv;
   logic [31:0] h_rdata;
-  always_ff @(posedge clk) begin h_rv <= h_go && !h_we; h_rdata <= 32'hFFFF_FFFD; end
+  always_ff @(posedge clk) begin h_rv <= h_go && h_rdy_i && !h_we; h_rdata <= 32'hFFFF_FFFD; end
+  assign h_go_o = h_go; assign h_we_o = h_we;
   logic [3:0]  wb_col;
   logic [15:0] wb_din;
   logic [1:0]  wb_be;
   logic [63:0] p_dout;
 
-  m3_bus #(.AW(26), .MIDI_GAP(500)) u_bus (
+  m3_bus #(.AW(26), .MIDI_GAP(500), .FAST(FAST), .R3P(R3P)) u_bus (
     .clk, .rst,
     .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
     .sn_req, .sn_addr, .sn_inv, .sn_ack,
@@ -97,20 +104,20 @@ module m3_bus_tb
     .ln_start, .ln, .ext_int,
     .irq_state_o, .irq_enable_o(), .crom_bank_o(),
     .n_submit, .n_cull_lo, .n_cull_hi(), .n_poly, .n_tex(), .n_vrom(), .n_unmapped, .last_unmapped(),
-    .pingpong_o(), .pingpong_i(1'b0), .h_go, .h_rdy(1'b1), .h_we, .h_addr(), .h_wdata(), .h_rv, .h_rdata,
+    .pingpong_o(), .pingpong_i(1'b0), .h_go, .h_rdy(h_rdy_i), .h_we, .h_addr(h_addr_o), .h_wdata(h_wdata_o), .h_rv, .h_rdata,
     .r3d_cfg0(), .r3d_cfg1(), .r3d_cfg2(),
     .jt_wr, .jt_wdata, .jt_busy, .jt_tdo, .jt_cfg_we(1'b0), .jt_cfg0('0), .jt_cfg1('0), .jt_cfg2('0),
     .tr_v(), .tr_master(), .tr_we(), .tr_addr(), .tr_be(), .tr_data());
 
-  m3_sdr_port #(.AW(26)) u_port (
-    .clk, .rst(!rst_n),
+  m3_sdr_port #(.AW(26), .L16(L16), .LW1(LW1), .PAIR(PAIR), .RA(RA), .PW(PW), .RA_CONF(RA_CONF), .FWD(FWD), .FREQ(FREQ), .PW_DLY(PW_DLY)) u_port (
+    .clk, .rst(!rst_n), .ra_clr(1'b0),
     .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
     .p_req, .p_we, .p_addr, .p_din, .p_be, .p_long, .p_dout, .p_lo, .p_ack, .wb_col, .wb_din, .wb_be);
 
   logic [1:0] pk, pl;
   logic [1:0][63:0] pd;
   assign p_ack = pk[0]; assign p_lo = pl[0]; assign p_dout = pd[0];
-  m2_sdram #(.COL_BITS(10), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(1'b1), .MASK_ON_A(1'b1), .INIT_NOP(200), .WB(2'b01)) u_sdram (
+  m2_sdram #(.COL_BITS(10), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(1'b1), .MASK_ON_A(1'b1), .INIT_NOP(200), .WB(2'b01), .L16({1'b0, L16}), .BXOR(BXOR), .PAIR({1'b0, PAIR}), .FDSP(FDSP), .HITRD(HITRD)) u_sdram (
     .clk, .rst_n, .ready, .rd_lat_sel(3'd2),
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm(), .sd_dq_o, .sd_dq_oe(), .sd_dq_i,
     .wr_req(1'b0), .wr_addr('0), .wr_din('0), .wr_be('0), .wr_ack(),

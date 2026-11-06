@@ -98,13 +98,23 @@ module r3d_rast_texel #(
         su = (5'd5 + {2'd0, i_tw} >= {1'b0, i_lv}) ? 5'(5'd5 + {2'd0, i_tw} - {1'b0, i_lv}) : 5'd0;
         sv = (5'd5 + {2'd0, i_th} >= {1'b0, i_lv}) ? 5'(5'd5 + {2'd0, i_th} - {1'b0, i_lv}) : 5'd0;
         pw = 13'd1 << su; ph = 13'd1 << sv;
-        um = (i_mu ? {pw[11:0], 1'b0} : pw) - 13'd1;
-        vm = (i_mv ? {ph[11:0], 1'b0} : ph) - 13'd1;
+        // the masks as thermometers of su + mu, sv + mv (= (mu ? 2 pw : pw) - 1), and the neighbour
+        // (a + 1) & m as (x + 1) & m, side by side with a (study R109: the table's word ran through
+        // the side's subtract, the shift, the mask's subtract, the mask and the add in series)
+        for (int k = 0; k < 13; k++) begin
+          um[k] = 5'(k) < su + {4'd0, i_mu};
+          vm[k] = 5'(k) < sv + {4'd0, i_mv};
+        end
         ul = 19'(i_u[27:0] >> i_lv); vl = 19'(i_v[27:0] >> i_lv);
         a = {2'd0, ul[18:8]} & um;
         b = {2'd0, vl[18:8]} & vm;
-        u1a <= a; u1b <= (a + 13'd1) & um;
-        v1a <= b; v1b <= (b + 13'd1) & vm;
+        u1a <= a; u1b <= ({2'd0, ul[18:8]} + 13'd1) & um;
+        v1a <= b; v1b <= ({2'd0, vl[18:8]} + 13'd1) & vm;
+`ifdef VERILATOR
+        if (um != (i_mu ? {pw[11:0], 1'b0} : pw) - 13'd1 || vm != (i_mv ? {ph[11:0], 1'b0} : ph) - 13'd1 ||
+            ((({2'd0, ul[18:8]} + 13'd1) & um) != ((a + 13'd1) & um)) || ((({2'd0, vl[18:8]} + 13'd1) & vm) != ((b + 13'd1) & vm)))
+          $fatal(1, "texel: the masks as thermometers");
+`endif
         pw1 <= pw; ph1 <= ph;
         mu1 <= i_mu; mv1 <= i_mv;
         fu1 <= ul[7:0]; fv1 <= vl[7:0];
@@ -143,6 +153,12 @@ module r3d_rast_texel #(
   function automatic logic [12:0] mir(input logic [12:0] c, input logic [12:0] p);
     mir = (c < p) ? c : 13'((p << 1) - 13'd1 - c);
   endfunction
+  // the same without the compare and the subtract (study R109): p is a power of two and c < 2p (c is
+  // masked to 2p - 1 when mirrored, p - 1 otherwise), so c >= p is c's bit at p, and 2p - 1 - c is then
+  // c with its bits below 2p inverted
+  function automatic logic [12:0] mirx(input logic [12:0] c, input logic [12:0] p);
+    mirx = ((c & p) != 13'd0) ? (c ^ ({p[11:0], 1'b0} - 13'd1)) : c;
+  endfunction
 
   logic          v2;
   logic [TW-1:0] tag2;
@@ -155,10 +171,10 @@ module r3d_rast_texel #(
     if (en) begin
       logic [13:0] ca, cb;
       logic [10:0] ra, rb;
-      ca = {3'd0, x01} + {1'b0, mir(u1a, pw1)};
-      cb = {3'd0, x01} + {1'b0, mir(u1b, pw1)};
-      ra = 11'(y01 + 11'(mir(v1a, ph1)));
-      rb = 11'(y01 + 11'(mir(v1b, ph1)));
+      ca = {3'd0, x01} + {1'b0, mirx(u1a, pw1)};
+      cb = {3'd0, x01} + {1'b0, mirx(u1b, pw1)};
+      ra = 11'(y01 + 11'(mirx(v1a, ph1)));
+      rb = 11'(y01 + 11'(mirx(v1b, ph1)));
       aw[0] <= {ra, 11'd0} + 22'(ca);
       aw[1] <= {ra, 11'd0} + 22'(cb);
       aw[2] <= {rb, 11'd0} + 22'(ca);
@@ -166,6 +182,13 @@ module r3d_rast_texel #(
       fu2 <= fu1; fv2 <= fv1; fmt2 <= fmt1; tag2 <= tag1;
     end
   end
+
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && en && v1 && {mirx(u1a, pw1), mirx(u1b, pw1), mirx(v1a, ph1), mirx(v1b, ph1)} !=
+                            {mir(u1a, pw1), mir(u1b, pw1), mir(v1a, ph1), mir(v1b, ph1)})
+      $fatal(1, "texel: the mirror without the compare");
+`endif
 
   // the port: each bank's address from the first corner that lands in it
   logic [1:0] bk [4];
@@ -236,23 +259,30 @@ module r3d_rast_texel #(
     end
   end
 
-  // ---- 5: the u lerp of both rows ----------------------------------------------------------------
-  logic          v5;
-  logic [TW-1:0] tag5;
+  // ---- 5: the u lerp of both rows: the products (5a), then the adds (5b) ------------------------------
+  // (study R109: a stage more, so the DSP blocks' products are registered before the add; the DSP's
+  // multiply and the 16-bit add were 9.2 ns at -40C. The filter's latency is one cycle longer; its tags
+  // move with it, o_tag_e included.)
+  logic          v5a, v5;
+  logic [TW-1:0] tag5a, tag5;
+  logic signed [17:0] pt5a [4], pb5a [4];
+  logic [7:0]    ct5a [4], cb5a [4];
   logic [15:0]   top5 [4], bot5 [4];
-  logic [7:0]    fv5;
+  logic [7:0]    fv5a, fv5;
   always_ff @(posedge clk) begin
-    if (rst) v5 <= 1'b0;
-    else if (en) v5 <= v4;
+    if (rst) begin v5a <= 1'b0; v5 <= 1'b0; end
+    else if (en) begin v5a <= v4; v5 <= v5a; end
     if (en) begin
       for (int c = 0; c < 4; c++) begin
-        logic signed [17:0] pt, pb;
-        pt = dt4[c] * $signed({1'b0, fu4});
-        pb = db4[c] * $signed({1'b0, fu4});
-        top5[c] <= 16'({c4[0][8 * c +: 8], 8'd0} + 16'(pt));
-        bot5[c] <= 16'({c4[2][8 * c +: 8], 8'd0} + 16'(pb));
+        pt5a[c] <= dt4[c] * $signed({1'b0, fu4});
+        pb5a[c] <= db4[c] * $signed({1'b0, fu4});
+        ct5a[c] <= c4[0][8 * c +: 8];
+        cb5a[c] <= c4[2][8 * c +: 8];
+        top5[c] <= 16'({ct5a[c], 8'd0} + 16'(pt5a[c]));
+        bot5[c] <= 16'({cb5a[c], 8'd0} + 16'(pb5a[c]));
       end
-      fv5 <= fv4; tag5 <= tag4;
+      fv5a <= fv4; tag5a <= tag4;
+      fv5 <= fv5a; tag5 <= tag5a;
     end
   end
 

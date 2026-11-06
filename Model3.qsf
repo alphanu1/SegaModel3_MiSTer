@@ -319,3 +319,6 @@ set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to VGA_EN
 # Step 2 (Daytona 2) bus map and texture-upload port (study R100)
 set_global_assignment -name VERILOG_MACRO "M3_STEP2_BUS=1"
 set_global_assignment -name VERILOG_MACRO "M3_STEP2_TEX=1"
+# Release builds: every debug block off together (m3_system RELEASE: the overlay and its capture, CPI_MON, FBUSY;
+# about 2,400 ALM at 100 MHz, study R105). Test builds leave this commented out.
+#set_global_assignment -name VERILOG_MACRO "M3_RELEASE=1"

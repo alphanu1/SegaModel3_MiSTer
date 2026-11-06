@@ -185,9 +185,23 @@ module r3d_rast_tcache #(
   logic [3:0]    l0_use;
   logic [PW-1:0] l0_pay;
   logic          c_go;
-  assign i_ready = (!l0_v || c_go) && !sweeping;
+  // a skid in front of L0, so i_ready is a register (!sk_v) and not the lookup's c_go: the rasteriser's
+  // front stalls on i_ready, and c_go through it into every front enable was the slowest path at 110 MHz
+  // (study R109). The skid takes a pixel only when L0 is held; L0 takes the skid's first. L0 is loaded on
+  // the same cycles as before (each c_go with a pixel waiting), so the lookup sees the same stream.
+  logic          sk_v;
+  logic [19:0]   sk_a [4];
+  logic [3:0]    sk_use;
+  logic [PW-1:0] sk_pay;
+  logic          sw_nz;                    // = sweeping, as a register
+  assign i_ready = !sk_v && !sw_nz;
+  wire           l0_free = !l0_v || c_go;
   logic [17:0]   l0_ln [4];
   always_comb for (int b = 0; b < 4; b++) l0_ln[b] = line_of(l0_a[b]);
+
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && sw_nz != sweeping) $fatal(1, "tcache: sw_nz");
+`endif
 
   // ---- C: compare -----------------------------------------------------------------------------
   logic          c_v;
@@ -203,16 +217,25 @@ module r3d_rast_tcache #(
   logic [3:0]    c_hit;
   logic [WB-1:0] c_hway [4];
   logic [3:0]    c_mw, c_mq;               // = w_v && set_of(c_ln[b]) == w_set; Wq's alike
+  // the hit per way from the read's entry, W's and Wq's compared side by side and chosen by the
+  // registered set matches (study R109: the rows' two puts were in front of the tag compares)
   always_comb begin
     for (int b = 0; b < 4; b++) begin
+      logic tw, tq;
       crow[b] = trq[b];
       if (c_mq[b]) crow[b] = put(crow[b], wq_way, wq_tg);
       if (c_mw[b]) crow[b] = put(crow[b], w_way, w_tg);
+      tw = w_tg == tag_of(c_ln[b]);
+      tq = wq_tg == tag_of(c_ln[b]);
       c_hit[b] = 1'b0; c_hway[b] = '0;
       for (int w = 0; w < WAYS; w++) begin
         logic [EB-1:0] e;
-        e = crow[b][w * EB +: EB];
-        if (e[EB-1] && e[TB-1:0] == tag_of(c_ln[b])) begin c_hit[b] = 1'b1; c_hway[b] = WB'(w); end
+        logic          m;
+        e = trq[b][w * EB +: EB];
+        m = e[EB-1] && e[TB-1:0] == tag_of(c_ln[b]);
+        if (c_mq[b] && wq_way == WB'(w)) m = tq;
+        if (c_mw[b] && w_way == WB'(w)) m = tw;
+        if (m) begin c_hit[b] = 1'b1; c_hway[b] = WB'(w); end
       end
     end
     // the read: the next pixel's sets when C moves on, else C's own again
@@ -242,6 +265,16 @@ module r3d_rast_tcache #(
   always_comb for (int b = 0; b < 4; b++) way_e[b] = a_ok[b] ? a_way[b] : a_hway[b];
   logic [WB-1:0] rr, vic;
   logic [3:0]    dup;                      // bank on mb's line
+  // each bank's way one-hot and whether it holds one (a_use && (a_ok || a_hit)), kept as registers
+  // beside a_way and a_ok (study R109): the way's select and decode were the front of the victim's path
+  logic [WAYS-1:0] a_wo [4];
+  logic [3:0]      a_qb;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && a_v) for (int b = 0; b < 4; b++)
+      if (a_qb[b] != (a_use[b] && (a_ok[b] || a_hit[b])) || (a_qb[b] && a_wo[b] != WAYS'(1) << way_e[b]))
+        $fatal(1, "tcache: the ways one-hot");
+`endif
   logic [WB-1:0] vic_c [4];                // the victim were bank c the one missing
   always_comb begin
     for (int b = 0; b < 4; b++) dup[b] = |(a_eq[b] & mbh);
@@ -250,14 +283,19 @@ module r3d_rast_tcache #(
       logic [WAYS-1:0] busy;
       busy = '0;
       for (int b = 0; b < 4; b++)
-        for (int w = 0; w < WAYS; w++)
-          if (a_use[b] && (a_ok[b] || a_hit[b]) && a_ss[b][c] && way_e[b] == WB'(w)) busy[w] = 1'b1;
+        if (a_qb[b] && a_ss[b][c]) busy = busy | a_wo[b];
       vic_c[c] = rr;
       for (int k = WAYS - 1; k >= 0; k--) if (!busy[WB'(rr + WB'(k))]) vic_c[c] = WB'(rr + WB'(k));
     end
-    vic = '0;
-    for (int c = 0; c < 4; c++) if (mbh[c]) vic = vic_c[c];
+    vic = vic_c[mb];
   end
+  // a bank on mb's line has mb's set, so its own candidate's victim is mb's (the busy ways are those of
+  // the set): each bank's way is loaded from its own vic_c, not through the select (study R109)
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && a_v && mneed) for (int b = 0; b < 4; b++)
+      if (a_use[b] && !a_ok[b] && dup[b] && vic_c[b] != vic) $fatal(1, "tcache: a bank's own victim");
+`endif
 
   // fill queue {line, slot, allocating pixel}, indexed by the counters
   localparam int QW = 18 + LB + DB + 1;
@@ -278,8 +316,16 @@ module r3d_rast_tcache #(
   // A's rows with W applied: W is this pixel's own last allocation (a pixel arrives
   // only after a cycle without one, so W never holds an older pixel's)
   logic [RW-1:0] a_rowe [4];
+  // whether bank b's set is W's, a register (study R109): W's set is the allocation's (a_set_mb) on the
+  // edge W loads, so the next value is A's own same-set flag a_ss[b][mb], or for a pixel moving into A the
+  // compare of its line's set with a_set_mb. The compare after w_set ran into w_base and A's rows.
+  logic [3:0] a_wm;
   always_comb for (int b = 0; b < 4; b++)
-    a_rowe[b] = (w_v && set_of(a_ln[b]) == w_set) ? put(a_row[b], w_way, w_tg) : a_row[b];
+    a_rowe[b] = (w_v && a_wm[b]) ? put(a_row[b], w_way, w_tg) : a_row[b];
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && a_v && w_v) for (int b = 0; b < 4; b++) if (a_wm[b] != (set_of(a_ln[b]) == w_set)) $fatal(1, "tcache: a_wm");
+`endif
   logic [SB-1:0] a_set_mb;
   logic [TB-1:0] a_tag_mb;
   always_comb begin a_set_mb = set_of(a_ln[mb]); a_tag_mb = tag_of(a_ln[mb]); end
@@ -289,6 +335,7 @@ module r3d_rast_tcache #(
 
   always_ff @(posedge clk) begin
     if (a_done) pf[pix_n[DB-1:0]] <= {alloc_n, a_pay, a_j[3], a_j[2], a_j[1], a_j[0], slot[3], slot[2], slot[1], slot[0]};
+    if (a_done) pfn[pix_n[DB-1:0]] <= alloc_n;
     if (alloc) fq[alloc_n[FB-1:0]] <= {a_ln[mb], a_set_mb, vic, pix_n};
   end
 
@@ -378,9 +425,17 @@ module r3d_rast_tcache #(
   // ---- R: the head, read a cycle ahead into ph --------------------------------------------------
   logic [PFW-1:0] ph;
   logic           ph_v;
-  wire  [NB-1:0]  ph_need = ph[PFW-1 -: NB];
+  // the head's need from an MLAB of its own, read at rd_n as it stands (study R109): from the block
+  // RAM's output (ph) the subtract and r_go ran into the next read address; the MLAB's read is faster
+  // and the next address is chosen between rd_n and rd_n + 1, both registers
+  (* ramstyle = "MLAB, no_rw_check" *) logic [NB-1:0] pfn [D];
+  wire  [NB-1:0]  ph_need = pfn[rd_n[DB-1:0]];
+  logic [DB:0]    rd_n1;                   // rd_n + 1
   wire            out_free = !o_valid || o_ready;
   wire            r_go = ph_v && ($signed(done_n - ph_need) >= 0) && out_free;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && ph_v && ph_need != ph[PFW-1 -: NB]) $fatal(1, "tcache: the need's MLAB");
+`endif
   logic           r_v;
   logic [PW-1:0]  r_pay;
   logic [1:0]     r_j [4];
@@ -388,7 +443,7 @@ module r3d_rast_tcache #(
     dre = r_go;
     for (int b = 0; b < 4; b++) dra[b] = ph[b * LB +: LB];
   end
-  wire [DB:0] ra = rd_n + (r_go ? (DB+1)'(1) : '0);
+  wire [DB:0] ra = r_go ? rd_n1 : rd_n;
   always_ff @(posedge clk) ph <= pf[ra[DB-1:0]];
 
   function automatic logic [15:0] pick(input logic [63:0] w, input logic [1:0] j);
@@ -397,20 +452,30 @@ module r3d_rast_tcache #(
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      l0_v <= 1'b0; c_v <= 1'b0; a_v <= 1'b0; o_valid <= 1'b0; r_v <= 1'b0; ph_v <= 1'b0;
+      l0_v <= 1'b0; c_v <= 1'b0; a_v <= 1'b0; o_valid <= 1'b0; r_v <= 1'b0; ph_v <= 1'b0; sk_v <= 1'b0;
+      sw_nz <= 1'b1;
       w_v <= 1'b0; wq_v <= 1'b0; sw_q <= 1'b0; c_mw <= '0; c_mq <= '0;
-      alloc_n <= '0; iss_n <= '0; done_n <= '0; pix_n <= '0; rd_n <= '0;
+      alloc_n <= '0; iss_n <= '0; done_n <= '0; pix_n <= '0; rd_n <= '0; rd_n1 <= (DB+1)'(1);
       sw_n <= (SB+1)'(SETS); rr <= '0; bb_wp <= '0; bb_rp <= '0; wk <= 2'd0;
     end else begin
-      if (inval && !sweeping) sw_n <= (SB+1)'(SETS);
-      else if (sweeping) sw_n <= sw_n - 1'b1;
+      if (inval && !sweeping) begin sw_n <= (SB+1)'(SETS); sw_nz <= 1'b1; end
+      else if (sweeping) begin sw_n <= sw_n - 1'b1; sw_nz <= sw_n != (SB+1)'(1); end
       sw_q <= sweeping;
-      // L0
-      if (i_valid && i_ready) begin
-        l0_v <= 1'b1;
-        l0_a[0] <= i_a0; l0_a[1] <= i_a1; l0_a[2] <= i_a2; l0_a[3] <= i_a3;
-        l0_use <= i_use; l0_pay <= i_pay;
-      end else if (c_go) l0_v <= 1'b0;
+      // L0 and its skid
+      if (l0_free) begin
+        if (sk_v) begin
+          l0_v <= 1'b1; sk_v <= 1'b0;
+          l0_a <= sk_a; l0_use <= sk_use; l0_pay <= sk_pay;
+        end else if (i_valid && i_ready) begin
+          l0_v <= 1'b1;
+          l0_a[0] <= i_a0; l0_a[1] <= i_a1; l0_a[2] <= i_a2; l0_a[3] <= i_a3;
+          l0_use <= i_use; l0_pay <= i_pay;
+        end else l0_v <= 1'b0;
+      end else if (i_valid && i_ready) begin
+        sk_v <= 1'b1;
+        sk_a[0] <= i_a0; sk_a[1] <= i_a1; sk_a[2] <= i_a2; sk_a[3] <= i_a3;
+        sk_use <= i_use; sk_pay <= i_pay;
+      end
       // C
       if (c_go) begin
         c_v <= l0_v;
@@ -432,15 +497,20 @@ module r3d_rast_tcache #(
           a_way[b] <= '0;
         end
         a_hit <= c_hit; a_ok <= ~c_use; a_use <= c_use; a_pay <= c_pay;
+        a_qb <= c_use & c_hit;
+        for (int b = 0; b < 4; b++) a_wo[b] <= WAYS'(1) << c_hway[b];
       end else if (sweeping) begin
         for (int b = 0; b < 4; b++) a_row[b] <= '0;   // a row read before the upload is not written back
       end else begin
         for (int b = 0; b < 4; b++) a_row[b] <= a_rowe[b];
         if (alloc)                          // banks on the line are done
-          for (int b = 0; b < 4; b++) if (a_use[b] && !a_ok[b] && dup[b]) begin a_ok[b] <= 1'b1; a_way[b] <= vic; end
+          for (int b = 0; b < 4; b++) if (a_use[b] && !a_ok[b] && dup[b]) begin
+            a_ok[b] <= 1'b1; a_way[b] <= vic_c[b]; a_qb[b] <= 1'b1; a_wo[b] <= WAYS'(1) << vic_c[b];
+          end
       end
       // W, Wq
       w_v <= alloc; w_set <= a_set_mb; w_way <= vic; w_tg <= a_tag_mb; w_base <= a_rowe[mb];
+      for (int b = 0; b < 4; b++) a_wm[b] <= a_go ? (set_of(c_ln[b]) == a_set_mb) : a_ss[b][mb];
       wq_v <= w_v && !sweeping; wq_set <= w_set; wq_way <= w_way; wq_tg <= w_tg;
       for (int b = 0; b < 4; b++) begin    // tra is C's set next cycle
         c_mw[b] <= alloc && tra[b] == a_set_mb;
@@ -457,9 +527,9 @@ module r3d_rast_tcache #(
         if (wk == 2'd3) done_n <= done_n + 1'b1;
       end
       // R: the head is valid once written before this edge
-      ph_v <= (pix_n - ra) != '0;
+      ph_v <= r_go ? (pix_n != rd_n1) : (pix_n != rd_n);
       if (r_go) begin
-        rd_n <= rd_n + 1'b1;
+        rd_n <= rd_n1; rd_n1 <= rd_n1 + 1'b1;
         r_pay <= ph[4 * LB + 8 +: PW];
         for (int b = 0; b < 4; b++) r_j[b] <= ph[4 * LB + 2 * b +: 2];
       end

@@ -836,7 +836,8 @@ void r3d_geo::draw_model(uint32_t addr) {
     if (twice) st.d19_copies++;
     for (int copy = twice ? 1 : 0; copy >= 0; copy--)
     for (int i = 2; i < nv; i++) {
-      bool const alpha = (h[6] & 0x1) || ((h[6] & 0x800000) == 0);
+      // texture alpha: h6 bit 0 on Step 1.0; any of bits 2:0 from Step 1.5 (Supermodel's TextureAlpha; Daytona 2's smoke)
+      bool const alpha = ((h[6] & (step >= 0x15 ? 0x7 : 0x1)) != 0) || ((h[6] & 0x800000) == 0);
       uint64_t &cnt = alpha ? tri_a : tri_o;
       if (cnt >= (alpha ? 15000u : 50000u)) { exitrec(off, 5); return; }
       uint32_t const bi = uint32_t(cnt++);

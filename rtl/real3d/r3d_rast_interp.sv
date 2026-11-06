@@ -214,7 +214,7 @@ module r3d_rast_interp #(
   end
 
   localparam int DB = TW + 9 + 9 + 1 + 42 + 42 + 42 + 9 + 10 + 10 + 9 + 6 + 1 + 1 + 1;
-  localparam int DW = DB + (MIP ? 4 : 0);
+  localparam int DW = DB;
   localparam int LAG = 11;
   // the line in M10K (study R98: -110 ALM of MLAB for 6 M10K). Read registered
   // at the address dwp will hold next cycle, less LAG: never the address
@@ -225,7 +225,7 @@ module r3d_rast_interp #(
   logic [DW-1:0] dl_d;
   logic [DW-1:0] dq;
   generate if (MIP) begin : g_dlm
-    assign dl_d = {tag2, x2, y2, tex2, s2, u2, w2, se2, shu2, shv2, eo2, n2, neg2, pos2, v2, lv2};
+    assign dl_d = {tag2, x2, y2, tex2, s2, u2, w2, se2, shu2, shv2, eo2, n2, neg2, pos2, v2};
   end else begin : g_dl
     assign dl_d = {tag2, x2, y2, tex2, s2, u2, w2, se2, shu2, shv2, eo2, n2, neg2, pos2, v2};
   end endgenerate
@@ -233,6 +233,15 @@ module r3d_rast_interp #(
   always_ff @(posedge clk) begin
     if (en) dl[dwp] <= dl_d;
     dq <= dl[dwp_n];
+  end
+  // the level in a line of its own (study R109), written an en later at the entry before: lv2 (the Z
+  // word, the table, the subtract and the clamps) is registered first, not run into the block RAM's
+  // input. Read at the same index as dq, eleven entries behind, so long after its write.
+  (* ramstyle = "MLAB, no_rw_check" *) logic [3:0] dlv [16];
+  logic [3:0] lv2r, lvq;
+  always_ff @(posedge clk) begin
+    if (en) begin lv2r <= MIP ? lv2 : 4'd0; dlv[dwp - 4'd1] <= lv2r; end
+    lvq <= dlv[dwp_n];
   end
   always_ff @(posedge clk) begin
     if (rst) begin dwp <= 4'd0; vsr <= '0; end
@@ -245,6 +254,9 @@ module r3d_rast_interp #(
   logic        [8:0]  x13, y13;
   logic               tex13;
   logic signed [41:0] s13, u13, w13;
+  // |u|, |w|, |s| registered here off the delay line's block RAM (study R109): the negates were in front
+  // of S14's multipliers and of the shade's leading-one search
+  logic        [40:0] au13, aw13, as13;
   logic signed [8:0]  se13, eo13;
   logic signed [9:0]  shu13, shv13;
   logic        [5:0]  n13;
@@ -257,7 +269,14 @@ module r3d_rast_interp #(
     else if (en) v13 <= vsr[10];
     if (en) begin
       {tag13, x13, y13, tex13, s13, u13, w13, se13, shu13, shv13, eo13, n13, neg13, pos13, dv13} <= dq[DW-1 -: DB];
-      lv13 <= MIP ? dq[3:0] : 4'd0;
+      begin
+        logic signed [41:0] ds, du, dw;
+        {ds, du, dw} = dq[DW-1-(TW+9+9+1) -: 126];
+        as13 <= ds[41] ? 41'(-ds) : ds[40:0];
+        au13 <= du[41] ? 41'(-du) : du[40:0];
+        aw13 <= dw[41] ? 41'(-dw) : dw[40:0];
+      end
+      lv13 <= MIP ? lvq : 4'd0;
       r13 <= r12;
     end
   end
@@ -285,18 +304,18 @@ module r3d_rast_interp #(
     if (en) begin
       logic [40:0] au, aw;
       tag14 <= tag13; x14 <= x13; y14 <= y13; tex14 <= tex13;
-      au = u13[41] ? 41'(-u13) : u13[40:0];
-      aw = w13[41] ? 41'(-w13) : w13[40:0];
+      au = au13;
+      aw = aw13;
       pu14 <= 66'(au) * 66'(r13);
       pv14 <= 66'(aw) * 66'(r13);
       su14 <= u13[41] ^ neg13;
       sv14 <= w13[41] ^ neg13;
       zu14 <= !pos13 && !neg13;
       shu14 <= shu13; shv14 <= shv13;
-      sa14 <= s13[41] ? 41'(-s13) : s13[40:0];
+      sa14 <= as13;
       ss14 <= s13[41];
       sz14 <= (s13 == 42'sd0);
-      sn14 <= lead41(s13[41] ? 41'(-s13) : s13[40:0]);
+      sn14 <= lead41(as13);
       ssh14 <= {se13[8], se13} - 10'sd41;
       eo14 <= eo13; n14 <= n13; pos14 <= pos13; r14 <= r13; lv14 <= lv13;
     end
@@ -317,7 +336,12 @@ module r3d_rast_interp #(
   logic      [TW-1:0] tag15;
   logic        [8:0]  x15, y15;
   logic               tex15;
-  logic        [31:0] qu15, qv15, qs15;
+  logic        [31:0] qs15;
+  // u and v: the shift's whole bytes here, its last 0-7 places with the sign in the out stage (study R109:
+  // the multipliers' final adds and the 131-bit shift by an 8-bit amount were S15's path)
+  logic        [38:0] qu15, qv15;
+  logic        [2:0]  fu15, fv15;
+  logic               zuq15, zvq15;
   logic               su15, sv15, ss15, sat15;
   logic signed [8:0]  eo15;
   logic        [5:0]  n15;
@@ -331,8 +355,21 @@ module r3d_rast_interp #(
       logic [72:0] xs;
       logic [6:0]  k;
       tag15 <= tag14; x15 <= x14; y15 <= y14; tex15 <= tex14;
-      qu15 <= zu14 ? 32'd0 : qsh(pu14, shu14);
-      qv15 <= zu14 ? 32'd0 : qsh(pv14, shv14);
+      begin
+        logic [7:0] tu, tv;
+        logic [130:0] xu, xv;
+        tu = 8'(shu14 + 10'sd32); tv = 8'(shv14 + 10'sd32);
+        xu = {33'd0, pu14, 32'd0} >> {tu[7:3], 3'd0};
+        xv = {33'd0, pv14, 32'd0} >> {tv[7:3], 3'd0};
+        qu15 <= xu[38:0]; fu15 <= tu[2:0];
+        qv15 <= xv[38:0]; fv15 <= tv[2:0];
+        zuq15 <= zu14 || shu14 < -10'sd32 || shu14 > 10'sd98;
+        zvq15 <= zu14 || shv14 < -10'sd32 || shv14 > 10'sd98;
+`ifdef VERILATOR
+        qchk_u <= zu14 ? 32'd0 : qsh(pu14, shu14);
+        qchk_v <= zu14 ? 32'd0 : qsh(pv14, shv14);
+`endif
+      end
       su15 <= su14 && !zu14; sv15 <= sv14 && !zu14;
       // shade: |s| 2^ssh; saturate when its leading one lands at bit 31 or above
       top = {5'd0, sn14} + {ssh14[9], ssh14};
@@ -349,14 +386,22 @@ module r3d_rast_interp #(
     end
   end
 
+  wire [38:0] quf_x = qu15 >> fu15, qvf_x = qv15 >> fv15;
+  wire [31:0] quf = zuq15 ? 32'd0 : quf_x[31:0];
+  wire [31:0] qvf = zvq15 ? 32'd0 : qvf_x[31:0];
+`ifdef VERILATOR
+  logic [31:0] qchk_u, qchk_v;
+  always_ff @(posedge clk) if (!rst && v15 && (quf != qchk_u || qvf != qchk_v)) $fatal(1, "interp: the shift in two stages");
+`endif
+
   // ---- out: signs and saturation ----------------------------------------------------------
   always_ff @(posedge clk) begin
     if (rst) o_valid <= 1'b0;
     else if (en) o_valid <= v15;
     if (en) begin
       o_tag <= tag15; o_x <= x15; o_y <= y15; o_tex <= tex15;
-      o_u <= su15 ? 32'd0 - qu15 : qu15;
-      o_v <= sv15 ? 32'd0 - qv15 : qv15;
+      o_u <= su15 ? 32'd0 - quf : quf;
+      o_v <= sv15 ? 32'd0 - qvf : qvf;
       if (sat15) o_shade <= ss15 ? 32'h8000_0000 : 32'h7fff_ffff;
       else o_shade <= ss15 ? 32'd0 - qs15 : qs15;
       o_r <= r15; o_n <= n15; o_eo <= eo15; o_pos <= pos15; o_lv <= MIP ? lv15 : 4'd0;

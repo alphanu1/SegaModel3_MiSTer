@@ -6,7 +6,8 @@
 // Bench top for m3_sdr_port: the port on m2_sdram's port 0 (as m3_system
 // builds it), port 1 a second reader the C++ drives for contention (the tile
 // generator's 4-word bursts), the SDRAM at its pins.
-module m3_sdr_tb (
+module m3_sdr_tb #(parameter bit L16 = 1'b0, parameter bit BXOR = 1'b0, parameter bit LW1 = 1'b0, parameter bit PAIR = 1'b0, parameter bit RA = 1'b0, parameter bit PW = 1'b0, parameter bit RA_CONF = 1'b0,
+  parameter bit FWD = 1'b0, parameter bit FREQ = 1'b0, parameter bit FDSP = 1'b0, parameter bit HITRD = 1'b0, parameter bit FAST = 1'b0, parameter int PW_DLY = 0, parameter bit R3P = 1'b0) (   // FAST, R3P: the bus's (no bus here)
   input  logic        clk,
   input  logic        rst_n,
   output logic        ready,
@@ -42,12 +43,12 @@ module m3_sdr_tb (
   logic [1:0]  ack, lo;
   logic [1:0][63:0] dout;
 
-  m3_sdr_port #(.AW(26)) u_port (
-    .clk, .rst(!rst_n),
+  m3_sdr_port #(.AW(26), .L16(L16), .LW1(LW1), .PAIR(PAIR), .RA(RA), .PW(PW), .RA_CONF(RA_CONF), .FWD(FWD), .FREQ(FREQ), .PW_DLY(PW_DLY)) u_port (
+    .clk, .rst(!rst_n), .ra_clr(1'b0),
     .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
     .p_req, .p_we, .p_addr, .p_din, .p_be, .p_long, .p_dout(dout[0]), .p_lo(lo[0]), .p_ack(ack[0]), .wb_col, .wb_din, .wb_be);
 
-  m2_sdram #(.COL_BITS(10), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(1'b1), .MASK_ON_A(1'b1), .INIT_NOP(200), .WB(2'b01)) u_sdram (
+  m2_sdram #(.COL_BITS(10), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(1'b1), .MASK_ON_A(1'b1), .INIT_NOP(200), .WB(2'b01), .L16({1'b0, L16}), .BXOR(BXOR), .PAIR({1'b0, PAIR}), .FDSP(FDSP), .HITRD(HITRD)) u_sdram (
     .clk, .rst_n, .ready, .rd_lat_sel(3'd2),
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm(), .sd_dq_o, .sd_dq_oe(), .sd_dq_i,
     .wr_req(1'b0), .wr_addr('0), .wr_din('0), .wr_be('0), .wr_ack(),

@@ -95,6 +95,12 @@ static long n88 = 0, n8c = 0, n98 = 0, nunm = 0, n_io = 0, n_jt = 0, n_sc = 0;
 static std::deque<std::pair<int, uint32_t>> tg_regs_exp;   // (word, LE value)
 static std::deque<std::pair<int, uint16_t>> pal_exp;
 
+// the Real3D host port's writes, in bus order (R112: with R3P they are posted; each strobe must be the
+// next of these, and a status read's strobe must find none still owed)
+static std::deque<std::pair<uint32_t, uint32_t>> r3_exp;
+static long r3_bad = 0, r3_n = 0;
+static long r3_order = 0;           // an access to another bus target taken with host-port writes still owed (MPC105 8.1.2.2: one PCI queue)
+static int r3_ready = 10;          // the host port ready this many clocks in ten
 static uint8_t io_byte(int off) { return uint8_t(0x5A ^ (off * 17)); }
 static uint32_t sc_data(int w) { return 0xC0DE0000u | uint32_t(w); }
 
@@ -164,6 +170,12 @@ static void at_ack(Txn &x, int m) {
     }
   }
   if (x.kind == K_MEM && (x.cmd == 1 || x.cmd == 3) && !in_c(x.addr)) { last_w = x.addr; last_w_ok = 1; }
+  // R114: every access to a bus target other than the SDRAM is taken after every host-port write before it
+  // has gone to the Real3D (a posted write of the host port is the one exception)
+  if (x.kind != K_MEM && x.kind != K_FILL && !((x.kind == K_R3D88 || x.kind == K_R3D8C || x.kind == K_R3D98) && (x.cmd == 1 || x.cmd == 3)) &&
+      !r3_exp.empty()) {
+    if (r3_order++ < 5) std::printf("cycle %lu: master %d kind %d %08X taken with %zu host-port writes owed\n", (unsigned long)cyc, m, x.kind, x.addr, r3_exp.size());
+  }
   switch (x.kind) {
     case K_FILL: { fill_line = x.addr >> 5; uint32_t c = (x.addr >> 2) & 7; for (int k = 0; k < 8; k++) x.exp.push_back(tru[(x.addr & ~31u) + 4 * ((c + k) & 7)]); break; }
     case K_MEM:
@@ -185,9 +197,12 @@ static void at_ack(Txn &x, int m) {
       break;
     }
     case K_PAL: pal_exp.push_back({int((x.addr >> 2) & 0x7FFF), uint16_t(((x.wd[0] >> 16) & 0xFF) << 8 | (x.wd[0] >> 24))}); break;
-    case K_R3D88: n88++; break;
-    case K_R3D8C: n8c += x.cmd == 1 ? 8 : 1; break;
-    case K_R3D98: n98 += x.cmd == 1 ? 8 : 1; break;
+    case K_R3D88: n88++; r3_exp.push_back({x.addr, bswap(x.wd[0])}); break;
+    case K_R3D8C: case K_R3D98:
+      (x.kind == K_R3D8C ? n8c : n98) += x.cmd == 1 ? 8 : 1;
+      if (x.cmd == 1) for (int k = 0; k < 8; k++) r3_exp.push_back({x.addr + 4 * k, bswap(x.wd[k])});
+      else r3_exp.push_back({x.addr, bswap(x.wd[0])});
+      break;
     case K_R3DST: x.check = false; break;
     case K_SCSI: n_sc++; if (x.cmd == 2) x.exp = {sc_data(int((x.addr >> 2) & 31))}; break;
     case K_IO: n_io++; x.exp = {uint32_t(io_byte(int((x.addr >> 2) & 15))) << 24}; break;
@@ -218,6 +233,9 @@ static void c_access(bool st, uint32_t a, uint32_t v) {
 int main(int argc, char **argv) {
   long n = argc > 1 ? std::atol(argv[1]) : 20000;
   rng.seed(argc > 2 ? unsigned(std::atoi(argv[2])) : 1);
+  for (int k = 3; k < argc; k++) if (!std::strcmp(argv[k], "--bxor")) sd.bxor = true;   // the build's BXOR (study R107)
+  for (int k = 3; k < argc; k++) if (!std::strcmp(argv[k], "--r3stall")) r3_ready = 6;   // the host port not ready 40% of clocks (R112)
+  for (int k = 3; k < argc; k++) if (!std::strcmp(argv[k], "--r3slow")) r3_ready = 1;    // ready one clock in ten: the post buffer fills (R112)
   t = new Vm3_bus_tb;
   ref.assign(size_t(1) << 27, 0);
   for (uint32_t a = 0; a < 0x10000; a += 2) {
@@ -227,10 +245,25 @@ int main(int argc, char **argv) {
   }
   t->rst_n = 0; t->rst = 1; t->m_req = 0; t->sc_ack = 0; t->cf_ack = 0; t->jt_busy = 0; t->ln_start = 0;
   t->sc_win_en = 1; t->sc_win_base = 0xC00000; t->scsi_irq = 0; t->jt_tdo = 0;
+  t->h_rdy_i = 1;
   auto tick = [&]() {
     t->sd_dq_i = sd.dq(cyc);
     t->io_rbyte = io_byte(t->io_off);
+    t->h_rdy_i = r3_ready >= 10 ? 1 : int(rng() % 10) < r3_ready;
     t->clk = 0; t->eval();
+    // the host port's strobe at this edge
+    if (t->h_go_o && t->h_rdy_i) {
+      if (t->h_we_o) {
+        r3_n++;
+        if (r3_exp.empty() || r3_exp.front().first != t->h_addr_o || r3_exp.front().second != t->h_wdata_o) {
+          if (r3_bad++ < 5) std::printf("cycle %lu: host port write %08X %08X, expected %08X %08X\n", (unsigned long)cyc, t->h_addr_o, t->h_wdata_o,
+                                        r3_exp.empty() ? 0 : r3_exp.front().first, r3_exp.empty() ? 0 : r3_exp.front().second);
+        }
+        if (!r3_exp.empty()) r3_exp.pop_front();
+      } else if (!r3_exp.empty()) {
+        if (r3_bad++ < 5) std::printf("cycle %lu: host port read with %zu earlier writes not yet given\n", (unsigned long)cyc, r3_exp.size());
+      }
+    }
     sd.cmd(cyc, t->sd_cke, t->sd_cs_n, t->sd_ras_n, t->sd_cas_n, t->sd_we_n, t->sd_ba, t->sd_a, t->sd_dq_o);
     t->clk = 1; t->eval();
     cyc++;
@@ -399,7 +432,8 @@ int main(int argc, char **argv) {
   std::printf("  %ld stale (a write landing on a held line, or a stale hit), %ld 53C810 reads before the push\n", stale, unpushed);
   std::printf("  %ld read mismatches, %ld protocol errors, %ld image bytes wrong, %ld tile register / %ld palette strobes wrong, %ld counters wrong, %zu/%zu strobes missing\n",
               bad, proto, img_bad, tg_bad, pal_bad, cnt_bad, tg_regs_exp.size(), pal_exp.size());
-  bool ok = !stale && !unpushed && n_push > 0 && n_inv > 0 && !bad && !proto && !img_bad && !tg_bad && !pal_bad && !cnt_bad && !jt_early && tg_regs_exp.empty() && pal_exp.empty() && M[0].done + M[1].done == n;
+  std::printf("  host port: %ld writes in order, %ld wrong or out of order, %zu not given, %ld accesses ahead of them\n", r3_n, r3_bad, r3_exp.size(), r3_order);
+  bool ok = !r3_bad && !r3_order && r3_exp.empty() && !stale && !unpushed && n_push > 0 && n_inv > 0 && !bad && !proto && !img_bad && !tg_bad && !pal_bad && !cnt_bad && !jt_early && tg_regs_exp.empty() && pal_exp.empty() && M[0].done + M[1].done == n;
   std::printf("%s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }

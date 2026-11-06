@@ -13,6 +13,8 @@
 //              [--ddr-busy PCT] [--ddr-lat LO HI]
 //              [--cfg FILE] [--xmem FILE] [--fix8 FILE] [--nvram FILE] [--prof-vrom FILE]   (study R100)
 //
+// --sdr-bxor: the model was built with SDR_BXOR (study R107); sdram_dev applies the same bank hash.
+// --prof2 FILE: the CPU's cycles by cause, its memory port and the SDRAM ports, a line a frame (prof2.h).
 // --prof-vrom appends a line a frame: frame, cycles the geometry was busy, VROM
 // requests, VROM words, cycles a VROM request was waiting (raised to its last word).
 //
@@ -60,6 +62,7 @@
 #include "verilated.h"
 #include "verilated_save.h"
 #include "sdram_dev.h"
+#include "prof2.h"
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -94,6 +97,17 @@ struct ddr_dev {
   uint64_t &at(uint64_t a) { static uint64_t s; if (a < BASE || a >= BASE + SIZE) { bad++; return s; } return m[a - BASE]; }
 };
 static ddr_dev dd;
+static Prof2 p2;
+// --check-lw (study R107): every work-RAM line write (cast-out, a push, a 53C810 line write) is
+// recorded beat by beat as its master hands each beat over on m_wnext, by line, and checked against
+// the SDRAM when m3_sdr_port takes its next write: the port takes the beats as shown
+struct LwCheck {
+  bool on = false; uint64_t n = 0, bad = 0, lost = 0;
+  uint32_t a[2] = {}; int k[2] = {}; bool act[2] = {}, req_d[2] = {}; uint32_t bt[2][8] = {};
+  std::map<uint32_t, std::vector<uint32_t>> got;   // line (CPU address) -> its beats, as handed over
+  uint8_t st_d = 0; uint32_t sa = 0; bool sw = false;
+};
+static LwCheck lwc;
 
 static std::set<long> parse_list(const char *s) {
   std::set<long> r;
@@ -132,6 +146,9 @@ int main(int argc, char **argv) {
     else if (a == "--window") window = std::strtol(nx().c_str(), nullptr, 0);
     else if (a == "--quiet") quiet = true;
     else if (a == "--prof") prof = true;
+    else if (a == "--check-lw") lwc.on = true;
+    else if (a == "--sdr-bxor") sd.bxor = true;   // the build's SDR_BXOR (R107): the device array takes the bank hash back
+    else if (a == "--prof2") { p2.f = std::fopen(nx().c_str(), "w"); p2.header(); }
     else if (a == "--tb-fast") tb_fast = true;
     else if (a == "--tb-fast-pc") tb_pc = uint32_t(std::strtoul(nx().c_str(), nullptr, 16));
     else if (a == "--no-fatal-stop") fatal_stop = false;
@@ -191,6 +208,40 @@ int main(int argc, char **argv) {
     }
     t->clk = 1; t->eval();
     cyc++;
+    if (p2.f) p2.tick(t->rootp, cyc, t->rt_valid_o, t->rt_pc_o, t->frame);
+    if (lwc.on) {
+      auto *q = t->rootp;
+      for (int m = 0; m < 2; m++) {
+        bool const rq = (q->m3_system__DOT__m_req >> m) & 1;
+        if (rq && !lwc.req_d[m] && ((q->m3_system__DOT__m_cmd >> (2 * m)) & 3) == 1) {
+          lwc.act[m] = true; lwc.k[m] = 0; lwc.a[m] = uint32_t(q->m3_system__DOT__m_addr >> (32 * m)) & ~31u;
+        }
+        lwc.req_d[m] = rq;
+        if (lwc.act[m] && ((q->m3_system__DOT__m_wnext >> m) & 1)) {
+          lwc.bt[m][lwc.k[m]++ & 7] = uint32_t(q->m3_system__DOT__m_wdata >> (32 * m));
+          if (lwc.k[m] == 8) {
+            lwc.act[m] = false;
+            if (lwc.a[m] < 0x00800000) lwc.got[lwc.a[m]] = std::vector<uint32_t>(lwc.bt[m], lwc.bt[m] + 8);
+          }
+        }
+      }
+      // The check is made as the port takes its next write (a single write or a line write): by then
+      // every line write before it is in SDRAM, a posted one included (m3_sdr_port PW holds writes
+      // behind it), and nothing newer has reached those lines.
+      uint8_t const st = q->m3_system__DOT__u_sport__DOT__st;
+      if ((st == 3 || st == 4) && st != lwc.st_d) {
+        for (auto &e : lwc.got) {
+          lwc.n++;
+          for (int b = 0; b < 8; b++) {
+            uint32_t const sa = 0x6400000 + e.first + 4 * b;
+            uint32_t const v = uint32_t(sd.m[sa >> 1]) | (uint32_t(sd.m[(sa >> 1) + 1]) << 16);   // (the array is by address)
+            if (v != e.second[b]) { if (lwc.bad++ < 10) std::printf("check-lw: line %08X beat %d: SDRAM %08X, handed over %08X\n", e.first, b, v, e.second[b]); }
+          }
+        }
+        lwc.got.clear();
+      }
+      lwc.st_d = st;
+    }
     // --prof: the CPU's data-memory wait cycles by the region of the data
     // cache's last memory request (m3_cpu_mon's ev_q[5], a clock late)
     if (prof) {
@@ -414,6 +465,7 @@ int main(int argc, char **argv) {
     t->rootp->m3_system__DOT__cfg_flags = uint8_t((t->rootp->m3_system__DOT__cfg_flags & ~1u) | unsigned(vrom_x & 1));
     std::printf("VROM readers: flag bit 0 set to %d\n", vrom_x & 1);
   }
+  p2.dt2 = t->rootp->m3_system__DOT__cfg_step >= 0x20;
   std::FILE *pvf = pv_fn.empty() ? nullptr : std::fopen(pv_fn.c_str(), "a");
   uint64_t pv_busy = 0, pv_req = 0, pv_words = 0, pv_wait = 0;
   int pv_left = 0; bool pv_on = false; uint32_t pv_frame = t->frame;
@@ -623,6 +675,7 @@ int main(int argc, char **argv) {
     // a new frame: the bench's frame count steps at the start of vertical blanking
     if (t->frame != frame_seen) {
       frame_seen = t->frame;
+      if (p2.f) { p2.dt2 = t->rootp->m3_system__DOT__cfg_step >= 0x20; p2.frame(frame_seen); }
       if (trf) { Rec r{t->frame, last_pc, 0, 2, 3, 0, 0, 0}; std::fwrite(&r, sizeof r, 1, trf); std::fflush(trf); }
       if (prof && frame_seen % 10 == 0 && pf_cyc) {
         std::printf("prof frame %u: cycles %" PRIu64 " CPI %.2f data wait %.1f%%;", frame_seen, pf_cyc,
@@ -688,6 +741,8 @@ int main(int argc, char **argv) {
               t->frame, cyc, s, double(cyc - c0) / s / 1000.0, nrec, last_pc, sd.reads, sd.writes);
   (void)nunm;
   if (trf) std::fclose(trf);
+  if (p2.f) { p2.report(); std::fclose(p2.f); }
+  if (lwc.on) std::printf("check-lw: %llu work-RAM line writes checked, %llu words wrong, %llu not seen handed over\n", (unsigned long long)lwc.n, (unsigned long long)lwc.bad, (unsigned long long)lwc.lost);
   if (!save_fn.empty()) {
     VerilatedSave os;
     os.open(save_fn.c_str());

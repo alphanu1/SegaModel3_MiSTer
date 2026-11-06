@@ -1090,7 +1090,12 @@ module ppc_core
   // own step 0's above all. It never resumes from a replay (an add makes no
   // access), so EX always holds its step 0 as it leaves ID. From predecode
   // flops already in the queue: no register of its own.
-  wire id_xuea    = id_s1 && q_pd.crack == 2'd1 && !q_pd.fdx && !q_pd.fpw && !q_pd.ifault;
+  wire id_xuea    = id_s1 && q_pd.uea;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && id_valid && q_pd.uea != (q_pd.crack == 2'd1 && !q_pd.fdx && !q_pd.fpw && !q_pd.ifault))
+      $fatal(1, "predecoded update-load kind against the queue head's fields");
+`endif
   // formed for both values of d_valid and chosen by it last (timing, study R104: the D-cache's
   // d_valid through wb_ldw and the hazard terms into the queue's pop and its 60-bit head was the 100 MHz
   // system build's worst path, six LUTs; now d_valid is one LUT from load_use)
@@ -1209,6 +1214,24 @@ module ppc_core
     else if (h_op == 6'd31 && h_x == 10'd470 && msr_q[MSR_PR]) id_opf = OP_ILLEGAL;
     else if (id_s0 || q_pd.crack == 2'd2 || (q_pd.fdx && id_s1)) id_opf = q_pd.pop;
     else                                                      id_opf = OP_ADD;
+  // EX's redirect kind, one-hot, registered beside ex_u.op (R108): branch, sc, illegal, trap / mtmsr /
+  // isync (pc + 4), rfi. The redirect's address and decision took ex_u.op through a 6-bit compare in
+  // front of their selects (the 100 MHz build's ex_u.op -> redir_a_q, seven levels). Formed as id_opf
+  // is, from the predecoded op through a LUT beside the overrides
+  function automatic logic [4:0] rk_of(input alu_op_t op);
+    rk_of = {op == OP_RFI, op == OP_TRAP || op == OP_MTMSR || op == OP_ISYNC, op == OP_ILLEGAL, op == OP_SC,
+             op == OP_BRANCH};
+  endfunction
+  logic [4:0] id_rk, ex_rk;
+  always_comb
+    if (h_fpa)                                                id_rk = fp_ok(q_hi) ? 5'd0 : 5'b00100;
+    else if (h_op == 6'd31 && h_x == 10'd470 && msr_q[MSR_PR]) id_rk = 5'b00100;
+    else if (id_s0 || q_pd.crack == 2'd2 || (q_pd.fdx && id_s1)) id_rk = rk_of(q_pd.pop);
+    else                                                      id_rk = 5'd0;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && ex_rk != rk_of(ex_u.op)) $fatal(1, "EX's redirect kind %b against ex_u.op %0d", ex_rk, ex_u.op);
+`endif
 `ifdef VERILATOR
   always_ff @(posedge clk)
     if (!rst && id_valid &&
@@ -1396,7 +1419,7 @@ module ppc_core
   logic [31:0] fimm_q;                                 // step 1's immediate: 4, or after a replay fea4_q
   wire        id_xfea  = q_pd.fdx && id_s1;
   wire        id_xz    = id_xzero || id_xfea || id_xuea;
-  wire        id_yreg  = q_pd.yreg && !id_xfea && !id_xuea;
+  wire        id_yreg  = q_pd.yreg && !(id_s1 && (q_pd.fdx || q_pd.uea));   // !id_xfea && !id_xuea
   // y's immediate, by the predecoded form (the decoder's id_u.imm, built here
   // from the raw fields)
   logic [31:0] id_imm;
@@ -1473,7 +1496,18 @@ module ppc_core
     fw_mux = (k == 2'd0) ? b : (k == 2'd1) ? vm : (k == 2'd2) ? vl : vw;
   endfunction
   (* keep = 1 *) wire [1:0] x_k = fw_k(x_m, x_wb, wb_live);
-  (* keep = 1 *) wire [1:0] y_k = fw_k(y_m, y_wb, wb_live);
+  // y's select (R108): ID's term (id_yreg) one LUT from the queue head (the update-load kind
+  // predecoded, pd.uea), WB's terms from registers, and MEM's valid bit and select into y_k itself:
+  // y_k is two LUTs from the head and one from m.valid (it was three from the head: h0 -> id_yreg ->
+  // y_k -> op_y led the 100 MHz release build; with MEM's term formed beside WB's, m.valid was three)
+  (* keep = 1 *) wire       y_id = id_yreg;
+  (* keep = 1 *) wire       y_wl = wb_valid && qf_w[1] && !wb_live;
+  (* keep = 1 *) wire       y_w  = wb_valid && qf_w[1];
+  (* keep = 1 *) wire [1:0] y_k = {y_id && !(m.valid && qf_m[1]) && y_w, y_id && ((m.valid && qf_m[1]) || y_wl)};
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && y_k != fw_k(y_m, y_wb, wb_live)) $fatal(1, "y_k by ID's term last against fw_k");
+`endif
   (* keep = 1 *) wire [1:0] a_k = fw_k(a_m, a_wb, wb_live);
   (* keep = 1 *) wire [1:0] s_k = fw_k(s_m, s_wb, wb_live);
   // The capture as two LUTs side by side, the base (register file or
@@ -1956,33 +1990,70 @@ module ppc_core
       else            ok[j] = (x[17 + j] ^ y[17 + j] ^ bepi[j]) == gx[(j + 14) % 15];
     dbat_hit = valid && &ok;
   endfunction
-  // dbat_hit laid out by hand (keep), as the micro-TLB's compare below: each
+  // dbat_hit was laid out by hand (keep), as the micro-TLB's compare below: each
   // bit's carry-free test as one LUT of x, y and BEPI at the bit and the one
   // below (db_cf), then the bit's outcome by its static kind (masked, a run's
   // lowest against the sum, else the test: db_ok), then the AND. Left to
   // Quartus it took five levels from op_y, and a round-3 cached full build
   // ran op_y through it and xl_rp into the data cache's posted answer (d_valid).
-  (* keep = 1 *) wire [59:0] db_cf, db_ok;          // [15k + j]: DBAT k, BEPI bit j (EA bit 17 + j)
-  genvar dbk, dbj;
+  // The compare split in two (R108), so the hit is one level shallower than with each bit's outcome
+  // (db_ok) in front of the AND: a bit passes exactly when (cf | ML) & (!L | sum == BEPI), ML: the bit
+  // is masked or a run's lowest, L: it is a run's lowest. A_k ANDs the first factor (the carry-free
+  // tests, three bits a LUT, then the groups with the valid bit), B_k the second (two of the run's
+  // lowest bits a LUT, from the sum). ML and L are LUTs of BL alone.
+  (* keep = 1 *) wire [59:0] db_cf;                // [15k + j]: DBAT k, BEPI bit j (EA bit 17 + j); j = 0 unused
+  (* keep = 1 *) wire [59:0] db_ml;                // masked or a run's lowest
+  (* keep = 1 *) wire [47:0] db_lo;                // [12k + j], j < 12: a run's lowest (none above bit 28)
+  (* keep = 1 *) wire [19:0] db_ag;                // [5k + g]: A's group g, bits j = 3g + 1 .. 3g + 3
+  (* keep = 1 *) wire [3:0]  db_vl;                // the valid bit under MSR[PR]
+  (* keep = 1 *) wire [3:0]  db_a;
+  (* keep = 1 *) wire [23:0] db_bp;                // [6k + q]: B's pair q, bits j = 2q, 2q + 1
+  (* keep = 1 *) wire [3:0]  db_b;
+  genvar dbk, dbj, dbq;
   generate
   for (dbk = 0; dbk < 4; dbk = dbk + 1) begin : g_db
-    wire [14:0] um = {4'b1111, ~bat_bl[4 + dbk]};
+    wire [14:0] blx = {4'b0000, bat_bl[4 + dbk]};    // masked (BL bits 0-10 mask EA bits 17-27)
     for (dbj = 0; dbj < 15; dbj = dbj + 1) begin : g_b
       if (dbj == 0) begin : g_0
-        assign db_cf[15*dbk + dbj] = 1'b0;           // (bit 17 is always a run's lowest where unmasked)
-        assign db_ok[15*dbk + dbj] = !um[0] || ea_x[17] == bat_bepi[4 + dbk][0];
+        assign db_cf[15*dbk + dbj] = 1'b0;
+        assign db_ml[15*dbk + dbj] = 1'b1;             // (bit 17 is masked or a run's lowest)
+        assign db_lo[12*dbk + dbj] = !blx[0];
       end else begin : g_j
         assign db_cf[15*dbk + dbj] = (op_x[17+dbj] ^ op_y[17+dbj] ^ bat_bepi[4 + dbk][dbj]) ==
                                      ((op_x[16+dbj] & op_y[16+dbj]) | ((op_x[16+dbj] ^ op_y[16+dbj]) & ~bat_bepi[4 + dbk][dbj-1]));
-        assign db_ok[15*dbk + dbj] = !um[dbj] || (!um[dbj-1] ? ea_x[17+dbj] == bat_bepi[4 + dbk][dbj] : db_cf[15*dbk + dbj]);
+        assign db_ml[15*dbk + dbj] = blx[dbj] || blx[dbj-1];
+        if (dbj < 12) begin : g_l
+          assign db_lo[12*dbk + dbj] = !blx[dbj] && blx[dbj-1];
+        end
       end
     end
+    for (dbj = 0; dbj < 5; dbj = dbj + 1) begin : g_g
+      localparam int J0 = 3 * dbj + 1;
+      localparam int JN = (dbj == 4) ? 2 : 3;          // (bits 1-14)
+      wire [2:0] t;
+      for (dbq = 0; dbq < 3; dbq = dbq + 1) begin : g_t
+        if (dbq < JN) begin : g_u
+          assign t[dbq] = db_cf[15*dbk + J0 + dbq] || db_ml[15*dbk + J0 + dbq];
+        end else begin : g_n
+          assign t[dbq] = 1'b1;
+        end
+      end
+      assign db_ag[5*dbk + dbj] = &t;
+    end
+    assign db_vl[dbk] = msr_q[MSR_PR] ? bat_vp[4 + dbk] : bat_vs[4 + dbk];
+    assign db_a[dbk]  = db_vl[dbk] && &db_ag[5*dbk +: 5];
+    for (dbj = 0; dbj < 6; dbj = dbj + 1) begin : g_p
+      assign db_bp[6*dbk + dbj] =
+        (!db_lo[12*dbk + 2*dbj]     || ea_x[17 + 2*dbj]     == bat_bepi[4 + dbk][2*dbj]) &&
+        (!db_lo[12*dbk + 2*dbj + 1] || ea_x[17 + 2*dbj + 1] == bat_bepi[4 + dbk][2*dbj + 1]);
+    end
+    assign db_b[dbk] = &db_bp[6*dbk +: 6];
   end
   endgenerate
   always_comb begin
     db_pa = 15'd0; db_wimg = 4'd0;
     for (int k = 0; k < 4; k++) begin
-      db_hit[k] = (msr_q[MSR_PR] ? bat_vp[4 + k] : bat_vs[4 + k]) && &db_ok[15*k +: 15];
+      db_hit[k] = db_a[k] && db_b[k];
       // BAT protection (PEM 7.4.4): PP = 00 none, 10 read/write, x1 read only
       db_go[k]  = db_hit[k] && (is_st ? bat_pp[4 + k] == 2'd2 : bat_pp[4 + k] != 2'd0);
       db_pa   = db_pa   | ({15{db_hit[k]}} & (bat_brpn[4 + k] | {4'd0, ea_x[27:17] & bat_bl[4 + k]}));
@@ -1994,14 +2065,43 @@ module ppc_core
   // translated by that BAT); one leaving the block, or with no BAT hit, takes
   // the alignment exception. The block ends at EA's last word when EA[16:2]
   // and EA's bits under the hitting BAT's BL are all ones.
+  // Without the full adder (R105's design, built in R108): given BAT k's hit, its unmasked bits of
+  // EA[27:17] are BEPI's, so EA's last page in the block is EA[27:12] = {BEPI | BL, 11111}, tested
+  // against x + y as the micro-TLB's tag is (each bit's carry from the bit below), with the carry
+  // into bit 12 from the low 12 bits' adder (and the split's + 4)
+  wire  [12:0] db_c12s = {1'b0, op_x[11:0]} + {1'b0, op_y[11:0]} + {10'd0, ex_sp1, 2'b00};
+  (* keep = 1 *) wire [63:0] db_lt;                // [16k + i]: DBAT k, EA bit 12 + i of its block's last page
+  (* keep = 1 *) wire [3:0]  db_lv;
+  generate
+  for (dbk = 0; dbk < 4; dbk = dbk + 1) begin : g_lv
+    wire [15:0] dblk = {bat_bepi[4 + dbk][10:0] | bat_bl[4 + dbk], 5'b11111};
+    for (dbj = 0; dbj < 16; dbj = dbj + 1) begin : g_i
+      if (dbj == 0) begin : g_0
+        assign db_lt[16*dbk + dbj] = (op_x[12] ^ op_y[12] ^ dblk[0]) == db_c12s[12];
+      end else begin : g_j
+        assign db_lt[16*dbk + dbj] = (op_x[12+dbj] ^ op_y[12+dbj] ^ dblk[dbj]) ==
+                                     ((op_x[11+dbj] & op_y[11+dbj]) | ((op_x[11+dbj] ^ op_y[11+dbj]) & ~dblk[dbj-1]));
+      end
+    end
+    assign db_lv[dbk] = &db_lt[16*dbk +: 16];
+  end
+  endgenerate
   logic        db_leave;
   always_comb begin
     db_leave = 1'b0;
     for (int k = 0; k < 4; k++)
-      db_leave = db_leave | (db_hit[k] && &(ea_x[27:17] | ~bat_bl[4 + k]));
-    db_leave = db_leave && &ea_x[16:12];
+      db_leave = db_leave | (db_hit[k] && db_lv[k]);
   end
   wire         db_stay = db_any && !db_leave;
+`ifdef VERILATOR
+  always_ff @(posedge clk) begin
+    automatic logic lv_ref = 1'b0;
+    for (int k = 0; k < 4; k++)
+      lv_ref = lv_ref | (db_hit[k] && &(ea_x[27:17] | ~bat_bl[4 + k]));
+    lv_ref = lv_ref && &ea_x[16:12];
+    if (!rst && db_leave != lv_ref) $fatal(1, "DBAT block end from the carry-free test against the sum's");
+  end
+`endif
 `ifdef VERILATOR
   always_ff @(posedge clk)
     for (int k = 0; k < 4; k++)
@@ -3101,24 +3201,16 @@ module ppc_core
                               ex_u.pc + 32'd4;
     redirect_sel  = 1'b1;
     if (ex_adv) begin
-      case (ex_u.op)
-        OP_BRANCH:  begin
-                      redirect_sel = br_taken;
-                      br_go        = 1'b1;          // redirects on a mispredict (below)
-                    end
-        OP_SC:      redirect_c = 1'b1;
-        OP_ILLEGAL: redirect_c = 1'b1;
-        // A trap redirects to the next instruction from EX, decided by the
-        // opcode alone; if it fired, MEM redirects again to the vector one cycle
-        // later (below). The operand compare is then off the fetch path entirely
-        // (R23 timing). Nothing younger can be in EX or ID by then: the first
-        // redirect flushed them. Traps do not appear in VF3's census (R12).
-        OP_TRAP:    redirect_c = 1'b1;
-        OP_RFI:     redirect_c = 1'b1;
-        OP_MTMSR, OP_ISYNC:
-                    redirect_c = 1'b1;
-        default: ;
-      endcase
+      if (ex_rk[0]) begin                              // a branch
+        redirect_sel = br_taken;
+        br_go        = 1'b1;                           // redirects on a mispredict (below)
+      end
+      // sc, illegal, trap, rfi, mtmsr, isync. A trap redirects to the next instruction from EX,
+      // decided by the opcode alone; if it fired, MEM redirects again to the vector one cycle later
+      // (below). The operand compare is then off the fetch path entirely (R23 timing). Nothing
+      // younger can be in EX or ID by then: the first redirect flushed them. Traps do not appear in
+      // VF3's census (R12).
+      if (|ex_rk[4:1]) redirect_c = 1'b1;
       if (ex_xcm) begin                                // (a kill from MEM overrides it below)
         redirect_c = 1'b1; redirect_sel = 1'b1;
       end
@@ -3139,17 +3231,10 @@ module ppc_core
   // The exception's vector is formed here for both values of ex_s0ok (it decides only the
   // interrupt, xc_irq) and chosen by it last, so the register is one LUT from the 32-bit mux
   // (the 100 MHz build's ex_s0ok -> redir_a_q, -0.62 ns). The vectors are mx.xvec's (checked below).
-  logic [31:0] rp_case;
-  always_comb
-    case (ex_u.op)
-      OP_BRANCH:          rp_case = br_target;
-      OP_SC:              rp_case = exc_vec | 32'h0C00;
-      OP_ILLEGAL:         rp_case = exc_vec | 32'h0700;
-      OP_TRAP:            rp_case = ex_u.pc + 32'd4;
-      OP_RFI:             rp_case = {srr0_in[31:2], 2'b00};
-      OP_MTMSR, OP_ISYNC: rp_case = ex_u.pc + 32'd4;
-      default:            rp_case = 32'd0;
-    endcase
+  // (by ex_rk, one-hot: an AND-OR of the five sources, 0 for any other op)
+  wire  [31:0] rp_case = ({32{ex_rk[0]}} & br_target) | ({32{ex_rk[1]}} & (exc_vec | 32'h0C00)) |
+                         ({32{ex_rk[2]}} & (exc_vec | 32'h0700)) | ({32{ex_rk[3]}} & (ex_u.pc + 32'd4)) |
+                         ({32{ex_rk[4]}} & {srr0_in[31:2], 2'b00});
   wire        xc_noirq = ex_ifault || xc_fpx || ex_fpun;           // ex_xcm without the interrupt
   wire        xc_irq0  = irq_req && ex_first;                      // xc_irq where ex_s0ok = 0
   wire [12:0] xv_noirq = xc_fpx ? 13'h0700 : (ex_ifault && ifl_miss) ? 13'h1000 : ex_ifault ? 13'h0400 : 13'h0800;
@@ -3193,26 +3278,21 @@ module ppc_core
   // it (ex_valid && !ex_hold) and m_z last: WB's wb_got through ex_hold, the redirect and the choice
   // into redir_k_q was a 100 MHz system build's worst path, -1.11 ns (study R104). Where EX does not
   // advance only MEM's kill or a fired trap redirects (to redirect_pc_b).
-  logic rc_a, bg_a, sl_a;
-  always_comb begin
-    rc_a = 1'b0; bg_a = 1'b0; sl_a = 1'b1;
-    case (ex_u.op)
-      OP_BRANCH: bg_a = 1'b1;
-      OP_SC, OP_ILLEGAL, OP_TRAP, OP_RFI, OP_MTMSR, OP_ISYNC: rc_a = 1'b1;
-      default: ;
-    endcase
-    if (ex_xcm) rc_a = 1'b1;
-    if (m_kill || wb_trap) begin rc_a = 1'b1; sl_a = 1'b0; end
-  end
+  // (R108: the op's kind from ex_rk, registered, not a compare of ex_u.op; MEM's kill and a fired trap
+  // (rd_kn, from WB's hold) chosen last: with either, the choice is b and there is a redirect, for
+  // both values of EX's advance. WB's hold through m_kill into rc_a / sl_a and the choice was a
+  // two-level detour into redir_k_q)
+  wire              bg_a    = ex_rk[0];
+  wire              rc_a    = (|ex_rk[4:1]) || ex_xcm;
   wire              rd_kn   = m_kill || wb_trap;
   (* keep = 1 *) wire       rdfa_z0 = rc_a || (bg_a && (brt_z0 != ex_pred));
   (* keep = 1 *) wire       rdfa_z1 = rc_a || (bg_a && (brt_z1 != ex_pred));
-  // redirect_sel: a branch's taken bit (by m_z), else 1, with MEM's kill choosing b
-  (* keep = 1 *) wire [1:0] rdka_z0 = !rdfa_z0 ? 2'd2 : (sl_a && (!bg_a || ex_xcm || brt_z0)) ? 2'd0 : 2'd1;
-  (* keep = 1 *) wire [1:0] rdka_z1 = !rdfa_z1 ? 2'd2 : (sl_a && (!bg_a || ex_xcm || brt_z1)) ? 2'd0 : 2'd1;
+  // redirect_sel: a branch's taken bit (by m_z), else 1
+  (* keep = 1 *) wire [1:0] rdka_z0 = !rdfa_z0 ? 2'd2 : (!bg_a || ex_xcm || brt_z0) ? 2'd0 : 2'd1;
+  (* keep = 1 *) wire [1:0] rdka_z1 = !rdfa_z1 ? 2'd2 : (!bg_a || ex_xcm || brt_z1) ? 2'd0 : 2'd1;
   wire              ex_advx = ex_valid && !ex_hold;
-  wire              rdf_x   = ex_advx ? (m_z ? rdfa_z1 : rdfa_z0) : rd_kn;
-  wire [1:0]        rdk_x   = ex_advx ? (m_z ? rdka_z1 : rdka_z0) : (rd_kn ? 2'd1 : 2'd2);
+  wire              rdf_x   = rd_kn || (ex_advx && (m_z ? rdfa_z1 : rdfa_z0));
+  wire [1:0]        rdk_x   = rd_kn ? 2'd1 : ex_advx ? (m_z ? rdka_z1 : rdka_z0) : 2'd2;
 `ifdef R104_CHECK
   always_ff @(posedge clk)
     if (!rst && (rdf_x != (m_z ? rdf_z1 : rdf_z0) ||
@@ -3225,17 +3305,40 @@ module ppc_core
   // second brings its own)
   wire [31:0] redirect_msr = wb_trap ? wb_tmsr : m_kill ? m_msrx :
                              (ex_u.op == OP_TRAP && !ex_xcm) ? msr_q : mx.msr;
+  // (R108) fetch's three MSR bits by the same choice as fetch's redirect registers (rdf_x): MEM's kill or
+  // a fired trap (rd_kn) last, then EX's advance and m_z, each case's value formed beside them; EX's
+  // exception (ex_xcm, from the FPSCR and the interrupt) is one level from them. Through redirect and
+  // redirect_msr, fpscr_q and m.result reached f_ir / f_pr / f_tg four levels deep (a CPU subsystem
+  // spike's fpscr_q -> f_pr). The values: MEM's or WB's MSR (fm_p); EX's exception's, which clears
+  // IR, PR and TGPR and sets TGPR for an ITLB miss (fm_mx); else EX's new MSR, or a trap's msr_q (fm_n).
+  wire [31:0] fm_xc  = (msr_q & ~MSR_XCLR) | {31'd0, msr_q[MSR_ILE]};
+  wire [31:0] fm_mn  = ex_fsu ? fm_xc : ex_kmsr[0] ? s_val & MSR_MASK :
+                       ex_kmsr[1] ? (srr1_in & SRR1_KEEP) | (msr_q & 32'h0001_0000) : ex_kmsr[2] ? fm_xc : msr_q;
+  wire [31:0] fm_r   = (ex_u.op == OP_TRAP) ? msr_q : fm_mn;
+  wire [2:0]  fm_q   = {f_tg, f_pr, f_ir};
+  wire [2:0]  fm_p   = wb_trap ? {wb_tmsr[MSR_TGPR], wb_tmsr[MSR_PR], wb_tmsr[MSR_IR]}
+                               : {m_msrx[MSR_TGPR], m_msrx[MSR_PR], m_msrx[MSR_IR]};
+  wire [2:0]  fm_mx  = {fm_xc[MSR_TGPR] || (!xc_fpx && !xc_irq && ex_ifault && ifl_miss), fm_xc[MSR_PR], fm_xc[MSR_IR]};
+  wire [2:0]  fm_n   = {fm_r[MSR_TGPR], fm_r[MSR_PR], fm_r[MSR_IR]};
+  wire        rdfn_z0 = (|ex_rk[4:1]) || (bg_a && (brt_z0 != ex_pred));   // rdfa without ex_xcm
+  wire        rdfn_z1 = (|ex_rk[4:1]) || (bg_a && (brt_z1 != ex_pred));
+  (* keep = 1 *) wire [2:0] fm_u0 = ex_xcm ? fm_mx : rdfn_z0 ? fm_n : fm_q;
+  (* keep = 1 *) wire [2:0] fm_u1 = ex_xcm ? fm_mx : rdfn_z1 ? fm_n : fm_q;
   always_ff @(posedge clk) begin
     if (rst) begin
       f_ir <= 1'b0;
       f_pr <= 1'b0;
       f_tg <= 1'b0;
-    end else if (redirect) begin
-      f_ir <= redirect_msr[MSR_IR];
-      f_pr <= redirect_msr[MSR_PR];
-      f_tg <= redirect_msr[MSR_TGPR];
+    end else if (rd_kn || ex_advx) begin
+      {f_tg, f_pr, f_ir} <= rd_kn ? fm_p : m_z ? fm_u1 : fm_u0;
     end
   end
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && ((rd_kn || ex_advx) ? (rd_kn ? fm_p : m_z ? fm_u1 : fm_u0) : fm_q) !=
+                (redirect ? {redirect_msr[MSR_TGPR], redirect_msr[MSR_PR], redirect_msr[MSR_IR]} : fm_q))
+      $fatal(1, "fetch's MSR bits by case against redirect_msr");
+`endif
 
 
   always_ff @(posedge clk) begin
@@ -3273,6 +3376,7 @@ module ppc_core
         // redirect decision (R23 timing)
         ex_u       <= id_u;
         ex_u.op    <= id_opf;                          // (= id_u.op)
+        ex_rk      <= id_rk;
         ex_bd      <= q_hi[27] ? {{6{q_hi[25]}}, q_hi[25:2], 2'b00}            // b (18), else bc (16)
                                : {{16{q_hi[15]}}, q_hi[15:2], 2'b00};
         ex_pred    <= id_pred;
@@ -3507,7 +3611,39 @@ module ppc_core
   endfunction
   logic [31:0] mis_w0;                                 // a split load's first word
   // WB's, on the forward path: the word straight from the port
-  assign ld_val   = ld_align(d_rdata, wb_msize, wb_boff, wb_msigned, wb_brev);
+  // (as an aligner, R108: each result byte one byte of the port's word by a select of WB's registers,
+  // then zero or the sign, so the port's word is one LUT from a data bit of ld_val)
+  function automatic logic [1:0] la_ix(input logic [1:0] r, input logic [1:0] sz, input logic [1:0] bo,
+                                       input logic rv);
+    logic [1:0] hb;                                    // the halfword's first byte: bo 0, 1, else 2
+    hb = bo[1] ? 2'd2 : bo;
+    case (sz)
+      2'd2:    la_ix = rv ? 2'd3 - r : r;
+      2'd1:    la_ix = hb + ((r[0] ^ rv) ? 2'd1 : 2'd0);
+      default: la_ix = bo;
+    endcase
+  endfunction
+  // (the byte selects, data and sign bits registered beside WB's fields, so wb_msize is not in front
+  // of the port's word: la_jq, la_dq, la_sq, loaded as wb_msize is)
+  logic [3:0][1:0] la_jq;
+  logic [3:0]      la_dq;
+  logic            la_sq;
+  logic [3:0][7:0] la_dat;
+  genvar lar;
+  generate
+  for (lar = 0; lar < 4; lar = lar + 1) begin : g_la
+    wire [1:0] j = la_jq[lar];
+    assign la_dat[lar] = d_rdata[31 - 8*j -: 8];
+  end
+  endgenerate
+  wire         la_sgn = la_sq && la_dat[2][7];
+  assign ld_val = {la_dq[0] ? la_dat[0] : {8{la_sgn}}, la_dq[1] ? la_dat[1] : {8{la_sgn}},
+                   la_dq[2] ? la_dat[2] : 8'd0,        la_dq[3] ? la_dat[3] : 8'd0};
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && wb_valid && ld_val != ld_align(d_rdata, wb_msize, wb_boff, wb_msigned, wb_brev))   // (fields loaded)
+      $fatal(1, "WB's aligner against ld_align: %08X %08X", ld_val, ld_align(d_rdata, wb_msize, wb_boff, wb_msigned, wb_brev));
+`endif
   // MEM's, for an answer that came while the uop was in MEM: into wb_result
   // (the first word as it leaves WB, in the cycle it does: the second's answer
   // may come in that cycle, while it is in MEM)
@@ -3518,9 +3654,67 @@ module ppc_core
   wire         mg_wb = wb_valid && wb_sp1 && !wb_got;
   wire  [31:0] mg_w1 = mg_wb ? d_rdata : (m_got ? m_dq : d_rdata);
   wire  [31:0] mg_w0 = mg_wb ? mis_w0 : m.sp1 ? mis_w0_m : mg_w1;
-  wire  [31:0] ld_mg = ld_mrg(mg_w0, mg_w1, mg_wb ? wb_msize : m.msize, mg_wb ? wb_boff : m.boff,
-                              mg_wb ? wb_msigned : m.msigned, mg_wb ? wb_brev : m.brev);
+  wire  [1:0]  mg_sz = mg_wb ? wb_msize : m.msize;
+  wire  [1:0]  mg_bo = mg_wb ? wb_boff : m.boff;
+  wire         mg_sx = mg_wb ? wb_msigned : m.msigned;
+  wire         mg_rv = mg_wb ? wb_brev : m.brev;
+  // The merge as a load aligner (R108): each result byte is one byte of one of four words (the port's
+  // d_rdata, m_dq, wb_dq, mis_w0), chosen by selects formed from registers, d_valid only choosing
+  // between the port and mis_w0 for a split's first word still in WB; then zero or the sign. ld_mrg
+  // on mg_w0 / mg_w1 put the word muxes, the 64-bit shift and the extension in line, seven levels
+  // from the port into wb_result (the 100 MHz release build's d_rdata and d_valid -> wb_result).
+  // (wb_adv && wb_sp0 is wb_valid && wb_sp0 && (wb_got || d_valid): a split's first word is an
+  // integer access that made its request, asserted below)
+  wire         mg_sp = !mg_wb && m.sp1;                // w0 is a split's first word
+  wire         mg_hd = wb_valid && wb_sp0;             // ... and it is in WB
+  wire         mg_1q = !mg_wb && m_got;                // w1 is m_dq, else the port's word
+  // a result byte's source byte in {w0, w1} (0-7) for data, else zero or the sign (byte 2's top bit)
+  function automatic logic [2:0] mg_ix(input logic [1:0] r, input logic [1:0] sz, input logic [1:0] bo,
+                                       input logic rv);
+    case (sz)
+      2'd2:    mg_ix = {1'b0, rv ? 2'd3 - r : r} + {1'b0, bo};
+      2'd1:    mg_ix = {1'b0, (r[0] ^ rv) ? 2'd1 : 2'd0} + {1'b0, bo};
+      default: mg_ix = {1'b0, bo};
+    endcase
+  endfunction
+  function automatic logic mg_isd(input logic [1:0] r, input logic [1:0] sz);
+    mg_isd = sz == 2'd2 || (sz == 2'd1 && r[1]) || r == 2'd3;
+  endfunction
+  logic [3:0][7:0] mg_dat;                             // [r]: result byte r (0: bits 31:24), as data
+  logic [3:0][1:0] mg_ws;                              // its word: 0 d_rdata, 1 m_dq, 2 wb_dq, 3 mis_w0
+  logic [3:0][2:0] mg_bx;
+  logic [3:0][2:0] mbx_q, wbx_q;                       // mg_ix of MEM's fields, of WB's
+  (* keep = 1 *) wire [31:0] mg_dp;                    // the port's byte for each result byte
+  genvar mgr;
+  generate
+  for (mgr = 0; mgr < 4; mgr = mgr + 1) begin : g_mg
+    assign mg_bx[mgr] = mg_wb ? wbx_q[mgr] : mbx_q[mgr];   // (registered beside m and WB's fields)
+    wire [1:0] j = mg_bx[mgr][1:0];
+    wire [1:0] ws1 = mg_1q ? 2'd1 : 2'd0;              // w1's word
+    // (a byte of w0 when the index is below 4)
+    (* keep = 1 *) wire [1:0] ws = mg_bx[mgr][2] ? ws1 :
+                                    mg_wb ? 2'd3 : !mg_sp ? ws1 : !mg_hd ? 2'd3 : wb_got ? 2'd2 :
+                                    d_valid ? 2'd0 : 2'd3;
+    assign mg_ws[mgr] = ws;
+    assign mg_dp[31 - 8*mgr -: 8] = d_rdata[31 - 8*j -: 8];
+    wire [7:0] bq = m_dq[31 - 8*j -: 8], bw = wb_dq[31 - 8*j -: 8], b0 = mis_w0[31 - 8*j -: 8];
+    assign mg_dat[mgr] = ws == 2'd0 ? mg_dp[31 - 8*mgr -: 8] : ws == 2'd1 ? bq : ws == 2'd2 ? bw : b0;
+  end
+  endgenerate
+  wire         mg_sgn = mg_sz == 2'd1 && mg_sx && mg_dat[2][7];
+  wire  [31:0] ld_mg = {mg_isd(2'd0, mg_sz) ? mg_dat[0] : {8{mg_sgn}}, mg_isd(2'd1, mg_sz) ? mg_dat[1] : {8{mg_sgn}},
+                        mg_isd(2'd2, mg_sz) ? mg_dat[2] : 8'd0,        mg_isd(2'd3, mg_sz) ? mg_dat[3] : 8'd0};
   assign ld_val_m = ld_mg;
+`ifdef VERILATOR
+  always_ff @(posedge clk) begin
+    for (int r = 0; r < 4; r++)
+      if (!rst && mg_bx[r] != mg_ix(r[1:0], mg_sz, mg_bo, mg_rv)) $fatal(1, "the merge's registered byte index");
+    if (!rst && ld_mg != ld_mrg(mg_w0, mg_w1, mg_sz, mg_bo, mg_sx, mg_rv))
+      $fatal(1, "the merge as an aligner against ld_mrg: %08X %08X", ld_mg, ld_mrg(mg_w0, mg_w1, mg_sz, mg_bo, mg_sx, mg_rv));
+    if (!rst && wb_valid && wb_sp0 && (!wb_iss || wb_fl || wb_sp1))
+      $fatal(1, "a split's first word in WB without its request, or an FP load");
+  end
+`endif
 `ifdef VERILATOR
   always_ff @(posedge clk)
     if (!rst && !mg_wb && m.valid && m.is_load && m.req && !m.rp && !m.xc && !m.sp1 && !m.sp0 &&
@@ -3533,6 +3727,7 @@ module ppc_core
       m.valid <= 1'b0;
     end else if (!mem_hold) begin
       m <= mx;
+      for (int r = 0; r < 4; r++) mbx_q[r] <= mg_ix(r[1:0], mx.msize, mx.boff, mx.brev);
       m.valid <= (ex_adv || mis_go) && !m_kp;
     end
     if (!mem_hold) m_rpq <= mx.rp;
@@ -3808,21 +4003,29 @@ module ppc_core
   // HID0's cache bits as flip-flops (zero at reset, table 2-2), and the
   // flash-invalidate pulses as HID0 is written with ICFI or DCFI set
   logic [31:0] hid0_q;
+  // HID0[DCE] for the data cache, a copy of its own loaded as hid0_q[14] is (preserve): the bit reaches
+  // the snoop's decision and the tag write's select there (R108: hid0_q[14] -> tw_d_q, a 1.8 ns route)
+  (* preserve *) logic hid_dce_q;
   logic        icfi_q, dcfi_q;
   wire         m_hid0 = m_ok && m.spr_we && m.spr == 6'd9;
   always_ff @(posedge clk) begin
     if (rst) begin
       hid0_q <= 32'd0;
+      hid_dce_q <= 1'b0;
       icfi_q <= 1'b0;
       dcfi_q <= 1'b0;
     end else begin
       if (m_hid0) hid0_q <= m.sprv;
+      if (m_hid0) hid_dce_q <= m.sprv[14];
       icfi_q <= m_hid0 && m.hcfi[1];
       dcfi_q <= m_hid0 && m.hcfi[0];
     end
   end
   assign hid_ice    = hid0_q[15];
-  assign hid_dce    = hid0_q[14];
+  assign hid_dce    = hid_dce_q;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && hid_dce_q != hid0_q[14]) $fatal(1, "HID0[DCE] copy");
+`endif
   assign hid_ilock  = hid0_q[13];
   assign hid_dlock  = hid0_q[12];
   assign hid_icfi   = icfi_q;
@@ -3869,6 +4072,9 @@ module ppc_core
     end
   end
 
+  wire wbr_ld = !rst && ((!wb_hold && m.is_load) || (wb_hold && ans_wb && wb_sp1));
+  wire wbr_rs = !rst && !wb_hold && !m.is_load;
+
   // ======================================================================= WB
   // A load or store waits here for its answer, and the GPR or FPR write is
   // made as WB is left. A load's word that arrives here is aligned on the
@@ -3888,7 +4094,6 @@ module ppc_core
         wb_irq    <= mem_adv ? m.irq : 2'd0;
         wb_evm    <= !mem_adv ? 5'd0 : {m.rp, m.irq != 2'd0, m_dsi || (m.xc && m.xvec == 13'h0400),
                                         m.xc && m.imiss, m_tmiss && !m.imiss};
-        wb_result <= m.is_load ? ld_val_m : m.result;
         wb_iss    <= m_iss;
         wb_got    <= m_got || ans_m;
         wb_live_q <= m.is_load && !(m_got || ans_m);
@@ -3901,6 +4106,12 @@ module ppc_core
         wb_boff   <= m.boff;
         wb_msigned <= m.msigned;
         wb_brev   <= m.brev;
+        for (int r = 0; r < 4; r++) begin
+          la_jq[r] <= la_ix(r[1:0], m.msize, m.boff, m.brev);
+          la_dq[r] <= mg_isd(r[1:0], m.msize);
+          wbx_q[r] <= mg_ix(r[1:0], m.msize, m.boff, m.brev);
+        end
+        la_sq     <= m.msize == 2'd1 && m.msigned;
         wb_fpw    <= mem_adv && m.fpw && !m.rp && !m.algn;
         wb_fl     <= mem_adv && m.fld && !m.rp && !m.algn;
         wb_fsl    <= m.is_load && m.fsl;
@@ -3914,12 +4125,15 @@ module ppc_core
           wb_got    <= 1'b1;
           wb_live_q <= 1'b0;
           wb_dq     <= d_rdata;
-          // a split load's second word, merged a cycle (WB holds for it)
-          if (wb_sp1) wb_result <= ld_mg;
+          // a split load's second word, merged a cycle (WB holds for it): wb_result, below
         end
       end
     end
     if (wb_adv && wb_fhi) fhi_q <= ldw;
+    // wb_result: MEM's result or load value as WB takes MEM's uop, or a split load's second word
+    // merged while WB holds; its two loads formed from d_valid beside the merge (R108)
+    if (wbr_ld)      wb_result <= ld_mg;
+    else if (wbr_rs) wb_result <= m.result;
     if (wb_adv && wb_sp0) mis_w0 <= ldw;                 // a split's first word, kept for its second
   end
 

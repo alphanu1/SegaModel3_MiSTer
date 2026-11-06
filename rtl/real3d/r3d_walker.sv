@@ -154,7 +154,13 @@ module r3d_walker #(
   logic        rs_we;
   logic [RS_LOG2-1:0] rs_wa;
   logic [45:0] rs_wd;
-  assign rs_top = rs_mem[rs_sp[RS_LOG2-1:0] - 1'b1];
+  // the top's index rs_sp - 1 kept as a register beside rs_sp (study R109: the decrement was in front of
+  // the MLAB's read address, the frame's add and rd_addr)
+  logic [RS_LOG2:0] rs_spm1;
+  assign rs_top = rs_mem[rs_spm1[RS_LOG2-1:0]];
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && rs_spm1 != rs_sp - 1'b1) $fatal(1, "walker: rs_spm1");
+`endif
 
   // the FSM's three writes: push a block frame, push a list frame, step a list
   always_comb begin
@@ -169,7 +175,7 @@ module r3d_walker #(
       end
       S_RET: if (rs_sp != '0 && rs_top[45] && rs_top[19:0] != 20'd0) begin
         rs_we = 1'b1;
-        rs_wa = rs_sp[RS_LOG2-1:0] - 1'b1;
+        rs_wa = rs_spm1[RS_LOG2-1:0];
         rs_wd = {rs_top[45:20], rs_top[19:0] - 20'd1};
       end
       default: ;
@@ -193,7 +199,7 @@ module r3d_walker #(
       mem_req <= 1'b0;
       ev_valid <= 1'b0;
       overflow <= 1'b0;
-      rs_sp <= '0;
+      rs_sp <= '0; rs_spm1 <= '1;
       ldepth <= '0;
     end else begin
       if (ev_valid && ev_ready) ev_valid <= 1'b0;
@@ -202,7 +208,7 @@ module r3d_walker #(
         S_IDLE: if (start) begin
           overflow <= 1'b0;
           rd_base <= 3'd0;
-          rs_sp <= '0;
+          rs_sp <= '0; rs_spm1 <= '1;
           ldepth <= '0;
           pass <= 2'd0;
           ctab <= 20'h400;
@@ -342,11 +348,11 @@ module r3d_walker #(
         end
         S_BLK_CW: if (cull_valid) st <= cull_out ? S_BLK_SKIP : S_BLK_FRAME;
         S_BLK_SKIP: begin                              // frame only: POP and sibling still follow
-          rs_sp <= rs_sp + 1'b1;
+          rs_sp <= rs_sp + 1'b1; rs_spm1 <= rs_sp;
           st <= S_RET;
         end
         S_BLK_FRAME: begin
-          rs_sp <= rs_sp + 1'b1;                       // frame written by the port above
+          rs_sp <= rs_sp + 1'b1; rs_spm1 <= rs_sp;                       // frame written by the port above
           if (rbuf[0][3]) begin
             rd_addr <= {8'd0, rbuf[5][23:0]}; rd_len <= 3'd0; rd_ret <= S_BLK_L4; st <= S_RD;
           end else begin
@@ -389,7 +395,7 @@ module r3d_walker #(
           end
         end
         S_LST_PUSH: begin
-          rs_sp <= rs_sp + 1'b1;
+          rs_sp <= rs_sp + 1'b1; rs_spm1 <= rs_sp;
           st <= S_RET;
         end
         S_LST_ENT: begin
@@ -404,7 +410,7 @@ module r3d_walker #(
           if (rs_sp == '0) st <= S_VP_NEXT;
           else if (!rs_top[45]) st <= S_RET_POP;
           else if (rs_top[19:0] == 20'd0) begin
-            rs_sp <= rs_sp - 1'b1;
+            rs_sp <= rs_sp - 1'b1; rs_spm1 <= rs_spm1 - 1'b1;
             ldepth <= ldepth - 2'd1;
           end else begin                               // the port above steps the index
             rd_addr <= {8'd0, rs_top[43:20]} + {12'd0, rs_top[19:0] - 20'd1};
@@ -414,7 +420,7 @@ module r3d_walker #(
         S_RET_POP: if (ev_free) begin
           ev_valid <= 1'b1; ev_type <= EV_POP;
           link <= rs_top[31:0];
-          rs_sp <= rs_sp - 1'b1;
+          rs_sp <= rs_sp - 1'b1; rs_spm1 <= rs_spm1 - 1'b1;
           st <= rs_top[44] ? S_LINK : S_RET;
         end
 

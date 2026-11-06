@@ -104,7 +104,9 @@ module m3_bus
   parameter int          MIDI_GAP   = 32000,
   parameter bit          STEP2      = 1'b0,           // the Step 2.x map (R100)
   parameter logic [26:0] SDR_FIX8   = 27'h730_0000,   // a Step 2 set's 8 MiB fixed CROM
-  parameter int          RTC_HZ     = 100_000_000     // clocks a second, for the RTC
+  parameter int          RTC_HZ     = 100_000_000,    // clocks a second, for the RTC
+  parameter bit          FAST       = 1'b0,           // the CPU's work-RAM reads to the SDRAM port from B_IDLE, past B_DEC (R112)
+  parameter bit          R3P        = 1'b0            // writes to the Real3D's host port posted in an eight-word buffer (R112)
 ) (
   input  logic          clk,
   input  logic          rst,
@@ -238,7 +240,7 @@ module m3_bus
   // arbitration and the transaction
   // ===========================================================================
   typedef enum logic [3:0] {
-    B_IDLE, B_DEC, B_SDR, B_INT, B_INTW, B_SCSI, B_CFG, B_JTAG, B_BEAT, B_R3D, B_R3DR, B_SEC
+    B_IDLE, B_DEC, B_SDR, B_INT, B_INTW, B_SCSI, B_CFG, B_JTAG, B_BEAT, B_R3D, B_R3DR, B_SEC, B_R3P
   } bst_t;
   bst_t        bs;
   logic        who;               // the owning master
@@ -479,7 +481,7 @@ module m3_bus
 
       // the Real3D's window writes, counted as they go to r3d_cmd
       if (h_go && h_we) begin
-        case (addr[31:24])
+        case (h_addr[31:24])
           8'h88: n_submit  <= n_submit + 24'd1;
           8'h8C: n_cull_lo <= n_cull_lo + 24'd1;
           8'h8E: n_cull_hi <= n_cull_hi + 24'd1;
@@ -560,9 +562,34 @@ module m3_bus
     end
   end
 
+  // ---- R3P (R112): the Real3D host port's writes, posted ----
+  // On the board the 53C810's DMA to the Real3D is a PCI-to-PCI transfer: it does not hold the 603e's bus
+  // while the Real3D takes each word. Here every host-port write went word by word with the bus held
+  // (B_R3D waits for h_rdy), so the CPU's misses waited behind the Real3D. With R3P a write to the host port
+  // (either master's, a line's beats or a single word) goes into an eight-word buffer, a word a beat, and
+  // the bus is free once the last is in; the buffer gives the words to r3d_cmd in order as h_rdy allows.
+  // A read of the host port, and a write to 9C (the Real3D's configuration), wait for the buffer to empty,
+  // so every access to the Real3D sees the writes before it in bus order. R114: so does every access to a
+  // target other than the SDRAM (B_DEC), as the MPC105 orders them behind its posted PCI writes.
+  (* ramstyle = "MLAB, no_rw_check" *) logic [59:0] r3q [8];   // {addr[31:24], addr[21:2], data}
+  logic [3:0]  r3_wp, r3_rp;
+  wire         r3_full  = (r3_wp[2:0] == r3_rp[2:0]) && (r3_wp[3] != r3_rp[3]);
+  wire         r3_empty = (r3_wp == r3_rp);
+  wire [59:0]  r3_head  = r3q[r3_rp[2:0]];
+  wire         r3_go    = R3P && !r3_empty && h_rdy;            // the buffer's head to r3d_cmd
+  logic        r3_push;
+  logic [59:0] r3_pd;
+  always_ff @(posedge clk) if (R3P && r3_push) r3q[r3_wp[2:0]] <= r3_pd;
+  always_ff @(posedge clk)
+    if (rst || !R3P) begin r3_wp <= '0; r3_rp <= '0; end
+    else begin
+      if (r3_push) r3_wp <= r3_wp + 4'd1;
+      if (r3_go)   r3_rp <= r3_rp + 4'd1;
+    end
+
   // ---- the state machine ----
   always_ff @(posedge clk) begin
-    m_ack <= '0; m_wnext <= '0; m_rvalid <= '0;
+    m_ack <= '0; m_wnext <= '0; m_rvalid <= '0; r3_push <= 1'b0;
     s_req <= s_req && !s_ack;
     sc_req <= sc_req && !sc_ack;
     sec_req <= sec_req && !sec_ack;
@@ -573,18 +600,41 @@ module m3_bus
       bs <= B_IDLE; last <= 1'b1; s_req <= 1'b0; sc_req <= 1'b0; cf_req <= 1'b0; r_pend <= 1'b0; sec_req <= 1'b0;
     end else begin
       case (bs)
-        B_IDLE: if (rq != 2'b00) begin
+        B_IDLE: begin
+          // the beat a master shows, a clock longer: m3_sdr_port's LW1 takes a cast-out's last beat
+          // the clock after the bus has seen its last s_wnext (study R107); B_DEC sets s_wdata for
+          // the next transaction after this
+          s_wdata <= m_wdata[who];
+          // FAST: the CPU's SDRAM fields loaded every idle clock (nothing reads them while s_req is low), so
+          // only s_req and the state wait on the grant and the decode below
+          if (FAST) begin
+            s_cmd <= m_cmd[0]; s_sa <= SDR_RAM + {4'd0, m_addr[0][22:0]}; s_swap <= 1'b0; s_zero <= 1'b0; s_be <= m_be[0];
+          end
+          if (rq != 2'b00) begin
           who <= g; last <= g;
           cmd <= m_cmd[g]; addr <= m_addr[g]; be <= m_be[g]; wd <= m_wdata[g];
           crit <= (m_cmd[g] == MC_LINE_RD) ? m_addr[g][4:2] : 3'd0;
           beat <= 3'd0;
           bs <= B_DEC;
+          // FAST (R112): a read by the CPU of work RAM needs none of B_DEC's decode (its SDRAM address is
+          // SDR_RAM plus the low 23 bits, word form, never zero), so it goes to the port now. Reads only:
+          // s_wdata keeps following the master this clock for LW1 (above), and B_SDR takes it on
+          if (FAST && !g && m_addr[0][31:23] == 9'd0 && !m_cmd[0][0]) begin
+            s_req <= 1'b1;
+            bs <= B_SDR;
+          end
+          end
         end
 
         B_DEC: begin
           if (tgt == X_SDR) begin
             s_req <= 1'b1; s_cmd <= cmd; s_sa <= dsa; s_swap <= dswap; s_zero <= dzero; s_be <= be; s_wdata <= wd;
             bs <= B_SDR;
+          end else if (R3P && !(tgt == X_R3DH && cur_w) && (!r3_empty || r3_push)) begin
+            // R3P (R114): on the board every processor access to PCI leaves the MPC105 behind the writes it
+            // has posted (MPC105 manual 8.1.2.2: two 16-byte processor-to-PCI write buffers, one PCI
+            // interface), so any access here but a host-port write waits for the buffer to empty, as the
+            // bus waited for each host-port write before R3P; not acknowledged until then
           end else begin
             m_ack[who] <= 1'b1;       // internal targets: taken now, beats follow
             addr <= is_line ? {addr[31:5], crit, 2'b00} : addr;
@@ -622,7 +672,20 @@ module m3_bus
 
         // internal targets: one beat, or eight for a line
         B_BEAT: begin
-          if (tgt == X_R3DH) begin
+          if (R3P && tgt == X_R3DH && cur_w) begin
+            // R3P: the beat into the buffer (a line write's beat taken from the master as below), then on;
+            // r3_push is registered, so the buffer has its word an edge later: B_R3P waits that edge out
+            if (!r3_full && !(r3_push && 3'(r3_wp[2:0] + 3'd1) == r3_rp[2:0])) begin
+              if (cmd == MC_LINE_WR) m_wnext[who] <= 1'b1;
+              r3_push <= 1'b1;
+              r3_pd   <= {addr[31:24], addr[21:2], (cmd == MC_LINE_WR) ? m_wdata[who] : wd};
+              tr_v <= 1'b1; tr_master <= who; tr_we <= 1'b1; tr_addr <= addr; tr_be <= (cmd == MC_LINE_WR) ? 4'hF : be;
+              tr_data <= (cmd == MC_LINE_WR) ? m_wdata[who] : wd;
+              bs <= B_R3P;
+            end
+          end else if (R3P && (tgt == X_R3DH || (tgt == X_R3D && cur_w)) && (!r3_empty || r3_push)) begin
+            // R3P: a read of the host port, or a 9C write, after every posted write
+          end else if (tgt == X_R3DH) begin
             // the Real3D: a line write's beat is taken first, then each word goes
             if (cur_w && cmd == MC_LINE_WR) begin m_wnext[who] <= 1'b1; wd <= m_wdata[who]; be <= 4'hF; end
             bs <= B_R3D;
@@ -660,8 +723,15 @@ module m3_bus
           end else bs <= B_IDLE;
         end
 
+        // R3P: the beat is in the buffer; the next beat, or the end
+        B_R3P: begin
+          if (cmd == MC_LINE_WR && beat != 3'd7) begin
+            beat <= beat + 3'd1; addr <= {addr[31:5], addr[4:2] + 3'd1, 2'b00}; bs <= B_BEAT;
+          end else bs <= B_IDLE;
+        end
+
         // the Real3D's host port: the strobe goes in a cycle with h_rdy (h_go)
-        B_R3D: if (h_rdy) begin
+        B_R3D: if (h_rdy && !(R3P && r3_go)) begin
           if (cur_w) begin
             tr_v <= 1'b1; tr_master <= who; tr_we <= 1'b1; tr_addr <= addr; tr_be <= be; tr_data <= wd;
             if (cmd == MC_LINE_WR && beat != 3'd7) begin
@@ -725,9 +795,10 @@ module m3_bus
   assign irq_enable_o = irq_enable;
   assign crom_bank_o  = crom_bank;
   assign pingpong_o   = pingpong_i;
-  assign h_go    = (bs == B_R3D) && h_rdy;
-  assign h_we    = cur_w;
-  assign h_addr  = addr;
-  assign h_wdata = wd_le;
+  // (with R3P the bus's own strobe is a read, the buffer empty; the buffer's head goes first otherwise)
+  assign h_go    = r3_go || ((bs == B_R3D) && h_rdy);
+  assign h_we    = r3_go ? 1'b1 : cur_w;
+  assign h_addr  = r3_go ? {r3_head[59:52], 2'b00, r3_head[51:32], 2'b00} : addr;
+  assign h_wdata = r3_go ? bswap(r3_head[31:0]) : wd_le;
 
 endmodule
