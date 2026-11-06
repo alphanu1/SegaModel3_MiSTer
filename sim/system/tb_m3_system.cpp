@@ -264,7 +264,7 @@ int main(int argc, char **argv) {
 
   // power-on
   t->mem_rst_n = 0; t->reset = 0; t->ioctl_download = 0; t->ioctl_wr = 0; t->ioctl_index = 0;
-  t->rd_lat_sel = 2; t->overlay_en = 0; t->tb_fast = 0; t->ddr_ok = 1;
+  t->rd_lat_sel = 2; t->overlay_en = 0; t->fps_en = 0; t->tb_fast = 0; t->ddr_ok = 1;
   for (int i = 0; i < 8; i++) tick();
   t->mem_rst_n = 1;
 

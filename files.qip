@@ -28,6 +28,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/cpu/ppc_cpu.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/dbg/m3_uart_tx.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/dbg/m3_cpu_mon.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/dbg/m3_frame_busy.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/dbg/m3_fps.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/dbg/m3_cputest.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_ram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m2_sdram.sv

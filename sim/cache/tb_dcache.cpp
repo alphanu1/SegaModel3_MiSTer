@@ -328,11 +328,24 @@ int main(int argc, char **argv) {
     }
   };
   uint64_t s_t0 = 0, s_mark[4] = {};
+#ifdef TB_EARLY
+  // ppc_dcache EARLY: d_eok says d_rdata is the d_eword of the cycle before; checked every cycle, and the
+  // load answers it marks counted (the ones ppc_core's LU2 takes from the early word)
+  uint32_t e_prev = 0; uint64_t n_eok_ld = 0, n_eok_err = 0;
+#endif
 
   long max_cyc = nops * 200 + 200000;
   while (phase != DONE && (long)cyc < max_cyc) {
     // ---------------------------------------------------- outputs of the last edge
     bool dv = t->d_valid; uint32_t drd = t->d_rdata;
+#ifdef TB_EARLY
+    if (t->d_eok && drd != e_prev) {
+      if (n_eok_err++ < 10) std::printf("EARLY WORD MISMATCH cyc %lu: d_eok with d_rdata %08X, last cycle's d_eword %08X\n", (unsigned long)cyc, drd, e_prev);
+      errors++;
+    }
+    if (t->d_eok && dv && !outq.empty() && outq.front().k == OP_LD) n_eok_ld++;
+    e_prev = t->d_eword;
+#endif
     if (t->t_alloc) {
       dut_allocs.push_back({t->t_alloc_set, t->t_alloc_way, t->t_alloc_tag});
       if (snoop_mode) { last_alloc_cyc[(t->t_alloc_tag << 12) | (t->t_alloc_set << 5)] = cyc; last_miss_cyc = cyc; }
@@ -668,6 +681,9 @@ int main(int argc, char **argv) {
   std::printf("  port: fills %lu cast-outs %lu single reads %lu single writes %lu; HID0 DCE %lu DLOCK %lu NOOPTI %lu DCFI %lu\n",
               (unsigned long)ma.n_fill, (unsigned long)ma.n_wb, (unsigned long)ma.n_rd, (unsigned long)ma.n_wr,
               (unsigned long)n_dce, (unsigned long)n_dlock, (unsigned long)n_noopti, (unsigned long)n_dcfi);
+#ifdef TB_EARLY
+  std::printf("  early word: load answers with d_eok %lu of %lu loads\n", (unsigned long)n_eok_ld, (unsigned long)n_ld);
+#endif
   const char *cn[4] = {"load hit", "load miss", "store hit", "store miss"};
   for (int c = 0; c < 4; c++) if (lat_n[c])
     std::printf("  %-10s request to d_valid: min %lu mean %.2f max %lu cycles (%lu)\n", cn[c], (unsigned long)lat_min[c],

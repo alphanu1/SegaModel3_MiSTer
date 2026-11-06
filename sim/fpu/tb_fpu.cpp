@@ -220,7 +220,13 @@ void shape(Op op, bool sgl, uint64_t &a, uint64_t &b, uint64_t &c) {
 Vfpu_tb_top *top;
 uint64_t cycle = 0;
 
+#ifdef FPU_FAST_EF
+bool ef_mode = false;   // run_ef drives the single unit's sources itself
+#endif
 void tick() {
+#ifdef FPU_FAST_EF
+  if (!ef_mode) { top->f_sel = 0; top->f_aq = top->f_a; top->f_bq = top->f_b; top->f_cq = top->f_c; }
+#endif
   top->clk = 0; top->eval();
   top->clk = 1; top->eval();
   cycle++;
@@ -488,6 +494,85 @@ void run_pipeline(long n_rand, int issue_pct, int div_pct) {
   }
 }
 
+#ifdef FPU_FAST_EF
+// ------------------------------------------- the single unit's early forward (FPU_FAST_EF, EF = 1)
+// A stream of fast-port ops (single arithmetic, some frsqrte) with VE = ZE = OE = UE = 0, so every result is
+// written and is a single value. An operand the op reads is, now and then, the result of the op issued LS - 1
+// cycles before (f_sel 3: from the single unit's R5, single-unit producers and consumers only), LS cycles
+// before (2: the output register), or earlier (1: the held copy, 0: the operand register), the value the
+// reference model gave it. The sources the RTL must not read for that operand get random bits, and so does
+// the port's own operand (f_a ...) for an R5 one.
+long n_efs[4] = {}, n_ef_ops = 0;
+In gen_ef_op() {
+  In in{};
+  static const Op ops[] = {FADD, FSUB, FMUL, FMADD, FMSUB, FNMADD, FNMSUB, FMADD, FNMSUB, FMUL};
+  in.op = P(8) ? FRSQRTE : ops[Ri(10)];
+  in.single = in.op != FRSQRTE;
+  in.a = gen_sgl_val(); in.b = gen_sgl_val(); in.c = gen_sgl_val();
+  if (in.op == FRSQRTE && P(70)) in.b &= ~SIGN64;
+  shape(in.op, true, in.a, in.b, in.c);
+  if (!sgl_ok(in.a)) in.a = gen_sgl_val();
+  if (!sgl_ok(in.b)) in.b = gen_sgl_val();
+  if (!sgl_ok(in.c)) in.c = gen_sgl_val();
+  uint32_t f = gen_fpscr();
+  in.fpscr = f & ~(VE | ZE | OE | UE);
+  return summaries(in.fpscr) == in.fpscr ? in : (in.fpscr = summaries(in.fpscr), in);
+}
+void run_ef(long n, int ls, int issue_pct) {
+  struct H { uint64_t res; bool sfma; };
+  std::map<uint64_t, H> at;       // issue cycle -> its result
+  long issued = 0;
+  int ftag = 0;
+  ef_mode = true;
+  while (issued < n || !pend.empty()) {
+    top->f_valid = 0; top->f_fast = 0; top->d_start = 0; top->f_sel = 0;
+    if (issued < n && P(issue_pct)) {
+      In in = gen_ef_op();
+      uint64_t *opv[3] = {&in.a, &in.b, &in.c};
+      bool rd[3] = {in.op != FRSQRTE, in.op != FMUL, in.op != FADD && in.op != FSUB && in.op != FRSQRTE};
+      uint64_t q[3], x[3], pa[3];
+      int sel[3] = {0, 0, 0};
+      for (int p = 0; p < 3; p++) {
+        int k = Ri(4);
+        if (rd[p] && P(50)) {
+          uint64_t d = k == 0 ? uint64_t(ls - 1) : k == 1 ? uint64_t(ls) : uint64_t(ls + 1 + Ri(6));
+          auto it = cycle >= d ? at.find(cycle - d) : at.end();
+          if (it != at.end() && !(k == 0 && (!it->second.sfma || in.op == FRSQRTE))) {
+            *opv[p] = it->second.res;
+            sel[p] = 3 - k;
+            n_efs[k]++;
+          }
+        }
+        q[p] = sel[p] >= 1 ? R() : *opv[p];
+        x[p] = sel[p] == 1 ? *opv[p] : R();
+        pa[p] = sel[p] == 3 ? R() : *opv[p];
+      }
+      if (sel[0] == 3 || sel[1] == 3 || sel[2] == 3) n_ef_ops++;
+      if (!top->f_fast_ok) { printf("FAIL EF stream: f_fast_ok low\n"); fails++; }
+      int tag = ftag++ & 127;
+      top->f_valid = 1; top->f_fast = 1; top->f_tag = tag;
+      top->f_op = fma_code(in.op); top->f_single = in.single; top->f_ctl = in.fpscr & 0xFF;
+      top->f_a = pa[0]; top->f_b = pa[1]; top->f_c = pa[2];
+      top->f_aq = q[0]; top->f_bq = q[1]; top->f_cq = q[2];
+      top->f_ax = x[0]; top->f_bx = x[1]; top->f_cx = x[2];
+      top->f_sel = sel[0] | (sel[1] << 2) | (sel[2] << 4);
+      Out w = exec(in);
+      Pend pd{in, w, cycle};
+      pd.fast = true;
+      pend[tag] = pd;
+      at[cycle] = H{w.frd, in.op != FRSQRTE};
+      issued++;
+    }
+    tick();
+    check_out();
+    at.erase(at.begin(), at.lower_bound(cycle > 40 ? cycle - 40 : 0));
+    if (pend.size() > 200) { printf("FAIL results lost\n"); fails++; break; }
+  }
+  top->f_valid = 0; top->f_sel = 0;
+  ef_mode = false;
+}
+#endif
+
 // --------------------------------------------- the combinational units
 void run_comb(long n) {
   for (long i = 0; i < n; i++) {
@@ -701,6 +786,26 @@ int main(int argc, char **argv) {
   // random: mostly back-to-back, some gaps; divides interleaved
   run_pipeline(n_pipe, 90, 30);
   run_comb(n_comb);
+#ifdef FPU_FAST_EF
+  {
+    // the fast port's latency first (an idle unit)
+    In in{}; in.op = FADD; in.single = true; in.a = 0x3FF0000000000000ull; in.b = in.a;
+    top->f_valid = 1; top->f_op = 0; top->f_single = 1; top->f_fast = 1; top->f_ctl = 0;
+    top->f_a = in.a; top->f_b = in.b; top->f_c = 0; top->f_tag = 203;
+    pend[203] = Pend{in, exec(in), cycle};
+    uint64_t t0 = cycle;
+    tick();
+    top->f_valid = 0; top->f_fast = 0;
+    while (!top->o_valid) tick();
+    int ls = int(cycle - t0);
+    check_out();
+    long f0 = fails, c0 = checked;
+    run_ef(n_pipe, ls, 92);
+    run_ef(n_pipe / 4, ls, 60);
+    printf("early forward (LS %d): %ld ops checked, %ld failures; dependent operands by source: R5 %ld, output register %ld, held %ld, register %ld; ops with an R5 operand %ld\n",
+           ls, checked - c0, fails - f0, n_efs[0], n_efs[1], n_efs[2], n_efs[3], n_ef_ops);
+  }
+#endif
 
   printf("checked %ld, failures %ld\n", checked, fails);
   printf("coverage (pipeline): UX %ld (UE=1 %ld), OX %ld (OE=1 %ld), FI %ld, FR %ld, exact %ld,\n"

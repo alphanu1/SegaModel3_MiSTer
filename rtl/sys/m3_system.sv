@@ -72,6 +72,7 @@ module m3_system
   // reported once a second on the debug UART ("P nn value", tools/uart_capture.py)
   // and shown on the overlay with CPI x 256. 0 drops it (the release).
   parameter bit          CPI_MON  = 1'b1,
+  parameter bit          FPS      = 1'b1,         // the frame counter, top right, OSD-switched; kept in release builds
   parameter bit          FBUSY    = 1'b1,         // the CPU's busy time per frame on overlay row 7 (study R104)
   // RELEASE = 1 drops every debug block together: the overlay and its capture
   // logic, CPI_MON's counters and UART, FBUSY (study R105). Release builds
@@ -180,6 +181,7 @@ module m3_system
   output logic        v_hs, v_vs, v_hblank, v_vblank,
   output logic [7:0]  v_r, v_g, v_b,
   input  logic        overlay_en,
+  input  logic        fps_en,        // the frame counter (FPS) shown
 
   output logic        led,
   output logic        uart_tx,
@@ -1004,10 +1006,22 @@ module m3_system
     assign ov_box = 1'b0; assign ov_ink = 1'b0; assign ov_idx = '0; assign ov_v = '0;
   end endgenerate
 
+  // the frame counter: Real3D frames begun a second, n_draw's low bit toggling once a frame
+  logic fps_box, fps_ink;
+  generate if (FPS) begin : g_fps
+    logic nd0_q;
+    always_ff @(posedge clk) nd0_q <= n_draw[0];
+    m3_fps #(.CLK_HZ(CLK_HZ)) u_fps (.clk, .rst, .en(fps_en), .draw(n_draw[0] ^ nd0_q), .x(x_d), .y(y_d),
+                                     .box(fps_box), .ink(fps_ink));
+  end else begin : g_nofps
+    assign fps_box = 1'b0; assign fps_ink = 1'b0;
+  end endgenerate
+
   always_ff @(posedge clk) if (ce_pix) begin
     logic [23:0] c;
     c = px;
     if (ov_box) c = ov_ink ? 24'hffffff : {1'b0, c[23:17], 1'b0, c[15:9], 1'b0, c[7:1]} & 24'h3f3f3f;
+    if (fps_box) c = fps_ink ? 24'hffffff : {1'b0, c[23:17], 1'b0, c[15:9], 1'b0, c[7:1]} & 24'h3f3f3f;
     {v_r, v_g, v_b} <= (hb_d || vb_d) ? 24'd0 : c;
     v_hs <= hs_d; v_vs <= vs_d; v_hblank <= hb_d; v_vblank <= vb_d;
   end

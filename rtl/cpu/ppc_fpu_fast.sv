@@ -48,6 +48,12 @@
 //     consumers stay on the fast port when its exponent is in single range.
 //  5. Forwarding as before: a result's write enable is always 1 while
 //     FPSCR[VE] = FPSCR[ZE] = 0.
+//  6. EF = 1 (the single unit's early forward, study R117): the single unit takes its operands by source,
+//     f_sel per operand (0 f_aq ..., the operand registers; 1 f_ax ..., their held copies; 2 this unit's
+//     output register; 3 the single unit's R5). An op issued in cycle t whose operand is the result of a
+//     single-unit op (not frsqrte) issued in cycle t - LS + 1 with OE = UE = 0 may take it with f_sel = 3;
+//     f_a ... f_c are then that op's operands for the other units and the route only (the R5 operand's own
+//     value is not there yet).
 
 module ppc_fpu_fast
   import ppc_fpu_pkg::*;
@@ -67,7 +73,8 @@ module ppc_fpu_fast
   parameter bit SQ2    = 1'b1,
   parameter bit SQ3    = 1'b1,
   parameter bit SQ4    = 1'b1,
-  parameter bit SQ5    = 1'b1
+  parameter bit SQ5    = 1'b1,
+  parameter bit EF     = 1'b0         // the single unit's early forward (rule 6)
 ) (
   input  logic            clk,
   input  logic            rst,
@@ -80,7 +87,15 @@ module ppc_fpu_fast
   input  logic [63:0]     f_a,
   input  logic [63:0]     f_b,
   input  logic [63:0]     f_c,
+  // the double unit's operands: the same values as f_a, f_b, f_c whenever an op goes to it (f_fast = 0); a
+  // core may give the fast port its operands through a later select than these (ppc_core's FP operand bypass)
+  input  logic [63:0]     f_ad,
+  input  logic [63:0]     f_bd,
+  input  logic [63:0]     f_cd,
   input  logic [TAGW-1:0] f_tag,
+  // EF: the single unit's operands by source (rule 6)
+  input  logic [2:0][1:0] f_sel,
+  input  logic [63:0]     f_aq, f_bq, f_cq, f_ax, f_bx, f_cx,
   output logic            f_fast_ok,  // a fast op may issue this cycle (rule 2)
 
   input  logic            d_start,
@@ -137,10 +152,12 @@ module ppc_fpu_fast
   logic [63:0]     sf_res, rq_res;
   fpu_flags_t      sf_flags, rq_flags;
 
-  ppc_fpu_sfma #(.TAGW(TAGW), .Q1(SQ1), .Q2(SQ2), .Q3(SQ3), .Q4(SQ4), .Q5(SQ5)) u_sfma (
+  ppc_fpu_sfma #(.TAGW(TAGW), .Q1(SQ1), .Q2(SQ2), .Q3(SQ3), .Q4(SQ4), .Q5(SQ5), .EF(EF)) u_sfma (
     .clk (clk), .rst (rst),
     .in_valid (f_valid & f_fast & ~is_rsq), .in_op (f_op), .in_ctl (f_ctl),
     .in_a (f_a), .in_b (f_b), .in_c (f_c), .in_tag (f_tag),
+    .in_sel (f_sel), .in_aq (f_aq), .in_bq (f_bq), .in_cq (f_cq), .in_ax (f_ax), .in_bx (f_bx), .in_cx (f_cx),
+    .in_fo (out_res),
     .o_valid (sf_v), .o_tag (sf_tag), .o_res (sf_res), .o_flags (sf_flags)
   );
 
@@ -160,7 +177,7 @@ module ppc_fpu_fast
   ppc_fpu_fma #(.TAGW(TAGW), .P1A(P1A), .P2(P2), .P3(P3), .P4A(P4A), .P5A(P5A), .P5(P5), .P6A(P6A), .P6(P6), .P7(P7)) u_fma (
     .clk (clk), .rst (rst),
     .in_valid (f_valid & ~f_fast), .in_op (f_op), .in_single (f_single), .in_ctl (f_ctl),
-    .in_a (f_a), .in_b (f_b), .in_c (f_c), .in_tag (f_tag),
+    .in_a (f_ad), .in_b (f_bd), .in_c (f_cd), .in_tag (f_tag),
     .inj_valid (inj_valid), .inj_next (inj_next), .inj_ready (inj_ready), .inj_special (inj_special),
     .inj_payload (inj_payload), .inj_sign (inj_sign), .inj_q (inj_q), .inj_sticky (inj_sticky),
     .inj_e (inj_e), .inj_e0c (inj_e0c), .inj_sden (inj_sden), .inj_cap (inj_cap), .inj_single (inj_single), .inj_ctl (inj_ctl), .inj_xx_en (inj_xx_en),
@@ -184,6 +201,20 @@ module ppc_fpu_fast
 
   // synthesis translate_off
   initial if (LS < 3 || LS >= L) $error("ppc_fpu_fast: LS = %0d is not supported", LS);
+  initial if (EF && !SQ5) $error("ppc_fpu_fast: EF needs the single unit's R5 (SQ5)");
+`ifdef R104_CHECK
+  // EF: f_sel names the same values as f_a ... f_c wherever it is not 3
+  always_ff @(posedge clk)
+    if (!rst && EF && f_valid)
+      for (int p = 0; p < 3; p++)
+        if (f_sel[p] != 2'd3 && (p == 0 ? f_a : p == 1 ? f_b : f_c) !=
+            (f_sel[p] == 2'd0 ? (p == 0 ? f_aq : p == 1 ? f_bq : f_cq) :
+             f_sel[p] == 2'd1 ? (p == 0 ? f_ax : p == 1 ? f_bx : f_cx) : out_res))
+          $fatal(1, "ppc_fpu_fast: operand %0d by source %0d differs from the port's", p, f_sel[p]);
+`endif
+  always_ff @(posedge clk)
+    if (!rst && f_valid && !f_fast && {f_ad, f_bd, f_cd} != {f_a, f_b, f_c})
+      $fatal(1, "ppc_fpu_fast: the double unit's operands differ from the port's");
   // synthesis translate_on
 
 endmodule

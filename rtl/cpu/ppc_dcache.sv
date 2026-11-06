@@ -105,7 +105,10 @@ module ppc_dcache
   parameter logic [19:0] RSV_TAG = 20'hF00FF,
   // the snoop port; 0: sn_ack answers every request a cycle later, nothing is
   // looked up, and res_kill is 0
-  parameter bit          SNOOP   = 1'b1
+  parameter bit          SNOOP   = 1'b1,
+  // the early word for ppc_core's load-use 2 (LU2): d_eword, the predicted way's word in the lookup cycle,
+  // and d_eok; 0: both 0
+  parameter bit          EARLY   = 1'b1
 )(
   input  logic        clk,
   input  logic        rst,
@@ -120,6 +123,8 @@ module ppc_dcache
   output logic        d_rdy,        // a request may be made this cycle (a register)
   output logic        d_valid,
   output logic [31:0] d_rdata,
+  output logic [31:0] d_eword,      // EARLY: the predicted way's word at rd_a, in the lookup cycle (dq[pw])
+  output logic        d_eok,        // EARLY: d_rdata is the d_eword of the cycle before (a register)
 
   input  logic        hid_dce,
   input  logic        hid_dlock,
@@ -687,6 +692,21 @@ module ppc_dcache
     d_valid_q <= !rst && (post || (l_ans && !l_post) || er_ans || srd_ans || fh);
     d_rdata <= ld_word;
   end
+  // The early word (EARLY, ppc_core LU2): ld_word is dq[pw] unless a fill word, a single read's, the fill
+  // buffer's or a store-buffer byte goes in, and d_rdata always takes ld_word; so with none of those this
+  // cycle, d_rdata next cycle is this cycle's dq[pw]. d_eok says so, from the same selects as ld_word's;
+  // the hit is not in it (the core takes d_eok with d_valid). The core takes dq[pw] in the lookup cycle as
+  // its operand where a load's consumer has left ID, and confirms it with d_valid and d_eok.
+  assign d_eword = EARLY ? dq[pw] : 32'd0;
+  always_ff @(posedge clk)
+    d_eok <= EARLY && !(er_ans || srd_ans || fh) && !(sb_m && |sb_be) && !(sbl_m && |sbl_be);
+`ifdef VERILATOR
+`ifndef LU2_NOCHK
+  logic [31:0] e_chk;
+  always_ff @(posedge clk) e_chk <= dq[pw];
+  always_ff @(posedge clk) if (!rst && d_eok && d_rdata != e_chk) $fatal(1, "dcache: d_eok with d_rdata %08X not last cycle's early word %08X", d_rdata, e_chk);
+`endif
+`endif
 
   // ============================================================ R, X
   // Only the valid bits (and X's phase and known way) wait on the compare.

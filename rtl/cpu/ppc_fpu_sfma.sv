@@ -34,6 +34,16 @@
 //  - the rounding carry selects between two finished results, so the add is
 //    not in front of the exponent, FPRF and overflow logic.
 //
+// EF = 1 (study R117, needs Q5): an op may take an operand from the op in R5 a cycle before that op's
+// result reaches the output register (in_sel = 3: its consumer issues LS - 1 cycles after it). S5 keeps in R5
+// the result's sign, its exponent field for both outcomes of S6's rounding carry kc (c1 or c2), and the
+// fraction bits S1 classifies; S1 runs twice, for kc = 0 and kc = 1, and R1 keeps both versions of the fields
+// that depend on it (r1x_q), chosen in S2 by kc as registered (r1_k). The significands R1 takes (frA, frC
+// into the multiplier, frB into the alignment shift) are the result's own, from S6 in that cycle. The
+// operands come in by a 4:1 select per operand (in_sel: 0 the operand register, 1 its held copy, 2 the
+// output register, 3 R5), so S1 sees one select level as with ppc_core's FP operand bypass. Valid only for
+// a producer issued with OE = UE = 0 (its result is then a single value; ppc_core's fr_sf).
+//
 // Stages (R1 ... R5 optional; the last is the double unit's output register):
 //   S1  classify, special result, exponent sums, alignment shift, anchor -> R1 (DSP in)
 //   S2  24 x 24 product; alignment shift and its sticky                   -> R2 (DSP out)
@@ -51,7 +61,8 @@ module ppc_fpu_sfma
   parameter bit Q2 = 1'b1,
   parameter bit Q3 = 1'b1,
   parameter bit Q4 = 1'b1,
-  parameter bit Q5 = 1'b1
+  parameter bit Q5 = 1'b1,
+  parameter bit EF = 1'b0
 ) (
   input  logic            clk,
   input  logic            rst,
@@ -63,6 +74,10 @@ module ppc_fpu_sfma
   input  logic [63:0]     in_b,
   input  logic [63:0]     in_c,
   input  logic [TAGW-1:0] in_tag,
+  // EF: the operands by source (in_sel per operand, A B C: 0 in_*q, 1 in_*x, 2 in_fo, 3 R5); in_a ... in_c
+  // are not used then
+  input  logic [2:0][1:0] in_sel,
+  input  logic [63:0]     in_aq, in_bq, in_cq, in_ax, in_bx, in_cx, in_fo,
 
   // the finished result, combinational from R5: into the output register
   output logic            o_valid,
@@ -85,108 +100,6 @@ module ppc_fpu_sfma
   } side_t;
 
   // ================================================================== S1
-  logic has_b, has_c, subb, negr;
-  always_comb begin
-    has_b = 1'b1; has_c = 1'b1; subb = 1'b0; negr = 1'b0;
-    case (in_op)
-      FMA_ADD:   has_c = 1'b0;
-      FMA_SUB:   begin has_c = 1'b0; subb = 1'b1; end
-      FMA_MUL:   has_b = 1'b0;
-      FMA_MSUB:  subb = 1'b1;
-      FMA_NMADD: negr = 1'b1;
-      FMA_NMSUB: begin negr = 1'b1; subb = 1'b1; end
-      default:   ;
-    endcase
-  end
-
-  // An operand is a zero (exponent 0; the route lets no double denormal
-  // through), an infinity or NaN (exponent all ones), or a normalised value
-  // with a 24-bit significand. fadds multiply frA by 1.0.
-  wire [10:0] a_e = in_a[62:52], b_e = in_b[62:52], c_e = in_c[62:52];
-  wire a_zero = (a_e == 11'd0), b_zero = (b_e == 11'd0), c_zr = (c_e == 11'd0);
-  wire a_e1 = (a_e == 11'h7FF), b_e1 = (b_e == 11'h7FF), c_e1 = (c_e == 11'h7FF);
-  wire a_fz = (in_a[51:29] == 23'd0), b_fz = (in_b[51:29] == 23'd0), c_fz = (in_c[51:29] == 23'd0);
-  wire a_inf = a_e1 & a_fz, b_inf = b_e1 & b_fz;
-  wire a_nan = a_e1 & ~a_fz, b_nan = b_e1 & ~b_fz;
-  wire a_snan = a_nan & ~in_a[51], b_snan = b_nan & ~in_b[51];
-  wire c_zero = has_c & c_zr, c_inf = has_c & c_e1 & c_fz, c_nan = has_c & c_e1 & ~c_fz;
-  wire c_snan = c_nan & ~in_c[51];
-  wire a_s = in_a[63], b_s = in_b[63], c_s = has_c & in_c[63];
-
-  // special operands, as ppc_fpu_fma's S1b [PEM 3.3.1.7, D-4]
-  wire pb_nan  = has_b & b_nan;
-  wire nan_any = a_nan | pb_nan | c_nan;
-  wire vxsnan  = a_snan | (has_b & b_snan) | c_snan;
-  wire sp_     = a_s ^ c_s;
-  wire sbe     = b_s ^ subb;
-  wire imz     = has_c & ~a_nan & ~c_nan & ((a_inf & c_zero) | (a_zero & c_inf));
-  wire pinf    = (a_inf | c_inf) & ~a_nan & ~c_nan & ~imz;
-  wire isi     = has_b & pinf & b_inf & (sp_ != sbe);
-  wire binf    = has_b & b_inf;
-  // special = nan_any | imz | isi | pinf | binf, which is exactly "an operand
-  // the op reads has an all-ones exponent" (each infinity case needs one, and
-  // any infinity read is one of them): three levels instead of six
-  wire special = a_e1 | (has_c & c_e1) | (has_b & b_e1);
-  wire sp_isnan = nan_any | imz | isi;
-
-  // (the special result's sign and the effective operation are formed in
-  // S2, from these registered: sp_sign2 below)
-  wire prod_on   = ~special;
-  wire prod_live = prod_on & ~a_zero & ~c_zero;
-  wire add_on    = special | (has_b & ~b_zero);
-
-  // unbiased exponents; sh puts the addend's hidden bit at V[74 - sh].
-  // ea + ec - eb + 27 is formed for both values of has_c from the raw
-  // fields (one three-input add each, with has_c, the op's, choosing after),
-  // and E0's choice between eb - 73 and ep0 is registered and made in S2,
-  // where E0 is first used: the has_c mux in front of the adders and the
-  // E0 mux after them led the core's spike (fc_q into R1, R63)
-  exp_t ep0, sh_raw, e0b, shc, shn, epc, epn;
-  assign shc    = exp_t'({2'b00, a_e}) + exp_t'({2'b00, c_e}) - exp_t'({2'b00, b_e}) - exp_t'(996);
-  assign shn    = exp_t'({2'b00, a_e}) - exp_t'({2'b00, b_e}) + exp_t'(27);
-  assign epc    = exp_t'({2'b00, a_e}) + exp_t'({2'b00, c_e}) - exp_t'(2092);
-  assign epn    = exp_t'({2'b00, a_e}) - exp_t'(1069);
-  assign sh_raw = has_c ? shc : shn;                   // ea + ec - eb + 27
-  assign ep0    = has_c ? epc : epn;                   // ea + ec - 46
-  assign e0b    = exp_t'({2'b00, b_e}) - exp_t'(1096); // eb - 73
-  wire   sh_neg = has_c ? shc < 0 : shn < 0;
-  wire   sh_big = has_c ? shc > exp_t'(127) : shn > exp_t'(127);
-  // E0 = eb - 73 for a special result, no live product, or an addend above
-  // the window; else ep0
-  wire   e0_b   = special || !prod_live || (add_on && sh_neg);
-  logic [6:0] sh;
-  always_comb begin
-    if (special || !prod_live)  sh = 7'd0;
-    else if (!add_on)           sh = 7'd127;
-    else if (sh_neg)            sh = 7'd0;
-    else if (sh_big)            sh = 7'd127;
-    else                        sh = sh_raw[6:0];
-  end
-
-  // The addend frB. A special result (a NaN operand's payload quieted, an
-  // infinity or the default QNaN) takes its place in S2, after the alignment
-  // shift, which is 0 for it.
-  wire [23:0] b_nrm = {24{has_b & ~b_zero}} & {1'b1, in_b[51:29]};
-  wire [23:0] ma = {~a_zero, in_a[51:29]};
-  wire [23:0] mc = has_c ? {~c_zr, in_c[51:29]} : 24'h80_0000;
-
-  side_t s1_sd;
-  always_comb begin
-    s1_sd.tag      = in_tag;
-    s1_sd.negr     = negr;
-    s1_sd.special  = special;
-    s1_sd.sp_isnan = sp_isnan;
-    s1_sd.rmode    = in_ctl[1:0];
-    s1_sd.ve       = in_ctl[7];
-    s1_sd.oe       = in_ctl[6];
-    s1_sd.ue       = in_ctl[5];
-    s1_sd.ni       = in_ctl[2];
-    s1_sd.invalid  = vxsnan | imz | isi;
-    s1_sd.vxsnan   = vxsnan;
-    s1_sd.vximz    = imz;
-    s1_sd.vxisi    = isi;
-  end
-
   typedef struct packed {
     logic [23:0] ma, mc, b;
     logic [6:0]  sh;
@@ -199,18 +112,212 @@ module ppc_fpu_sfma
     logic        pon;
     side_t       sd;
   } r1_t;
+
+  // S1 as a function of the op and its operands (only bits 63:29 of each are read), so EF can form it for
+  // both outcomes of the producer's rounding carry
+  function automatic r1_t s1f(input fma_op_t op, input logic [7:0] ctl, input logic [63:0] a, b, c,
+                              input logic [TAGW-1:0] tag);
+    logic has_b, has_c, subb, negr;
+    logic [10:0] a_e, b_e, c_e;
+    logic a_zero, b_zero, c_zr, a_e1, b_e1, c_e1, a_fz, b_fz, c_fz, a_inf, b_inf, a_nan, b_nan, a_snan, b_snan;
+    logic c_zero, c_inf, c_nan, c_snan, a_s, b_s, c_s;
+    logic pb_nan, nan_any, vxsnan, sp_, sbe, imz, pinf, isi, special, sp_isnan, prod_on, prod_live, add_on;
+    exp_t ep0, sh_raw, e0b, shc, shn, epc, epn;
+    logic sh_neg, sh_big, e0_b;
+    logic [6:0] sh;
+    logic [23:0] b_nrm, ma, mc;
+    r1_t  d;
+    has_b = 1'b1; has_c = 1'b1; subb = 1'b0; negr = 1'b0;
+    case (op)
+      FMA_ADD:   has_c = 1'b0;
+      FMA_SUB:   begin has_c = 1'b0; subb = 1'b1; end
+      FMA_MUL:   has_b = 1'b0;
+      FMA_MSUB:  subb = 1'b1;
+      FMA_NMADD: negr = 1'b1;
+      FMA_NMSUB: begin negr = 1'b1; subb = 1'b1; end
+      default:   ;
+    endcase
+
+    // An operand is a zero (exponent 0; the route lets no double denormal
+    // through), an infinity or NaN (exponent all ones), or a normalised value
+    // with a 24-bit significand. fadds multiply frA by 1.0.
+    a_e = a[62:52]; b_e = b[62:52]; c_e = c[62:52];
+    a_zero = (a_e == 11'd0); b_zero = (b_e == 11'd0); c_zr = (c_e == 11'd0);
+    a_e1 = (a_e == 11'h7FF); b_e1 = (b_e == 11'h7FF); c_e1 = (c_e == 11'h7FF);
+    a_fz = (a[51:29] == 23'd0); b_fz = (b[51:29] == 23'd0); c_fz = (c[51:29] == 23'd0);
+    a_inf = a_e1 & a_fz; b_inf = b_e1 & b_fz;
+    a_nan = a_e1 & ~a_fz; b_nan = b_e1 & ~b_fz;
+    a_snan = a_nan & ~a[51]; b_snan = b_nan & ~b[51];
+    c_zero = has_c & c_zr; c_inf = has_c & c_e1 & c_fz; c_nan = has_c & c_e1 & ~c_fz;
+    c_snan = c_nan & ~c[51];
+    a_s = a[63]; b_s = b[63]; c_s = has_c & c[63];
+
+    // special operands, as ppc_fpu_fma's S1b [PEM 3.3.1.7, D-4]
+    pb_nan  = has_b & b_nan;
+    nan_any = a_nan | pb_nan | c_nan;
+    vxsnan  = a_snan | (has_b & b_snan) | c_snan;
+    sp_     = a_s ^ c_s;
+    sbe     = b_s ^ subb;
+    imz     = has_c & ~a_nan & ~c_nan & ((a_inf & c_zero) | (a_zero & c_inf));
+    pinf    = (a_inf | c_inf) & ~a_nan & ~c_nan & ~imz;
+    isi     = has_b & pinf & b_inf & (sp_ != sbe);
+    // special = nan_any | imz | isi | pinf | binf, which is exactly "an operand
+    // the op reads has an all-ones exponent" (each infinity case needs one, and
+    // any infinity read is one of them): three levels instead of six
+    special  = a_e1 | (has_c & c_e1) | (has_b & b_e1);
+    sp_isnan = nan_any | imz | isi;
+
+    // (the special result's sign and the effective operation are formed in
+    // S2, from these registered: sp_sign2 below)
+    prod_on   = ~special;
+    prod_live = prod_on & ~a_zero & ~c_zero;
+    add_on    = special | (has_b & ~b_zero);
+
+    // unbiased exponents; sh puts the addend's hidden bit at V[74 - sh].
+    // ea + ec - eb + 27 is formed for both values of has_c from the raw
+    // fields (one three-input add each, with has_c, the op's, choosing after),
+    // and E0's choice between eb - 73 and ep0 is registered and made in S2,
+    // where E0 is first used: the has_c mux in front of the adders and the
+    // E0 mux after them led the core's spike (fc_q into R1, R63)
+    shc    = exp_t'({2'b00, a_e}) + exp_t'({2'b00, c_e}) - exp_t'({2'b00, b_e}) - exp_t'(996);
+    shn    = exp_t'({2'b00, a_e}) - exp_t'({2'b00, b_e}) + exp_t'(27);
+    epc    = exp_t'({2'b00, a_e}) + exp_t'({2'b00, c_e}) - exp_t'(2092);
+    epn    = exp_t'({2'b00, a_e}) - exp_t'(1069);
+    sh_raw = has_c ? shc : shn;                   // ea + ec - eb + 27
+    ep0    = has_c ? epc : epn;                   // ea + ec - 46
+    e0b    = exp_t'({2'b00, b_e}) - exp_t'(1096); // eb - 73
+    sh_neg = has_c ? shc < 0 : shn < 0;
+    sh_big = has_c ? shc > exp_t'(127) : shn > exp_t'(127);
+    // E0 = eb - 73 for a special result, no live product, or an addend above
+    // the window; else ep0
+    e0_b   = special || !prod_live || (add_on && sh_neg);
+    if (special || !prod_live)  sh = 7'd0;
+    else if (!add_on)           sh = 7'd127;
+    else if (sh_neg)            sh = 7'd0;
+    else if (sh_big)            sh = 7'd127;
+    else                        sh = sh_raw[6:0];
+
+    // The addend frB. A special result (a NaN operand's payload quieted, an
+    // infinity or the default QNaN) takes its place in S2, after the alignment
+    // shift, which is 0 for it.
+    b_nrm = {24{has_b & ~b_zero}} & {1'b1, b[51:29]};
+    ma = {~a_zero, a[51:29]};
+    mc = has_c ? {~c_zr, c[51:29]} : 24'h80_0000;
+
+    d.ma = ma;  d.mc = mc;  d.b = b_nrm;  d.sh = sh;  d.e0p = ep0;  d.e0b = e0b;  d.e0s = e0_b;
+    d.a_nan = a_nan;  d.pb_nan = pb_nan;  d.c_nan = c_nan;  d.a_s = a_s;  d.b_s = b_s;  d.c_s = c_s;
+    d.pinf = pinf;  d.sp_ = sp_;  d.sbe = sbe;  d.has_b = has_b;  d.pon = prod_on;
+    d.sd.tag      = tag;
+    d.sd.negr     = negr;
+    d.sd.special  = special;
+    d.sd.sp_isnan = sp_isnan;
+    d.sd.rmode    = ctl[1:0];
+    d.sd.ve       = ctl[7];
+    d.sd.oe       = ctl[6];
+    d.sd.ue       = ctl[5];
+    d.sd.ni       = ctl[2];
+    d.sd.invalid  = vxsnan | imz | isi;
+    d.sd.vxsnan   = vxsnan;
+    d.sd.vximz    = imz;
+    d.sd.vxisi    = isi;
+    return d;
+  endfunction
+
+  // the fields of R1 that depend on an EF operand's rounding carry (the exponent, and the classes an overflow
+  // to infinity, a flush or a result below the rounding place change); the signs, the NaN tests (an EF NaN is
+  // the producer's special result, whatever kc) and the significands do not
+  typedef struct packed {
+    logic [6:0] sh;
+    exp_t       e0p, e0b;
+    logic       e0s, pinf, pon, special, sp_isnan, invalid, vximz, vxisi;
+  } r1k_t;
+  function automatic r1k_t r1k_of(input r1_t d);
+    r1k_of = {d.sh, d.e0p, d.e0b, d.e0s, d.pinf, d.pon, d.sd.special, d.sd.sp_isnan, d.sd.invalid, d.sd.vximz, d.sd.vxisi};
+  endfunction
+  function automatic r1_t r1_with(input r1_t d, input r1k_t k);
+    r1_with = d;
+    {r1_with.sh, r1_with.e0p, r1_with.e0b, r1_with.e0s, r1_with.pinf, r1_with.pon, r1_with.sd.special,
+     r1_with.sd.sp_isnan, r1_with.sd.invalid, r1_with.sd.vximz, r1_with.sd.vxisi} = k;
+  endfunction
+
+  // EF: what R5 holds for the result's consumer (S5 below) and the S6 values the consumer's R1 takes
+  typedef struct packed {
+    logic        s;                       // the result's sign
+    logic [10:0] e0, e1;                  // its exponent field for kc = 0 / kc = 1
+    logic        q, nz;                   // fraction bit 51 and "fraction not zero" where it matters (e = 7FF)
+  } xf_t;
+  xf_t        xf5;                        // R5's (below)
+  logic       xkc6, xh6;                  // S6: the rounding carry (c1 or c2); the result's exponent is not 0
+  logic [22:0] xm6;                       // S6: the result's fraction bits 51:29
+
   // R1 and R4 are kept where they are (preserve): Quartus merged R1 with
   // the double unit's identical operand register (a route across both units,
   // +0.06 ns), and retimed R4 into S5's normalise shift (-0.19 ns)
   r1_t  s1_d;
   (* preserve *) r1_t r1_q;
   logic r1_v;
-  always_comb begin
-    s1_d.ma = ma;  s1_d.mc = mc;  s1_d.b = b_nrm;  s1_d.sh = sh;  s1_d.e0p = ep0;  s1_d.e0b = e0b;  s1_d.e0s = e0_b;
-    s1_d.a_nan = a_nan;  s1_d.pb_nan = pb_nan;  s1_d.c_nan = c_nan;  s1_d.a_s = a_s;  s1_d.b_s = b_s;  s1_d.c_s = c_s;
-    s1_d.pinf = pinf;  s1_d.sp_ = sp_;  s1_d.sbe = sbe;  s1_d.has_b = has_b;
-    s1_d.pon = prod_on;  s1_d.sd = s1_sd;
-  end
+  r1_t  r1e;                              // R1 as S2 sees it (EF: the kc version chosen)
+  generate if (!EF) begin : g_s1
+    assign s1_d = s1f(in_op, in_ctl, in_a, in_b, in_c, in_tag);
+    assign r1e  = r1_q;
+  end else begin : g_s1ef
+    // the operands, one 4:1 select each, for kc = 0 and kc = 1 (only the exponent differs: an R5 operand is
+    // {sign, its exponent for that kc, fraction 51:29 standing for its class bits})
+    logic [63:0] xo [2];
+    logic [63:0] opk [2][3];
+    logic [63:0] srcq [3], srcx [3];
+    assign srcq[0] = in_aq;  assign srcq[1] = in_bq;  assign srcq[2] = in_cq;
+    assign srcx[0] = in_ax;  assign srcx[1] = in_bx;  assign srcx[2] = in_cx;
+    always_comb
+      for (int k = 0; k < 2; k++) begin
+        xo[k] = {xf5.s, (k == 1) ? xf5.e1 : xf5.e0, xf5.q, 21'd0, xf5.nz, 29'd0};
+        for (int p = 0; p < 3; p++)
+          case (in_sel[p])
+            2'd0:    opk[k][p] = srcq[p];
+            2'd1:    opk[k][p] = srcx[p];
+            2'd2:    opk[k][p] = in_fo;
+            default: opk[k][p] = xo[k];
+          endcase
+      end
+    r1_t s1_0, s1_1;
+    assign s1_0 = s1f(in_op, in_ctl, opk[0][0], opk[0][1], opk[0][2], in_tag);
+    assign s1_1 = s1f(in_op, in_ctl, opk[1][0], opk[1][1], opk[1][2], in_tag);
+    // the significands of R5 operands: S6's result now
+    wire hb = !(in_op == FMA_MUL);
+    wire hc = !(in_op == FMA_ADD || in_op == FMA_SUB);
+    always_comb begin
+      s1_d = s1_0;
+      if (in_sel[0] == 2'd3) s1_d.ma = {xh6, xm6};
+      if (in_sel[2] == 2'd3 && hc) s1_d.mc = {xh6, xm6};
+      if (in_sel[1] == 2'd3) s1_d.b = {24{hb & xh6}} & {1'b1, xm6};
+    end
+    wire fw = (in_sel[0] == 2'd3) || (in_sel[1] == 2'd3) || (in_sel[2] == 2'd3);
+    r1k_t r1x_q;
+    logic r1_k;
+    always_ff @(posedge clk) begin
+      r1x_q <= r1k_of(s1_1);
+      r1_k  <= fw & xkc6;
+    end
+    assign r1e = r1_k ? r1_with(r1_q, r1x_q) : r1_q;
+`ifdef R104_CHECK
+    // an R5 operand is the result S6 forms now: R1, its kc version chosen, is S1 of these operands with that
+    // result in place
+    logic [63:0] chk [3];
+    r1_t ref1, eff1;
+    always_comb begin
+      for (int p = 0; p < 3; p++) chk[p] = (in_sel[p] == 2'd3) ? o_res : opk[0][p];
+      ref1 = s1f(in_op, in_ctl, chk[0], chk[1], chk[2], in_tag);
+      eff1 = (fw & xkc6) ? r1_with(s1_d, r1k_of(s1_1)) : s1_d;
+    end
+    always_ff @(posedge clk)
+      if (!rst && in_valid && fw) begin
+        if (!o_valid) $fatal(1, "sfma EF: an R5 operand with R5 empty");
+        if (r5_q.sd.oe || r5_q.sd.ue) $fatal(1, "sfma EF: the producer has OE or UE set");
+        if (ref1 != eff1) $fatal(1, "sfma EF: R1 %h against %h (kc %0d, sel %h; result %h, R5 e0 %h e1 %h s %b q %b nz %b, tiny %b zero %b rtz %b den_at %b ovf0 %b ovf_at %b)",
+                                 eff1, ref1, xkc6, in_sel, o_res, xf5.e0, xf5.e1, xf5.s, xf5.q, xf5.nz, r5_q.tiny, r5_q.zero, r5_q.rtz, r5_q.den_at, r5_q.ovf0, r5_q.ovf_at);
+      end
+`endif
+  end endgenerate
   generate if (Q1) begin : g_r1
     always_ff @(posedge clk) begin
       if (rst) r1_v <= 1'b0;
@@ -231,27 +338,27 @@ module ppc_fpu_sfma
   // shift: a NaN operand's payload, quieted (frA's, frB's, frC's in that
   // order; ma, b and mc hold them), else infinity (payload 0) or the
   // default QNaN (its quiet bit)
-  wire        nan2 = r1_q.a_nan | r1_q.pb_nan | r1_q.c_nan;
-  wire [22:0] nf2  = r1_q.a_nan ? r1_q.ma[22:0] : r1_q.pb_nan ? r1_q.b[22:0] : r1_q.mc[22:0];
-  wire [23:0] spv2 = nan2 ? {1'b0, nf2 | (23'd1 << 22)} : {1'b0, r1_q.sd.sp_isnan, 22'd0};
-  wire [73:0] al2 = r1_q.sd.special ? {spv2, 50'd0} : {r1_q.b, 50'd0} >> r1_q.sh;
+  wire        nan2 = r1e.a_nan | r1e.pb_nan | r1e.c_nan;
+  wire [22:0] nf2  = r1e.a_nan ? r1e.ma[22:0] : r1e.pb_nan ? r1e.b[22:0] : r1e.mc[22:0];
+  wire [23:0] spv2 = nan2 ? {1'b0, nf2 | (23'd1 << 22)} : {1'b0, r1e.sd.sp_isnan, 22'd0};
+  wire [73:0] al2 = r1e.sd.special ? {spv2, 50'd0} : {r1e.b, 50'd0} >> r1e.sh;
   logic [23:0] lost2;
   always_comb
-    for (int j = 0; j < 24; j++) lost2[j] = (8'(j) + 8'd51 <= {1'b0, r1_q.sh});
-  wire st2 = !r1_q.sd.special && |(r1_q.b & lost2);
+    for (int j = 0; j < 24; j++) lost2[j] = (8'(j) + 8'd51 <= {1'b0, r1e.sh});
+  wire st2 = !r1e.sd.special && |(r1e.b & lost2);
   // the signs, as S1 had them (sp_sign: the special result's)
   logic sp_sign2;
   always_comb begin
-    if (r1_q.a_nan)                              sp_sign2 = r1_q.a_s;
-    else if (r1_q.pb_nan)                        sp_sign2 = r1_q.b_s;
-    else if (r1_q.c_nan)                         sp_sign2 = r1_q.c_s;
-    else if (r1_q.sd.vximz | r1_q.sd.vxisi)      sp_sign2 = 1'b0;
-    else if (r1_q.pinf)                          sp_sign2 = r1_q.sp_;
-    else                                         sp_sign2 = r1_q.sbe;
+    if (r1e.a_nan)                              sp_sign2 = r1e.a_s;
+    else if (r1e.pb_nan)                        sp_sign2 = r1e.b_s;
+    else if (r1e.c_nan)                         sp_sign2 = r1e.c_s;
+    else if (r1e.sd.vximz | r1e.sd.vxisi)      sp_sign2 = 1'b0;
+    else if (r1e.pinf)                          sp_sign2 = r1e.sp_;
+    else                                        sp_sign2 = r1e.sbe;
   end
-  wire r_sp2  = r1_q.sd.special ? sp_sign2 : r1_q.sp_;
-  wire r_sb2  = r1_q.sd.special ? sp_sign2 : (r1_q.has_b ? r1_q.sbe : r1_q.sp_);
-  wire effs2  = ~r1_q.sd.special & (r_sp2 ^ r_sb2);
+  wire r_sp2  = r1e.sd.special ? sp_sign2 : r1e.sp_;
+  wire r_sb2  = r1e.sd.special ? sp_sign2 : (r1e.has_b ? r1e.sbe : r1e.sp_);
+  wire effs2  = ~r1e.sd.special & (r_sp2 ^ r_sb2);
 
   typedef struct packed {
     logic [47:0] p;
@@ -263,8 +370,8 @@ module ppc_fpu_sfma
   r2_t  s2_d, r2_q;
   logic r2_v;
   always_comb begin
-    s2_d.p = prod2;  s2_d.al = {al2, st2};  s2_d.e0 = r1_q.e0s ? r1_q.e0b : r1_q.e0p;
-    s2_d.sp = r_sp2;  s2_d.sb = r_sb2;  s2_d.effsub = effs2;  s2_d.pon = r1_q.pon;  s2_d.sd = r1_q.sd;
+    s2_d.p = prod2;  s2_d.al = {al2, st2};  s2_d.e0 = r1e.e0s ? r1e.e0b : r1e.e0p;
+    s2_d.sp = r_sp2;  s2_d.sb = r_sb2;  s2_d.effsub = effs2;  s2_d.pon = r1e.pon;  s2_d.sd = r1e.sd;
   end
   generate if (Q2) begin : g_r2
     always_ff @(posedge clk) begin
@@ -459,6 +566,29 @@ module ppc_fpu_sfma
       if (!rst && bnj5[j] != base5 + exp_t'(j)) $fatal(1, "sfma bnu%0d against base5 + %0d", j, j);
 `endif
 
+  // EF: the result as its consumer's S1 sees it, for both outcomes of S6's rounding carry kc (with OE = UE = 0,
+  // the producers EF is used for): S6's cases in its order. A special result's fraction is s[73:51] (it is not
+  // shifted); with kc = 1 a result below the rounding place (rtz) is not 0, and with the rounding place at
+  // d = 25 (far5, or exactly 25) the carry is c2 (bnu2)
+  xf_t xf_s5;
+  always_comb begin
+    automatic logic rtz5   = (d5 >= 5'd24);
+    automatic logic toinf5 = (r4_q.sd.rmode == 2'b00) || (r4_q.sd.rmode == 2'b10 && !r4_q.sign) ||
+                             (r4_q.sd.rmode == 2'b11 && r4_q.sign);
+    automatic logic [10:0] om5 = toinf5 ? 11'h7FF : 11'h47E;
+    automatic logic ov0 = ~force5 & ~r4_q.zero & ~tiny5 & ~far5 & (lz5 < r4_q.k54);
+    automatic logic ov1 = ~force5 & ~r4_q.zero & ~tiny5 & ~far5 & (lz5 <= r4_q.k54);
+    automatic logic fl0 = r4_q.sd.ni & tiny5 & ~r4_q.sd.ue;
+    automatic logic fl1 = fl0 & ~(~far5 & (lz5 == r4_q.k200));
+    automatic logic flip5 = r4_q.sd.negr & ~(force5 & r4_q.sd.sp_isnan);
+    automatic logic zs5 = r4_q.effsub ? (r4_q.sd.rmode == 2'b11) : r4_q.sign;
+    xf_s5.s  = ((~force5 & r4_q.zero) ? zs5 : r4_q.sign) ^ flip5;
+    xf_s5.e0 = force5 ? 11'h7FF : r4_q.zero ? 11'd0 : ov0 ? om5 : (rtz5 || fl0) ? 11'd0 : bnj5[0][10:0];
+    xf_s5.e1 = force5 ? 11'h7FF : r4_q.zero ? 11'd0 : ov1 ? om5 : fl1 ? 11'd0 : (d5 == 5'd25) ? bnj5[2][10:0] : bnj5[1][10:0];
+    xf_s5.q  = force5 & r4_q.s[73];
+    xf_s5.nz = force5 & (r4_q.s[73:51] != 23'd0);
+  end
+
   typedef struct packed {
     logic [28:0] z, keep, one;
     logic        lsb, g, x, rtz;
@@ -466,6 +596,7 @@ module ppc_fpu_sfma
     bexp_t       bnu0, bnu1, bnu2, bo0, bo1;
     logic        sign, effsub;
     side_t       sd;
+    xf_t         xf;                      // EF (S1 above)
   } r5_t;
   r5_t  s5_d, r5_q;
   logic r5_v;
@@ -483,6 +614,7 @@ module ppc_fpu_sfma
     s5_d.bo0  = bx_of(bo5);
     s5_d.bo1  = bx_of(bo5 + exp_t'(1));
     s5_d.sign = r4_q.sign;  s5_d.effsub = r4_q.effsub;  s5_d.sd = r4_q.sd;
+    s5_d.xf = xf_s5;
   end
   generate if (Q5) begin : g_r5
     always_ff @(posedge clk) begin
@@ -561,6 +693,12 @@ module ppc_fpu_sfma
   end endgenerate
 
   wire [63:0] res6 = c1 ? res_k[1] : res_k[0];
+  // EF: the rounding carry, and the result's significand for a consumer's R1 (exponent not 0: not a zero,
+  // not rounded to zero, not flushed)
+  assign xkc6 = c1 | c2;
+  assign xh6  = spc6 | ~(r5_q.zero | rzero6 | (sd6.ni & r5_q.tiny & ~sd6.ue & ~rzero6 & ~(r5_q.den_at & c1)));
+  assign xm6  = res6[51:29];
+  assign xf5  = r5_q.xf;
   wire [4:0]  cls6 = c1 ? cls_k[1] : cls_k[0];
   wire        ovf6 = c1 ? ovf_k[1] : ovf_k[0];
   wire        ovd6 = c1 ? ovfd_k[1] : ovfd_k[0];

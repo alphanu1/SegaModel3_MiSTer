@@ -66,7 +66,7 @@
 // cycles its uop waited in MEM) moves the cycle at which an interrupt or a
 // DEC / timebase read was decided.
 //
-//   tb_ppc_core [seeds] [first_seed] [length] [max_wait] [--mode n] [--dlat n] [--ilat n] [--rdy p] [--loops]
+//   tb_ppc_core [seeds] [first_seed] [length] [max_wait] [--mode n] [--dlat n] [--ilat n] [--rdy p] [--loops] [--fpburst]
 //
 // --alias: update forms whose registers overlap, a third of the memory ops
 // (alias_mem, and FP in fp_mem): loads with rD = rB and rA = rB, stores with
@@ -131,6 +131,8 @@ int g_dlat = 0, g_ilat = 0, g_rdy = 0;
 bool g_board = false;
 bool g_mis = false;                           // --mis: misaligned accesses (mis_mem)
 bool g_alias = false;                         // --alias: overlapping registers in update forms (alias_mem)
+bool g_fpburst = false;                       // --fpburst: multiply-adds, then FP loads behind them (fp_burst, cpi112)
+bool g_fpchain = false;                       // --fpchain: chains of dependent single multiply-adds (fp_chain, fp117)
 bool g_loops = false;
 uint32_t g_intdrop = 40000;   // the interrupt line drops before it is taken, 1 in N clocks (--intdrop, study R104)
 int g_snoop = 0;                              // --snoop n (PPC_CPU only)                         // --loops: backward branches, calls and (real mode) rewritten code                         // --emit: the board harness without caches cannot dcbz       // fixed data / fetch wait (0: random), % of cycles with d_rdy low
@@ -895,7 +897,39 @@ struct Gen {
       else { emit(D(14, 3, 0, (r32() % (g_span / 4 - 0x100)) & ~7u)); emit(X(fr(), base_r, 3, x)); }
     }
   }
+  // --fpburst (cpi112): multiply-add ops, then FP loads behind them, so loads reach WB while results come
+  // back on the FPR write port and the load write slot must wait (ppc_core FLW), and consumers right after
+  void fp_burst() {
+    int n = 1 + rnd(4);
+    for (int i = 0; i < n; i++) fp_madd(0);
+    int m = 2 + rnd(4);
+    for (int j = 0; j < m; j++) fp_mem();
+    if (rnd(2)) fp_madd(0);
+    if (rnd(2)) fp_arith();
+  }
+  // --fpchain (fp117): single-precision multiply-adds reading the last results (one, two or three back) and often
+  // writing one of their own sources or the FPR still being written (WAW), with now and then a move, a store, a
+  // compare, an frsqrte or a double op among them: the early forward (ppc_core FEF) at every distance and the
+  // relaxed WAW rule (FWW), on single values (the pool's), so most of them take the fast port
+  int fd_hist[3] = {0, 0, 0};
+  int fcs() { int k = rnd(8); return k < 3 ? fd_hist[0] : k < 5 ? fd_hist[1] : k < 6 ? fd_hist[2] : fr(); }
+  void fp_chain() {
+    int n = 2 + rnd(7);
+    for (int i = 0; i < n; i++) {
+      static const int xo[] = {20, 21, 25, 28, 29, 30, 31};
+      int x = xo[rnd(7)], k = rnd(16);
+      int a = fcs(), b = (x == 25) ? 0 : fcs(), c = (x == 20 || x == 21) ? 0 : fcs();
+      int d = k < 5 ? a : k < 8 ? (x == 25 ? a : b) : k < 10 ? fd_hist[0] : fr();
+      if (k == 10) { emit(FX(fr(), 0, fd_hist[0], 72, 0)); continue; }                        // fmr of the last result
+      if (k == 11) { fp_mem(); continue; }
+      if (k == 12 && rnd(2)) { emit(FX(fr(), 0, fd_hist[0], 26, 0)); continue; }           // frsqrte
+      emit(FA(rnd(8) ? 59 : 63, d, a, b, c, x, rnd(16) == 0));
+      fd_hist[2] = fd_hist[1]; fd_hist[1] = fd_hist[0]; fd_hist[0] = d; last_fd = d;
+    }
+  }
   void fp_insn() {
+    if (g_fpchain && rnd(2) == 0) { fp_chain(); return; }
+    if (g_fpburst && rnd(3) == 0) { fp_burst(); return; }
     int k = rnd(20);
     if (k < 10) fp_arith();
     else if (k < 17) fp_mem();
@@ -1327,6 +1361,10 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
   struct DAns { uint64_t t; uint32_t word; };
   std::deque<DAns> dq;                                 // data answers outstanding, in order
   uint64_t d_last = 0;                                 // cycle of the latest answer scheduled
+#ifdef TB_LU2
+  uint32_t e_prev = 0;                                 // last cycle's d_eword (LU2, below)
+  std::mt19937 e_rng(seed ^ 0x5A5A1717u);              // its own stream: the others' are as without LU2
+#endif
   bool d_rdy = true;
 
 #ifdef PPC_CPU
@@ -1466,6 +1504,18 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
     top.d_valid = !dq.empty() && dq.front().t == cycles;
     top.d_rdata = top.d_valid ? dq.front().word : uint32_t(rrng());   // junk outside an answer
     top.d_rdy   = d_rdy;
+    // ppc_core LU2's early word, as ppc_dcache gives it: the word of the answer due next cycle three times in
+    // four, else junk (a miss, the other way); d_eok when this cycle's answer is last cycle's early word, seven
+    // times in eight (else as for a store-buffer byte). The core may only rely on d_eok with d_valid.
+#ifdef TB_LU2
+    {
+      size_t const k = top.d_valid ? 1 : 0;
+      bool const nx = dq.size() > k && dq[k].t == cycles + 1;
+      top.d_eok = top.d_valid && top.d_rdata == e_prev && (e_rng() & 7) != 0;
+      top.d_eword = (nx && (e_rng() & 3) != 0) ? dq[k].word : uint32_t(e_rng());
+      e_prev = top.d_eword;
+    }
+#endif
     top.d_idle  = dq.empty();
     top.icbi_ack = top.icbi_req;                       // no I-cache: taken at once
     top.clk = 0; top.eval();
@@ -1784,6 +1834,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--intdrop") && i + 1 < argc) g_intdrop = uint32_t(atoi(argv[++i]));   // study R104
     else if (!strcmp(argv[i], "--mis")) g_mis = true;
     else if (!strcmp(argv[i], "--alias")) g_alias = true;
+    else if (!strcmp(argv[i], "--fpburst")) g_fpburst = true;
+    else if (!strcmp(argv[i], "--fpchain")) g_fpchain = true;
     else if (!strcmp(argv[i], "--snoop") && i + 1 < argc) g_snoop = atoi(argv[++i]);
     else pos.push_back(argv[i]);
   }
