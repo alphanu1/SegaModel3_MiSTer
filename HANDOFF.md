@@ -4,6 +4,8 @@
 
 The study's R134-R137 and D-49 carry this. The tree is build `c7_s1`'s RTL (RBF be782d4a): 41,091 ALM (98%), 347
 M10K, 88 DSP; setup −2.59 / −2.55 ns, HDMI met, hold least +0.084 ns.
+Committed and pushed as 71e669c (2026-11-08). Timing closure is under way in `sm3-builds/tc` (CPU paths in
+`tc/cpu`, everything else in `tc/r3d`; the census of all 3,267 failing endpoints in `tc/cen_100.txt`, `cen_n40.txt`).
 
 - **Lost World's foliage (R134):** an L8 texel of 0xFF is transparent, as Supermodel. The green boxes are gone.
 - **Texture decode follows Supermodel (D-49, R135):** formats 1-6 under contour, texture inversion, and the glass
