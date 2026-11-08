@@ -40,8 +40,11 @@ namespace r3d {
 constexpr int SCR_W = 496, SCR_H = 384;
 
 // MAME's TRI_PARAM bits, as the 'T' record carries them
+// Bit 0 was MAME's texture page (a copy of tex page, read by nothing here); from study R135 the geometry
+// sends texture alpha there (header[6] bits 2:0 from Step 1.5, bit 0 on 1.0). Lists made before carry the
+// page: set_talpha() rewrites it from the polygon header for the game's step.
 enum : uint32_t {
-  TP_PAGE = 0x1, TP_MIRROR_U = 0x2, TP_MIRROR_V = 0x4, TP_TEXTURE = 0x8,
+  TP_TALPHA = 0x1, TP_MIRROR_U = 0x2, TP_MIRROR_V = 0x4, TP_TEXTURE = 0x8,
   TP_CONTOUR = 0x10, TP_COLORMOD = 0x20,
 };
 
@@ -72,6 +75,8 @@ struct rframe {
 };
 
 bool read_rframe(std::string const &tri_file, rframe &out);
+// TP_TALPHA of every triangle from its polygon header for a game of this step (0x10, 0x15, 0x20, 0x21)
+void set_talpha(rframe &f, unsigned step);
 
 // Texture RAM as the Supermodel dump holds it: 2048 x 2048 16-bit texels, page 1
 // from row 1024 (MAME's m_texture_ram[0] then [1]).
@@ -80,8 +85,25 @@ struct texram {
   // MAME's texture decode for (sheet position, size, format) at a mirrored
   // coordinate u, v in [0, 2 * (32 << w)) x [0, 2 * (32 << h)), ARGB8888
   uint32_t texel(uint32_t page, uint32_t tx, uint32_t ty, uint32_t tw, uint32_t th, uint32_t fmt,
-                 uint32_t u, uint32_t v, bool *outside = nullptr) const;
+                 uint32_t u, uint32_t v, bool *outside = nullptr, bool ctr = false) const;
+  // The core's decode of one texel: MAME's, except that with l8_key an L8 texel of 0xFF (formats 5
+  // and 6) has alpha 0, as Supermodel's ExtractColour (study R134: Lost World's foliage, format 5 under
+  // contour). Alpha only matters to the contour and texture-alpha kinds. Off: MAME's get_texture, for
+  // the comparisons with MAME's renders.
+  bool l8_key = true;
+  // Supermodel's texture decode, contour and texture alpha (study R135, New3D's ExtractColour, GetTexFormat and
+  // GetTextureValue): format 2 with its alpha in the low nibble; under contour formats 1-4 lose their alpha
+  // nibble and luminance 15 is transparent (Supermodel's types 8-11), and the four corners' colours are dilated
+  // from the opaque ones before the filter; contour on format 7 is no test; the contour test keeps a filtered
+  // alpha of 32 or more and writes opaque; texture alpha and polygon translucency as Supermodel's alpha
+  // (r3d_rast_rtl.cpp frag). Off: the form before (MAME's get_texture and draw kinds, with l8_key).
+  bool sm_tex = true;
+  // ctr: the polygon's contour bit (with sm_tex, formats 1-4 decode as Supermodel's types 8-11)
+  uint32_t decode(int fmt, uint32_t p, bool ctr = false) const;
 };
+// Supermodel's colour dilation for a contour texel's four corners (texBiLinear under alphaTest): in its order,
+// a corner whose alpha is below an edge neighbour's takes that neighbour's colour; alpha stays (study R135)
+void sm_dilate(uint32_t c[4]);
 
 // Draw kinds, MAME's scanline functions
 enum rkind : uint8_t {
@@ -212,8 +234,10 @@ uint8_t d25_log2t(int i);        // 256 log2(1 + (i + 1/2) / 64), rounded
 int64_t d25_fog_p(__int128 o2, int eo, float K);
 // render_d25's colour for one pixel (frag, then fog when fogint != 0): false when
 // the alpha test discards it; rgb after fog, fb the blend factor (-1 none)
+// sm, am (study R135): Supermodel's contour and texture alpha, am = d25_am(t) = {inv, at, ta, cm}
 bool d25_colour(rkind k, uint32_t texel, uint32_t color, uint32_t trans, int32_t shade, uint32_t fogint,
-                int32_t const fc[3], int32_t S, int32_t P, uint32_t &rgb, int &fb, bool &zw);
+                int32_t const fc[3], int32_t S, int32_t P, uint32_t &rgb, int &fb, bool &zw, bool sm = false, uint32_t am = 0);
+uint32_t d25_am(rtri const &t);
 // render_d25's scroll fog: the rectangle [x0, x1) x [y0, y1) holds col (what a
 // blend reads) until drawn; a pixel left undrawn shows shown = col x alpha
 struct d25_sfog { int x0 = 0, x1 = 0, y0 = 0, y1 = 0; uint32_t col = 0, shown = 0, alpha = 0; };

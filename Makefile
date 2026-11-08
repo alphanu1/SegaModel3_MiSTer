@@ -728,7 +728,7 @@ $(RAST_OBJ)/colour/Vr3d_rast_colour: rtl/real3d/r3d_rast_colour.sv sim/real3d/tb
 .PHONY: test_real3d_rast100_colour
 test_real3d_rast100_colour: $(RAST_OBJ)/colour/Vr3d_rast_colour
 	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME rtl/real3d/r3d_rast_colour.sv
-	@for g in vf3 bassdx; do ./$(RAST_OBJ)/colour/Vr3d_rast_colour --tris $(RAST_DIR)/tris_$$g --dumps sm3-builds/census/dumps_$$g --frames 100 || exit 1; done
+	@for g in vf3 bassdx; do ./$(RAST_OBJ)/colour/Vr3d_rast_colour --tris $(RAST_DIR)/tris_$$g --dumps sm3-builds/census/dumps_$$g --frames 100 --step 10 || exit 1; done
 	@./$(RAST_OBJ)/colour/Vr3d_rast_colour --random 3000000
 
 # r3d_face alone against the model's FP32 test: random matrices and polygons, three seeds
@@ -741,6 +741,7 @@ test_real3d_face: $(R3D_OBJ)/face/Vr3d_face
 	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -Wno-PINCONNECTEMPTY -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM --top-module r3d_face \
 	  rtl/real3d/r3d_ram.sv rtl/real3d/r3d_fp_mul.sv rtl/real3d/r3d_fp_add.sv rtl/real3d/r3d_face.sv
 	@for s in 1 2 3; do ./$(R3D_OBJ)/face/Vr3d_face 300000 $$s || exit 1; done
+	@for s in 4 5; do FACE_STEP15=1 ./$(R3D_OBJ)/face/Vr3d_face 300000 $$s || exit 1; done
 
 # the same with the LOD word (LOD = 1, study D-33): B = d x (NP x C) checked
 # in order, C changed while idle; KZ2 1.0 (Supermodel's frustum) and MAME's
@@ -754,6 +755,8 @@ test_real3d_face_lod: $(R3D_OBJ)/face_lod1/Vr3d_face $(R3D_OBJ)/face_lod2/Vr3d_f
 	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -Wno-PINCONNECTEMPTY -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM --top-module r3d_face -GLOD=1 \
 	  rtl/real3d/r3d_ram.sv rtl/real3d/r3d_fp_mul.sv rtl/real3d/r3d_fp_add.sv rtl/real3d/r3d_face.sv
 	@for k in 1 2; do for s in 1 2 3; do ./$(R3D_OBJ)/face_lod$$k/Vr3d_face 300000 $$s || exit 1; done; done
+	@# Step 1.5 and later (study D-46): 13.11 positions, NP u10.14
+	@for k in 1 2; do for s in 4 5; do FACE_STEP15=1 ./$(R3D_OBJ)/face_lod$$k/Vr3d_face 300000 $$s || exit 1; done; done
 
 # MAME's rows have no facing test
 R3D_ROWP = $(if $(filter mame,$(R3D_ROWS)),-GSM_FLAT=0 -GSM_FIXED=0 -GSM_DOUBLE=0 -GSM_LIGHT=0 -GSM_TRANS=0 -GSM_CTAB=0 -GSM_CULL=0,)
@@ -879,6 +882,7 @@ test_real3d_rast100_mip: $(RAST_OBJ)/texelm/Vr3d_rast_texel $(RAST_OBJ)/interpm/
 	@$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -GMIP=1 rtl/real3d/r3d_rast_intake.sv
 	@for g in vf3 bassdx; do ./$(RAST_OBJ)/texelm/Vr3d_rast_texel --mip --tris $(RAST_DIR)/tris_$$g --dumps sm3-builds/census/dumps_$$g --frames $(RAST_FRAMES) || exit 1; done
 	@./$(RAST_OBJ)/texelm/Vr3d_rast_texel --mip --random 3000000
+	@./$(RAST_OBJ)/texelm/Vr3d_rast_texel --mip --random 2000000 --rkey 3
 	@for g in vf3 bassdx; do ./$(RAST_OBJ)/interpm/Vr3d_rast_interp --mip --tris $(RAST_DIR)/tris_$$g --dumps sm3-builds/census/dumps_$$g --frames $(RAST_FRAMES) || exit 1; done
 	@./$(RAST_OBJ)/interpm/Vr3d_rast_interp --mip --random 3000000
 	@./$(RAST_OBJ)/intakem/Vr3d_rast_intake --mip --tris $(RAST_DIR)/tris_vf3 --frames 40 --oow
@@ -990,6 +994,9 @@ RAST_CHUNK ?= 25
 # 20-200, beat gaps 30%, 8 lines in flight, input gaps 50%
 RAST_P0 =
 RAST_P1 = --ack 1 400 30 --tack 1 400 2 --busy 60 --lat 20 200 --gap 30 --maxrd 8 --igap 50
+# the lists' param bit 0 is MAME's page; the record's is texture alpha (study R135), set from the polygon
+# headers for the game's step: VF3 and Bass Fishing are Step 1.0
+RAST_STEP = --step 10
 $(RAST_OBJ)/rast/Vr3d_rast: $(RAST_TOP_RTL) sim/real3d/tb_r3d_rast.cpp sim/real3d/r3d_rast.cpp sim/real3d/r3d_rast_rtl.cpp sim/real3d/r3d_geo.cpp $(RAST_HDR) $(R3D_HDR)
 	@mkdir -p $(dir $@)
 	@$(VERILATOR) $(R3D_VFLAGS) --x-initial unique --x-assign unique --top-module r3d_rast -CFLAGS "-O2 -std=c++17 -ffp-contract=off -I$(PWD)/sim/real3d" \
@@ -1017,15 +1024,15 @@ lint_real3d_rast_top:
 test_real3d_rast_top: lint_real3d_rast_top $(RAST_OBJ)/rast/Vr3d_rast $(RAST_OBJ)/fogvp/Vr3d_rast_fogvp
 	@for s in 1 2 3; do ./$(RAST_OBJ)/fogvp/Vr3d_rast_fogvp 1000000 $$s || exit 1; done
 	@for g in vf3 bassdx; do echo "== r3d_rast, $$g, profile p0"; \
-	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rast/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_p0.log $(RAST_P0) || exit 1; \
+	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rast/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_p0.log $(RAST_P0) $(RAST_STEP) || exit 1; \
 	  echo "== r3d_rast, $$g, profile p1"; \
-	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rast/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_p1.log $(RAST_P1) || exit 1; done
+	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rast/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_p1.log $(RAST_P1) $(RAST_STEP) || exit 1; done
 # MIP = 1 with the geometry's B (render_d25 mip 1, lod 1, d25_opts::lodb); logs w_<game>_m<profile>.log
 test_real3d_rast_top_mip: lint_real3d_rast_top $(RAST_OBJ)/rastm/Vr3d_rast
 	@for g in vf3 bassdx; do echo "== r3d_rast MIP, $$g, profile p0"; \
-	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rastm/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_mp0.log --mip --geo-lod $(PWD)/sm3-builds/r3d/vrom_$$g.bin $(RAST_P0) || exit 1; \
+	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rastm/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_mp0.log --mip --geo-lod $(PWD)/sm3-builds/r3d/vrom_$$g.bin $(RAST_P0) $(RAST_STEP) || exit 1; \
 	  echo "== r3d_rast MIP, $$g, profile p1"; \
-	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rastm/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_mp1.log --mip --geo-lod $(PWD)/sm3-builds/r3d/vrom_$$g.bin $(RAST_P1) || exit 1; done
+	  sim/real3d/run_rast.sh $(PWD)/$(RAST_OBJ)/rastm/Vr3d_rast $$g $(RAST_CHUNK) $(RAST_JOBS) $(PWD)/sm3-builds/rast/w_$${g}_mp1.log --mip --geo-lod $(PWD)/sm3-builds/r3d/vrom_$$g.bin $(RAST_P1) $(RAST_STEP) || exit 1; done
 measure_real3d_store: $(RAST_OBJ)/r3d_store_census
 	@for g in vf3 bassdx; do ./$(RAST_OBJ)/r3d_store_census --tris $(RAST_DIR)/tris_$$g; done
 

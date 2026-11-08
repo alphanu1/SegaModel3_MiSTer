@@ -47,16 +47,20 @@ SYS_RTL = $(R3D_SYS) rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/sys/m3_jtag
 
 .PHONY: test_jtag test_jtag_fault lint_sys test_io test_sdr_port test_bus system test_xmem test_sec test_texup2
 
-# r3d_texup's Step 2.x texture port (R100) against its FIFO path. TEXUP2_RTL: the
-# r3d_texup carrying STEP2_PORT (held outside the tree: sm3-builds/dt2/handoff2)
-TEXUP2_RTL ?= sm3-builds/dt2/handoff2/rtl/r3d_texup.sv
+# r3d_texup's three-word texture port (R100; Step 1.5 and later, D-46) against its FIFO
+# path, on 64 MiB of VROM (Daytona 2) and on 32 MiB (--v32: a Step 1.5 set). TEXUP2_RTL:
+# the r3d_texup carrying STEP2_PORT (in the tree since the Step 2 merge)
+TEXUP2_RTL ?= rtl/real3d/r3d_texup.sv
 $(SYS_OBJ)/texup2/Vr3d_texup: $(TEXUP2_RTL) sim/system/tb_r3d_texup2.cpp
 	@$(VERILATOR) $(VFLAGS) --public-flat-rw -GSTEP2_PORT=1 --top-module r3d_texup -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/texup2 $(TEXUP2_RTL) sim/system/tb_r3d_texup2.cpp >/dev/null
 
 test_texup2: $(SYS_OBJ)/texup2/Vr3d_texup
-	@echo "== r3d_texup: the Step 2.x texture port against the FIFO"
+	@echo "== r3d_texup: the three-word texture port against the FIFO"
 	./$(SYS_OBJ)/texup2/Vr3d_texup 300 1
 	./$(SYS_OBJ)/texup2/Vr3d_texup 300 2
+	./$(SYS_OBJ)/texup2/Vr3d_texup 300 3 --v32
+	./$(SYS_OBJ)/texup2/Vr3d_texup 300 4 --v32
+	! TEXUP_FAULT_V64=1 ./$(SYS_OBJ)/texup2/Vr3d_texup 20 5 --v32 > /dev/null
 
 # m3_sec (the 315-5881, study R100) against Daytona 2's Supermodel trace
 SEC_TRACE ?= sm3-builds/dt2/sec_dt2.bin
@@ -68,14 +72,31 @@ test_sec: $(SYS_OBJ)/sec/Vm3_sec
 	./$(SYS_OBJ)/sec/Vm3_sec $(SEC_TRACE) 29250e16
 	! ./$(SYS_OBJ)/sec/Vm3_sec $(SEC_TRACE) 29250e16 --fault > /dev/null
 
-# m3_xmem (study R100): VROM in the extra memory, against a reference
+# m3_xmem (study R100): VROM in the extra memory, against a reference. R100's bench (one request at a time)
+# runs on the MRA layout (XLIN 0), both forms; R127's (tb_m3_xmem2: requests overlapped as r3d_mstream asks
+# them, 64 MiB texture reads, bursts) on all four
 $(SYS_OBJ)/xmem/Vm3_xmem: rtl/sys/m3_xmem.sv sim/system/tb_m3_xmem.cpp
-	@$(VERILATOR) $(VFLAGS) --top-module m3_xmem -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/xmem rtl/sys/m3_xmem.sv sim/system/tb_m3_xmem.cpp >/dev/null
+	@$(VERILATOR) $(VFLAGS) --top-module m3_xmem -GXLIN=0 -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/xmem rtl/sys/m3_xmem.sv sim/system/tb_m3_xmem.cpp >/dev/null
+$(SYS_OBJ)/xmem_one/Vm3_xmem: rtl/sys/m3_xmem.sv sim/system/tb_m3_xmem.cpp
+	@$(VERILATOR) $(VFLAGS) --top-module m3_xmem -GXLIN=0 -GPIPE=0 -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/xmem_one rtl/sys/m3_xmem.sv sim/system/tb_m3_xmem.cpp >/dev/null
+XMEM2 = p1l1:-GPIPE=1:-GXLIN=1 p1l0:-GPIPE=1:-GXLIN=0 p0l1:-GPIPE=0:-GXLIN=1 p0l0:-GPIPE=0:-GXLIN=0
+$(SYS_OBJ)/xmem2_%/Vm3_xmem: rtl/sys/m3_xmem.sv sim/system/tb_m3_xmem2.cpp
+	@$(VERILATOR) $(VFLAGS) --top-module m3_xmem $(subst :, ,$(patsubst $*:%,%,$(filter $*:%,$(XMEM2)))) -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/xmem2_$* rtl/sys/m3_xmem.sv sim/system/tb_m3_xmem2.cpp >/dev/null
 
-test_xmem: $(SYS_OBJ)/xmem/Vm3_xmem
+test_xmem: $(SYS_OBJ)/xmem/Vm3_xmem $(SYS_OBJ)/xmem_one/Vm3_xmem $(SYS_OBJ)/xmem2_p1l1/Vm3_xmem $(SYS_OBJ)/xmem2_p1l0/Vm3_xmem $(SYS_OBJ)/xmem2_p0l1/Vm3_xmem $(SYS_OBJ)/xmem2_p0l0/Vm3_xmem
 	@echo "== m3_xmem: geometry and texture VROM reads on a pipelined port"
 	./$(SYS_OBJ)/xmem/Vm3_xmem 200000 1
 	./$(SYS_OBJ)/xmem/Vm3_xmem 200000 2
+	./$(SYS_OBJ)/xmem_one/Vm3_xmem 200000 1
+	./$(SYS_OBJ)/xmem2_p1l1/Vm3_xmem 1 300000 --xlin
+	./$(SYS_OBJ)/xmem2_p1l1/Vm3_xmem 2 300000 --xlin
+	./$(SYS_OBJ)/xmem2_p1l1/Vm3_xmem 3 300000 --xlin --gout 0 --seq 30 --tex 20
+	./$(SYS_OBJ)/xmem2_p1l1/Vm3_xmem 4 300000 --xlin --gout 0 --lat 40 136 --ack 40
+	./$(SYS_OBJ)/xmem2_p1l0/Vm3_xmem 1 300000
+	./$(SYS_OBJ)/xmem2_p1l0/Vm3_xmem 2 300000 --gout 0 --lat 1 2 --ack 100
+	./$(SYS_OBJ)/xmem2_p0l1/Vm3_xmem 3 300000 --xlin --gout 1
+	./$(SYS_OBJ)/xmem2_p0l0/Vm3_xmem 4 300000 --gout 1
+	./$(SYS_OBJ)/xmem2_p0l0/Vm3_xmem 5 300000 --gout 1
 
 $(SYS_OBJ)/jtag/Vm3_jtag: rtl/sys/m3_jtag.sv sim/system/tb_m3_jtag.cpp
 	@$(VERILATOR) $(VFLAGS) --top-module m3_jtag -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/jtag rtl/sys/m3_jtag.sv sim/system/tb_m3_jtag.cpp >/dev/null
@@ -94,6 +115,15 @@ $(SYS_OBJ)/io/Vm3_io: rtl/io/m3_93c46.sv rtl/io/m3_io.sv sim/system/tb_m3_io.cpp
 test_io: $(SYS_OBJ)/io/Vm3_io
 	@echo "== m3_io (315-5649, 93C46) against the Supermodel trace"
 	./$(SYS_OBJ)/io/Vm3_io $(TRACE)
+
+# R133: the DIP bank from the MRA's <switches> (index 254), in Main's order
+$(SYS_OBJ)/loader_sw/Vm3_loader: rtl/cpu/ppc_cache_pkg.sv rtl/sys/m3_loader.sv sim/system/tb_loader_sw.cpp
+	@mkdir -p $(SYS_OBJ)/loader_sw
+	@$(VERILATOR) $(VFLAGS) --top-module m3_loader -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/loader_sw rtl/cpu/ppc_cache_pkg.sv rtl/sys/m3_loader.sv sim/system/tb_loader_sw.cpp >/dev/null
+
+test_loader_sw: $(SYS_OBJ)/loader_sw/Vm3_loader
+	@echo "== m3_loader: the DIP bank from <switches>"
+	./$(SYS_OBJ)/loader_sw/Vm3_loader
 
 $(SYS_OBJ)/sdr/Vm3_sdr_tb: rtl/sys/m3_sdr_port.sv rtl/mem/m2_sdram.sv sim/system/m3_sdr_tb.sv sim/system/tb_m3_sdr_port.cpp rtl/cpu/ppc_cache_pkg.sv
 	@$(VERILATOR) $(VFLAGS) --top-module m3_sdr_tb -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/sdr \

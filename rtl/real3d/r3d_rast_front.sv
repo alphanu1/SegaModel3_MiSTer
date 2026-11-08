@@ -16,9 +16,14 @@
 // multiply and walk run. In the rasteriser the divider runs once a triangle in
 // the set-up and the walker once a (triangle, band) pair; this chain is their
 // bench and fit together.
+//
+// The pair's tag rides with it (study R131): r3d_rast keeps what the span
+// path takes from a pair (the Z plane, the Z kind) in a table by tag, so a
+// pair enters the divider while the one before it is still walking.
 
 module r3d_rast_front #(
-  parameter bit PRE_DIV = 1'b0    // r3d_rast_div's PRE: the triangle holds a cycle before t_valid
+  parameter bit PRE_DIV = 1'b0,   // r3d_rast_div's PRE: the triangle holds a cycle before t_valid
+  parameter int TGW     = 8
 ) (
   input  logic               clk,
   input  logic               rst,
@@ -27,12 +32,15 @@ module r3d_rast_front #(
   output logic               t_ready,
   input  logic signed [31:0] t_x1, t_y1, t_x2, t_y2, t_x3, t_y3,
   input  logic        [8:0]  t_b0, t_b1,
+  input  logic     [TGW-1:0] t_tag,
 
   output logic               s_valid,
   input  logic               s_ready,
   output logic [8:0]         s_y,
   output logic [8:0]         s_x0,
   output logic [8:0]         s_x1,
+  output logic [TGW-1:0]     s_tag,
+  output logic [TGW-1:0]     s_tag_n,     // s_tag after this edge
 
   output logic               busy
 );
@@ -41,6 +49,7 @@ module r3d_rast_front #(
   logic signed [31:0] d_x1, d_y1, d_x2, d_y2, d_x3, d_y3;
   logic signed [53:0] d_s12, d_s13, d_s23;
   logic        [8:0]  d_b0, d_b1;
+  logic     [TGW-1:0] d_tag;
 
   // the band rides beside the divider, which holds one triangle at a time
   always_ff @(posedge clk)
@@ -49,22 +58,22 @@ module r3d_rast_front #(
       d_b1 <= t_b1;
     end
 
-  r3d_rast_div #(.PRE(PRE_DIV)) u_div (
+  r3d_rast_div #(.PRE(PRE_DIV), .TGW(TGW)) u_div (
     .clk, .rst,
     .i_valid(t_valid), .i_ready(t_ready),
-    .i_x1(t_x1), .i_y1(t_y1), .i_x2(t_x2), .i_y2(t_y2), .i_x3(t_x3), .i_y3(t_y3),
+    .i_x1(t_x1), .i_y1(t_y1), .i_x2(t_x2), .i_y2(t_y2), .i_x3(t_x3), .i_y3(t_y3), .i_tag(t_tag),
     .o_valid(d_valid), .o_ready(d_ready),
-    .o_x1(d_x1), .o_y1(d_y1), .o_x2(d_x2), .o_y2(d_y2), .o_x3(d_x3), .o_y3(d_y3),
+    .o_x1(d_x1), .o_y1(d_y1), .o_x2(d_x2), .o_y2(d_y2), .o_x3(d_x3), .o_y3(d_y3), .o_tag(d_tag),
     .o_s12(d_s12), .o_s13(d_s13), .o_s23(d_s23)
   );
 
-  r3d_rast_edge u_edge (
+  r3d_rast_edge #(.TGW(TGW)) u_edge (
     .clk, .rst,
     .t_valid(d_valid), .t_ready(d_ready),
     .t_x1(d_x1), .t_y1(d_y1), .t_x2(d_x2), .t_y2(d_y2), .t_x3(d_x3), .t_y3(d_y3),
     .t_s12(d_s12), .t_s13(d_s13), .t_s23(d_s23),
-    .t_b0(d_b0), .t_b1(d_b1),
-    .s_valid, .s_ready, .s_y, .s_x0, .s_x1,
+    .t_b0(d_b0), .t_b1(d_b1), .t_tag(d_tag),
+    .s_valid, .s_ready, .s_y, .s_x0, .s_x1, .s_tag, .s_tag_n,
     .busy(e_busy)
   );
 

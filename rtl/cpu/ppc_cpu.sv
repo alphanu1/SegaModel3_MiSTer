@@ -44,7 +44,9 @@ module ppc_cpu
   parameter bit          FETCH2   = 1'b0,             // two-word fetch (D-30; off by default, D-36)
   parameter bit          LA       = 1'b1,             // the 603e's CR look-ahead (D-30)
   parameter bit          SNOOP    = 1'b1,             // the data cache's snoop port (D-41)
-  parameter bit          LU2      = 1'b1              // load-use 2: the D-cache's early word into the core (ppc_core LU2)
+  parameter bit          LU2      = 1'b1,             // load-use 2: the D-cache's early word into the core (ppc_core LU2)
+  parameter bit          ISB      = 1'b0,             // a 32 KiB I-cache (ppc_icache ISB; the 603e's is 16 KiB)
+  parameter bit          FAST     = 1'b1              // the single-precision unit (ppc_core FAST; 0: one FMA)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -112,9 +114,9 @@ module ppc_cpu
   logic        i_req, i_seq, i_valid;
   logic [31:0] i_addr, i_data;
   logic [1:0]  i_way, i_pway;
-  logic        i_arr, i_pv, i_pre;
+  logic        i_arr, i_pv, i_pre, i_eix;
   logic [19:0] i_pa, i_ppa;
-  logic [11:2] i_pidx;
+  logic [12:2] i_pidx;
   logic        i_two, i_w2;
   logic [31:0] i_data2;
   logic [3:0]  i_wimg;
@@ -129,11 +131,11 @@ module ppc_cpu
   logic [6:0]  icbi_set;
   logic        d_resv, d_cond, res_kill;
 
-  ppc_core #(.RESET_PC (RESET_PC), .PVR (PVR), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA), .LU2 (LU2)) u_core (
+  ppc_core #(.RESET_PC (RESET_PC), .PVR (PVR), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA), .LU2 (LU2), .FAST (FAST)) u_core (
     .clk (clk), .rst (rst),
     .i_req (i_req), .i_addr (i_addr), .i_wimg (i_wimg), .i_seq (i_seq), .i_valid (i_valid), .i_data (i_data),
     .i_way (i_way), .i_arr (i_arr), .i_pa (i_pa), .i_pv (i_pv), .i_pidx (i_pidx), .i_pway (i_pway), .i_ppa (i_ppa),
-    .i_pre (i_pre), .i_two (i_two), .i_w2 (i_w2), .i_data2 (i_data2),
+    .i_pre (i_pre), .i_eix (i_eix), .i_two (i_two), .i_w2 (i_w2), .i_data2 (i_data2),
     .d_req (d_req), .d_we (d_we), .d_addr (d_addr), .d_be (d_be), .d_wdata (d_wdata),
     .d_wimg (d_wimg), .d_op (d_op), .d_rdy (d_rdy), .d_idle (d_idle), .d_valid (d_valid), .d_rdata (d_rdata),
     .d_eword (d_eword), .d_eok (d_eok),
@@ -170,11 +172,11 @@ module ppc_cpu
   logic [31:0] dm_addr, dm_wdata;
   logic [3:0]  dm_be;
 
-  ppc_icache #(.PRE (BTB), .FETCH2 (FETCH2)) u_ic (
+  ppc_icache #(.PRE (BTB), .FETCH2 (FETCH2), .ISB (ISB)) u_ic (
     .clk (clk), .rst (rst),
     .i_req (i_req), .i_addr (i_addr), .i_seq (i_seq), .i_wimg (i_wimg), .i_valid (i_valid), .i_data (i_data),
     .i_way (i_way), .i_arr (i_arr), .i_pa (i_pa), .i_pv (i_pv), .i_pidx (i_pidx), .i_pway (i_pway), .i_ppa (i_ppa),
-    .i_pre (i_pre), .i_two (i_two), .i_w2 (i_w2), .i_data2 (i_data2),
+    .i_pre (i_pre), .i_eix (i_eix), .i_two (i_two), .i_w2 (i_w2), .i_data2 (i_data2),
     .hid_ice (hid_ice), .hid_ilock (hid_ilock), .hid_icfi (hid_icfi), .icfi_ack (),
     .icbi_req (icbi_req), .icbi_set (icbi_set), .icbi_ack (icbi_ack), .i_idle (),
     .m_req (im_req), .m_cmd (im_cmd), .m_addr (im_addr), .m_be (im_be),

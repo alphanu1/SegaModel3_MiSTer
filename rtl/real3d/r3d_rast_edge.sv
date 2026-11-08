@@ -26,10 +26,11 @@
 //   stop  x = x1 + (fy - y1) s12   while r < r2 (that is, fy < y2)
 //             x2 + (fy - y2) s23   after
 // in 2^-36 px. The first row's values are products of the row offset (up to
-// 32 bits: a band can start far below y1) and the slope, two offset bits a
-// cycle, stopping when the rest of both offsets is zero: 8 cycles for a
-// triangle's own first row, about 13 for a band start, in the edge registers
-// before the walk. Every row after adds s << 16. The span is [round(start), round(stop)), swapped if reversed,
+// 32 bits: a band can start far below y1) and the slope, PB offset bits a
+// cycle, stopping when the rest of both offsets is zero: at PB = 2, 8 cycles
+// for a triangle's own first row, about 13 for a band start, in the edge
+// registers before the walk. PB = 1 (study R131) takes one bit a cycle through
+// the adder each edge register walks with, so the three 3-input adders go. Every row after adds s << 16. The span is [round(start), round(stop)), swapped if reversed,
 // clamped to [0, SCR_W), and sent only if non-empty.
 //
 // Arithmetic is modulo 2^56. For every row that is sent the row offset is at
@@ -45,7 +46,9 @@
 // y <= b - 1/2 on the 16.16 value, so those compares need no round.
 
 module r3d_rast_edge #(
-  parameter int SCR_W = 496
+  parameter int SCR_W = 496,
+  parameter int TGW   = 8,        // the pair's tag, carried to its spans (study R131)
+  parameter int PB    = 2         // product bits a cycle: 2 (three adders of their own), or 1 on the walk's adders (R131)
 ) (
   input  logic               clk,
   input  logic               rst,
@@ -58,12 +61,16 @@ module r3d_rast_edge #(
   /* verilator lint_on UNUSEDSIGNAL */
   input  logic        [8:0]  t_b0,     // band rows [b0, b1), b1 <= SCR_H
   input  logic        [8:0]  t_b1,
+  input  logic     [TGW-1:0] t_tag,
+
 
   output logic               s_valid,
   input  logic               s_ready,
   output logic [8:0]         s_y,
   output logic [8:0]         s_x0,
   output logic [8:0]         s_x1,
+  output logic [TGW-1:0]     s_tag,
+  output logic [TGW-1:0]     s_tag_n,   // the tag s_tag holds after this edge (a registered read's address)
 
   output logic               busy
 );
@@ -96,6 +103,7 @@ module r3d_rast_edge #(
   logic signed [53:0] z_s12, z_s13, z_s23;
   logic signed [16:0] z_r1, z_r2, z_r3;
   logic        [8:0]  z_b0, z_b1;
+  logic     [TGW-1:0] z_tag, w_tag, p1_tag;
   logic               z_c1, z_c2, z_c21, z_c3;   // r1 > b0, r2 > b0, r2 > r1, r3 < b1
 
   wire signed [16:0] i_r1 = round16(t_y1), i_r2 = round16(t_y2), i_r3 = round16(t_y3);
@@ -115,7 +123,7 @@ module r3d_rast_edge #(
         z_full <= 1'b1;
         z_x1 <= t_x1; z_x2 <= t_x2; z_y1 <= t_y1; z_y2 <= t_y2;
         z_s12 <= t_s12; z_s13 <= t_s13; z_s23 <= t_s23;
-        z_r1 <= i_r1; z_r2 <= i_r2; z_r3 <= i_r3; z_b0 <= t_b0; z_b1 <= t_b1;
+        z_r1 <= i_r1; z_r2 <= i_r2; z_r3 <= i_r3; z_b0 <= t_b0; z_b1 <= t_b1; z_tag <= t_tag;
         z_c1  <= y1x > h_b0;
         z_c2  <= y2x > h_b0;
         z_c21 <= i_r2 > i_r1;
@@ -214,31 +222,46 @@ module r3d_rast_edge #(
         s_y     <= p1_y;
         s_x0    <= lo;
         s_x1    <= hi;
+        s_tag   <= p1_tag;
+        p1_tag  <= w_tag;
         // stage A: the rounds of the current row
         p1_v  <= w_act;
         p1_y  <= w_y[8:0];
         p1_rs <= round36(a13);
         p1_re <= round36(w_up ? a12 : a23);
       end
+      if (PB == 1) begin
+        // one adder an edge register (study R131): the walk's step, or one offset bit of the product
+        logic e12, e13, e23;
+        e12 = (w_adv && w_up) || m_busy; e13 = w_adv || m_busy; e23 = (w_adv && !w_up) || m_busy;
+        if (e12) a12 <= a12 + (m_busy ? (m_d1[0] ? m_s12 : '0) : d12);
+        if (e13) a13 <= a13 + (m_busy ? (m_d1[0] ? m_s13 : '0) : d13);
+        if (e23) a23 <= a23 + (m_busy ? (m_d2[0] ? m_s23 : '0) : d23);
+      end else begin
+        if (w_adv) begin
+          a13  <= a13 + d13;
+          if (w_up) a12 <= a12 + d12;
+          else      a23 <= a23 + d23;
+        end
+        if (m_busy) begin
+          a12   <= a12 + pp2(m_d1[1:0], m_s12);
+          a13   <= a13 + pp2(m_d1[1:0], m_s13);
+          a23   <= a23 + pp2(m_d2[1:0], m_s23);
+        end
+      end
       if (w_adv) begin
         w_y  <= w_y + 17'sd1;
         w_last <= (w_y + 17'sd2 >= w_end);
         w_up <= (w_y + 17'sd1 < w_r2);
-        a13  <= a13 + d13;
-        if (w_up) a12 <= a12 + d12;
-        else      a23 <= a23 + d23;
         if (w_last) w_act <= 1'b0;
       end
       if (m_busy) begin
-        a12   <= a12 + pp2(m_d1[1:0], m_s12);
-        a13   <= a13 + pp2(m_d1[1:0], m_s13);
-        a23   <= a23 + pp2(m_d2[1:0], m_s23);
-        m_s12 <= m_s12 <<< 2;
-        m_s13 <= m_s13 <<< 2;
-        m_s23 <= m_s23 <<< 2;
-        m_d1  <= m_d1 >> 2;
-        m_d2  <= m_d2 >> 2;
-        if (m_d1[31:2] == 30'd0 && m_d2[31:2] == 30'd0) begin
+        m_s12 <= m_s12 <<< PB;
+        m_s13 <= m_s13 <<< PB;
+        m_s23 <= m_s23 <<< PB;
+        m_d1  <= m_d1 >> PB;
+        m_d2  <= m_d2 >> PB;
+        if ((m_d1 >> PB) == 32'd0 && (m_d2 >> PB) == 32'd0) begin
           m_busy <= 1'b0;
           w_act  <= (w_y < w_end);
         end
@@ -261,10 +284,12 @@ module r3d_rast_edge #(
         w_up   <= up0;
         w_r2   <= z_r2;
         w_end  <= ye;
+        w_tag  <= z_tag;
       end
     end
   end
 
   assign busy = z_full || m_busy || w_act || p1_v || s_valid;
+  assign s_tag_n = adv ? p1_tag : s_tag;
 
 endmodule

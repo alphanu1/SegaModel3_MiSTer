@@ -66,7 +66,7 @@
 // cycles its uop waited in MEM) moves the cycle at which an interrupt or a
 // DEC / timebase read was decided.
 //
-//   tb_ppc_core [seeds] [first_seed] [length] [max_wait] [--mode n] [--dlat n] [--ilat n] [--rdy p] [--loops] [--fpburst]
+//   tb_ppc_core [seeds] [first_seed] [length] [max_wait] [--mode n] [--dlat n] [--ilat n] [--rdy p] [--loops] [--fpburst] [--mis] [--xpage]
 //
 // --alias: update forms whose registers overlap, a third of the memory ops
 // (alias_mem, and FP in fp_mem): loads with rD = rB and rA = rB, stores with
@@ -130,6 +130,7 @@ bool dtrace = getenv("DTRACE") != nullptr;   // every data request, answer and r
 int g_dlat = 0, g_ilat = 0, g_rdy = 0;
 bool g_board = false;
 bool g_mis = false;                           // --mis: misaligned accesses (mis_mem)
+bool g_xpage = false;                         // --xpage: integer accesses crossing a page, translated (xpage_mem)
 bool g_alias = false;                         // --alias: overlapping registers in update forms (alias_mem)
 bool g_fpburst = false;                       // --fpburst: multiply-adds, then FP loads behind them (fp_burst, cpi112)
 bool g_fpchain = false;                       // --fpchain: chains of dependent single multiply-adds (fp_chain, fp117)
@@ -494,6 +495,68 @@ struct Gen {
       emit(D(rnd(2) ? 46 : 47, 24 + rnd(8), 1, ((r32() % (g_span / 2 - 0x800)) & ~3u) + 1 + uint32_t(rnd(3))));
     }
   }
+  // --xpage (translated programs; study R124, xpage): an integer halfword or
+  // word crossing a 4 KiB page with MSR[DR] = 1, which the 603e splits with
+  // the second word translated on its own page (4.5.3). The crossing is into
+  // one of seg 6's data pages (both pages mapped but where the layout left
+  // one out), into a page with no entry (the second word's DTLB miss, then the
+  // handler's DSI), from a page into DBAT0's block, out of the block into a
+  // page, or inside the block (D-39's split), or across a 4 MiB line in seg 6
+  // (the second page's API, DCMP, differs). Half the time the second page is
+  // first taken out of the TLB (tlbie: its own DTLB miss) and the first
+  // page's word touched (so the first word hits); a third of the time the
+  // access is made twice (both pages in the micro-TLB). Every load and store
+  // form, D and X, update and byte-reversed, and Scud Race's lwzx rD,rD,rB
+  // (rD = rA) at its EA FF292FFE's page offset.
+  void xpage_mem() {
+    int kind = rnd(9);
+    uint32_t pgb;                                        // the second page
+    if (kind == 8)      pgb = 0x60800000u;                                       // across a 4 MiB line: the API
+    else if (kind < 4)  pgb = (rnd(2) ? L.vd1 : L.vd1b) + 0x1000u * uint32_t(1 + rnd(7));
+    else if (kind == 4) pgb = (rnd(2) ? L.vd1 : L.vd1b) + 0x8000u;              // no entry
+    else if (kind == 5) pgb = L.vd2;                                             // a page into the block
+    else if (kind == 6) pgb = L.vd2 + 0x20000u;                                  // out of the block
+    else                pgb = L.vd2 + 0x1000u * uint32_t(1 + rnd(31));           // inside it
+    bool half = rnd(3) == 0;
+    uint32_t ea = half ? pgb - 1 : pgb - 1 - uint32_t(rnd(3));
+    if (rnd(4) == 0 && !half) ea = pgb - 2;                                      // Scud Race's offset, FFE
+    if (rnd(2)) { li32(12, pgb); emit(TLBIE(12)); emit(SYNC); }
+    if (rnd(2)) { int rt = dst(); if (rt == 12) rt = 13; li32(12, ea & ~3u); emit(D(32, rt, 12, 0)); }
+    // a quarter of them an FP double at the page's last word (lfd, lfdu, stfd, stfdu, lfdx, lfdux, stfdx,
+    // stfdux): it takes the alignment exception when its EA has no DBAT hit (4.5.6.1.1, a page-address
+    // translation access), and is two words, each translated on its own, when it has one (inside the block,
+    // or leaving it into a page: "no special handling for accesses that fall into BAT regions")
+    if (rnd(4) == 0) {
+      static const int fdd[] = {50, 51, 54, 55}, fdx[] = {599, 631, 727, 759};
+      uint32_t fea = pgb - 4;
+      int fr = rnd(32);
+      for (int i = 0, n = rnd(3) == 0 ? 2 : 1; i < n; i++) {
+        if (rnd(2)) { li32(6, fea - 0x100); emit(D(fdd[rnd(4)], fr, 6, 0x100)); }
+        else        { li32(6, fea - 0x40); emit(D(14, 3, 0, 0x40)); emit(X(fr, 6, 3, fdx[rnd(4)])); }
+      }
+      return;
+    }
+    static const int wl[] = {32, 33}, ws[] = {36, 37}, hl[] = {40, 41, 42, 43}, hs[] = {44, 45};
+    static const int wlx[] = {23, 55, 534}, wsx[] = {151, 183, 662}, hlx[] = {279, 311, 343, 375, 790}, hsx[] = {407, 439, 918};
+    bool st = rnd(2), xf = rnd(2);
+    int reps = rnd(3) == 0 ? 2 : 1;
+    if (!xf) {
+      int op = half ? (st ? hs[rnd(2)] : hl[rnd(4)]) : (st ? ws[rnd(2)] : wl[rnd(2)]);
+      int rt = st ? src() : dst(); if (rt == 6) rt = 7;
+      for (int i = 0; i < reps; i++) { li32(6, ea - 0x100); emit(D(op, rt, 6, 0x100)); }
+      return;
+    }
+    int xo = half ? (st ? hsx[rnd(3)] : hlx[rnd(5)]) : (st ? wsx[rnd(3)] : wlx[rnd(3)]);
+    bool upd = xo == 55 || xo == 183 || xo == 311 || xo == 375 || xo == 439;
+    if (!st && !upd && rnd(2)) {                         // rD = rA, as Scud Race's lwzx r16,r16,r5
+      int rx = dst(), rb = 3; if (rx == 12) rx = 13;
+      if (xo == 23 && rnd(2)) { rx = 16; rb = 5; }       // the word itself: 7E10282E
+      for (int i = 0; i < reps; i++) { li32(rx, ea - 0x40); emit(D(14, rb, 0, 0x40)); emit(X(rx, rx, rb, xo)); }
+      return;
+    }
+    int rt = st ? src() : dst(); if (rt == 6 || rt == 3) rt = 7;
+    for (int i = 0; i < reps; i++) { li32(6, ea - 0x40); emit(D(14, 3, 0, 0x40)); emit(X(rt, 6, 3, xo)); }
+  }
   // --alias: the update forms with overlapping registers. Every EA is in the
   // data region; rB, when it is not rA, is a random value with rA = EA - rB.
   void alias_mem() {
@@ -574,6 +637,7 @@ struct Gen {
     }
   }
   void mem() {
+    if (g_xpage && xl && rnd(3) == 0) { xpage_mem(); return; }
     if (g_mis && rnd(3) == 0) { mis_mem(); return; }
     if (g_alias && rnd(3) == 0) { alias_mem(); return; }
     int base_r;
@@ -1113,6 +1177,15 @@ struct Gen {
     if (g_alias)                                 // frames 40-47 of the 64: the data pages take at most 32
       for (int v = 0; v < 2; v++)
         for (int p = 0; p < 8; p++) pte(L.vsid6[v], L.vrep + 0x1000 * uint32_t(p), frames[40 + p], (r32() & 6), 2, 1, 1);
+    if (g_xpage) {                               // --xpage: a page below DBAT0's block, and (half the time) one above
+      static const uint32_t xpp[] = {2, 2, 1, 3};
+      pte(L.sr[7] & 0xFFFFFF, L.vd2 - 0x1000, frames[50], (r32() & 6), xpp[rnd(4)], rnd(2), rnd(2));
+      if (rnd(2)) pte(L.sr[7] & 0xFFFFFF, L.vd2 + 0x20000, frames[51], (r32() & 6), xpp[rnd(4)], rnd(2), rnd(2));
+      for (int v = 0; v < 2; v++) {              // seg 6's 0x607FF000 and 0x60800000, either VSID: a crossing whose
+        pte(L.vsid6[v], 0x607FF000u, frames[52 + 2 * v], (r32() & 6), xpp[rnd(4)], rnd(2), rnd(2));   // pages differ
+        pte(L.vsid6[v], 0x60800000u, frames[53 + 2 * v], (r32() & 6), xpp[rnd(4)], rnd(2), rnd(2));   // in EA[4-9]
+      }
+    }
     for (int p = 0; p < 64; p++) pte(L.sr[10] & 0xFFFFFF, 0xA0000000 + 0x1000 * uint32_t(p), 0x50000, 0, 2, 1, 0);
     pte(L.sr[11] & 0xFFFFFF, 0xB0001000, 0x51000, 1, 2, 1, 0);              // guarded: the handler's ISI
     junk_ptes(300);
@@ -1252,7 +1325,8 @@ struct Cov {
   uint64_t btb[4] = {};                       // ev_btb: predicted targets, failed checks, MEM refetches, writes
   uint64_t insns[4] = {}, cycles[4] = {};
   uint64_t fpc = 0, fprec = 0, fpdel = 0, fpsupp = 0, fpld = 0, fpst = 0, fpops[ppcfpu::NUM_OPS] = {};
-  uint64_t mis[7] = {};                       // misaligned accesses done (PpcIss::mis_n)
+  uint64_t mis[18] = {};                      // misaligned accesses done (PpcIss::mis_n)
+  uint64_t xrf = 0;                           // ev_xrf: a split's first word made again after its second replayed
   // update forms completed with overlapping registers: integer load rD = rB,
   // load rA = rB (FP too), integer store rS = rB, rS = rA, store rA = rB (FP
   // too); and the reproducer's values checked (--alias)
@@ -1267,7 +1341,8 @@ struct Cov {
     fpc += c.fpc; fprec += c.fprec; fpdel += c.fpdel; fpsupp += c.fpsupp; fpld += c.fpld; fpst += c.fpst;
     for (int i = 0; i < ppcfpu::NUM_OPS; i++) fpops[i] += c.fpops[i];
     for (int i = 0; i < 0x20; i++) vec[i] += c.vec[i];
-    for (int i = 0; i < 7; i++) mis[i] += c.mis[i];
+    for (int i = 0; i < 18; i++) mis[i] += c.mis[i];
+    xrf += c.xrf;
     for (int i = 0; i < 5; i++) alias[i] += c.alias[i];
     alias_chk += c.alias_chk;
     ext += c.ext; dec += c.dec; sh_writes += c.sh_writes; replays += c.replays; fslow += c.fslow;
@@ -1295,6 +1370,7 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
   // was killed, replaced or replayed and still reached memory) shows here even
   // when it changed nothing, as it would matter on I/O.
   std::vector<uint64_t> acc_rtl, acc_iss;
+  size_t acc_last_n = 0;                               // stream entries of the last data request (ev_xrf)
   auto acc_ld = [](uint32_t a) { return (uint64_t(1) << 40) | a; };
   auto acc_st = [](uint32_t a, uint8_t v) { return (uint64_t(2) << 40) | (uint64_t(v) << 32) | a; };
   PpcIss iss;
@@ -1587,6 +1663,15 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
     if (dtrace && top.rt_valid)
       printf("    cyc %llu: retire pc %08X insn %08X last %d gpr_we %d r%d%s = %08X dly %d\n", (unsigned long long)cycles, top.rt_pc, top.rt_insn, int(top.rt_last), int(top.rt_gpr_we), top.rt_gpr, top.rt_gpr_sh ? "(sh)" : "", top.rt_gpr_val, int(top.rt_dly));
     if (dreq && !d_rdy) { printf("seed %u: data request with d_rdy low at cycle %llu\n", seed, (unsigned long long)cycles); return false; }
+    // ev_xrf: a page crossing's second word replayed (micro-TLB miss) after its first word was made, and the
+    // instruction is fetched again, so that first word will be made again: its earlier access, the last
+    // request made (the replay holds EX from the cycle after it), leaves the stream the model compares
+#ifndef TB_NO_XRF                                      // (an RTL without the port: the reproducer on the old core)
+    if (top.ev_xrf) {
+      if (acc_last_n == 0 || acc_last_n > acc_rtl.size()) { printf("seed %u: ev_xrf with no request to drop at cycle %llu\n", seed, (unsigned long long)cycles); return false; }
+      acc_rtl.resize(acc_rtl.size() - acc_last_n); acc_last_n = 0; cov.xrf++;
+    }
+#endif
     cov.replays += (top.ev_mmu >> 4) & 1;
     cov.fslow   += (top.ev_mmu >> 5) & 1;
     // The retire record is taken before the edge, as its uop leaves WB (the
@@ -1606,6 +1691,8 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
     d_rdy = !(g_rdy && int(rrng() % 100) < g_rdy);     // next cycle's, registered
     uint32_t d_word = 0;
     if (dreq) {
+      size_t acc_n0 = acc_rtl.size();
+      struct Mark { std::vector<uint64_t> &v; size_t n0; size_t &n; ~Mark() { n = v.size() - n0; } } mark{acc_rtl, acc_n0, acc_last_n};
       uint64_t t = cycles + uint64_t(g_dlat ? g_dlat : wait_for());
       if (t <= d_last) t = d_last + 1;
       d_last = t;
@@ -1719,7 +1806,7 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
         for (int i = 0; i < 0x20; i++) cov.vec[i] = iss.exc_count[i];
         cov.fprec = iss.fp_prec; cov.fpdel = iss.fp_delayed; cov.fpsupp = iss.fp_supp;
         cov.fpld = iss.fp_ls[0]; cov.fpst = iss.fp_ls[1];
-        for (int i = 0; i < 7; i++) cov.mis[i] = iss.mis_n[i];
+        for (int i = 0; i < 18; i++) cov.mis[i] = iss.mis_n[i];
         for (int i = 0; i < ppcfpu::NUM_OPS; i++) cov.fpops[i] = iss.fp_ops[i];
         cov.insns[mode] = insns_here; cov.cycles[mode] = cycles;
         cov.fpc = fp_checks;
@@ -1833,6 +1920,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--loops")) g_loops = true;
     else if (!strcmp(argv[i], "--intdrop") && i + 1 < argc) g_intdrop = uint32_t(atoi(argv[++i]));   // study R104
     else if (!strcmp(argv[i], "--mis")) g_mis = true;
+    else if (!strcmp(argv[i], "--xpage")) g_xpage = true;
     else if (!strcmp(argv[i], "--alias")) g_alias = true;
     else if (!strcmp(argv[i], "--fpburst")) g_fpburst = true;
     else if (!strcmp(argv[i], "--fpchain")) g_fpchain = true;
@@ -1875,6 +1963,17 @@ int main(int argc, char **argv) {
     printf("  misaligned done: in a word %llu, across a word %llu, a doubleword %llu, a line %llu, a page %llu (with DR = 1, in a DBAT block: %llu; stores %llu)\n",
            (unsigned long long)c.mis[0], (unsigned long long)c.mis[1], (unsigned long long)c.mis[2],
            (unsigned long long)c.mis[3], (unsigned long long)c.mis[4], (unsigned long long)c.mis[6], (unsigned long long)c.mis[5]);
+  if (g_mis || g_xpage)
+    printf("  page crossings with DR = 1: done %llu (both pages page-translated %llu, one word in a DBAT block %llu), "
+           "second page DTLB miss %llu, second page DSI %llu; first words made again after a replay (ev_xrf) %llu\n",
+           (unsigned long long)c.mis[6], (unsigned long long)c.mis[7], (unsigned long long)c.mis[8],
+           (unsigned long long)c.mis[9], (unsigned long long)c.mis[10], (unsigned long long)c.xrf);
+  if (g_mis || g_xpage)
+    printf("  page crossings with DR = 1 met, by page offset: word at FFD %llu, FFE %llu, FFF %llu; halfword at FFF %llu\n",
+           (unsigned long long)c.mis[11], (unsigned long long)c.mis[12], (unsigned long long)c.mis[13], (unsigned long long)c.mis[14]);
+  if (g_xpage)
+    printf("  FP doubles across a page with DR = 1: alignment exception (no DBAT hit) %llu, two words inside a DBAT block %llu, two words leaving it %llu\n",
+           (unsigned long long)c.mis[15], (unsigned long long)c.mis[16], (unsigned long long)c.mis[17]);
   if (g_alias)
     printf("  aliased update forms done: load rD = rB %llu, load rA = rB %llu, store rS = rB %llu, store rS = rA %llu,"
            " store rA = rB %llu; reproducer values checked %llu\n",

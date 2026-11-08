@@ -21,13 +21,23 @@
 #include <map>
 
 static const uint32_t RSV = 0xF00FF;
+// TB_ISB: the 32 KiB geometry (ppc_icache ISB): 256 sets, the set's top bit EA[19], which the bench makes
+// from the physical address's bit 12 and a per-page alias bit (some pages are "mapped" with EA[19] != PA[19])
+#ifdef TB_ISB
+static const unsigned NSET = 256;
+static unsigned ea19(uint32_t a) { uint32_t pg = a >> 12; return ((a >> 12) & 1) ^ (((pg * 0x9E37u) >> 7) & 1); }
+#else
+static const unsigned NSET = 128;
+static unsigned ea19(uint32_t) { return 0; }
+#endif
+static unsigned set_of(uint32_t a) { return (ea19(a) << 7) | ((a >> 5) & 127); }
 
 struct RefLine { bool v = false; uint32_t tag = 0; uint32_t w[8]; };
 struct Alloc { unsigned set, way; uint32_t tag; };
 
 struct Ref {
-  RefLine c[128][4];
-  uint8_t plru[128] = {};
+  RefLine c[NSET][4];
+  uint8_t plru[NSET] = {};
   Memory mem;
   std::vector<Single> singles;
   std::vector<Alloc> allocs;
@@ -43,14 +53,14 @@ struct Ref {
   }
   bool bypass(uint32_t a, unsigned wimg) const { return (wimg & 4) || !ice || (a >> 12) == RSV; }
   bool resident(uint32_t a) const {
-    unsigned s = (a >> 5) & 127;
+    unsigned s = set_of(a);
     for (int w = 0; w < 4; w++) if (c[s][w].v && c[s][w].tag == (a >> 12)) return true;
     return false;
   }
   uint32_t fetch(uint32_t a, unsigned wimg, bool &hit) {
     hit = false;
     if (bypass(a, wimg)) { byp++; singles.push_back({false, a, 15, 0}); return mem.rd(a); }
-    unsigned s = (a >> 5) & 127;
+    unsigned s = set_of(a);
     for (int w = 0; w < 4; w++) if (c[s][w].v && c[s][w].tag == (a >> 12)) {
       hits++; hit = true; touch(s, w); return c[s][w].w[(a >> 2) & 7];
     }
@@ -66,7 +76,7 @@ struct Ref {
     allocs.push_back({s, (unsigned)v, a >> 12});
     return L.w[(a >> 2) & 7];
   }
-  void icbi(unsigned s) { for (auto &l : c[s]) l.v = false; }
+  void icbi(unsigned s) { for (auto &l : c[s & 127]) l.v = false; if (NSET > 128) for (auto &l : c[128 | (s & 127)]) l.v = false; }
   void flash() { for (auto &s : c) for (auto &l : s) l.v = false; for (auto &p : plru) p = 0; }
 };
 
@@ -204,6 +214,9 @@ int main(int argc, char **argv) {
         cur_two = si >= script.size() && seq && t->i_two && !no_seq && rnd(0, 3) != 0;
         if (cur_two) { bool h2; cur_exp2 = ref.fetch(a + 4, wimg, h2); pc = a + 4; n_two++; }
         t->i_req = 1; t->i_addr = a; t->i_seq = seq; t->i_wimg = wimg; t->i_w2 = cur_two;
+#ifdef TB_ISB
+        t->i_eix = ea19(a);
+#endif
         out = true;
       }
     }

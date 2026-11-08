@@ -28,6 +28,8 @@
 //          -> r3d_rast_colour (fog off) -> FIFO -> r3d_rast_band (the two
 //             band buffers, D-29's blend, the flush into the DDR3 layer on
 //             m2_ddr3's request contract, D-20)
+// The texel and colour instances keep MAME's texture rules (SMTX = 0, study
+// R135): the viewer's tables carry no contour or alpha-mode bits.
 //
 // Per-triangle data goes into two M10K tables by the triangle's tag when the
 // front takes it: the planes the interpolants read (one read, as the pixel
@@ -382,7 +384,7 @@ module m3v_raster (
 
   // F: the texel path's address stages (its filter is not used)
   logic [19:0] fa0, fa1, fa2, fa3;
-  r3d_rast_texel #(.TW(1), .MIP(1'b1)) u_tf (
+  r3d_rast_texel #(.TW(1), .MIP(1'b1), .SMTX(1'b0)) u_tf (
     .clk, .rst, .en(en_f),
     .i_valid(r_v), .i_tag(1'b0), .i_u(r_u), .i_v(r_vv), .i_page(a_page), .i_tx(a_tx), .i_ty(a_ty),
     .i_tw(a_tw), .i_th(a_th), .i_mu(a_mu), .i_mv(a_mv), .i_fmt(a_fmt), .i_lv(r_lv),
@@ -447,7 +449,7 @@ module m3v_raster (
   logic        tb_valid;
   logic [6:0]  tb_n;
   logic [31:0] tb_texel;
-  r3d_rast_texel #(.TW(7), .MIP(1'b1)) u_tb (
+  r3d_rast_texel #(.TW(7), .MIP(1'b1), .SMTX(1'b0)) u_tb (
     .clk, .rst, .en(1'b1),
     .i_valid(b_in_v), .i_tag(b_in_n), .i_u({4'd0, b_u}), .i_v({4'd0, b_v}),
     .i_page(rq_a[22]), .i_tx(rq_a[21:16]), .i_ty(rq_a[15:11]), .i_tw(rq_a[10:8]), .i_th(rq_a[7:5]),
@@ -469,7 +471,7 @@ module m3v_raster (
   logic [6:0]  co_n;
   logic [7:0]  co_fb;
   logic [23:0] co_rgb;
-  r3d_rast_colour #(.TW(7)) u_col (
+  r3d_rast_colour #(.TW(7), .SMTX(1'b0)) u_col (
     .clk, .rst, .en(1'b1),
     .i_valid(cb_v), .i_tag(cb_n), .i_kind(rq_b[RBW-1 -: 3]), .i_texel(cb_texel),
     .i_color(rq_b[55:32]), .i_trans(rq_b[61:56]), .i_shade(rq_b[31:0]),

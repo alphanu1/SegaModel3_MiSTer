@@ -74,7 +74,8 @@ module ppc_fpu_fast
   parameter bit SQ3    = 1'b1,
   parameter bit SQ4    = 1'b1,
   parameter bit SQ5    = 1'b1,
-  parameter bit EF     = 1'b0         // the single unit's early forward (rule 6)
+  parameter bit EF     = 1'b0,        // the single unit's early forward (rule 6)
+  parameter bit SF     = 1'b1         // 0: no single unit (f_fast only for frsqrte; ppc_core FAST = 0)
 ) (
   input  logic            clk,
   input  logic            rst,
@@ -152,9 +153,10 @@ module ppc_fpu_fast
   logic [63:0]     sf_res, rq_res;
   fpu_flags_t      sf_flags, rq_flags;
 
+  // (SF = 0: never valid, so synthesis removes the unit; the instance stays for its state's names)
   ppc_fpu_sfma #(.TAGW(TAGW), .Q1(SQ1), .Q2(SQ2), .Q3(SQ3), .Q4(SQ4), .Q5(SQ5), .EF(EF)) u_sfma (
     .clk (clk), .rst (rst),
-    .in_valid (f_valid & f_fast & ~is_rsq), .in_op (f_op), .in_ctl (f_ctl),
+    .in_valid (SF & f_valid & f_fast & ~is_rsq), .in_op (f_op), .in_ctl (f_ctl),
     .in_a (f_a), .in_b (f_b), .in_c (f_c), .in_tag (f_tag),
     .in_sel (f_sel), .in_aq (f_aq), .in_bq (f_bq), .in_cq (f_cq), .in_ax (f_ax), .in_bx (f_bx), .in_cx (f_cx),
     .in_fo (out_res),
@@ -202,6 +204,7 @@ module ppc_fpu_fast
   // synthesis translate_off
   initial if (LS < 3 || LS >= L) $error("ppc_fpu_fast: LS = %0d is not supported", LS);
   initial if (EF && !SQ5) $error("ppc_fpu_fast: EF needs the single unit's R5 (SQ5)");
+  initial if (EF && !SF) $error("ppc_fpu_fast: EF needs the single unit (SF)");
 `ifdef R104_CHECK
   // EF: f_sel names the same values as f_a ... f_c wherever it is not 3
   always_ff @(posedge clk)

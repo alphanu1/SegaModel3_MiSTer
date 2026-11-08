@@ -154,7 +154,8 @@ module r3d_host_tb #(
   logic s1_req;
   logic [AW:1] s1_addr;
   r3d_texup #(.AW(AW)) u_tex (
-    .clk, .rst, .t_valid, .t_ready, .t_vrom, .t_data, .t_flush, .t_pend, .mark(t_mark), .t_mpend, .go(t_go), .busy(t_busy),
+    .clk, .rst, .port3w(1'b0), .vrom64(1'b0),   // VF3: the one-word port, 32 MiB of VROM
+    .t_valid, .t_ready, .t_vrom, .t_data, .t_flush, .t_pend, .mark(t_mark), .t_mpend, .go(t_go), .busy(t_busy),
     .s_req(s1_req), .s_addr(s1_addr), .s_ack(p_ack[1]), .s_dout(p_dout[1]),
     .d_req(d_req[2]), .d_we(d_we[2]), .d_addr(d_addr[2]), .d_blen(d_blen[2]), .d_din(d_din[2]), .d_be(d_be[2]),
     .d_wacc(d_wacc[2]), .d_rvalid(d_rvalid[2]), .d_ack(d_ack[2]), .d_dout(dm_dout),

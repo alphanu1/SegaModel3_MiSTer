@@ -10,12 +10,13 @@
 //   A  the FIFO (94): for each texture a size word, the header and its texel
 //      words, then words of garbage, so a decode that reads past the words the
 //      port would copy sees different data in A and B
-//   B  the Step 2 port (90): the VROM word address, the header and a third word
+//   B  the three-word port (90): the VROM word address, the header and a third word
 //      that starts the upload (any value); the texels
-//      are in VROM (64 MiB, the MRA's four 16 MiB blocks)
+//      are in VROM (64 MiB, the MRA's four 16 MiB blocks: Daytona 2, vrom64; or with
+//      --v32 32 MiB in four 8 MiB blocks: a Step 1.5 set such as Scud Race, study D-46)
 // The size word in A is the one the port makes, plus the garbage; the batch's
 // sheets are compared texel for texel after every upload.
-//   Vr3d_texup [batches] [seed]
+//   Vr3d_texup [batches] [seed] [--v32]
 #include "Vr3d_texup.h"
 #include "Vr3d_texup___024root.h"
 #include "verilated.h"
@@ -24,6 +25,7 @@
 #include <deque>
 #include <map>
 #include <random>
+#include <string>
 #include <vector>
 
 struct Mem {   // the DDR3 at r3d_texup's d_* port, and VROM at its s_* port
@@ -36,6 +38,7 @@ struct Mem {   // the DDR3 at r3d_texup's d_* port, and VROM at its s_* port
 };
 
 static uint64_t cyc;
+static bool v32 = false;   // VROM 32 MiB (8 MiB blocks), vrom64 low
 
 static void tick(Vr3d_texup *t, Mem &m, std::mt19937 &rng) {
   t->d_ack = 0; t->d_rvalid = 0; t->d_wacc = 0; t->s_ack = 0;
@@ -61,7 +64,8 @@ static void tick(Vr3d_texup *t, Mem &m, std::mt19937 &rng) {
   // VROM (m2_sdram's p_ contract, a 64-bit read a request)
   if (t->s_req && m.s_wait < 0) m.s_wait = 2 + int(rng() % 10);
   if (m.s_wait == 0) {
-    uint32_t const off = uint32_t(t->s_addr) - 0x2000000u, beat = off >> 2, b = beat >> 21, g = beat & 0x1FFFFF;
+    uint32_t const off = uint32_t(t->s_addr) - 0x2000000u, beat = off >> 2;
+    uint32_t const b = v32 ? (beat >> 20) & 3 : beat >> 21, g = v32 ? beat & 0xFFFFF : beat & 0x1FFFFF;
     uint32_t const i0 = (g << 3) | (b << 1);
     t->s_dout = (uint64_t((*m.vrom)[i0 + 1]) << 32) | (*m.vrom)[i0];
     t->s_ack = 1; m.s_wait = -1;
@@ -82,13 +86,15 @@ static uint32_t words(uint32_t h) {
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
   long nb = argc > 1 ? std::atol(argv[1]) : 200;
+  v32 = argc > 3 && std::string(argv[3]) == "--v32";
   std::mt19937 rng(argc > 2 ? unsigned(std::atoi(argv[2])) : 1);
   std::vector<uint32_t> vrom(1u << 24);
   for (auto &w : vrom) w = rng();
   Vr3d_texup *a = new Vr3d_texup, *b = new Vr3d_texup;
   Mem ma, mb; ma.vrom = mb.vrom = &vrom;
   auto both = [&]() { tick(a, ma, rng); tick(b, mb, rng); cyc++; };
-  a->rst = b->rst = 1; a->step2 = 0; b->step2 = 1;
+  a->rst = b->rst = 1; a->port3w = 0; b->port3w = 1; a->vrom64 = b->vrom64 = !v32;
+  if (std::getenv("TEXUP_FAULT_V64")) b->vrom64 = v32;   // planted fault: the other block size (must FAIL)
   a->t_valid = b->t_valid = 0; a->t_flush = b->t_flush = 0; a->mark = b->mark = 0; a->go = b->go = 0;
   for (int i = 0; i < 4; i++) both();
   a->rst = b->rst = 0;
@@ -116,7 +122,10 @@ int main(int argc, char **argv) {
       uint32_t h = (type << 24) | ((rng() & 1) << 23) | ((rng() & 3) << 21) | ((rng() & 1) << 20) | (hc << 17) | (wc << 14) |
                    ((rng() % 16) << 7) | (rng() % 32);
       uint32_t const nw = words(h);
-      uint32_t const addr = uint32_t(rng() % ((1u << 24) - nw - 8));
+      // a 32 MiB set's address may carry bit 23 (its VROM in the upper half of the 64 MiB space, as MAME's
+      // interleave_vroms puts it): the port ignores it there
+      uint32_t const addr = uint32_t(rng() % ((1u << (v32 ? 23 : 24)) - nw - 8));
+      uint32_t const paddr = v32 ? (addr | ((rng() & 1) << 23)) : addr;
       int const pad = int(rng() % 8);
       // A: the FIFO
       send(a, ma, false, (8 * (nw + 2 + pad)) - 4);
@@ -124,7 +133,7 @@ int main(int argc, char **argv) {
       for (uint32_t i = 0; i < nw; i++) send(a, ma, false, vrom[addr + i]);
       for (int i = 0; i < pad; i++) send(a, ma, false, rng());
       // B: the Step 2 port
-      send(b, mb, true, addr);
+      send(b, mb, true, paddr);
       send(b, mb, true, h);
       send(b, mb, true, rng());           // the third word starts the upload (Daytona 2's DMA writes 90000008)
       ntex++; texels += nw;

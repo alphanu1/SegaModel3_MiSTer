@@ -596,14 +596,16 @@ module r3d_geo
     assign su_q = 3'd0;
   end endgenerate
   // emission record: {layer 1, fog 5, fixed 1, double 1, colour 32, transparency 6, param 6, fmt 3,
-  // tex_h 3, tex_w 3, tex_y 5, tex_x 6, page 1, tex_en 1, poly 20, alpha 1, pass 2}
+  // tex_h 3, tex_w 3, tex_y 5, tex_x 6, page 1, tex_en 1, poly 20, alpha 1, pass 2}; param's bit 0 (45) is
+  // texture alpha alone (study R135; it was the page again); and above the layer bit (97) texture inversion
+  // (header[6] bits 30:24 = 2 on a textured polygon: Supermodel's TranslatorMapOffset, study R135)
   logic        re_we;
   logic [5:0]  re_wa, re_ra;
-  logic [96:0] re_wd, re_q;
-  // stored without bits 24:23 (page, tex_en), which repeat bits 45 and 48
-  logic [94:0] re_sq;
-  r3d_ram #(.W(95), .A(5)) u_remi (.clk, .we(re_we), .wa(re_wa[4:0]), .wd({re_wd[96:25], re_wd[22:0]}), .ra(re_ra[4:0]), .rq(re_sq));
-  assign re_q = {re_sq[94:23], re_sq[43], re_sq[46], re_sq[22:0]};
+  logic [97:0] re_wd, re_q;
+  // stored without bit 23 (tex_en), which repeats bit 48
+  logic [96:0] re_sq;
+  r3d_ram #(.W(97), .A(5)) u_remi (.clk, .we(re_we), .wa(re_wa[4:0]), .wd({re_wd[97:24], re_wd[22:0]}), .ra(re_ra[4:0]), .rq(re_sq));
+  assign re_q = {re_sq[96:23], re_sq[47], re_sq[22:0]};
   // u/v words, {polygon, vertex}, block RAM
   logic        pu_we;
   logic [7:0]  pu_wa, pu_ra;
@@ -942,7 +944,10 @@ module r3d_geo
   logic [3:0]  s_qa, s_qb, s_qc, s_qy, s_qg;
   logic [2:0]  s_comp;
   generate if (SETUP_OUT) begin : g_tq
-    r3d_ram #(.W(9), .A(4)) u_tq (.clk, .we(tq_we), .wa(tq_wp[3:0]), .wd(tq_wd), .ra(tq_rp[3:0]), .rq(tq_q));
+    // the write address through a LUT of its own (keep), as u_lvl's (R104 fix 21): straight from tq_wp it
+    // missed hold by 0.034 / 0.064 ns at the slow corners in a 110 MHz release fit (lw15a_s2)
+    (* keep = 1 *) wire [3:0] tq_wa = tq_wp[3:0];
+    r3d_ram #(.W(9), .A(4)) u_tq (.clk, .we(tq_we), .wa(tq_wa), .wd(tq_wd), .ra(tq_rp[3:0]), .rq(tq_q));
   end else begin : g_notq
     assign tq_q = 9'd0;
   end endgenerate
@@ -1050,7 +1055,9 @@ module r3d_geo
   logic [5:0]  fv_wp;
   logic [1:0]  fv_q;
   logic        fv_rdy;
-  r3d_ram #(.W(2), .A(5)) u_fv (.clk, .we(f_vv), .wa(fv_wp[4:0]), .wd({f_gt, f_lt}), .ra(cp[4:0]), .rq(fv_q));
+  // the write address through a kept LUT, as u_fb's and u_tq's (+0.072 ns hold at fast -40C in lw15a_s1)
+  (* keep = 1 *) wire [4:0] fv_wa = fv_wp[4:0];
+  r3d_ram #(.W(2), .A(5)) u_fv (.clk, .we(f_vv), .wa(fv_wa), .wd({f_gt, f_lt}), .ra(cp[4:0]), .rq(fv_q));
   always_ff @(posedge clk) begin
     if (rst || f_init) fv_wp <= '0;
     else if (f_vv) fv_wp <= fv_wp + 6'd1;
@@ -1065,7 +1072,10 @@ module r3d_geo
   logic        fb_rdy;
   generate if (LOD_WORD && SM_CULL) begin : g_fb
     logic [5:0] fb_dist;
-    r3d_ram #(.W(32), .A(5)) u_fb (.clk, .we(f_bv), .wa(fb_wp[4:0]), .wd(f_bw), .ra(e_poly[4:0]), .rq(fb_q));
+    // the write address through a LUT of its own (keep), as u_lvl's (R104 fix 21): straight from fb_wp it
+    // missed hold by 0.010 / 0.039 ns at the slow corners in a 110 MHz release fit (lw15a_s1)
+    (* keep = 1 *) wire [4:0] fb_wa = fb_wp[4:0];
+    r3d_ram #(.W(32), .A(5)) u_fb (.clk, .we(f_bv), .wa(fb_wa), .wd(f_bw), .ra(e_poly[4:0]), .rq(fb_q));
     always_ff @(posedge clk) begin
       if (rst || f_init) fb_wp <= '0;
       else if (f_bv) fb_wp <= fb_wp + 6'd1;
@@ -2000,8 +2010,8 @@ module r3d_geo
   //            tex_en, inverted copy, alpha buffer, pass 2}
   //   word 1  {0, tex_y 5, tex_x 6, polygon number 20}
   //   word 2  colour (header colour or the colour-table word)
-  //   word 3  {0, faces away, translucency layer (header[6] bit 17),
-  //            fog intensity (header[6] bits 11-15)}
+  //   word 3  {0, texture inversion (study R135), faces away, translucency
+  //            layer (header[6] bit 17), fog intensity (header[6] bits 11-15)}
   //   then nv vertices of 6 words: x, y, 1/w, u/w, v/w, shade
   // viewport record, 6 words (nv = 0): {0, pass 2}, node words 0x20 (scroll
   // fog), 0x22 (fog colour), 0x23 (fog density), 0x25 (fog ambient, start),
@@ -2071,7 +2081,7 @@ module r3d_geo
                     e_inv, re_q[2], re_q[1:0]};
       3'd1: e_hw = {1'b0, re_q[35:31], re_q[30:25], re_q[22:3]};
       3'd2: e_hw = re_q[88:57];
-      3'd3: e_hw = {25'd0, SM_CULL && e_cf, re_q[96], re_q[95:91]};
+      3'd3: e_hw = {24'd0, re_q[97], SM_CULL && e_cf, re_q[96], re_q[95:91]};
       default: e_hw = e_inv ? negf(fb_q) : fb_q;              // LOD_WORD: B (the copy's -B)
     endcase
     case (vr_k)
@@ -2607,19 +2617,20 @@ module r3d_geo
         end
         D_COLW: if (ms_cv) begin colour <= ms_cd; dst <= D_COMMIT; end
         D_COMMIT: begin
-          logic ex4, alpha, cm, drop;
+          logic ex4, alpha, talpha, cm, drop;
           ex4 = h6[10] && (h3[5:3] >= 3'd6 || h3[2:0] >= 3'd6);
           // texture alpha: h6[0] on Step 1.0; from Step 1.5 any of h6[2:0] (Supermodel's
           // TextureAlpha: Daytona 2's smoke sets bit 1 or 2 alone, with formats 1 and 3;
           // VF3 keeps bit 0, study R100 hand-off 5); or polygon translucency
-          alpha = (step15 ? (|h6[2:0]) : h6[0]) || !h6[23];
+          talpha = step15 ? (|h6[2:0]) : h6[0];
+          alpha = talpha || !h6[23];
           cm = h6[10] && (h6[9:7] != 3'd7) && h3[7];
           drop = SM_TRANS && !h6[23] && h6[22:18] == 5'd0;   // Supermodel: alpha byte 0, not drawn
           ra_we <= 1'b1; ra_wa <= ch_wp;
           rs_wd <= {p_fixed, SM_DOUBLE && h1[4], h6[10]};
           ra_wd <= {SM_DOUBLE && h1[4], ex4 || drop, h6[16], h1[6], nv, nref[3], nref[2], nref[1], nref[0]};
           re_we <= 1'b1; re_wa <= ch_wp;
-          re_wd <= {h6[17], h6[15:11], p_fixed, SM_DOUBLE && h1[4], colour, h6[23] ? 6'd32 : {1'b0, h6[22:18]}, cm, h6[31], h6[10], h2[0], h2[1], h4[6],
+          re_wd <= {h6[10] && h6[30:24] == 7'd2, h6[17], h6[15:11], p_fixed, SM_DOUBLE && h1[4], colour, h6[23] ? 6'd32 : {1'b0, h6[22:18]}, cm, h6[31], h6[10], h2[0], h2[1], talpha,
                     h6[9:7], h3[2:0], h3[5:3], h5[4:0], h4[4:0], h5[7], h4[6], h6[10], poly_seq, alpha, pass_d};
           ch_wp <= ch_wp + 6'd1;
           ch_n <= ch_n + 5'd1;

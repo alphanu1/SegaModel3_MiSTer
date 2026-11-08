@@ -1,0 +1,108 @@
+<misterromdescription>
+    <!--
+      Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1
+      SPDX-License-Identifier: GPL-3.0-or-later
+
+      The Lost World - Jurassic Park (Revision A). Step 1.5 (study D-46): attract mode, no sound, I/O stubbed
+      (D-37). From MAME 0.289 model3.cpp ROM_START(lostwsga); sim/system/m3_mra.py
+      writes it, and packs the same image for the system bench. Index 4, the
+      game configuration (rtl/sys/m3_loader.sv), gives the step; the rest of it
+      is the Step 1.0 default but for CROM banks 8-15, which mirror 0-7, and
+      index 0 is laid out as VF3's.
+
+      SDRAM (bytes): 0x0000000 banked CROM, 64 MiB; 0x4000000 VROM, 32 MiB;
+      0x6000000 fixed CROM, 2 MiB; 0x6200000 backup RAM, 128 KiB of 00.
+      Word form: the PowerPC's 32-bit word at A is the little-endian word at
+      SDRAM A. The sound ROMs (68000 program, samples) are not loaded (D-8).
+    -->
+    <name>The Lost World - Jurassic Park (Revision A)</name>
+    <setname>lostwsga</setname>
+    <rbf>Model3</rbf>
+    <mameversion>0289</mameversion>
+    <year>1997</year>
+    <manufacturer>Sega</manufacturer>
+    <category>Shooter</category>
+    <!-- the CPU board's DIP bank, 315-5649 port G (index 254); Reset & apply after a change -->
+    <switches default="FF">
+        <dip name="SW1 (debug)" bits="7" ids="On,Off"/>
+        <dip name="SW2" bits="6" ids="On,Off"/>
+        <dip name="SW3" bits="5" ids="On,Off"/>
+        <dip name="SW4" bits="4" ids="On,Off"/>
+        <dip name="SW5" bits="3" ids="On,Off"/>
+        <dip name="SW6" bits="2" ids="On,Off"/>
+        <dip name="SW7" bits="1" ids="On,Off"/>
+        <dip name="SW8" bits="0" ids="On,Off"/>
+    </switches>
+
+    <!-- game configuration: step 15, flags 00, banks 0-7 and their mirror 8-15 in slots 0-7, idle ports C and D -->
+    <rom index="4" md5="none">
+        <part>15 00 00 01 02 03 04 05 06 07 00 01 02 03 04 05 06 07 FF FF</part>
+    </rom>
+    <rom index="0" zip="lostwsga.zip" md5="none">
+        <!-- 0x0000000  CROM0, 16 MiB (banks 0-1) -->
+        <interleave output="64">
+            <part name="mpr-19919.2" crc="ff119949" map="21000000"/>
+            <part name="mpr-19918.1" crc="95b690e9" map="00210000"/>
+            <part name="mpr-19921.4" crc="9af3227f" map="00002100"/>
+            <part name="mpr-19920.3" crc="8df33574" map="00000021"/>
+        </interleave>
+        <!-- 0x1000000  CROM1, 16 MiB (banks 2-3) -->
+        <interleave output="64">
+            <part name="mpr-19923.6" crc="ed515cb2" map="21000000"/>
+            <part name="mpr-19922.5" crc="4dfd7fc6" map="00210000"/>
+            <part name="mpr-19925.8" crc="cfa4bb49" map="00002100"/>
+            <part name="mpr-19924.7" crc="4ee3ddc5" map="00000021"/>
+        </interleave>
+        <!-- 0x2000000  CROM2, 16 MiB (banks 4-5) -->
+        <interleave output="64">
+            <part name="mpr-19927.10" crc="0c96ef11" map="21000000"/>
+            <part name="mpr-19926.9" crc="05a232e0" map="00210000"/>
+            <part name="mpr-19929.12" crc="16491f63" map="00002100"/>
+            <part name="mpr-19928.11" crc="9afd5d4a" map="00000021"/>
+        </interleave>
+        <!-- 0x3000000  CROM3, 16 MiB (banks 6-7) -->
+        <interleave output="64">
+            <part name="mpr-19931.14" crc="448a5007" map="21000000"/>
+            <part name="mpr-19930.13" crc="b598c2f2" map="00210000"/>
+            <part name="mpr-19933.16" crc="8e2acd3b" map="00002100"/>
+            <part name="mpr-19932.15" crc="04389385" map="00000021"/>
+        </interleave>
+        <!-- 0x4000000  VROM block 0, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19902.26" crc="178bd471" map="00000021"/>
+            <part name="mpr-19903.27" crc="fe575871" map="00002100"/>
+            <part name="mpr-19904.28" crc="57971d7d" map="00210000"/>
+            <part name="mpr-19905.29" crc="6fa122ee" map="21000000"/>
+        </interleave>
+        <!-- 0x4800000  VROM block 1, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19906.30" crc="a5b16dd9" map="00000021"/>
+            <part name="mpr-19907.31" crc="84a425cd" map="00002100"/>
+            <part name="mpr-19908.32" crc="7702aa7c" map="00210000"/>
+            <part name="mpr-19909.33" crc="8fca65f9" map="21000000"/>
+        </interleave>
+        <!-- 0x5000000  VROM block 2, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19910.34" crc="1ef585e2" map="00000021"/>
+            <part name="mpr-19911.35" crc="ca26a48d" map="00002100"/>
+            <part name="mpr-19912.36" crc="ffe000e0" map="00210000"/>
+            <part name="mpr-19913.37" crc="c003049e" map="21000000"/>
+        </interleave>
+        <!-- 0x5800000  VROM block 3, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19914.38" crc="3c21a953" map="00000021"/>
+            <part name="mpr-19915.39" crc="fd0f2a2b" map="00002100"/>
+            <part name="mpr-19916.40" crc="10b0c52e" map="00210000"/>
+            <part name="mpr-19917.41" crc="3035833b" map="21000000"/>
+        </interleave>
+        <!-- 0x6000000  fixed CROM, 2 MiB (FFE00000-FFFFFFFF) -->
+        <interleave output="64">
+            <part name="epr-19938a.18" crc="38afe27a" map="21000000"/>
+            <part name="epr-19939a.17" crc="8788b939" map="00210000"/>
+            <part name="epr-19936a.20" crc="2f1ca664" map="00002100"/>
+            <part name="epr-19937a.19" crc="9dbf5712" map="00000021"/>
+        </interleave>
+        <!-- 0x6200000  backup RAM, 128 KiB of 00 (Supermodel's fresh state; MAME fills FF) -->
+        <part repeat="0x20000">00</part>
+    </rom>
+</misterromdescription>

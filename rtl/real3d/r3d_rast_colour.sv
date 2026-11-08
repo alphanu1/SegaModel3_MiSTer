@@ -25,10 +25,30 @@
 //          Z; texture alpha: alpha 0 discards, blends by it; solid
 //          translucent: factor (t << 3 | t >> 2) truncated to 8 bits unless
 //          0xff. Alpha is not carried: the band writes 0xff.
+//
+// SMTX (study R135): contour and texture alpha as Supermodel's GetTextureValue
+// and main (R3DShaderCommon.h, R3DShaderTriangles.h), with i_am = {inv, at, ta,
+// cm}: inv texture inversion (the texel's RGB is 255 - RGB on every textured
+// kind, before anything else reads it), at the alpha test (contour, not format
+// 7), ta texture alpha, cm colour modulation, and A the filtered texel alpha.
+//   contour      A < 32 discards when at (Supermodel's 32/255); otherwise
+//                written opaque, no blend, Z written (the colour layer)
+//   alpha list   (texture alpha or polygon translucency) A < 32 discards when
+//                at; a = (ta or at ? A : 255) P / 255, P = t << 3 | t >> 2 (255
+//                opaque), formed (m + (m >> 8) + 128) >> 8, m = the product:
+//                exact when either is 255; a < 8 discards (Supermodel's 1/32);
+//                blends by a, or writes without a blend at 255; no Z write
+//                (D-29); colour modulated when cm
+// MAME's tex_alpha read no polygon translucency and no colour, so a textured
+// translucent polygon drew opaque wherever its texels were, and see-through
+// where a format 0 texel had bit 15 set: Daytona 2's car glass. The product is
+// registered at stage 2 and a and the verdicts formed at stage 3, beside the
+// shade's stages, so the latency is unchanged.
 
 /* verilator lint_off UNUSEDSIGNAL */
 module r3d_rast_colour #(
-  parameter int TW = 8
+  parameter int TW = 8,
+  parameter bit SMTX = 1'b1        // Supermodel's contour and texture alpha (study R135); 0: MAME's kinds
 ) (
   input  logic               clk,
   input  logic               rst,
@@ -45,6 +65,7 @@ module r3d_rast_colour #(
   input  logic        [23:0] i_fc,      // fog colour x ambient, RGB
   input  logic signed [17:0] i_fs,      // fog start, 1/1024
   input  logic        [12:0] i_fp,      // fog depth term P
+  input  logic        [3:0]  i_am,      // SMTX: {inversion, alpha test, texture alpha, colour modulation}
 
   output logic               o_valid,
   output logic      [TW-1:0] o_tag,
@@ -64,6 +85,8 @@ module r3d_rast_colour #(
   logic [31:0]   s1;
   logic          ok1, zw1, fbv1;
   logic [7:0]    fb1;
+  logic          al1;                  // SMTX: the alpha list's kind (a decided at stage 3)
+  logic [7:0]    xa1, xp1;             // SMTX: its two factors
   logic [4:0]    fi1;
   logic [23:0]   fc1;
   logic [10:0]   lin1;
@@ -76,21 +99,29 @@ module r3d_rast_colour #(
       logic [8:0]  tr;
       logic signed [18:0] l;
       sol = (i_kind == K_SOLID) || (i_kind == K_STRANS);
-      mod = (i_kind == K_CMOD) || (i_kind == K_CONT);
+      mod = (i_kind == K_CMOD) || (i_kind == K_CONT) || (SMTX && i_kind == K_TALPHA && i_am[0]);
       for (int c = 0; c < 3; c++) begin
         logic [7:0]  a, k;
         logic [15:0] m;
-        a = sol ? i_color[8 * c +: 8] : i_texel[8 * c +: 8];
+        a = sol ? i_color[8 * c +: 8] : (i_texel[8 * c +: 8] ^ {8{SMTX && i_am[3]}});
         k = i_color[8 * c +: 8];
         m = a * k;
         b1[c] <= mod ? m[15:8] : a;
       end
       ta = i_texel[31:24];
       tr = {i_trans, 3'd0} | {5'd0, i_trans[5:2]};        // t << 3 | t >> 2; t = 32 gives 264
-      ok1  <= !((i_kind == K_CONT && ta < 8'hf8) || (i_kind == K_TALPHA && ta == 8'd0));
+      if (SMTX) begin
+        ok1  <= !((i_kind == K_CONT || i_kind == K_TALPHA) && i_am[2] && ta < 8'd32);
+        fbv1 <= i_kind == K_STRANS && tr != 9'h0ff;      // the alpha list's at stage 3
+      end else begin
+        ok1  <= !((i_kind == K_CONT && ta < 8'hf8) || (i_kind == K_TALPHA && ta == 8'd0));
+        fbv1 <= (i_kind == K_CONT) || (i_kind == K_TALPHA) || (i_kind == K_STRANS && tr != 9'h0ff);
+      end
       zw1  <= (i_kind == K_SOLID) || (i_kind == K_TEX) || (i_kind == K_CMOD) || (i_kind == K_CONT);
-      fbv1 <= (i_kind == K_CONT) || (i_kind == K_TALPHA) || (i_kind == K_STRANS && tr != 9'h0ff);
       fb1  <= (i_kind == K_STRANS) ? tr[7:0] : ta;
+      al1  <= SMTX && i_kind == K_TALPHA;
+      xa1  <= (i_am[2] || i_am[1]) ? ta : 8'hff;
+      xp1  <= (i_trans[5]) ? 8'hff : tr[7:0];
       tag1 <= i_tag; s1 <= i_shade; fi1 <= i_fogint; fc1 <= i_fc;
       l = {i_fs[17], i_fs} + 19'(i_fp);
       lin1 <= l[18] ? 11'd0 : (l > 19'sd1024) ? 11'd1024 : l[10:0];
@@ -104,6 +135,8 @@ module r3d_rast_colour #(
   logic [4:0]    hi2 [3];
   logic          ok2, zw2, fbv2;
   logic [7:0]    fb2;
+  logic          al2;
+  logic [15:0]   xm2;                  // SMTX: the alpha list's product
   logic          fo2;
   logic [23:0]   fc2;
   logic [10:0]   g2;
@@ -119,6 +152,7 @@ module r3d_rast_colour #(
         hi2[c] <= h[4:0];
       end
       tag2 <= tag1; ok2 <= ok1; zw2 <= zw1; fbv2 <= fbv1; fb2 <= fb1;
+      al2 <= al1; xm2 <= xa1 * xp1;
       fo2 <= fi1 != 5'd0; fc2 <= fc1;
       gg = fi1 * lin1;
       g2 <= gg[14:4];
@@ -144,7 +178,17 @@ module r3d_rast_colour #(
         else if (q[30:16] != 15'd0) c3[c] <= 8'd255;
         else c3[c] <= q[15:8];
       end
-      tag3 <= tag2; ok3 <= ok2; zw3 <= zw2; fbv3 <= fbv2; fb3 <= fb2; fo3 <= fo2; fc3 <= fc2; g3 <= g2;
+      tag3 <= tag2; zw3 <= zw2; fo3 <= fo2; fc3 <= fc2; g3 <= g2;
+      if (al2) begin
+        // the alpha list (SMTX): a = m / 255 rounded, discarded below 8, no blend at 255
+        logic [16:0] r;
+        logic [7:0]  a;
+        r = {1'b0, xm2} + {9'd0, xm2[15:8]} + 17'd128;
+        a = r[15:8];
+        ok3 <= ok2 && a >= 8'd8; fbv3 <= a != 8'hff; fb3 <= a;
+      end else begin
+        ok3 <= ok2; fbv3 <= fbv2; fb3 <= fb2;
+      end
     end
   end
 

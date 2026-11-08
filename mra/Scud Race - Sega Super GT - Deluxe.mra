@@ -1,0 +1,102 @@
+<misterromdescription>
+    <!--
+      Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1
+      SPDX-License-Identifier: GPL-3.0-or-later
+
+      Scud Race - Sega Super GT - Deluxe. Step 1.5 (study D-46): attract mode, no sound, I/O stubbed
+      (D-37). From MAME 0.289 model3.cpp ROM_START(scuddxo); sim/system/m3_mra.py
+      writes it, and packs the same image for the system bench. Index 4, the
+      game configuration (rtl/sys/m3_loader.sv), gives the step; the rest of it
+      is the Step 1.0 default, and index 0 is laid out as VF3's.
+
+      SDRAM (bytes): 0x0000000 banked CROM, 64 MiB; 0x4000000 VROM, 32 MiB;
+      0x6000000 fixed CROM, 2 MiB; 0x6200000 backup RAM, 128 KiB of 00.
+      Word form: the PowerPC's 32-bit word at A is the little-endian word at
+      SDRAM A. The sound ROMs (68000 program, samples) are not loaded (D-8).
+    -->
+    <name>Scud Race - Sega Super GT - Deluxe</name>
+    <setname>scuddxo</setname>
+    <rbf>Model3</rbf>
+    <mameversion>0289</mameversion>
+    <year>1996</year>
+    <manufacturer>Sega</manufacturer>
+    <category>Driving</category>
+    <!-- the CPU board's DIP bank, 315-5649 port G (index 254); Reset & apply after a change -->
+    <switches default="7F">
+        <dip name="SW1 (debug)" bits="7" ids="On,Off"/>
+        <dip name="SW2" bits="6" ids="On,Off"/>
+        <dip name="SW3" bits="5" ids="On,Off"/>
+        <dip name="SW4" bits="4" ids="On,Off"/>
+        <dip name="SW5" bits="3" ids="On,Off"/>
+        <dip name="SW6" bits="2" ids="On,Off"/>
+        <dip name="SW7" bits="1" ids="On,Off"/>
+        <dip name="SW8" bits="0" ids="On,Off"/>
+    </switches>
+
+    <!-- game configuration: step 15, flags 00, banks 0-7 in slots 0-7, idle ports C and D -->
+    <rom index="4" md5="none">
+        <part>15 00 00 01 02 03 04 05 06 07 80 80 80 80 80 80 80 80 AF FF</part>
+    </rom>
+    <rom index="0" zip="scuddxo.zip" md5="none">
+        <!-- 0x0000000  CROM0, 16 MiB (banks 0-1) -->
+        <interleave output="64">
+            <part name="mpr-19591.2" crc="48e1aaff" map="21000000"/>
+            <part name="mpr-19592.1" crc="d9003b6f" map="00210000"/>
+            <part name="mpr-19589.4" crc="5482238f" map="00002100"/>
+            <part name="mpr-19590.3" crc="a5cd4718" map="00000021"/>
+        </interleave>
+        <!-- 0x1000000  CROM1, 16 MiB (banks 2-3) -->
+        <interleave output="64">
+            <part name="mpr-19595.6" crc="d06fd9d6" map="21000000"/>
+            <part name="mpr-19596.5" crc="5672e3f4" map="00210000"/>
+            <part name="mpr-19593.8" crc="21e48ff8" map="00002100"/>
+            <part name="mpr-19594.7" crc="654c26b0" map="00000021"/>
+        </interleave>
+        <!-- 0x2000000  CROM2, 16 MiB (banks 4-5) -->
+        <interleave output="64">
+            <part name="mpr-19599.10" crc="65c1d33c" map="21000000"/>
+            <part name="mpr-19600.9" crc="a25da127" map="00210000"/>
+            <part name="mpr-19597.12" crc="4d0ffe60" map="00002100"/>
+            <part name="mpr-19598.11" crc="a081592e" map="00000021"/>
+        </interleave>
+        <!-- 0x3000000  CROM3, 16 MiB (banks 6-7) -->
+        <part repeat="0x1000000">00</part>
+        <!-- 0x4000000  VROM block 0, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19574.26" crc="9be8f314" map="00000021"/>
+            <part name="mpr-19573.27" crc="57b61d65" map="00002100"/>
+            <part name="mpr-19576.28" crc="85f9b587" map="00210000"/>
+            <part name="mpr-19575.29" crc="dab11c34" map="21000000"/>
+        </interleave>
+        <!-- 0x4800000  VROM block 1, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19578.30" crc="ae882c42" map="00000021"/>
+            <part name="mpr-19577.31" crc="36a1fe5d" map="00002100"/>
+            <part name="mpr-19580.32" crc="62503cee" map="00210000"/>
+            <part name="mpr-19579.33" crc="af9698d0" map="21000000"/>
+        </interleave>
+        <!-- 0x5000000  VROM block 2, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19582.34" crc="c8b9cf1a" map="00000021"/>
+            <part name="mpr-19581.35" crc="8863c2d7" map="00002100"/>
+            <part name="mpr-19584.36" crc="256b056c" map="00210000"/>
+            <part name="mpr-19583.37" crc="c22cb5aa" map="21000000"/>
+        </interleave>
+        <!-- 0x5800000  VROM block 3, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19586.38" crc="ac37163e" map="00000021"/>
+            <part name="mpr-19585.39" crc="e2598012" map="00002100"/>
+            <part name="mpr-19588.40" crc="42e20ae9" map="00210000"/>
+            <part name="mpr-19587.41" crc="c288c910" map="21000000"/>
+        </interleave>
+        <!-- 0x6000000  fixed CROM, 2 MiB (FFE00000-FFFFFFFF) -->
+        <interleave output="64">
+            <part name="epr-19609.18" crc="75d2675c" map="21000000"/>
+            <part name="epr-19610.17" crc="3632870a" map="00210000"/>
+            <part name="epr-19607.20" crc="365ce059" map="00002100"/>
+            <part name="epr-19608.19" crc="56b46d26" map="00000021"/>
+        </interleave>
+        <!-- 0x6200000  backup RAM, 128 KiB of 00 (Supermodel's fresh state; MAME fills FF) -->
+        <part repeat="0x20000">00</part>
+    </rom>
+</misterromdescription>

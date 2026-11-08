@@ -802,7 +802,7 @@ void r3d_geo::draw_model(uint32_t addr) {
       face_lt = d < 0.0f;
       if (lod_word) {
         // r3d_face.sv: Q = NP x C in the polygon's own period, B = d x Q two later
-        float const np = float(h[5] >> 8) * float(1.0 / 4096.0);
+        float const np = float(h[5] >> 8) * float(step < 0x15 ? 1.0 / 4096.0 : 1.0 / 16384.0);   // u12.12, u10.14 from Step 1.5
         lod_d = d;
         lod_b = f.mul(d, f.mul(np, lod_c));
       }
@@ -843,7 +843,9 @@ void r3d_geo::draw_model(uint32_t addr) {
       uint32_t const bi = uint32_t(cnt++);
       st.tris++;
       uint32_t param = 0;
-      param |= (h[4] & 0x40) ? 0x1 : 0;
+      // bit 0: texture alpha alone (study R135; it was MAME's page bit, a copy of word 0 bit 5): the
+      // rasteriser needs it apart from the polygon's translucency, which the alpha flag also carries
+      param |= (h[6] & (step >= 0x15 ? 0x7 : 0x1)) ? 0x1 : 0;
       param |= (h[6] & 0x400) ? 0x8 : 0;
       param |= (h[2] & 0x2) ? 0x2 : 0;
       param |= (h[2] & 0x1) ? 0x4 : 0;

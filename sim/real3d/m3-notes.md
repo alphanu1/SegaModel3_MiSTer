@@ -1847,6 +1847,22 @@ reset.
 
 An overflow drops the record from that bin or list and sets a flag. None occurred.
 
+**Study R136: the store resized.** The maximum above was VF3 and Bass Fishing on MAME's
+lists. The core's geometry sends Supermodel's rows with FACE_DROP, and on that stream
+Daytona 2's opaque list of pass 0 reaches 159,282 beats and Scud Race's 283,335 (28,555
+records in a frame, 2,570 runs in one bin); at LB 17 the newest records, the player's
+car, were dropped. Now LB 19 with PAIR: a pass's opaque and alpha lists share one region
+of 2^20 beats (8 MiB), the opaque list up from its base and the alpha list down from its
+top; 64 MiB of records for the two banks (0x400000-0xBFFFFF in the core). BB 12: 8,190
+runs a bin, the run lists apart at `RUNO` (the core: 0x1800000, 32 MiB). The bin table's
+entry stays 40 bits in its four M10K: the closed-run count is one bit narrower and the
+open run's valid bit is its beats being nonzero; the list pointers stay 20 bits (one
+MLAB) by keeping the alpha list's start less one, so a region's last beat is never used. Nothing bounds a frame's records, so this is three
+times the heaviest frame measured (311,849 beats in a pass, 2,570 runs in a bin) in 5,143
+frames of five games. A record or a pair still refused is dropped and counted in
+`n_ovff` (overlay row 2, the third word's low half), and the whole-rasteriser bench fails
+a frame whose binning sets `st_ovf`.
+
 **The port** is m2_ddr3's contract: request held to its acknowledge, a write beat a wacc
 (din and be live), a read beat a rvalid, one transaction at a time. That is D-20's switch
 to the second SDRAM (D-34). The binning and replay sides share it by owner. A read burst is

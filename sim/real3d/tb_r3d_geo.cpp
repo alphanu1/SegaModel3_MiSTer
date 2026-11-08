@@ -248,7 +248,8 @@ int main(int argc, char **argv) {
         e.w[32] = r.w.size() >= 37 ? (r.w[35] & 1) : 0;
         e.w[33] = r.w.size() >= 37 ? ((r.w[35] >> 1) & 1) : 0;
         uint32_t const h6 = r.w[3] < precs.size() ? precs[r.w[3]].w[9] : 0;
-        e.w[34] = (h6 >> 11) & 31; e.w[35] = (h6 >> 17) & 1;
+        // word 3: the layer bit, and bit 7 texture inversion on a textured polygon (study R135)
+        e.w[34] = (h6 >> 11) & 31; e.w[35] = ((h6 >> 17) & 1) | (((h6 & 0x400) && ((h6 >> 24) & 0x7f) == 2) ? 2u : 0u);
         e.w[36] = (lod && geo_lod_ok(r)) ? r.w.back() : 0;
         ref.push_back(e);
       }
@@ -341,9 +342,9 @@ int main(int argc, char **argv) {
         r[22] = (w0 >> 4) & 1; r[23] = (w0 >> 5) & 1; r[24] = (w1 >> 20) & 0x3f; r[25] = (w1 >> 26) & 0x1f;
         r[26] = (w0 >> 6) & 7; r[27] = (w0 >> 9) & 7; r[28] = (w0 >> 12) & 7; r[29] = (w0 >> 15) & 0x3f;
         r[30] = (w0 >> 21) & 0x3f; r[31] = rec[2]; r[32] = (w0 >> 3) & 1; r[33] = (w3 >> 6) & 1;
-        r[34] = w3 & 31; r[35] = (w3 >> 5) & 1;
+        r[34] = w3 & 31; r[35] = ((w3 >> 5) & 1) | (((w3 >> 7) & 1) << 1);
         r[36] = lod ? rec[4] : 0;
-        if (w3 >> 7) rec_bad++;
+        if (w3 >> 8) rec_bad++;
         got.push_back(r);
         sgot.push_back(std::vector<uint32_t>(rec.begin() + long(hw), rec.end()));
         rec.clear(); return;
@@ -359,9 +360,9 @@ int main(int argc, char **argv) {
         r[22] = (w0 >> 4) & 1; r[23] = (w0 >> 5) & 1; r[24] = (w1 >> 20) & 0x3f; r[25] = (w1 >> 26) & 0x1f;
         r[26] = (w0 >> 6) & 7; r[27] = (w0 >> 9) & 7; r[28] = (w0 >> 12) & 7; r[29] = (w0 >> 15) & 0x3f;
         r[30] = (w0 >> 21) & 0x3f; r[31] = rec[2]; r[32] = (w0 >> 3) & 1; r[33] = (w3 >> 6) & 1;
-        r[34] = w3 & 31; r[35] = (w3 >> 5) & 1;
+        r[34] = w3 & 31; r[35] = ((w3 >> 5) & 1) | (((w3 >> 7) & 1) << 1);
         r[36] = lod ? rec[4] : 0;
-        if (w3 >> 7) rec_bad++;
+        if (w3 >> 8) rec_bad++;
         got.push_back(r);
       }
       rec.clear();

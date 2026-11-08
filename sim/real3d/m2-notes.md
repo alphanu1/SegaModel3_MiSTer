@@ -1410,10 +1410,10 @@ Polygon record, 4 + 6 n words (a triangle 22, a quad 28; section 11 was 3 + 7 n)
 
 | Word | Bits |
 |---|---|
-| 0 | [1:0] priority pass, [2] alpha buffer, [3] inverted copy of a double-sided polygon, [4] texture on, [5] texture page, [8:6] texture width code, [11:9] height code, [14:12] texel format, [20:15] MAME's TRI_PARAM bits, [26:21] transparency (32 = opaque), [31:27] vertex count n (3..16) |
+| 0 | [1:0] priority pass, [2] alpha buffer, [3] inverted copy of a double-sided polygon, [4] texture on, [5] texture page, [8:6] texture width code, [11:9] height code, [14:12] texel format, [20:15] MAME's TRI_PARAM bits, except [15] (MAME's page again) is texture alpha alone from study R135 (header[6] bits 2:0 from Step 1.5, bit 0 on 1.0), [26:21] transparency (32 = opaque), [31:27] vertex count n (3..16) |
 | 1 | [19:0] polygon number, [25:20] texture x / 32, [30:26] texture y / 32 |
 | 2 | colour: h4 >> 8 or the colour-table word |
-| 3 | [4:0] fog intensity (header[6] bits 11-15), [5] translucency layer select (header[6] bit 17), [6] faces away (the normal test) |
+| 3 | [4:0] fog intensity (header[6] bits 11-15), [5] translucency layer select (header[6] bit 17), [6] faces away (the normal test), [7] texture inversion (header[6] bits 30:24 = 2 on a textured polygon; study R135) |
 | 4 + 6k .. 9 + 6k | vertex k: screen x, screen y, 1/w, 256 u / w, 256 v / w, shade (FP32) |
 
 1/w is every triangle's, textured or not: the projection kernel's own reciprocal

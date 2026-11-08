@@ -1,6 +1,111 @@
 # Handoff
 
-## Current state (2026-11-06, evening)
+## Update (2026-11-08, later)
+
+The study's R134-R137 and D-49 carry this. The tree is build `c7_s1`'s RTL (RBF be782d4a): 41,091 ALM (98%), 347
+M10K, 88 DSP; setup −2.59 / −2.55 ns, HDMI met, hold least +0.084 ns.
+
+- **Lost World's foliage (R134):** an L8 texel of 0xFF is transparent, as Supermodel. The green boxes are gone.
+- **Texture decode follows Supermodel (D-49, R135):** formats 1-6 under contour, texture inversion, and the glass
+  (texture-alpha kind) blended by the polygon's translucency. Daytona 2's windows are right on the board.
+- **The polygon store (R136):** the old 1 MiB list regions dropped the newest records, which were the player's car
+  in Daytona 2 and Scud Race. A pass's two lists now share an 8 MiB region, run lists 8,190 a bin above VROM, and an
+  overflow counter on overlay row 2. About 3× the heaviest of 5,143 sampled attract frames; there is no hard bound.
+- **Board (`c7_s1`):** Daytona 2 and Scud Race right; windows right.
+- **Not taken:** `TAOP`, Supermodel's opaque pass for texture alpha (R137): closer pictures, but Scud Race's worst
+  frame from 91% to 108%.
+- **Open:**
+  - Daytona 2's car shadow pokes out past the front-left fender; on the real cabinet it lies under the car.
+    Supermodel is wrong too (R137). Being worked in `sm3-builds/shd`.
+  - Lost World: leaves with too little fog in the T-rex scene (R134), board only.
+  - Timing: setup −2.59 ns at 110 MHz. A release needs every corner closed.
+
+## Update (2026-11-08)
+
+The study's R128-R133 and D-48 carry this round. The tree is build `c3_s1`'s RTL (RBF 9919dc9a), apart from
+comments renumbered to R121 / R124 / R133.
+
+- **D-48:** no area change may cost a game any cycles, and none that could make one slower. Room for sound has to
+  come from cycle-free changes.
+- **What `c3_s1` adds to `vr3`:**
+  - the rasteriser's overlapped front, the filter's duplicate arithmetic, one MPC106 register read and the dead SDRAM
+    VROM reader removed (R131, with `PB` = 2 under D-48);
+  - the CPU's TLB ways in M10K and the FP double crossing a page from a BAT block split, as 4.5.6.1.1 has it (R129);
+  - Lost World: the serial status 0x00, the geometry hold fix and its MRA (R132);
+  - Lost World's I-cache: the CPU board's DIP bank, per game, on the OSD's DIP Switches page (R133).
+- **`c3_s1`'s fit:** 40,826 ALM (97%), 347 M10K, 87 DSP; setup −1.85 / −1.61 ns, HDMI −0.14 / −0.28 ns, hold least
+  +0.059 ns.
+- **Board (`c1_s1`, the same without R133; then `c3_s1`):**
+  - VF3, Scud Race, Daytona 2: pictures clean, frame rates unchanged.
+  - Bass Fishing: a solid 58.
+  - Lost World: the intro draws its 3D and attract holds 58. SW1 On from the OSD takes the 3D away again, so the
+    switch reaches the game.
+- **Area left:** about 1,100 ALM free against 3,890-4,525 for sound and I/O. Cycle-free candidates not yet built:
+  the two-pass sound-chip ALU (about −900), the system selectors (−200 to −400), the Step 1.x / 2.x RBF split (−724).
+- **Not merged:** R130's geometry rank 1 (a standalone Fmax drop) and R129's iterative double front (under 0.1% of a
+  vblank), both out under D-48. Their work is in `sm3-builds/ar_geo` and `ar_cpu`.
+- **Open:**
+  - Lost World: some foliage cards in attract show a green box where they should be cut out (one texture or
+    polygon type; other foliage in the same frame is right). Being worked in `sm3-builds/lwtx`.
+  - Bass Fishing's water shadows and underwater tint; Scud Race's luminous polygons; the lemans24 download and the
+    missing parent sets.
+- **Tests on the merged tree:** `lint_sys` the same nine warnings; `test_loader_sw` (new, 13 checks) PASS.
+
+## Update (2026-11-07, later)
+
+- **The page-crossing fix is merged (R124, D-39 amended).** The tree is `xp1_s2`'s RTL (RBF 8851ce80).
+  - Scud Race no longer freezes.
+  - Bass Fishing boots and runs its attract at 30-60 fps. Its open faults: the water shadows, and some underwater
+    objects not tinted blue.
+  - VF3 and Daytona 2 show no regression.
+- **`du1` is merged (R126):** the data micro-TLB's LRU replacement, Daytona 2 work CPI −1.4%. The tree is `du1_s1`'s RTL
+  (RBF 9385d044), and it works on the board.
+- **Area (R125):** about 700 ALMs left to recover. Sound and I/O need an area pass first.
+- **The VROM overlap is merged (R127).** The tree is `vr3_s1`'s RTL (RBF 0fa26a16) apart from comments renumbered
+  R124 → R127. VROM sits in DDR3 in pair order (`VROM_LIN`), with up to four geometry requests in flight (`PIPE`).
+  It also fixes Daytona 2's texture-port uploads, which read half their words from the wrong VROM block.
+  - Scud Race's long view mostly holds 58, dipping to 30 for about a second.
+  - Bass Fishing mostly holds 58.
+  - VF3 shows no regression. Daytona 2's frame rate is unchanged (the rasteriser limits it), and no texture change
+    is visible by eye.
+  - `test_xmem` (12 runs) passes on the merged tree; `lint_sys` shows the same nine warnings as before.
+- **Area:** the census (`sm3-builds/area127`, draft to become R128) is not merged. A deeper pass is next.
+- **Still running:** Lost World (`sm3-builds/lw15`).
+
+## Current state (2026-11-07)
+
+The study's §15 R119–R123 and D-47 carry this round's findings. The tree is build `r7j1`'s RTL (RBF 6c89cad1),
+byte for byte, apart from the `M3_RELEASE` line that `Model3.qsf` keeps commented out for test builds.
+
+- **What `r7j1` is:**
+  - `r7f1`'s CPU;
+  - Step 1.5 for Scud Race (R119);
+  - the fetch-side LR/CTR look-ahead and a 4-entry instruction micro-TLB (R121);
+  - a 32 KB I-cache, `ISB` on in `Model3.sv` (D-47);
+  - the scan-out buffer fix (R123).
+- **`r7j1`'s fit:** 110 MHz, release, setup −2.72 / −2.77 ns, hold least +0.100 ns, 41,161 ALM, 336 M10K.
+- **Board, `r7j1`:**
+  - VF3's tearing is gone.
+  - Scud Race and Daytona 2 run at their earlier frame rates.
+  - Every game's 3D is one frame sooner than before (R123).
+- **Board, `r7i1`:** Daytona 2 holds 58 through one attract scene and 29 elsewhere. VF3 is about as before.
+- **Scud Race:** attract runs at 57-58 with slow long views. It freezes at Supermodel frame 10,730 on an alignment
+  exception: a page-crossing misaligned `lwzx` at 0x2DF34, EA FF292FFE (R122). D-39 traps that case and the 603e
+  evidently does not.
+- **Sega Bass Fishing:** its crash at frame 797 matches the same page-crossing loads (R122). Not proven on the board.
+- **Lost World (`lostwsga`):** bring-up in progress in `sm3-builds/lw15`.
+- **Data side (R120):** FSH and SLD are not kept. There are no CPU-side data levers above 0.5%.
+
+### Next
+
+1. The page-crossing misaligned split in the CPU (`sm3-builds/xpage`, build `xp1`). Then the board on Scud Race
+   past three minutes and on Bass Fishing, and an R-entry amending D-39.
+2. Lost World's report and board test.
+3. Speed: the Real3D's VROM requests overlapped in `m3_xmem`, or a VROM cache (R100, R119). That is where Scud
+   Race's long views and Daytona 2's geometry wait.
+4. Step 1.5 luminous polygons (R119).
+
+## State on 2026-11-06, evening
 
 The study's §15 R105–R118 and D-44 to D-46 carry every finding; this is the summary. The tree is build `r7f1`'s RTL
 (RBF 5c456258): byte for byte, except the `M3_RELEASE` line `Model3.qsf` keeps commented out for test builds.

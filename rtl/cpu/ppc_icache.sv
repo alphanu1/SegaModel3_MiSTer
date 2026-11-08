@@ -70,6 +70,14 @@
 // written), and the core asks for them with i_w2; the second word is
 // i_data2. Every other answer is one word.
 //
+// Geometry beyond the 603e's (ISB = 1, study R121, fe119): 32 KiB, 4 ways of 8 KiB, 256 sets. A way is
+// larger than a page, so the set's top bit is EA[19] (i_eix, untranslated, from the core's fetch address),
+// not PA[19]: virtually indexed, physically tagged. The tag stays PA[0-19], so a hit is always the right
+// physical line; a line fetched under two effective addresses whose EA[19] differ can sit in both sets,
+// as two copies of the same memory, and icbi invalidates the set of both values of EA[19] (two tag writes)
+// so neither survives it. Only the timing differs from the 16 KiB cache (ISB = 0, the 603e's 3.1); FETCH2
+// is not built with ISB = 1.
+//
 // Cache-inhibited fetches (I = 1), HID0[ICE] = 0, and misses under
 // HID0[ILOCK] (3.1.3.3) are single reads, never touching the arrays. icbi
 // invalidates all four ways of the set its EA indexes (3.7.8); HID0[ICFI]
@@ -82,7 +90,8 @@ module ppc_icache
   parameter logic [19:0] RSV_TAG = 20'hF00FF,
   parameter bit          WAYPRED = 1'b1,
   parameter bit          PRE     = 1'b1,               // the pre-read port (above)
-  parameter bit          FETCH2  = 1'b0                // two-word answers (above; off by default, D-36)
+  parameter bit          FETCH2  = 1'b0,               // two-word answers (above; off by default, D-36)
+  parameter bit          ISB     = 1'b0                // 32 KiB, 256 sets, EA[19] in the index (above)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -97,10 +106,11 @@ module ppc_icache
   output logic        i_arr,        // ... from the arrays (not a single read)
   output logic [19:0] i_pa,         // ... and its physical page
   input  logic        i_pv,         // pre-read T at this edge (with B's request)
-  input  logic [11:2] i_pidx,
+  input  logic [12:2] i_pidx,       // (bit 12, EA[19], used with ISB only)
   input  logic [1:0]  i_pway,
   input  logic [19:0] i_ppa,
   input  logic        i_pre,        // this request is T, pre-read at the last edge
+  input  logic        i_eix,        // with i_req: EA[19] of the fetch (ISB only)
   output logic        i_two,        // a sequential request now gets two words ...
   input  logic        i_w2,         // ... and this one asks for them
   output logic [31:0] i_data2,      // with i_valid after an i_w2 request: the next word
@@ -123,21 +133,34 @@ module ppc_icache
   input  logic [31:0] m_rdata,
 
   output logic        t_alloc,
-  output logic [6:0]  t_alloc_set,
+  output logic [6+ISB:0] t_alloc_set,
   output logic [1:0]  t_alloc_way,
   output logic [19:0] t_alloc_tag
 );
 
+  localparam int SB = ISB ? 1 : 0;             // the extra set bit
+  localparam int IW = 7 + SB, DW = 10 + SB, NS = 128 << SB;
+  // a set index from EA[19] (e) and PA[20-26]; a data index from e and PA[20-29]; with ISB = 0, e is dropped
+  function automatic logic [IW-1:0] six(input logic e, input logic [6:0] s);
+    six = IW'({e, s});
+  endfunction
+  function automatic logic [DW-1:0] dix(input logic e, input logic [9:0] s);
+    dix = DW'({e, s});
+  endfunction
+`ifdef VERILATOR
+  initial if (ISB && FETCH2) $fatal(1, "ppc_icache: ISB with FETCH2 is not built");
+`endif
+
   // ================================================================ arrays
-  logic [9:0]       rd_a;                       // data read index
-  logic [6:0]       ta_rd;                      // tag read index
+  logic [DW-1:0]    rd_a;                       // data read index
+  logic [IW-1:0]    ta_rd;                      // tag read index
   logic             fb_v;                       // a beat registered, written at the next edge
   logic [2:0]       fb_w;
   logic [31:0]      fb_d;
-  logic [6:0]       f_set;
+  logic [IW-1:0]    f_set;
   logic [1:0]       f_way;
   logic [3:0][31:0] dq, dq2;                    // the word read and (FETCH2) the next one
-  logic [9:0]       da;                         // the data output's index (registered rd_a)
+  logic [DW-1:0]    da;                         // the data output's index (registered rd_a)
   genvar gw, gl;
   generate
     if (FETCH2) begin : g_two
@@ -168,7 +191,7 @@ module ppc_icache
     end else begin : g_one
       for (gw = 0; gw < 4; gw++) begin : g_way
         for (gl = 0; gl < 4; gl++) begin : g_lane
-          ppc_cache_ram #(.W(8), .D(1024)) u_d (
+          ppc_cache_ram #(.W(8), .D(1024 << SB)) u_d (
             .clk (clk), .we (fb_v && f_way == gw), .wa ({f_set, fb_w}), .wd (fb_d[31-8*gl -: 8]),
             .ra (rd_a), .q (dq[gw][31-8*gl -: 8]));
         end
@@ -178,20 +201,20 @@ module ppc_icache
   endgenerate
 
   logic [1:0]  tw_en_q;
-  logic [6:0]  tw_set_q;
+  logic [IW-1:0] tw_set_q;
   logic [79:0] tw_d_q;
   logic [39:0] tq0, tq1;
-  ppc_cache_ram #(.W(40), .D(128)) u_t0 (.clk (clk), .we (tw_en_q[0]), .wa (tw_set_q), .wd (tw_d_q[39:0]),
+  ppc_cache_ram #(.W(40), .D(NS)) u_t0 (.clk (clk), .we (tw_en_q[0]), .wa (tw_set_q), .wd (tw_d_q[39:0]),
                                          .ra (ta_rd), .q (tq0));
-  ppc_cache_ram #(.W(40), .D(128)) u_t1 (.clk (clk), .we (tw_en_q[1]), .wa (tw_set_q), .wd (tw_d_q[79:40]),
+  ppc_cache_ram #(.W(40), .D(NS)) u_t1 (.clk (clk), .we (tw_en_q[1]), .wa (tw_set_q), .wd (tw_d_q[79:40]),
                                          .ra (ta_rd), .q (tq1));
   logic [3:0][19:0] tg;
   assign tg = {tq1[19:0], tq1[39:20], tq0[19:0], tq0[39:20]};
 
   // {mru[1:0], plru[2:0]} per set, read at the set whose tags are out
-  (* ramstyle = "MLAB, no_rw_check" *) logic [4:0] stm [0:127];
+  (* ramstyle = "MLAB, no_rw_check" *) logic [4:0] stm [0:NS-1];
   logic        st_we;
-  logic [6:0]  st_wa;
+  logic [IW-1:0] st_wa;
   logic [4:0]  st_wd;
   always_ff @(posedge clk) if (st_we) stm[st_wa] <= st_wd;
 
@@ -199,29 +222,34 @@ module ppc_icache
   logic        pend, p_unc;
   logic        wi_q;                            // i_wimg[2] of the last cycle's request
   logic [31:2] pa;
+  logic        pa_e;                            // ISB: EA[19] of pa's request
   logic [31:2] nx;                              // the next sequential word
+  logic        nx_e;                            // ISB: EA[19] of nx's stream
   logic        fs_q;                            // nx can be answered at once
   logic        f2_q;                            // ... with nx + 1 beside it (FETCH2: i_two)
   logic [31:5] kl;                              // the known line: its way is kl_way
+  logic        kl_e;                            // ISB: EA[19] of kl's set
   logic        kl_v;
   logic [1:0]  kl_way;
   logic        nl_v;                            // kl + 1 hits in nl_way (same page)
   logic [1:0]  nl_way;
   logic [4:0]  nl_st;                           // kl + 1's set state after that access
   logic        kt_v;                            // kl was entered by a crossing: its set's touch is
-  logic [6:0]  kt_set;                          // made at the first word served from it
+  logic [IW-1:0] kt_set;                        // made at the first word served from it
   logic [4:0]  kt_st;
   logic        da_av;                           // ... and it was written before it was read
   logic        ta_v, ta_look;                   // tags out: valid, and a lookahead
-  logic [6:0]  ta_idx;
+  logic [IW-1:0] ta_idx;
   logic [19:0] ta_exp;                          // the tag a lookahead compares
   logic        f_act;
   logic [31:5] f_line;
+  logic        f_e;                             // ISB: EA[19] of the fill's set (f_set's top bit)
   logic [2:0]  f_cnt, f_crit;
   logic [7:0]  avail;                           // fill words written
   logic        tw_last;
-  logic [6:0]  tw_lset;
+  logic [IW-1:0] tw_lset;
   logic        wk_act, wk_req, icfi_q;
+  logic        ib2_q;                           // ISB: icbi's first set written, the second next
   logic [7:0]  wk_cnt;
 
   typedef enum logic [1:0] { MP_IDLE, MP_RQ, MP_FILL, MP_SRD } mp_t;
@@ -234,7 +262,7 @@ module ppc_icache
   // stays pending (no check) or is answered, and the lookahead reads the
   // next set (asserted below).
   logic        stp_v;
-  logic [6:0]  stp_set;
+  logic [IW-1:0] stp_set;
   logic [1:0]  stp_way;
   logic [4:0]  stp_st;
   logic        fw_pend, fw2;                    // the fill's tag write: partner tag taken, then written
@@ -281,14 +309,14 @@ module ppc_icache
   always_ff @(posedge clk) if (!rst && pend && pa != pa_chk) $fatal(1, "icache pa against its start-only load");
 `endif
   wire         p_ui     = p_unc || (pend_new && (wi_q || pa[31:12] == RSV_TAG));
-  wire         chk      = pend && !p_ui && !p_line && ta_v && !ta_look && ta_idx == pa[11:5] && !t_haz && !wk_act;
+  wire         chk      = pend && !p_ui && !p_line && ta_v && !ta_look && ta_idx == six(pa_e, pa[11:5]) && !t_haz && !wk_act;
   // p_ui without pa's reserved-page compare, for the data read address only (timing, study R104: pa ->
   // the 16 data RAMs' address was the system's worst I-cache path). The two differ only in a request's
   // first pending cycle for the reserved page, which is a single read: it never uses the data RAMs, and
   // p_unc holds it from the next cycle, so a read of pa + 1 there is never answered.
   wire         p_ui_a   = p_unc || (pend_new && wi_q);
-  wire         chk_a    = pend && !p_ui_a && !p_line && ta_v && !ta_look && ta_idx == pa[11:5] && !t_haz && !wk_act;
-  wire         look     = !pend && ta_v && ta_look && kl_v && ta_idx == kl[11:5] + 7'd1 && ta_exp == kl[31:12] &&
+  wire         chk_a    = pend && !p_ui_a && !p_line && ta_v && !ta_look && ta_idx == six(pa_e, pa[11:5]) && !t_haz && !wk_act;
+  wire         look     = !pend && ta_v && ta_look && kl_v && ta_idx == six(kl_e, kl[11:5] + 7'd1) && ta_exp == kl[31:12] &&
                           !t_haz && !wk_act;
   wire         fast     = i_req && i_seq && fs_q && !pend;
   wire         pair     = FETCH2 && fast && i_w2;               // two words answered
@@ -340,7 +368,7 @@ module ppc_icache
       if (p_ui_a) serve_r = (mp == MP_SRD) && m_rvalid;
       else if (p_line) begin
         if (pfw_q) serve_r = m_rvalid ? (beat && bw == pa[4:2]) : (fb_v && fb_w == pa[4:2]);
-        else serve_r = da == pa[11:2] && da_av;
+        else serve_r = da == dix(pa_e, pa[11:2]) && da_av;
       end
     end
   end
@@ -354,7 +382,7 @@ module ppc_icache
     if (chk) begin
       if (any) begin
         chk_hit = 1'b1;
-        if (WAYPRED && hv[st[4:3]] && da == pa[11:2] && da_av) serve = 1'b1;
+        if (WAYPRED && hv[st[4:3]] && da == dix(pa_e, pa[11:2]) && da_av) serve = 1'b1;
       end else if (hid_ilock) to_unc = 1'b1;
       else if (fill_ok) start_fill = 1'b1;
     end
@@ -364,6 +392,11 @@ module ppc_icache
   function automatic logic av(input logic [31:5] ln, input logic [2:0] w, input logic fa,
                               input logic [31:5] fl, input logic [7:0] avl);
     av = !(fa && ln == fl && !avl[w]);
+  endfunction
+  // (ISB: the same with the sets' EA[19] compared too; e and fe are 0 with ISB = 0)
+  function automatic logic ave(input logic [31:5] ln, input logic e, input logic [2:0] w, input logic fa,
+                               input logic [31:5] fl, input logic fe, input logic [7:0] avl);
+    ave = !(fa && ln == fl && e == fe && !avl[w]);
   endfunction
 
   // ================================================================ read addresses
@@ -375,12 +408,12 @@ module ppc_icache
   wire [8:0]  nx2_e = {nx2[11:5], nx2[4:3] + {1'b0, nx2[2]}};
   wire [31:2] pa1 = pa + 30'd1;
   always_comb begin
-    if (pre_take)            rd_a = i_pidx;
-    else if (pfast)          rd_a = i_addr[11:2] + 10'd1;   // a miss is then served a cycle later
-    else if (fast)           rd_a = nxn[11:2];
-    else if (i_req && !pend) rd_a = i_addr[11:2];
-    else if (pend)           rd_a = (serve_r || (chk_a && WAYPRED)) ? pa1[11:2] : pa[11:2];
-    else                     rd_a = nx[11:2];
+    if (pre_take)            rd_a = dix(i_pidx[12], i_pidx[11:2]);
+    else if (pfast)          rd_a = dix(i_eix, i_addr[11:2] + 10'd1);   // a miss is then served a cycle later
+    else if (fast)           rd_a = dix(nx_e, nxn[11:2]);
+    else if (i_req && !pend) rd_a = dix(i_eix, i_addr[11:2]);
+    else if (pend)           rd_a = (serve_r || (chk_a && WAYPRED)) ? dix(pa_e, pa1[11:2]) : dix(pa_e, pa[11:2]);
+    else                     rd_a = dix(nx_e, nx[11:2]);
   end
   // da_av's next value for each candidate read address, chosen as rd_a is: through rd_a the
   // select (pfast from ta_idx's hazard compares) was in front of the fill-line compare and the
@@ -388,15 +421,18 @@ module ppc_icache
   // (the candidates; av() takes every input as an argument: Quartus 17 does not read a module's
   // signals inside a function)
   wire [9:0] ip1_a = i_addr[11:2] + 10'd1;
-  wire [9:0] pidx_a = i_pidx;
+  wire [9:0] pidx_a = i_pidx[11:2];
   wire [9:0] nxn_a = nxn[11:2], ia_a = i_addr[11:2], pa1_a = pa1[11:2], pa_a = pa[11:2], nx_a = nx[11:2];
-  (* keep = 1 *) wire av_pidx = av({f_line[31:12], pidx_a[9:3]}, pidx_a[2:0], f_act, f_line, avail);
-  (* keep = 1 *) wire av_ip1  = av({f_line[31:12], ip1_a[9:3]},  ip1_a[2:0],  f_act, f_line, avail);
-  (* keep = 1 *) wire av_nxn  = av({f_line[31:12], nxn_a[9:3]},  nxn_a[2:0],  f_act, f_line, avail);
-  (* keep = 1 *) wire av_ia   = av({f_line[31:12], ia_a[9:3]},   ia_a[2:0],   f_act, f_line, avail);
-  (* keep = 1 *) wire av_pa1  = av({f_line[31:12], pa1_a[9:3]},  pa1_a[2:0],  f_act, f_line, avail);
-  (* keep = 1 *) wire av_pa   = av({f_line[31:12], pa_a[9:3]},   pa_a[2:0],   f_act, f_line, avail);
-  (* keep = 1 *) wire av_nx   = av({f_line[31:12], nx_a[9:3]},   nx_a[2:0],   f_act, f_line, avail);
+  // (ISB: the set's EA[19] beside each; fe_c is f_e, or 0)
+  wire       fe_c = ISB && f_e;
+  wire       pe_c = ISB && i_pidx[12], ie_c = ISB && i_eix, nxe_c = ISB && nx_e, pae_c = ISB && pa_e;
+  (* keep = 1 *) wire av_pidx = ave({f_line[31:12], pidx_a[9:3]}, pe_c,  pidx_a[2:0], f_act, f_line, fe_c, avail);
+  (* keep = 1 *) wire av_ip1  = ave({f_line[31:12], ip1_a[9:3]},  ie_c,  ip1_a[2:0],  f_act, f_line, fe_c, avail);
+  (* keep = 1 *) wire av_nxn  = ave({f_line[31:12], nxn_a[9:3]},  nxe_c, nxn_a[2:0],  f_act, f_line, fe_c, avail);
+  (* keep = 1 *) wire av_ia   = ave({f_line[31:12], ia_a[9:3]},   ie_c,  ia_a[2:0],   f_act, f_line, fe_c, avail);
+  (* keep = 1 *) wire av_pa1  = ave({f_line[31:12], pa1_a[9:3]},  pae_c, pa1_a[2:0],  f_act, f_line, fe_c, avail);
+  (* keep = 1 *) wire av_pa   = ave({f_line[31:12], pa_a[9:3]},   pae_c, pa_a[2:0],   f_act, f_line, fe_c, avail);
+  (* keep = 1 *) wire av_nx   = ave({f_line[31:12], nx_a[9:3]},   nxe_c, nx_a[2:0],   f_act, f_line, fe_c, avail);
   logic da_av_n;
   always_comb begin
     if (pre_take)            da_av_n = av_pidx;
@@ -408,19 +444,19 @@ module ppc_icache
   end
 `ifdef VERILATOR
   always_ff @(posedge clk)
-    if (!rst && da_av_n != av({f_line[31:12], rd_a[9:3]}, rd_a[2:0], f_act, f_line, avail))
+    if (!rst && da_av_n != ave({f_line[31:12], rd_a[9:3]}, ISB && rd_a[DW-1], rd_a[2:0], f_act, f_line, fe_c, avail))
       $fatal(1, "icache da_av by candidate");
 `endif
 
   logic ta_k_look, ta_k_v;
   always_comb begin
     ta_k_look = 1'b0; ta_k_v = 1'b1;
-    if (pre_take)                 ta_rd = i_pidx[11:5];
-    else if (pfast)               ta_rd = i_addr[11:5];  // (no lookahead this cycle)
-    else if (i_req && !fast && !pend)  ta_rd = i_addr[11:5];
-    else if (pend)                ta_rd = pa[11:5];
+    if (pre_take)                 ta_rd = six(i_pidx[12], i_pidx[11:5]);
+    else if (pfast)               ta_rd = six(i_eix, i_addr[11:5]);  // (no lookahead this cycle)
+    else if (i_req && !fast && !pend)  ta_rd = six(i_eix, i_addr[11:5]);
+    else if (pend)                ta_rd = six(pa_e, pa[11:5]);
     else begin
-      ta_rd = kl[11:5] + 7'd1; ta_k_look = 1'b1; ta_k_v = kl_v && kl[11:5] != 7'd127;
+      ta_rd = six(kl_e, kl[11:5] + 7'd1); ta_k_look = 1'b1; ta_k_v = kl_v && kl[11:5] != 7'd127;
     end
   end
 
@@ -428,7 +464,7 @@ module ppc_icache
   wire kt_use = kt_v && (fast || (serve_r && p_line && !p_ui));
   always_comb begin
     st_we = 1'b0; st_wa = stp_set; st_wd = stp_new;
-    if (wk_act)      begin st_we = 1'b1; st_wa = wk_cnt[6:0]; st_wd = 5'd0; end
+    if (wk_act)      begin st_we = 1'b1; st_wa = IW'(wk_cnt); st_wd = 5'd0; end
     else if (stp_v)  st_we = 1'b1;
     else if (kt_use) begin st_we = 1'b1; st_wa = kt_set; st_wd = kt_st; end
   end
@@ -450,7 +486,7 @@ module ppc_icache
     // which the first pending cycle ignores), so the same value is there. As
     // the load of one branch it waited on phit and fast, and the fetch
     // translation into pa led two round-1 cached full builds (p_tgt -> pa)
-    if (!pend) pa <= i_addr[31:2];
+    if (!pend) begin pa <= i_addr[31:2]; pa_e <= ISB && i_eix; end
     da       <= rd_a;
     da_av    <= da_av_n;
     ta_idx   <= ta_rd;
@@ -485,19 +521,20 @@ module ppc_icache
     end
     // the next cycle's view of pa against kl and the fill
     pend_new <= i_req && !fast && !pend && !phit;
-    pl_q     <= chk_hit || start_fill || (kl_v && kl == pa[31:5]);
-    pfw_q    <= start_fill || (f_act && f_line == pa[31:5] && !avail_nx[pa[4:2]]);
+    pl_q     <= chk_hit || start_fill || (kl_v && kl == pa[31:5] && kl_e == pa_e);
+    pfw_q    <= start_fill || (f_act && f_line == pa[31:5] && f_e == pa_e && !avail_nx[pa[4:2]]);
 
     if (rst) begin
       pend <= 1'b0; fs_q <= 1'b0; f2_q <= 1'b0; kl_v <= 1'b0; nl_v <= 1'b0; kt_v <= 1'b0; f_act <= 1'b0; mp <= MP_IDLE; m_req <= 1'b0;
+      ib2_q <= 1'b0; kl_e <= 1'b0; nx_e <= 1'b0;
       wk_act <= 1'b1; wk_cnt <= 8'd0; wk_req <= 1'b0; tw_last <= 1'b0; ta_v <= 1'b0;
     end else begin
       begin
         // ---- the pre-read target, compared against the page and way the BTB holds
         if (phit) begin
           i_valid <= 1'b1;
-          nx      <= {ppa_q, i_addr[11:2]} + 30'd1;
-          kl      <= {ppa_q, i_addr[11:5]}; kl_way <= pw_q; kl_v <= 1'b1; nl_v <= 1'b0; kt_v <= 1'b0;
+          nx      <= {ppa_q, i_addr[11:2]} + 30'd1; nx_e <= ISB && i_eix;
+          kl      <= {ppa_q, i_addr[11:5]}; kl_e <= ISB && i_eix; kl_way <= pw_q; kl_v <= 1'b1; nl_v <= 1'b0; kt_v <= 1'b0;
           fs_q    <= i_addr[4:2] != 3'd7;
           f2_q    <= i_addr[4:2] < 3'd6;
         end else
@@ -511,11 +548,11 @@ module ppc_icache
             f2_q <= nl_v && !f_act && hid_ice;          // its words 0 and 1
             if (nl_v) begin
               kl <= kl + 27'd1; kl_way <= nl_way;
-              kt_v <= 1'b1; kt_set <= kl[11:5] + 7'd1; kt_st <= touch(nl_st, nl_way);
+              kt_v <= 1'b1; kt_set <= six(kl_e, kl[11:5] + 7'd1); kt_st <= touch(nl_st, nl_way);
             end else kl_v <= 1'b0;
             nl_v <= 1'b0;
           end else begin
-            fs_q <= av(kl, nxn[4:2], f_act, f_line, avail);
+            fs_q <= ave(kl, ISB && kl_e, nxn[4:2], f_act, f_line, fe_c, avail);
             f2_q <= nxn[4:2] != 3'd7 && av(kl, nxn[4:2], f_act, f_line, avail) &&
                     av(kl, nxn[4:2] + 3'd1, f_act, f_line, avail);
           end
@@ -527,19 +564,19 @@ module ppc_icache
         end else if (pend) begin
           fs_q <= 1'b0;
           f2_q <= 1'b0;
-          nx   <= pa1;                                   // what follows pa, once it is answered
+          nx   <= pa1; nx_e <= pa_e;                     // what follows pa, once it is answered
           p_unc <= p_ui;
           if (serve) begin
             if (p_line && !p_ui && serve_r) kt_v <= 1'b0;
             i_valid <= 1'b1;
             pend    <= 1'b0;
             fs_q    <= !p_ui && pa[4:2] != 3'd7 && hid_ice &&
-                       av(pa[31:5], pa1[4:2], f_act, f_line, avail);
+                       ave(pa[31:5], pae_c, pa1[4:2], f_act, f_line, fe_c, avail);
             f2_q    <= !p_ui && pa[4:2] < 3'd6 && hid_ice &&
                        av(pa[31:5], pa1[4:2], f_act, f_line, avail) && av(pa[31:5], pa1[4:2] + 3'd1, f_act, f_line, avail);
           end
           if (chk) begin                                 // kl follows the line checked
-            kl <= pa[31:5]; kl_way <= start_fill ? vic : hw;
+            kl <= pa[31:5]; kl_e <= pa_e; kl_way <= start_fill ? vic : hw;
             kl_v <= chk_hit || start_fill; nl_v <= 1'b0; kt_v <= 1'b0;
           end
           if (to_unc) p_unc <= 1'b1;
@@ -560,25 +597,31 @@ module ppc_icache
       // about lines, so they come after the paths above
       if (hid_icfi && !icfi_q && hid_ice) wk_req <= 1'b1;
       if (wk_act) begin
-        tw_en_q <= 2'b11; tw_set_q <= wk_cnt[6:0]; tw_d_q <= {4{RSV_TAG}};
+        tw_en_q <= 2'b11; tw_set_q <= IW'(wk_cnt); tw_d_q <= {4{RSV_TAG}};
         wk_cnt  <= wk_cnt + 8'd1;
-        if (wk_cnt == 8'd127) wk_act <= 1'b0;
+        if (wk_cnt == 8'(NS - 1)) wk_act <= 1'b0;
         kl_v <= 1'b0; nl_v <= 1'b0; fs_q <= 1'b0; f2_q <= 1'b0; kt_v <= 1'b0; pl_q <= 1'b0;
       end else if (wk_req && !f_act && mp_idle) begin
         wk_req <= 1'b0; wk_act <= 1'b1; wk_cnt <= 8'd0; icfi_ack <= 1'b1;
         kl_v <= 1'b0; nl_v <= 1'b0; fs_q <= 1'b0; f2_q <= 1'b0; kt_v <= 1'b0; pl_q <= 1'b0;
+      end else if (ISB && ib2_q) begin                  // icbi's second set: EA[19] = 1
+        tw_en_q <= 2'b11; tw_set_q <= six(1'b1, icbi_set); tw_d_q <= {4{RSV_TAG}};
+        icbi_ack <= 1'b1; ib2_q <= 1'b0;
+        kl_v <= 1'b0; nl_v <= 1'b0; fs_q <= 1'b0; f2_q <= 1'b0; kt_v <= 1'b0; pl_q <= 1'b0;
       end else if (icbi_req && !pend && !fw_pend && !fw2 && !icbi_ack) begin
-        tw_en_q <= 2'b11; tw_set_q <= icbi_set; tw_d_q <= {4{RSV_TAG}};
-        icbi_ack <= 1'b1;
+        tw_en_q <= 2'b11; tw_set_q <= six(1'b0, icbi_set); tw_d_q <= {4{RSV_TAG}};
+        if (ISB) ib2_q <= 1'b1; else icbi_ack <= 1'b1;
         kl_v <= 1'b0; nl_v <= 1'b0; fs_q <= 1'b0; f2_q <= 1'b0; kt_v <= 1'b0; pl_q <= 1'b0;
       end
 
       // ---- the fill
       // (its fields load while it is idle; only f_act waits on the compare)
       if (!f_act) begin
-        f_line <= pa[31:5]; f_set <= pa[11:5]; f_way <= vic; f_cnt <= 3'd0; f_crit <= pa[4:2];
+        f_line <= pa[31:5]; f_set <= six(pa_e, pa[11:5]); f_e <= ISB && pa_e; f_crit <= pa[4:2];
+        t_alloc_set <= six(pa_e, pa[11:5]); t_alloc_tag <= pa[31:12];
+        f_way <= vic; f_cnt <= 3'd0;
         avail  <= 8'd0;
-        t_alloc_set <= pa[11:5]; t_alloc_way <= vic; t_alloc_tag <= pa[31:12];
+        t_alloc_way <= vic;
       end
       if (start_fill) begin
         f_act <= 1'b1; t_alloc <= 1'b1;
@@ -617,7 +660,8 @@ module ppc_icache
     if (fast && i_addr[31:2] != nx) $error("ppc_icache: i_seq with a non-sequential address");
     if (stp_v && kt_use) $error("ppc_icache: two state writes");
     if (stp_v && stp_set == ta_idx && (chk || look)) $error("ppc_icache: state read during its write");
-    if (pfast && (ta_idx != i_addr[11:5] || da != i_addr[11:2])) $error("ppc_icache: i_pre for an address not pre-read");
+    if (pfast && (ta_idx != six(i_eix, i_addr[11:5]) || da != dix(i_eix, i_addr[11:2]))) $error("ppc_icache: i_pre for an address not pre-read");
+    if (fast && ISB && i_eix != nx_e) $error("ppc_icache: i_seq with another EA[19]");
     if (i_pre && i_seq) $error("ppc_icache: i_pre with i_seq");
     if (i_req && i_w2 && !(fast && f2_q)) $error("ppc_icache: i_w2 where two words cannot be answered");
   end

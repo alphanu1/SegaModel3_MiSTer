@@ -447,6 +447,8 @@ int main(int argc, char **argv) {
   std::atomic<size_t> next{0};
   auto work = [&]() {
     texram tex;
+    tex.l8_key = false;               // against MAME's renders: MAME's decode
+    tex.sm_tex = false;               // and MAME's contour and texture alpha (study R135)
     for (size_t i; (i = next++) < names.size();) {
       frame_res &r = res[i];
       r.name = names[i];

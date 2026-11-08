@@ -36,10 +36,10 @@
 using namespace r3d;
 namespace fs = std::filesystem;
 
-struct tin { uint32_t u, v, page, tx, ty, tw, th, mu, mv, fmt, texel, lv; };
+struct tin { uint32_t u, v, page, tx, ty, tw, th, mu, mv, fmt, texel, lv, ctr; };
 static tin mk(rtri const &t, uint32_t u, uint32_t v, uint32_t texel, uint32_t lv = 0) {
   return {u, v, t.page & 1, t.tex_x & 63, t.tex_y & 31, t.tex_w & 7, t.tex_h & 7, (t.param & TP_MIRROR_U) ? 1u : 0u,
-          (t.param & TP_MIRROR_V) ? 1u : 0u, t.fmt & 7, texel, lv};
+          (t.param & TP_MIRROR_V) ? 1u : 0u, t.fmt & 7, texel, lv, (t.param & TP_CONTOUR) ? 1u : 0u};
 }
 
 struct hook : d25_hook {
@@ -61,7 +61,7 @@ static uint64_t run(Vr3d_rast_texel &t, texram const &tex, std::vector<tin> cons
     if (feed) {
       tin const &c = v[si];
       t.i_tag = uint32_t(si & 255); t.i_u = c.u; t.i_v = c.v; t.i_page = c.page; t.i_tx = c.tx; t.i_ty = c.ty;
-      t.i_tw = c.tw; t.i_th = c.th; t.i_mu = c.mu; t.i_mv = c.mv; t.i_fmt = c.fmt; t.i_lv = c.lv;
+      t.i_tw = c.tw; t.i_th = c.th; t.i_mu = c.mu; t.i_mv = c.mv; t.i_fmt = c.fmt; t.i_lv = c.lv; t.i_ctr = c.ctr;
     }
     t.m_q0 = q[0]; t.m_q1 = q[1]; t.m_q2 = q[2]; t.m_q3 = q[3];
     t.clk = 0; t.eval();
@@ -79,8 +79,8 @@ static uint64_t run(Vr3d_rast_texel &t, texram const &tex, std::vector<tin> cons
     if (!out) continue;
     tin const &c = v[got];
     if ((ot != (got & 255) || ox != c.texel) && bad++ < 10)
-      std::printf("  %" PRIu64 ": u %08x v %08x page %u tx %u ty %u w %u h %u mir %u%u fmt %u lv %u: rtl %08x model %08x\n",
-                  got, c.u, c.v, c.page, c.tx, c.ty, c.tw, c.th, c.mu, c.mv, c.fmt, c.lv, ox, c.texel);
+      std::printf("  %" PRIu64 ": u %08x v %08x page %u tx %u ty %u w %u h %u mir %u%u fmt %u ctr %u lv %u: rtl %08x model %08x\n",
+                  got, c.u, c.v, c.page, c.tx, c.ty, c.tw, c.th, c.mu, c.mv, c.fmt, c.ctr, c.lv, ox, c.texel);
     got++;
   }
   return bad;
@@ -89,13 +89,16 @@ static uint64_t run(Vr3d_rast_texel &t, texram const &tex, std::vector<tin> cons
 int main(int argc, char **argv) {
   std::string tris, dumps;
   int frames = 1 << 30, nrand = 0;
-  bool mip = false;
+  bool mip = false, sm = true;
+  int rkey = 0;   // --rkey N: random texture RAM with one word in N of all-ones nibbles / bytes (study R135)
   for (int i = 1; i < argc; i++) {
     std::string const a = argv[i];
     auto nx = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
     if (a == "--tris") tris = nx(); else if (a == "--dumps") dumps = nx();
     else if (a == "--frames") frames = std::atoi(nx().c_str()); else if (a == "--random") nrand = std::atoi(nx().c_str());
     else if (a == "--mip") mip = true;
+    else if (a == "--sm") sm = std::atoi(nx().c_str()) != 0;
+    else if (a == "--rkey") rkey = std::atoi(nx().c_str());
   }
   Verilated::commandArgs(argc, argv);
   Vr3d_rast_texel t;
@@ -106,14 +109,17 @@ int main(int argc, char **argv) {
   uint64_t bad = 0, n = 0;
   size_t nfr = 0;
   texram tex;
+  tex.sm_tex = sm;
   if (nrand) {
     std::mt19937 g(6);
     for (auto &w : tex.t) w = uint16_t(g());
+    // keys (luminance 15, L8 0xff, bit 15) dense enough that most contour quads have both kinds of corner
+    if (rkey) for (auto &w : tex.t) if (g() % uint32_t(rkey) == 0) w = uint16_t(w | (0xfu << (4 * (g() % 4))) | ((g() & 1) ? 0x00ffu : 0) | ((g() & 1) ? 0xff00u : 0));
     std::vector<tin> v;
     for (int i = 0; i < nrand; i++) {
       rtri r{};
       r.page = g() & 1; r.tex_x = g() & 63; r.tex_y = g() & 31; r.tex_w = g() % 8; r.tex_h = g() % 8; r.fmt = g() & 7;
-      r.param = TP_TEXTURE | ((g() & 1) ? TP_MIRROR_U : 0) | ((g() & 1) ? TP_MIRROR_V : 0);
+      r.param = TP_TEXTURE | ((g() & 1) ? TP_MIRROR_U : 0) | ((g() & 1) ? TP_MIRROR_V : 0) | ((g() & 1) ? TP_CONTOUR : 0);
       uint32_t const u = (g() % 4) ? (g() & 0x3fffff) : g(), vv = (g() % 4) ? (g() & 0x3fffff) : g();
       bool outside;
       if (mip) {

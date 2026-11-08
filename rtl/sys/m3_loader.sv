@@ -29,7 +29,16 @@
 //      (BCD: 0x10, 0x21), byte 1 flags, bytes 2-17 the CROM bank map (bank b:
 //      bit 7 empty, bits 3:0 its 8 MiB slot in SDRAM), bytes 18-19 the idle
 //      inputs on 315-5649 ports C and D (default FF FF; Daytona 2's 4-speed
-//      shifter rests in a gear, so its port C reads AF, as in Supermodel)
+//      shifter rests in a gear, so its port C reads AF, as in Supermodel),
+//      byte 20 not used.
+// 254  the MRA's <switches> (Main's DIP Switches page): byte 0 the CPU board's
+//      DIP bank, 315-5649 port G (bit 7 SW1 ... bit 0 SW8, 0 = ON). Main sends
+//      it after the last <rom>, and again whenever a switch is changed; the
+//      game reads it live (Lost World at start-up, so "Reset & apply"). 7F
+//      until one arrives, and again as each game's configuration or image
+//      download starts, so a game whose MRA has no <switches> never keeps the
+//      last game's (study R133: Lost World reads SW1 at start-up and leaves its
+//      I-cache off when it is ON)
 //
 // Main sends each <rom index> as its own download from address 0, in file
 // order (hps_io's address is 27 bits, so 168 MiB cannot be one stream). Every
@@ -89,6 +98,7 @@ module m3_loader #(
   output logic [7:0]  cfg_flags,
   output logic [15:0][4:0] cfg_bank,  // {empty, slot[3:0]} by bank
   output logic [7:0]  cfg_in2, cfg_in3, // idle inputs, ports C and D
+  output logic [7:0]  cfg_dsw,          // the DIP bank, port G (index 254; R133)
 
   output logic        rom_loaded,
   output logic        busy,         // a download in progress or draining
@@ -101,6 +111,7 @@ module m3_loader #(
   wire dl0        = ioctl_download && ix == 6'd0;
   wire dl_cfg     = ioctl_download && ix == 6'd4;
   wire to_fifo    = dl_any && !dl_cfg;
+  wire dl_sw      = ioctl_download && ioctl_index == 16'd254;   // <switches>
 
   // destination classes in the FIFO
   localparam logic [1:0] K_SDR = 2'd0, K_X = 2'd1, K_EE = 2'd2;
@@ -133,7 +144,7 @@ module m3_loader #(
     endcase
   end
 
-  logic        rd_armed, wbusy, ack_d, dl0_d, done, cfg_seen, any_d;
+  logic        rd_armed, wbusy, ack_d, dl0_d, done, cfg_seen, any_d, dlc_d;
   logic [1:0]  h_k;
   logic [AW-1:0] h_adr;
   logic [15:0]   h_dat;
@@ -143,11 +154,12 @@ module m3_loader #(
     if (rst) begin
       wp <= '0; rp <= '0; rd_armed <= 1'b0; wbusy <= 1'b0; ack_d <= 1'b0; dl0_d <= 1'b0; done <= 1'b0;
       sdr_wr_req <= 1'b0; x_req <= 1'b0; overflow <= 1'b0; rom_loaded <= 1'b0; bytes <= '0;
-      cfg_seen <= 1'b0; any_d <= 1'b0;
-      cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF;
+      cfg_seen <= 1'b0; any_d <= 1'b0; dlc_d <= 1'b0;
+      cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
       for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
     end else begin
       ack_d <= sdr_wr_ack;
+      dlc_d <= dl_cfg;
       dl0_d <= dl0;
       any_d <= dl_any;
       if (to_fifo && ioctl_wr) begin
@@ -159,6 +171,7 @@ module m3_loader #(
       end
       if (dl0 && ioctl_wr) bytes <= ioctl_addr + 27'd2;
       // the game configuration
+      if (dl_cfg && !dlc_d) cfg_dsw <= 8'h7F;
       if (dl_cfg && ioctl_wr) begin
         cfg_seen <= 1'b1;
         if (ioctl_addr[26:1] == 26'd9) begin cfg_in2 <= ioctl_dout[7:0]; cfg_in3 <= ioctl_dout[15:8]; end
@@ -173,10 +186,12 @@ module m3_loader #(
       if (dl0 && !dl0_d) begin
         cfg_seen <= 1'b0;
         if (!cfg_seen) begin
-          cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF;
+          cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
           for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
         end
       end
+      // the DIP bank: byte 0 of <switches>
+      if (dl_sw && ioctl_wr && ioctl_addr[26:1] == 26'd0) cfg_dsw <= ioctl_dout[7:0];
       if (dl0) rom_loaded <= 1'b0;
       if (dl0_d && !dl0) done <= 1'b1;
       // drain: one write per entry, to its class's destination

@@ -64,13 +64,21 @@
 //     The alignment exception (0x600; SRR0 the instruction, DSISR from its
 //     encoding by table 4-13, DAR the EA) is taken instead, before anything
 //     is done, for: lmw, stmw, lwarx and stwcx. not word-aligned (lmw / stmw:
-//     DAR = EA + 4, 4.5.6.2); an FP load or store not word-aligned; a halfword,
-//     word or FP double crossing a page with MSR[DR] = 1 (4.5.6.1.1, EA ending
-//     0xFFF, 0xFFD-0xFFF, 0xFF9-0xFFF) with no DBAT hit, or leaving the DBAT
-//     block it hits (D-39: 4.5.6.1.1 is ambiguous for BAT regions; a crossing
-//     inside one block is split, both words translated by the BAT). SR[T] = 1
-//     is checked as a page access: a direct-store segment gives the alignment
-//     exception, not the DSI. With DR = 0 a page crossing is done in hardware.
+//     DAR = EA + 4, 4.5.6.2); an FP load or store not word-aligned; an FP
+//     double crossing a page with MSR[DR] = 1 (4.5.6.1.1, EA ending
+//     0xFF9-0xFFF) with no DBAT hit for its EA (a page-address translation
+//     access; one that hits a DBAT is two words, each translated on its own,
+//     even where the second leaves the block: "no special handling for
+//     accesses that fall into BAT regions", 4.5.6.1.1; R129).
+//     A halfword or word crossing a page is done in hardware with DR = 1 too
+//     (4.5.3: "The 603e supports the crossing of page boundaries"; study R124,
+//     xpage, amending D-39, after Scud Race's lwzx at FF292FFE): the first
+//     page's bytes are translated and accessed, then the second word, at
+//     (EA & ~3) + 4, the second page's first byte, is translated on its own. A
+//     fault there is taken "in the middle of the instruction" (4.5.3): DSI,
+//     DAR = that byte ("a byte address in the first word of the offending
+//     page"), or a DTLB miss, DMISS = it; a store's bytes in the first page
+//     have then been written (PEM 6.1.4), a load writes no register.
 //
 // Floating point: every 603e FP instruction, the arithmetic, the FPSCR and
 // CR1 from sim/fpu/ppc_fpu_ref.h (its own MPFR model, written from the
@@ -89,7 +97,9 @@
 //     executed next").
 //   lfd / stfd are two word accesses, high word first. A double crossing a
 //     page with MSR[DR] = 1 takes the alignment exception (603e 4.5.6.1.1,
-//     above), so the second word never faults where the first did not.
+//     above) when its EA has no DBAT hit; with one, its second word may leave
+//     the block and fault on its own page (a load then writes nothing, a
+//     store's first word is in memory, PEM 6.1.4).
 
 #pragma once
 #include <cstdint>
@@ -183,8 +193,15 @@ struct PpcIss {
   uint64_t exc_count[0x20] = {};              // exceptions taken, by vector / 0x100
   uint64_t fp_prec = 0, fp_delayed = 0, fp_ops[ppcfpu::NUM_OPS] = {}, fp_ls[2] = {}, fp_supp = 0;
   // misaligned integer accesses done: inside a word, then crossing a word, a
-  // doubleword, a 32-byte line and (MSR[DR] = 0) a page; [5] stores of them all
-  uint64_t mis_n[7] = {};                              // [6]: page crossings with DR = 1 (inside a DBAT block)
+  // doubleword, a 32-byte line and a page; [5] stores of them all; page
+  // crossings with DR = 1: [6] done, [7] done with both pages page-translated,
+  // [8] done with one word in a DBAT block and the other not (or another
+  // block), [9] second page's DTLB miss taken, [10] second page's DSI taken;
+  // [11]-[14] crossings with DR = 1 met (done or faulted), by EA's page offset:
+  // a word at 0xFFD, 0xFFE, 0xFFF, a halfword at 0xFFF
+  // [15]-[17] FP doubles crossing a page with DR = 1: trapped (no DBAT hit), split inside the block, split
+  // leaving it (R129)
+  uint64_t mis_n[18] = {};
   void exception(uint32_t vec, uint32_t save_pc, uint32_t srr1_bits) {
     exc_count[(vec >> 8) & 0x1F]++;
     if (vec == 0x700 && (srr1_bits & 0x00100000)) (srr1_bits & 0x00010000 ? fp_delayed : fp_prec)++;
@@ -395,8 +412,8 @@ struct PpcIss {
       bool cond_ok = (bo & 16) || (cr_bit(bi) == ((bo >> 3) & 1));
       return ctr_ok && cond_ok;
     };
-    // One translation covers each access: with MSR[DR] = 1 none crosses a page
-    // (the alignment exception), and with DR = 0 the address is the EA.
+    // One translation covers each access but an integer one crossing a page,
+    // whose second word is translated on its own (ld, st).
     bool fault = false;
     // table 4-13: indexed (X form, opcode 31) or immediate-index (D form)
     auto align_exc = [&](uint32_t dar_v) {
@@ -408,8 +425,8 @@ struct PpcIss {
       exception(0x600, pc, 0);
       fault = true;
     };
-    // D-39: with MSR[DR] = 1 a crossing inside one DBAT block is done (split);
-    // with no BAT hit, or leaving the block, it takes the alignment exception
+    // D-39 as amended (R124, R129): with MSR[DR] = 1 an FP double crossing a page takes the alignment
+    // exception only with no BAT hit for its EA (a page-address translation access, 4.5.6.1.1)
     auto dbat_of = [&](uint32_t ea) -> int {
       bool pr = msr & MSR_PR;
       for (int i = 0; i < 4; i++) {
@@ -420,28 +437,50 @@ struct PpcIss {
       }
       return -1;
     };
+    // (R129: an FP double whose EA hits a DBAT is not a page-address translation access, 4.5.6.1.1, so it is
+    // two words, each translated on its own, whether or not its second word leaves the block)
     auto pg_cross = [&](uint32_t ea, int size) {
       if (!(msr & MSR_DR) || (ea & 0xFFF) + uint32_t(size) <= 0x1000) return false;
-      int k = dbat_of(ea);
-      return k < 0 || dbat_of(ea + uint32_t(size) - 1) != k;
+      return dbat_of(ea) < 0;
     };
-    auto mis_count = [&](uint32_t a, int size, bool isst) {
+    auto mis_count = [&](uint32_t a, int size, bool isst) {          // (by EA)
       if (size == 1 || !(a & uint32_t(size - 1))) return;
       uint32_t e = a + uint32_t(size) - 1;
       int k = (e >> 12) != (a >> 12) ? 4 : (e >> 5) != (a >> 5) ? 3 : (e >> 3) != (a >> 3) ? 2 : (e >> 2) != (a >> 2) ? 1 : 0;
       mis_n[k]++;
       if (isst) mis_n[5]++;
-      if (k == 4 && (msr & MSR_DR)) mis_n[6]++;
+      if (k == 4 && (msr & MSR_DR)) {
+        int b0 = dbat_of(a), b1 = dbat_of(e);
+        mis_n[6]++;
+        if (b0 < 0 && b1 < 0) mis_n[7]++; else if (b0 != b1) mis_n[8]++;
+      }
+    };
+    // a page crossing's second word: (EA & ~3) + 4, the second page's first
+    // byte, translated on its own; a fault is counted and taken (4.5.3)
+    auto xpg_met = [&](uint32_t ea, int size) {
+      if (!(msr & MSR_DR) || size < 2 || (ea & 0xFFF) + uint32_t(size) <= 0x1000) return;
+      mis_n[size == 2 ? 14 : 11 + int((ea & 3) - 1)]++;
+    };
+    auto xpg2 = [&](uint32_t ea, Acc acc, uint32_t &a2) {
+      if (xlate((ea & ~3u) + 4, acc, a2)) return true;
+      uint32_t v = pc & 0xFFFF;
+      if (v == 0x1100 || v == 0x1200) mis_n[9]++; else if (v == 0x300) mis_n[10]++;
+      fault = true;
+      return false;
     };
     auto ld = [&](uint32_t ea, int size, bool sgn, bool brev) -> uint32_t {
-      uint32_t a;
-      if (size > 1 && pg_cross(ea, size)) { align_exc(ea); return 0; }
+      uint32_t a, a2 = 0;
+      xpg_met(ea, size);
       if (!xlate(ea, LOAD, a)) { fault = true; return 0; }
-      mis_count(a, size, false);
+      bool xp = size > 1 && (ea & 0xFFF) + uint32_t(size) > 0x1000;
+      uint32_t n1 = xp ? 0x1000 - (ea & 0xFFF) : uint32_t(size);      // bytes in the first page
       on_load(a & ~3u);
-      if ((a & 3) + uint32_t(size) > 4) on_load((a & ~3u) + 4);       // the second word of a split
+      if (xp) { if (!xpg2(ea, LOAD, a2)) return 0; on_load(a2); }      // the second page's word
+      else if ((a & 3) + uint32_t(size) > 4) on_load((a & ~3u) + 4);  // the second word of a split
+      mis_count(ea, size, false);
       uint32_t v;
-      if (size == 4 && !(a & 3)) v = rd32(a);
+      if (xp) { v = 0; for (uint32_t k = 0; k < uint32_t(size); k++) v = (v << 8) | rd8(k < n1 ? a + k : a2 + (k - n1)); }
+      else if (size == 4 && !(a & 3)) v = rd32(a);
       else if (size == 2 && !(a & 1)) v = rd16(a);
       else if (size == 1) v = rd8(a);
       else { v = 0; for (int k = 0; k < size; k++) v = (v << 8) | rd8(a + k); }
@@ -450,11 +489,19 @@ struct PpcIss {
       return v;
     };
     auto st = [&](uint32_t ea, int size, uint32_t v, bool brev) {
-      uint32_t a;
-      if (size > 1 && pg_cross(ea, size)) { align_exc(ea); return; }
+      uint32_t a, a2 = 0;
+      xpg_met(ea, size);
       if (!xlate(ea, STORE, a)) { fault = true; return; }
-      mis_count(a, size, true);
       if (brev) v = size == 4 ? bswap32(v) : bswap16(uint16_t(v));
+      if (size > 1 && (ea & 0xFFF) + uint32_t(size) > 0x1000) {       // across a page: the first page's
+        uint32_t n1 = 0x1000 - (ea & 0xFFF);                           // bytes, then the second word's
+        for (uint32_t k = 0; k < n1; k++) wr8(a + k, uint8_t(v >> (8 * (uint32_t(size) - 1 - k))));
+        if (!xpg2(ea, STORE, a2)) return;                              // (the first page's bytes stay, PEM 6.1.4)
+        for (uint32_t k = n1; k < uint32_t(size); k++) wr8(a2 + (k - n1), uint8_t(v >> (8 * (uint32_t(size) - 1 - k))));
+        mis_count(ea, size, true);
+        return;
+      }
+      mis_count(ea, size, true);
       if (size == 4 && !(a & 3)) wr32(a, v);
       else if (size == 2 && !(a & 1)) wr16(a, uint16_t(v));
       else if (size == 1) wr8(a, uint8_t(v));
@@ -474,6 +521,10 @@ struct PpcIss {
         bool iw  = x && xo == 983;
         uint32_t ea = (upd ? gpr[ra] : A0()) + (x ? gpr[rb] : uint32_t(simm));
         fp_ls[isst]++;
+        if (dbl && !(ea & 3) && (msr & MSR_DR) && (ea & 0xFFF) + 8u > 0x1000u) {
+          int k0 = dbat_of(ea);
+          mis_n[k0 < 0 ? 15 : dbat_of(ea + 7) == k0 ? 16 : 17]++;
+        }
         if ((ea & 3) || (dbl && pg_cross(ea, 8))) { align_exc(ea); return; }   // 4.5.6, 4.5.6.1.1
         if (!isst) {
           uint32_t w0 = ld(ea, 4, false, false);

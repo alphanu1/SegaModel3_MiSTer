@@ -67,7 +67,10 @@
 // two word accesses, the first made while EX holds a cycle; one inside its
 // word is a single access on its lanes. The alignment exception (0x600) is
 // taken for lmw, stmw, lwarx, stwcx. and FP accesses not word-aligned, and for
-// any access crossing a page with MSR[DR] = 1.
+// an FP double crossing a page with MSR[DR] = 1 and no DBAT hit (R129). An
+// integer access crossing a page is split like any other (603e 4.5.3: "The
+// 603e supports the crossing of page boundaries"); with MSR[DR] = 1 its second
+// word is translated on its own page (study R124, xpage, amending D-39).
 //
 // Not yet here: privilege checks other than dcbi's (MSR[PR] selects keys and
 // BAT valid bits), MSR[LE].
@@ -148,7 +151,23 @@ module ppc_core
   // FWW = 1: a uop whose frD has an FPU-port write outstanding (WAW) waits only until that write lands in its
   // first EX cycle or the next (it then leaves EX a cycle before the write, and that write does not clear frD's
   // pending bit: wsk_q); 0: until the write lands as it enters ID (see "Scoreboard")
-  parameter bit FWW = 1'b1
+  parameter bit FWW = 1'b1,
+  // LRA = 1: the LR / CTR look-ahead (603e 6.3.1, 6.4.1.1: the BPU executes a bclr / bcctr as it is fetched,
+  // with the LR or CTR from its rename register or the architected one). A bclr or bcctr the rule predicts taken
+  // whose target fetch knows is a soft redirect to it, as a b is (see "LR / CTR look-ahead"); 0: it is predicted
+  // not taken unless the BTB holds it
+  parameter bit LRA = 1'b1,
+  // IUN: the instruction micro-TLB's entries (2, 4 or 8), replaced in turn; the 603e's ITLB has 64 (5.4.3.1),
+  // and a hit in either costs no cycle, so more entries change only the timing
+  parameter int IUN = 4,
+  // DUN: the data micro-TLB's entries (2, 4, 6 or 8); the 603e's DTLB has 64 (5.4.3.1) and a hit costs no
+  // cycle, so this changes only the timing (a miss is a replay). DRP: its replacement, 0 in turn (a pointer),
+  // 1 least recently used (an empty entry first); both are timing only
+  parameter int DUN = 4,
+  parameter bit DRP = 1'b1,
+  // FAST = 0: no single unit (ppc_fpu_fast SF = 0); every multiply-add op goes to the double unit, frsqrte
+  // still to its estimate pipe. Same results, single ops at the double unit's latency (study R129)
+  parameter bit FAST = 1'b1
 )(
   input  logic        clk,
   input  logic        rst,
@@ -166,10 +185,11 @@ module ppc_core
   input  logic        i_arr,
   input  logic [19:0] i_pa,
   output logic        i_pv,
-  output logic [11:2] i_pidx,
+  output logic [12:2] i_pidx,       // (bit 12: the I-cache's ISB index bit, EA[19])
   output logic [1:0]  i_pway,
   output logic [19:0] i_ppa,
   output logic        i_pre,
+  output logic        i_eix,        // EA[19] of the request (the I-cache's ISB index bit)
   // two-word fetch: the cache offers two words to a sequential request
   // (i_two), the core asks (i_w2), the second comes in i_data2
   input  logic        i_two,
@@ -215,6 +235,10 @@ module ppc_core
   //   ev_btb: 0 a BTB prediction's target requested   1 its word failed the check
   //           2 a register target refetched from MEM   3 an entry written
   output logic [3:0]  ev_btb,
+  //   ev_xrf: a split's second word replayed after its first was made, and the replay refetched (no fault):
+  //           the first word's access is made again (the core bench drops the earlier one). Unconnected
+  //           outside the core bench
+  output logic        ev_xrf,
 
   // retire trace: one record per uop leaving WB, with the special registers it
   // committed. Unconnected in the core build, so it costs nothing there.
@@ -356,6 +380,11 @@ module ppc_core
     logic        sp0, sp1, algn, algd4;
   } mem_t;
   mem_t m;
+  // the page MEM translates a replay on (EA[0-19], from EX's ea_x): EA's, or for a split's second word once its
+  // first has gone (m_x4) EA + 4's, a page crossing's second page (DMISS / DAR its first byte). Registers of their
+  // own beside m, loaded as it is (mem_t's layout, and so the system bench's checkpoints, stay as they were)
+  logic [19:0] m_xpg;
+  logic        m_x4;
   (* preserve *) logic m_rpq;                          // = m.rp, for the queue's hold (below)
   wire         m_c1w = m.valid && m.fcr1 && !m_fsok;    // MEM holds an Rc = 1 arithmetic op: CR1 follows
 
@@ -405,10 +434,16 @@ module ppc_core
   //
   // TLB entry: [62] V, [61:38] VSID, [37:27] EA[4-14], [26:7] RPN, [6] C,
   // [5:2] WIMG, [1:0] PP: the PTE's words with EA[10-14] added (5.4.3.1).
-  (* ramstyle = "MLAB, no_rw_check" *) logic [62:0] dtlb0 [0:31];
-  (* ramstyle = "MLAB, no_rw_check" *) logic [62:0] dtlb1 [0:31];
-  (* ramstyle = "MLAB, no_rw_check" *) logic [62:0] itlb0 [0:31];
-  (* ramstyle = "MLAB, no_rw_check" *) logic [62:0] itlb1 [0:31];
+  // (R129) The TLB ways are M10K, read at a registered set: the instruction side's is f_rsp_pc's (as it loads),
+  // the data side's MEM's page (as m_xpg loads, or kept). Each slow lookup reads them in the
+  // cycle it uses them, as the MLABs were read; a TLB write on the edge into that cycle is not yet in what the
+  // block gives, so that lookup waits a cycle (itw_q, dtw_q) and reads again.
+  (* ramstyle = "M10K, no_rw_check" *) logic [62:0] dtlb0 [0:31];
+  (* ramstyle = "M10K, no_rw_check" *) logic [62:0] dtlb1 [0:31];
+  (* ramstyle = "M10K, no_rw_check" *) logic [62:0] itlb0 [0:31];
+  (* ramstyle = "M10K, no_rw_check" *) logic [62:0] itlb1 [0:31];
+  logic        itw_q, dtw_q;
+  logic [62:0] it0_q, it1_q, dt0_q, dt1_q;            // the blocks' reads (old data on a write's edge, as M10K)
   (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] dsr_mem [0:15];
   (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] fsr_mem [0:15];   // mfsr(in)'s copy
   (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] isr_mem [0:15];
@@ -546,11 +581,14 @@ module ppc_core
   assign redir_pc_q = (redir_k_q == 2'd0) ? redir_a_q : (redir_k_q == 2'd1) ? redir_b_q : redir_s_q;
   wire  [31:0] fetch_pc = redir_q ? redir_pc_q : pt_q ? {bt_tgt, 2'b00} : f_pc;
 
-  logic [1:0]        iu_v, iu_nx, iu_pr;
-  logic [1:0][19:0]  iu_pg, iu_pa;
-  logic [1:0][3:0]   iu_wimg;
+  localparam int IUW = (IUN > 2) ? $clog2(IUN) : 2;   // (2 entries: bit 0 alone counts, as before)
+  logic [IUN-1:0]        iu_v, iu_pr;
+  logic [IUW-1:0]        iu_nx;
+  wire  [$clog2(IUN)-1:0] iu_ix = iu_nx[$clog2(IUN)-1:0];   // the entry replaced next
+  logic [IUN-1:0][19:0]  iu_pg, iu_pa;
+  logic [IUN-1:0][3:0]   iu_wimg;
   logic [4:0][3:0]   fc_hit;                           // [candidate][IBAT]
-  logic [4:0][1:0]   fc_iu;                            // [candidate][micro-TLB entry]
+  logic [4:0][IUN-1:0] fc_iu;                          // [candidate][micro-TLB entry]
   logic [4:0]        fc_ok;                            // candidate may go out at once
   logic [4:0][31:0]  fc_pc;
   always_comb begin
@@ -562,7 +600,7 @@ module ppc_core
         // a BAT hit that allows the fetch: PP not 00, not guarded (table 5-3)
         fc_ok[c] = fc_ok[c] | (fc_hit[c][k] && bat_pp[k] != 2'd0 && !bat_wimg[k][0]);
       end
-      for (int e = 0; e < 2; e++) begin
+      for (int e = 0; e < IUN; e++) begin
         fc_iu[c][e] = iu_v[e] && iu_pr[e] == f_pr && iu_pg[e] == fc_pc[c][31:12];
         fc_ok[c]    = fc_ok[c] | fc_iu[c][e];
       end
@@ -572,7 +610,20 @@ module ppc_core
   wire  [3:0]  ib_hit = fc_hit[f_sel];
   // the micro-TLB's hit chosen too, not compared after the address mux (the
   // R63 full build's ROM address path ran through that compare)
-  wire  [1:0]  iu_hit = fc_iu[f_sel];
+  wire  [IUN-1:0] iu_hit = fc_iu[f_sel];
+  // with more than two entries the micro-TLB's page and WIMG are formed for each of the five candidates
+  // beside its compare, and the address's choice (f_sel, from registers) picks one last: through iu_hit,
+  // the choice and an eight-way AND-OR were in front of the I-cache's pa (an IUN = 8 spike's worst I-cache path)
+  logic [4:0][19:0] iu_pa_c;
+  logic [4:0][3:0]  iu_wg_c;
+  always_comb
+    for (int c = 0; c < 5; c++) begin
+      iu_pa_c[c] = 20'd0; iu_wg_c[c] = 4'd0;
+      for (int e = 0; e < IUN; e++) begin
+        iu_pa_c[c] = iu_pa_c[c] | ({20{fc_iu[c][e]}} & iu_pa[e]);
+        iu_wg_c[c] = iu_wg_c[c] | ({4{fc_iu[c][e]}} & iu_wimg[e]);
+      end
+    end
   wire         f_fast = !f_ir || fc_ok[f_sel];
   logic [14:0] ib_pa;
   logic [19:0] iu_pahi;
@@ -588,10 +639,13 @@ module ppc_core
                        (bat_brpn[k] | {4'd0, fetch_pc[27:17] & bat_bl[k]}));
       ib_wimg = ib_wimg | ({4{ib_hit[k]}} & bat_wimg[k] & 4'b1110);   // an IBAT has no G (3.5)
     end
-    for (int e = 0; e < 2; e++) begin
-      iu_pahi   = iu_pahi   | ({20{iu_hit[e]}} & iu_pa[e]);
-      iu_wimg_s = iu_wimg_s | ({4{iu_hit[e]}} & iu_wimg[e]);
-    end
+    if (IUN > 2) begin                                  // (formed per candidate, chosen by f_sel last: below)
+      iu_pahi = iu_pa_c[f_sel]; iu_wimg_s = iu_wg_c[f_sel];
+    end else
+      for (int e = 0; e < IUN; e++) begin
+        iu_pahi   = iu_pahi   | ({20{iu_hit[e]}} & iu_pa[e]);
+        iu_wimg_s = iu_wimg_s | ({4{iu_hit[e]}} & iu_wimg[e]);
+      end
   end
   // the fetch's WIMG: real mode 0011 (3.5), an IBAT's, or the micro-TLB's
   // (an untranslated request's goes nowhere: its response is not used)
@@ -601,8 +655,8 @@ module ppc_core
 
   // the slow cycles: f_rsp_pc's translation, from registers
   wire  [31:0] isr    = isr_mem[f_rsp_pc[31:28]];
-  wire  [62:0] it0    = itlb0[f_rsp_pc[16:12]];
-  wire  [62:0] it1    = itlb1[f_rsp_pc[16:12]];
+  wire  [62:0] it0    = it0_q;
+  wire  [62:0] it1    = it1_q;
   logic [1:0]  sb_pp;
   logic        sb_g;
   logic [3:0]  sb_hit, sb_wimg;
@@ -685,15 +739,38 @@ module ppc_core
   wire  [31:0] pw_tgt  = (i_data[1] ? 32'd0 : f_rsp_pc) + pw_disp;
   // a word the BTB already redirected for (bq_out) makes no soft redirect of
   // its own: its check is registered (bmis_q, below)
-  wire         f_soft1 = rsp_use && pw_pred && !bq_out;
+  wire         f_soft1 = rsp_use && (pw_pred || pw_lrs) && !bq_out;
+  wire         f_lra   = rsp_use && pw_lrs && !bq_out;           // (pw_pred is 0 for a bclr / bcctr)
   wire         f_soft  = f_soft1 || f_soft2;
   // bclr, or bcctr (BO[2] = 1), and the y-bit rule's taken for it (PEM 4.2.4.2)
   wire         pw_reg  = pw_op == 6'd19 && (i_data[10:1] == 10'd16 || (i_data[10:1] == 10'd528 && pw_bo[2]));
   wire         pw_rstk = la1[1] ? la1[0] : (pw_bo[4] && pw_bo[2]) || pw_bo[0];
+  // LR / CTR look-ahead (LRA). Fetch keeps what the LR will be once the words it has pushed into the queue
+  // have executed: lw_k 0, none of them writes the LR (since the queue was last emptied by a hard redirect),
+  // so the LR is lr_q once no older writer is in EX or MEM (it commits as MEM is left); 1, the youngest writer
+  // pushed is a branch with LK = 1, so the LR is its address + 4 (lw_lr, the 603e's LR rename register for a
+  // branch); 2, another writer (mtlr): not known until it executes (the 603e waits; this core predicts as
+  // before). The CTR is known when no writer of it is in the queue, EX or MEM (la_ctb): ctr_q. A bclr / bcctr
+  // first word that branches always (BO = 1z1zz) whose target is known, with no other register prediction in
+  // flight (rp_v), is a soft redirect to that target (f_lra), checked in EX as a BTB register prediction is
+  // (rp_tgt, rtm). With a BTB register prediction for it, the BTB's target must be that one (bq_ok1).
+  logic [1:0]  lw_k;
+  logic [31:2] lw_lr;
+  wire         pw_bcr  = pw_op == 6'd19 && (i_data[10:1] == 10'd16 || i_data[10:1] == 10'd528);   // bclr / bcctr, any BO
+  wire         pw_lk   = (pw_op == 6'd18 || pw_op == 6'd16 || pw_bcr) && i_data[0];               // a branch with LK = 1
+  wire         lr_old  = (ex_valid && ex_w_lr) || (m.valid && m.lr_we);
+  wire         pw_isl  = i_data[10:1] == 10'd16;
+  // (with the BTB only: its rp_v / rp_tgt carry the prediction to EX's check; one-word fetch only)
+  // (only a bclr / bcctr that branches always, BO = 1z1zz: its direction needs nothing from the look-ahead's CR
+  // scan, so the decision is two LUTs from the word and registers; a conditional one is predicted as before)
+  wire         lr_kn   = lw_k == 2'd1 || (lw_k == 2'd0 && !lr_old);
+  wire         pw_kn   = LRA && BTB && !FETCH2 && pw_reg && pw_bo[4] && pw_bo[2] && (pw_isl ? lr_kn : !la_ctb);
+  wire  [31:2] pw_rt   = pw_isl ? ((lw_k == 2'd1) ? lw_lr : lr_q[31:2]) : ctr_q[31:2];
+  wire         pw_lrs  = pw_kn && !rp_v;                           // a soft redirect if the BTB has not redirected
   // the queue's predicted bit: the static rule's, or a register branch the BTB
   // redirected for, whose word passes its check
   wire         bt_slot = FETCH2 && bt_x[22];            // the branch is the second word of its request
-  wire         w_prd   = pw_pred || (bq_out && !bt_slot && bt_preg && pw_reg && pw_rstk);
+  wire         w_prd   = pw_pred || (bq_out && !bt_slot && bt_preg && pw_reg && pw_rstk) || (pw_lrs && !bq_out);
   // two-word fetch: the second word's prediction, from i_data2 at f_rsp_pc + 4.
   // A first word predicted taken drops the second (it is not pushed).
   logic        f_w2_q;                                 // the outstanding request asked for two words
@@ -744,6 +821,7 @@ module ppc_core
                   (redir_hard_q || ({1'b0, q_cnt} + {1'b0, f_nin} < 4'd4));
   wire  f_room2 = {1'b0, q_cnt} + {1'b0, f_nin} < 4'd3;
   assign i_addr = {i_pahi, fetch_pc[11:0]};
+  assign i_eix  = fetch_pc[12];
   assign i_req  = f_issue;
   // i_seq: the request follows the previous one at + 4, both translated at
   // once (a request that went untranslated, f_xm, is fetched again from a
@@ -772,27 +850,27 @@ module ppc_core
       f_xm    <= 1'b0;
       f_slow  <= 1'b0;
       f_slow2 <= 1'b0;
-      iu_v    <= 2'd0;
-      iu_nx   <= 2'd0;
+      iu_v    <= '0;
+      iu_nx   <= '0;
     end else begin
       f_fpend <= s_flt;
       if (f_issue)    f_xm <= !f_fast;
       else if (s_flt) f_xm <= 1'b0;                     // the marker's response is used
-      f_slow  <= rsp_xm;
-      f_slow2 <= f_slow && !redir_q;
+      f_slow  <= rsp_xm || (f_slow && itw_q);       // (an ITLB write on the edge into it: read again)
+      f_slow2 <= f_slow && !itw_q && !redir_q;
       if (redir_hard_q)                  f_stall <= 1'b0;
       else if (rsp_use && f_fpend)       f_stall <= 1'b1;
-      if (iu_clr) iu_v <= 2'd0;
+      if (iu_clr) iu_v <= '0;
       else if (iu_sel) begin                            // (a fill in this cycle is dropped: it is refetched)
-        for (int e = 0; e < 2; e++)
+        for (int e = 0; e < IUN; e++)
           if (m.srw ? iu_pg[e][19:16] == m.ya[19:16] : iu_pg[e][4:0] == m.ya[4:0]) iu_v[e] <= 1'b0;
       end else if (s_ok) begin
-        iu_v[iu_nx[0]]  <= 1'b1;
-        iu_pg[iu_nx[0]] <= f_rsp_pc[31:12];
-        iu_pa[iu_nx[0]] <= sf_pa;
-        iu_pr[iu_nx[0]] <= f_pr;
-        iu_wimg[iu_nx[0]] <= sf_wimg;
-        iu_nx           <= {1'b0, !iu_nx[0]};
+        iu_v[iu_ix]    <= 1'b1;
+        iu_pg[iu_ix]   <= f_rsp_pc[31:12];
+        iu_pa[iu_ix]   <= sf_pa;
+        iu_pr[iu_ix]   <= f_pr;
+        iu_wimg[iu_ix] <= sf_wimg;
+        iu_nx          <= (IUN > 2) ? IUW'(iu_nx + 1'b1) : IUW'({1'b0, !iu_nx[0]});
       end
     end
     if (f_slow) begin
@@ -823,7 +901,7 @@ module ppc_core
       // soft one, its address loaded from a register (cr_tgt_q).
       redir_a_q    <= redirect_pc;
       redir_b_q    <= redirect_pc_b;
-      redir_s_q    <= bmis_q ? {cr_tgt_q, 2'b00} : (pw_pred || !FETCH2) ? pw_tgt : pw2_tgt;
+      redir_s_q    <= bmis_q ? {cr_tgt_q, 2'b00} : (LRA && !pw_pred && pw_lrs) ? {pw_rt, 2'b00} : (pw_pred || !FETCH2) ? pw_tgt : pw2_tgt;
       redir_k_q    <= rdk_x;
       if (f_issue)      f_pc <= fetch_pc + (i_w2 ? 32'd8 : 32'd4);
       else if (redir_q) f_pc <= redir_pc_q;
@@ -840,6 +918,19 @@ module ppc_core
       end
     end
   end
+
+  // the LR look-ahead's state, by the words pushed (LRA, above)
+  always_ff @(posedge clk)
+    if (rst || redir_hard_q) lw_k <= 2'd0;
+    else if (rsp_use && !f_fpend) begin
+      if (pw_lk) begin lw_k <= 2'd1; lw_lr <= f_rsp4; end
+      else if (pd_w.w_lr) lw_k <= 2'd2;
+    end
+`ifdef R104_CHECK
+  // every LR writer the predecode names is a branch with LK = 1 or not, and pw_lk names only LR writers
+  always_ff @(posedge clk)
+    if (!rst && LRA && rsp_use && !f_fpend && pw_lk && !pd_w.w_lr) $fatal(1, "LRA: a branch with LK = 1 the predecode does not mark as an LR writer");
+`endif
 
   // Queue writes go to the slot after the live entries, counted before any pop.
   logic [31:0] q_hi, q_hp;
@@ -879,7 +970,7 @@ module ppc_core
   wire         t_go   = f_issue && pt_q && !redir_q;
   assign i_w2   = w2_can && !(b_ok && !bt_slot);
   assign i_pv   = b_go;
-  assign i_pidx = bt_tgt[11:2];
+  assign i_pidx = bt_tgt[12:2];
   assign i_pway = bt_x[1:0];
   assign i_ppa  = bt_x[21:2];
   assign i_pre  = pt_q && !redir_q;
@@ -892,10 +983,13 @@ module ppc_core
   // is T's adder, the compare goes to one register), or for a register entry
   // a bclr / bcctr the y-bit rule predicts taken; in the second slot, with a
   // first word that predicts nothing
-  wire         bq_ok1 = bt_preg ? (pw_reg && pw_rstk) : (pw_pred && pw_tgt[31:2] == bt_tgt);
+  wire         bq_ok1 = bt_preg ? (pw_reg && pw_rstk && (!pw_kn || pw_rt == bt_tgt)) : (pw_pred && pw_tgt[31:2] == bt_tgt);
   wire         bq_ok2 = w2_in && !pw_pred && (bt_preg ? (pw2_reg && pw2_rstk) : (pw2_pred && pw2_tgt[31:2] == bt_tgt));
   wire         bq_ok  = bt_slot ? bq_ok2 : bq_ok1;
   logic        bmr_q;                                  // the failed check was a register entry's
+  logic        cr_lrk_q;                               // ... and the word's target is known (LRA): a register prediction to it
+  logic        al_lr1;                                 // LRA: the soft redirect was a bclr / bcctr's (a register entry)
+  logic        rp_lq;                                  // LRA: the register prediction in flight is the look-ahead's
   logic        cr_pred_q;                              // ... and a word predicts taken (to cr_tgt_q)
   logic        cr_slot_q, cr_sq_q, cr_pp_q;            // ... which word; its request was sequential; the key's size
   logic [31:2] cr_key_q;                               // ... the key of B's request (the one before it)
@@ -965,9 +1059,10 @@ module ppc_core
         // correction is dropped at redir_q, below)
         bmis_q    <= rsp_use && bq_out && !bq_ok && !rst;
         bmr_q     <= bt_preg;
-        cr_pred_q <= pw_pred || (w2_in && pw2_pred);
+        cr_pred_q <= pw_pred || (w2_in && pw2_pred) || pw_kn;
+        cr_lrk_q  <= pw_kn;
         cr_slot_q <= !pw_pred;
-        cr_tgt_q  <= pw_pred ? pw_tgt[31:2] : (w2_in && pw2_pred) ? pw2_tgt[31:2] : w2_in ? f_rsp8 : f_rsp4;
+        cr_tgt_q  <= pw_pred ? pw_tgt[31:2] : pw_kn ? pw_rt : (w2_in && pw2_pred) ? pw2_tgt[31:2] : w2_in ? f_rsp8 : f_rsp4;
         cr_key_q  <= f_rkey;
         cr_sq_q   <= rq_sq_q;
         cr_pp_q   <= rq_pp_q;
@@ -975,9 +1070,15 @@ module ppc_core
         // branch leaves EX (its target is checked there), or its word fails
         if (rst || redir_hard_q)                                rp_v <= 1'b0;
         else if (t_go && bt_preg)                               rp_v <= 1'b1;
+        else if (LRA && f_lra)                                  rp_v <= 1'b1;
+        else if (LRA && bmis_q && bmr_q && cr_lrk_q)            rp_v <= 1'b1;   // the BTB's target replaced by the known one
         else if ((bmis_q && bmr_q) || (ex_adv && ex_u.op == OP_BRANCH && ex_pred &&
                                        (ex_u.bkind == BR_BCLR || ex_u.bkind == BR_BCCTR))) rp_v <= 1'b0;
+        if (rst || redir_hard_q || t_go) rp_lq <= 1'b0;
+        else if (LRA && (f_lra || (bmis_q && bmr_q && cr_lrk_q))) rp_lq <= 1'b1;
         if (t_go) rp_tgt <= bt_tgt;
+        else if (LRA && f_lra) rp_tgt <= pw_rt;
+        else if (LRA && bmis_q && bmr_q && cr_lrk_q) rp_tgt <= cr_tgt_q;
         // allocation. The key of the last uop to leave EX is kept until another
         // leaves (a MEM refetch, rt_q, uses it too: nothing younger leaves EX
         // past a uop MEM kills)
@@ -991,6 +1092,7 @@ module ppc_core
         end
         rt_q    <= m_kill && m.rtm;
         al_sq   <= f_soft && !rst;
+        al_lr1  <= LRA && f_lra;
         al_s2q  <= !f_soft1;
         al_k1   <= f_rkey;
         al_pp1  <= rq_pp_q;
@@ -1007,13 +1109,13 @@ module ppc_core
           al_key  <= al_k1;                                  // have gone out since)
           al_slot <= al_s2q;
           al_pp   <= al_pp1;
-          al_reg  <= 1'b0;
+          al_reg  <= al_lr1;                                 // (LRA: a register entry for a bclr / bcctr)
         end else if (bmis_q) begin
           al_v    <= cr_pred_q && cr_sq_q;
           al_key  <= cr_key_q;
           al_slot <= cr_slot_q;
           al_pp   <= cr_pp_q;
-          al_reg  <= 1'b0;
+          al_reg  <= LRA && cr_lrk_q;
         end else if (rsp_use) al_v <= 1'b0;
       end
 `ifdef VERILATOR
@@ -1027,6 +1129,7 @@ module ppc_core
       assign bt_pv = 1'b0; assign bt_preg = 1'b0; assign bt_tgt = '0; assign bt_x = '0;
       assign pt_q = 1'b0; assign bq_out = 1'b0; assign bmis_q = 1'b0; assign cr_tgt_q = '0;
       assign rp_v = 1'b0; assign rp_tgt = '0;
+      assign cr_lrk_q = 1'b0; assign al_lr1 = 1'b0; assign rp_lq = 1'b0;
       assign bmr_q = 1'b0; assign cr_pred_q = 1'b0; assign cr_slot_q = 1'b0; assign cr_sq_q = 1'b0; assign cr_key_q = '0;
       assign cr_pp_q = 1'b0;
       assign al_v = 1'b0; assign al_reg = 1'b0; assign al_slot = 1'b0; assign al_key = '0; assign al_pp = 1'b0;
@@ -2002,20 +2105,43 @@ module ppc_core
   always_ff @(posedge clk)
     if (!rst && ex_valid && (is_ld || is_st) && boff != ea[1:0]) $fatal(1, "boff against the EA");
 `endif
+`ifdef R104_CHECK
+  // (page crossings, R124) ea_x is the EA but in a split's second cycle once its first word has gone; that
+  // second word, made, is in the first's page or the next; one whose first word replayed makes no request;
+  // MEM's translation page is the EA's but for that second word
+  always_ff @(posedge clk) begin
+    if (!rst && ex_valid && (is_ld || is_st) && ea_x != ea + {29'd0, ex_s0ok, 2'b00}) $fatal(1, "ea_x against the EA");
+    if (!rst && ex_s0ok && !ex_sp1) $fatal(1, "ex_s0ok outside a split's second cycle");
+    if (!rst && ex_valid && ex_sp1 && !ex_s0ok && d_req) $fatal(1, "a split's second word requested without its first");
+    if (!rst && m.valid && (m.is_load || m.req || m.rp) && !m_x4 && m_xpg != m.result[31:12])
+      $fatal(1, "MEM's translation page is not the EA's");
+    if (!rst && m.valid && m.rp && m_x4 && m_xpg != m.result[31:12] + 20'd1)
+      $fatal(1, "a split's second word replayed in its first word's page (EA %08X)", m.result);
+  end
+`endif
 
   // Misaligned accesses (603e 2.2.3, 4.5.6). An integer halfword or word that
   // crosses a word boundary (mis_x) is split: in its first cycle in EX (mis_hold,
   // EX holding) the word at EA goes out on the lanes from EA on, as a uop of
   // its own into MEM with no effect but the access (m.sp0); in the next
-  // (ex_sp1) the uop itself goes out at EA + 4 (ea_x's carry-in) on the rest.
+  // (ex_sp1) the uop itself goes out at EA + 4 (ea_x's carry-in, once the
+  // first word has gone: ex_s0ok) on the rest.
   // A load's first word is kept as it leaves WB (mis_w0) and merged with the
   // second, which WB takes a cycle for (wb_sp1). The alignment exception
   // instead (algn, taken from MEM as dcbz's, m_algc), before any access:
   // lmw / stmw (at step 0), lwarx, stwcx. and FP accesses not word-aligned;
-  // with MSR[DR] = 1 a halfword or word crossing a page, or an FP double
-  // (4.5.6.1.1: every DR = 1 access, a BAT's included, "no special handling
-  // for accesses that fall into BAT regions"). With DR = 0 a page crossing is
-  // split. String and LE accesses do not exist here.
+  // with MSR[DR] = 1 an FP double crossing a page with no DBAT hit for its EA
+  // (4.5.6.1.1: double-word operands "cause an alignment exception if the EA
+  // ends in 0xFF9-FFF"). A halfword or word crossing a page is split as any
+  // other, with DR = 1 too (4.5.3: "The 603e supports the crossing of page
+  // boundaries"; study R124, xpage): its second word, at EA + 4, is translated
+  // on its own page by the DBATs and the micro-TLB, and on a micro-TLB miss
+  // replays from MEM with that page (m_xpg), taking its own DTLB miss or DSI
+  // with DMISS / DAR its page's first byte ("a byte address in the first word
+  // of the offending page", 4.5.3, table 4-11). The first word has then been
+  // made: a store's bytes before the boundary are in memory (PEM 6.1.4), a
+  // load writes nothing (the instruction is run again by the handler's rfi,
+  // or the replay's refetch). String and LE accesses do not exist here.
   logic        ex_sp1, ex_s0ok, ex_lsm;                // the split's second cycle; its first word went; lmw / stmw
   // (ex_msw / ex_msh: an integer word / halfword access that may split,
   // registered from ID, so the split's hold is one LUT of registers and the
@@ -2035,8 +2161,7 @@ module ppc_core
   // without a split, with no access: ex_s0ok says the first word went)
   wire        mis_hold = ex_valid && mis_x && !ex_sp1 && !ex_xcm;
   wire        algn    = ls_mem && (((ex_u.fp || ex_u.reserve || ex_u.cond || (ex_lsm && ex_first)) && boff != 2'd0) ||
-                                   (msr_q[MSR_DR] && !db_stay && ((mis_x && ea_lo[11:2] == 10'h3FF) ||
-                                                                  (ex_u.fp && ex_fd0 && ea_lo[11:0] == 12'hFFC))));
+                                   (msr_q[MSR_DR] && !db_any && ex_u.fp && ex_fd0 && ea_lo[11:0] == 12'hFFC));
   // a store's lanes and data: the value left-justified (vl), shifted to EA's
   // lane, or for a split's second word the rest from lane 0
   logic [31:0] st_data, sv, vl;
@@ -2078,10 +2203,11 @@ module ppc_core
   // entries carry the MSR[PR] they were made under, so it never holds what
   // the TLB, the segment registers or the key would no longer give.
   logic        ex_mfsr;                                // mfsr(in) in EX
-  // (+ 4 for a split's second word, ex_sp1: its word index, and with DR = 0
-  // its page; with DR = 1 that word is in the first's page, so the DBAT and
-  // micro-TLB compares below give the first's translation)
-  wire  [31:0] ea_x    = op_x + op_y + {29'd0, ex_sp1, 2'b00};   // = ea for loads and stores
+  // (+ 4 for a split's second word once its first has gone, ex_s0ok: its word
+  // index and its page, which the DBAT and micro-TLB compares below translate;
+  // a second cycle whose first word replayed, ex_sp1 && !ex_s0ok, is EA's and
+  // replays again, so MEM translates the first word's page)
+  wire  [31:0] ea_x    = op_x + op_y + {29'd0, ex_s0ok, 2'b00};   // = ea for loads and stores
   wire  [31:0] fsr     = fsr_mem[op_y[31:28]];         // mfsr(in)'s copy of the segment registers
   logic [3:0]  db_hit, db_go;
   logic [14:0] db_pa;
@@ -2179,47 +2305,12 @@ module ppc_core
     end
   end
   wire         db_any  = |db_hit;
-  // D-39: an access crossing a page inside a DBAT block is split (both words
-  // translated by that BAT); one leaving the block, or with no BAT hit, takes
-  // the alignment exception. The block ends at EA's last word when EA[16:2]
-  // and EA's bits under the hitting BAT's BL are all ones.
-  // Without the full adder (R105's design, built in R108): given BAT k's hit, its unmasked bits of
-  // EA[27:17] are BEPI's, so EA's last page in the block is EA[27:12] = {BEPI | BL, 11111}, tested
-  // against x + y as the micro-TLB's tag is (each bit's carry from the bit below), with the carry
-  // into bit 12 from the low 12 bits' adder (and the split's + 4)
-  wire  [12:0] db_c12s = {1'b0, op_x[11:0]} + {1'b0, op_y[11:0]} + {10'd0, ex_sp1, 2'b00};
-  (* keep = 1 *) wire [63:0] db_lt;                // [16k + i]: DBAT k, EA bit 12 + i of its block's last page
-  (* keep = 1 *) wire [3:0]  db_lv;
-  generate
-  for (dbk = 0; dbk < 4; dbk = dbk + 1) begin : g_lv
-    wire [15:0] dblk = {bat_bepi[4 + dbk][10:0] | bat_bl[4 + dbk], 5'b11111};
-    for (dbj = 0; dbj < 16; dbj = dbj + 1) begin : g_i
-      if (dbj == 0) begin : g_0
-        assign db_lt[16*dbk + dbj] = (op_x[12] ^ op_y[12] ^ dblk[0]) == db_c12s[12];
-      end else begin : g_j
-        assign db_lt[16*dbk + dbj] = (op_x[12+dbj] ^ op_y[12+dbj] ^ dblk[dbj]) ==
-                                     ((op_x[11+dbj] & op_y[11+dbj]) | ((op_x[11+dbj] ^ op_y[11+dbj]) & ~dblk[dbj-1]));
-      end
-    end
-    assign db_lv[dbk] = &db_lt[16*dbk +: 16];
-  end
-  endgenerate
-  logic        db_leave;
-  always_comb begin
-    db_leave = 1'b0;
-    for (int k = 0; k < 4; k++)
-      db_leave = db_leave | (db_hit[k] && db_lv[k]);
-  end
-  wire         db_stay = db_any && !db_leave;
-`ifdef VERILATOR
-  always_ff @(posedge clk) begin
-    automatic logic lv_ref = 1'b0;
-    for (int k = 0; k < 4; k++)
-      lv_ref = lv_ref | (db_hit[k] && &(ea_x[27:17] | ~bat_bl[4 + k]));
-    lv_ref = lv_ref && &ea_x[16:12];
-    if (!rst && db_leave != lv_ref) $fatal(1, "DBAT block end from the carry-free test against the sum's");
-  end
-`endif
+  // D-39 as amended (R124, R129): an FP double crossing a page whose EA hits a DBAT is two word uops, each
+  // translated on its own (ea_x), whether or not its second word leaves the block: 4.5.6.1.1's exception is
+  // for a page-address translation access ("there is not a match in the BAT"), and "there is no special
+  // handling for accesses that fall into BAT regions". With no BAT hit it takes the alignment exception
+  // (algn). Integer crossings are split and translated word by word, so need neither. (Until R129 a double
+  // leaving its block trapped, which took a block-end compare per DBAT: db_lt, db_lv, db_leave.)
 `ifdef VERILATOR
   always_ff @(posedge clk)
     for (int k = 0; k < 4; k++)
@@ -2233,17 +2324,17 @@ module ppc_core
   // exactly when every bit i has x ^ y ^ K = the carry into i that the sum K
   // would need, (x & y) | ((x ^ y) & ~K) of bit i-1, which needs only bits i
   // and i-1; the carry into bit 12 is the low part's own.
-  logic [3:0]        du_v, du_wr, du_pr;
-  logic [3:0][19:0]  du_pg, du_pa;
-  logic [3:0][3:0]   du_wimg;
-  logic [1:0]        du_nx;                            // next entry to fill
-  logic [3:0]        du_use;                           // hit, and this access may use it
+  localparam int DUW = $clog2(DUN);
+  logic [DUN-1:0]        du_v, du_wr, du_pr;
+  logic [DUN-1:0][19:0]  du_pg, du_pa;
+  logic [DUN-1:0][3:0]   du_wimg;
+  logic [DUW-1:0]        du_nx;                        // next entry to fill
+  logic [DUN-1:0]        du_use;                       // hit, and this access may use it
   logic [19:0]       du_pahi;
   logic [3:0]        du_wimg_s;
-  // (no + 4 for a split's second word here: its carry into bit 12 differs
-  // only for a word crossing the page, which with DR = 1 is the alignment
-  // exception, and with DR = 0 the micro-TLB is not used)
-  wire  [12:0]       ea_lo = {1'b0, op_x[11:0]} + {1'b0, op_y[11:0]};
+  // (the split's + 4 as ea_x's: its carry into bit 12 is the second word's
+  // page, which differs from the first's only for a word crossing the page)
+  wire  [12:0]       ea_lo = {1'b0, op_x[11:0]} + {1'b0, op_y[11:0]} + {10'd0, ex_s0ok, 2'b00};
   function automatic logic sum_is(input logic [19:0] x, input logic [19:0] y, input logic [19:0] k,
                                   input logic cin);
     logic [19:0] c;
@@ -2263,13 +2354,13 @@ module ppc_core
   // ANDed into the hit. Left to synthesis the bit's test came out as two
   // levels and the hit as five, and the micro-TLB hit into the data cache's
   // address register led all three D-36 cached full builds (op_y -> r_a).
-  logic [3:0]  du_hit;
-  (* keep = 1 *) wire [79:0] du_mb;                  // [20k + i]: entry k, page bit i
-  (* keep = 1 *) wire [15:0] du_g;                   // [4k + j]: entry k, bits 5j .. 5j + 4
-  (* keep = 1 *) wire [3:0]  du_lv;                  // entry k is valid under this MSR[PR]
+  logic [DUN-1:0]  du_hit;
+  (* keep = 1 *) wire [20*DUN-1:0] du_mb;            // [20k + i]: entry k, page bit i
+  (* keep = 1 *) wire [4*DUN-1:0]  du_g;             // [4k + j]: entry k, bits 5j .. 5j + 4
+  (* keep = 1 *) wire [DUN-1:0]    du_lv;            // entry k is valid under this MSR[PR]
   genvar duk, dui;
   generate
-  for (duk = 0; duk < 4; duk = duk + 1) begin : g_du
+  for (duk = 0; duk < DUN; duk = duk + 1) begin : g_du
     for (dui = 0; dui < 20; dui = dui + 1) begin : g_b
       if (dui == 0) begin : g_0
         assign du_mb[20*duk + dui] = (op_x[12] ^ op_y[12] ^ du_pg[duk][0]) == ea_lo[12];
@@ -2287,7 +2378,7 @@ module ppc_core
   endgenerate
   always_comb begin
     du_pahi = 20'd0; du_wimg_s = 4'd0;
-    for (int k = 0; k < 4; k++) begin
+    for (int k = 0; k < DUN; k++) begin
       du_hit[k] = &du_g[4*k +: 4];
       du_use[k] = du_hit[k] && (is_ld || du_wr[k]);
       du_pahi   = du_pahi | ({20{du_hit[k]}} & du_pa[k]);
@@ -2296,16 +2387,45 @@ module ppc_core
   end
 `ifdef VERILATOR
   always_ff @(posedge clk)
-    for (int k = 0; k < 4; k++)
+    for (int k = 0; k < DUN; k++)
       if (!rst && du_hit[k] != (du_v[k] && du_pr[k] == msr_q[MSR_PR] &&
                                 sum_is(op_x[31:12], op_y[31:12], du_pg[k], ea_lo[12])))
         $fatal(1, "micro-TLB %0d: the laid-out compare against sum_is", k);
 `endif
   // the page's AND-OR of entries 0-2 as one level, so the page and the real
-  // mode select after it are a second (d_pahi below)
-  (* keep = 1 *) wire [19:0] du_p012 = ({20{du_hit[0]}} & du_pa[0]) | ({20{du_hit[1]}} & du_pa[1]) |
-                                       ({20{du_hit[2]}} & du_pa[2]);
-  (* keep = 1 *) wire        du_n012 = !(du_hit[0] || du_hit[1] || du_hit[2]);
+  // mode select after it are a second (d_pahi below). (DUN = 2: entries 0-1 as
+  // that level; DUN = 6 or 8: entries 3-5 and 6-7 as more groups beside it, and the
+  // low five bits take EA[15-19] by the DBAT hit, db_any, which never comes with a
+  // micro-TLB hit, in place of "no micro-TLB hit": where neither hits there is no
+  // request, and the page is not used)
+  localparam int DUA = (DUN < 3) ? DUN : 3;           // entries in the first group
+  logic [19:0] du_p012_c;
+  logic        du_h012_c;
+  always_comb begin
+    du_p012_c = 20'd0; du_h012_c = 1'b0;
+    for (int k = 0; k < DUA; k++) begin
+      du_p012_c = du_p012_c | ({20{du_hit[k]}} & du_pa[k]);
+      du_h012_c = du_h012_c || du_hit[k];
+    end
+  end
+  (* keep = 1 *) wire [19:0] du_p012 = du_p012_c;
+  (* keep = 1 *) wire        du_n012 = !du_h012_c;
+  wire [19:0] du_p345, du_p67;
+  generate if (DUN == 8) begin : g_du8
+    (* keep = 1 *) wire [19:0] p345 = ({20{du_hit[3]}} & du_pa[3]) | ({20{du_hit[4]}} & du_pa[4]) |
+                                      ({20{du_hit[5]}} & du_pa[5]);
+    (* keep = 1 *) wire [19:0] p67  = ({20{du_hit[6]}} & du_pa[6]) | ({20{du_hit[7]}} & du_pa[7]);
+    assign du_p345 = p345;
+    assign du_p67  = p67;
+  end else if (DUN == 6) begin : g_du6
+    (* keep = 1 *) wire [19:0] p345 = ({20{du_hit[3]}} & du_pa[3]) | ({20{du_hit[4]}} & du_pa[4]) |
+                                      ({20{du_hit[5]}} & du_pa[5]);
+    assign du_p345 = p345;
+    assign du_p67  = 20'd0;
+  end else begin : g_du4
+    assign du_p345 = 20'd0;
+    assign du_p67  = 20'd0;
+  end endgenerate
   wire         d_xl    = msr_q[MSR_DR] && (is_ld || is_st);
   // the access goes ahead from EX when a BAT allows it or the micro-TLB does;
   // anything else, a BAT protection fault included, is translated in MEM
@@ -2317,13 +2437,17 @@ module ppc_core
   // no select by db_any (the select was a level of the R63 full builds' EX
   // address paths); where neither hits there is no request.
   wire         du_any  = |du_hit;
-  wire  [19:0] du_p3   = {20{du_hit[3]}} & du_pa[3];
+  wire  [19:0] du_p3   = (DUN == 4) ? {20{du_hit[DUN-1]}} & du_pa[DUN-1] : 20'd0;
+  wire         du_n3   = (DUN == 4) ? !du_hit[DUN-1] : 1'b1;
   wire  [19:0] d_pahi  = !msr_q[MSR_DR] ? ea_x[31:12] :
+                         (DUN > 4) ? {db_pa | du_p012[19:5] | du_p345[19:5] | du_p67[19:5],
+                                       du_p012[4:0] | du_p345[4:0] | du_p67[4:0] | ({5{db_any}} & ea_x[16:12])} :
                          {db_pa | du_p012[19:5] | du_p3[19:5],
-                          du_p012[4:0] | du_p3[4:0] | ({5{du_n012 && !du_hit[3]}} & ea_x[16:12])};
+                          du_p012[4:0] | du_p3[4:0] | ({5{du_n012 && du_n3}} & ea_x[16:12])};
 `ifdef VERILATOR
   always_ff @(posedge clk)
-    if (!rst && msr_q[MSR_DR] && d_pahi != {db_pa | du_pahi[19:5], du_any ? du_pahi[4:0] : ea_x[16:12]})
+    if (!rst && msr_q[MSR_DR] && (DUN <= 4 || db_any || du_any) &&
+        d_pahi != {db_pa | du_pahi[19:5], du_any ? du_pahi[4:0] : ea_x[16:12]})
       $fatal(1, "d_pahi's laid-out form against the plain one");
 `endif
   // the access's WIMG: real mode 0011 (603e 3.5), the DBAT's, the micro-TLB's
@@ -2334,7 +2458,7 @@ module ppc_core
     if (!rst && d_req && msr_q[MSR_DR]) begin
       automatic logic [19:0] up = 20'd0;
       automatic logic [3:0]  uw = 4'd0;
-      for (int k = 0; k < 4; k++) begin
+      for (int k = 0; k < DUN; k++) begin
         up = up | ({20{du_use[k]}} & du_pa[k]);
         uw = uw | ({4{du_use[k]}} & du_wimg[k]);
       end
@@ -2352,10 +2476,10 @@ module ppc_core
   logic        db_wi, du_wi;
   always_comb begin
     db_wi = 1'b0; du_wi = 1'b0;
-    for (int k = 0; k < 4; k++) begin
+    for (int k = 0; k < 4; k++)                        // (the four DBATs)
       db_wi = db_wi | (db_hit[k] && (bat_wimg[4 + k][3] || bat_wimg[4 + k][2]));
+    for (int k = 0; k < DUN; k++)
       du_wi = du_wi | (du_use[k] && (du_wimg[k][3] || du_wimg[k][2]));
-    end
   end
 
   // Asynchronous interrupts (4.5.5, 4.5.9), maskable by MSR[EE]; the external
@@ -2653,7 +2777,7 @@ module ppc_core
   // next cycle; it issues in its first EX cycle and the single unit takes the operand from its R5 (ex_fbe)
   logic [FL-1:0]   fr_sf;                              // [k]: the port's write k cycles from now is the single unit's
   logic [1:0][2:0] nx_bye, hd_bye;
-  wire  [1:0]      nx_boe = {2{FEF && FBYP && SQ5 && fok}} & {q1_pd.frs, q_pd.frs};
+  wire  [1:0]      nx_boe = {2{FEF && FBYP && SQ5 && FAST && fok}} & {q1_pd.frs, q_pd.frs};
   logic [1:0]      nx_wfr, nx_haz;
   logic            hd_fz;
   logic            hd_sel, hd_val;
@@ -2752,6 +2876,10 @@ module ppc_core
   // (ppc_fpregfile, written below), the forward's values are tested from
   // their registers, and the op's kind is predecoded (frsqrte; a single op
   // reading A with B, C or both, q_pd.fub / fuc)
+  // the route the checks expect: fpu_fast_route, or with FAST = 0 frsqrte's alone
+  function automatic logic rt_ref(input fma_op_t op, input logic sg, input logic [63:0] a, b, c);
+    return FAST ? fpu_fast_route(op, sg, a, b, c) : (op == FMA_RSQRTE);
+  endfunction
   wire         sv_fo  = fpu_sgl_val(fo_res);
   wire         sv_wbf = fpu_sgl_val(wb_fdat_q);
   wire         sv_fw  = fo_valid ? sv_fo : sv_wbf;
@@ -2763,7 +2891,7 @@ module ppc_core
   wire         sv_a   = f_hit_id[0] ? sv_fw : f_byp_id[0] ? sv_by : f_bye_id[0] ? sv_be : !rf_na;
   wire         sv_b   = f_hit_id[1] ? sv_fw : f_byp_id[1] ? sv_by : f_bye_id[1] ? sv_be : !rf_nb;
   wire         sv_c   = f_hit_id[2] ? sv_fw : f_byp_id[2] ? sv_by : f_bye_id[2] ? sv_be : !rf_nc;
-  wire         id_frt = q_pd.frq || (q_pd.frs && sv_a && (!q_pd.fub || sv_b) && (!q_pd.fuc || sv_c));
+  wire         id_frt = q_pd.frq || (FAST && q_pd.frs && sv_a && (!q_pd.fub || sv_b) && (!q_pd.fuc || sv_c));
   // One register per operand for every FP unit and the store data. Separate
   // copies per unit (the FPU's standalone fits pointed at the operand
   // fanout) measured worse in the core on all three seeds and cost 357
@@ -2862,7 +2990,7 @@ module ppc_core
   end
   logic f_fast_ok;                                     // the unit's own issue check (simulation only)
   ppc_fpu_fast #(.TAGW (5), .P1A (P1A), .P2 (P2), .P3 (P3), .P4A (P4A), .P5A (P5A), .P5 (P5), .P6A (P6A), .P6 (P6), .P7 (P7),
-                 .SQ1 (SQ1), .SQ2 (SQ2), .SQ3 (SQ3), .SQ4 (SQ4), .SQ5 (SQ5), .EF (FEF && FBYP && SQ5)) u_fpu (
+                 .SQ1 (SQ1), .SQ2 (SQ2), .SQ3 (SQ3), .SQ4 (SQ4), .SQ5 (SQ5), .EF (FEF && FBYP && SQ5 && FAST), .SF (FAST)) u_fpu (
     .clk (clk), .rst (rst),
     .f_valid (ex_fma && fp_go), .f_op (fma_op_t'(ex_u.fop)), .f_single (ex_u.fsgl), .f_fast (ex_ffast),
     .f_ctl (fpscr_q[7:0]), .f_a (fa_x), .f_b (fb_x), .f_c (fc_x), .f_ad (fa_q), .f_bd (fb_q), .f_cd (fc_q), .f_tag (ex_frd),
@@ -3107,8 +3235,8 @@ module ppc_core
       if (ex_ffw != ex_ffast || (ex_ffast && !ex_fma)) $fatal(1, "ex_ffw");
       // (with a bypassed operand the route is from its predicted single-value bit: fast only where
       // the values allow it, and not always where they do)
-      if (ex_valid && ex_fma && !ex_ifault && ex_fbe == 3'b000 && (ex_fbu ? (ex_ffast && !fpu_fast_route(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x))
-                                                                : ex_ffast != fpu_fast_route(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x)))
+      if (ex_valid && ex_fma && !ex_ifault && ex_fbe == 3'b000 && (ex_fbu ? (ex_ffast && !rt_ref(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x))
+                                                                : ex_ffast != rt_ref(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x)))
         $fatal(1, "fast route %0d for EX's operands", ex_ffast);
       if (rf_na != !fpu_sgl_val(rf_fa) || rf_nb != !fpu_sgl_val(rf_fb) || rf_nc != !fpu_sgl_val(rf_fc))
         $fatal(1, "FPR single-value bit against the value read");
@@ -3127,8 +3255,8 @@ module ppc_core
         $fatal(1, "fast route kind of %08X off the multiply-add port", q_hi);
       if (wb_live_q != (wb_isld && !wb_got)) $fatal(1, "wb_live_q");
       if (f_iss && ex_ffast && !f_fast_ok) $fatal(1, "fast op issued against the unit's own check");
-      if (f_iss && ex_fbe == 3'b000 && (ex_fbu ? (ex_ffast && !fpu_fast_route(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x))
-                                     : ex_ffast != fpu_fast_route(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x)))
+      if (f_iss && ex_fbe == 3'b000 && (ex_fbu ? (ex_ffast && !rt_ref(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x))
+                                     : ex_ffast != rt_ref(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x)))
         $fatal(1, "fast route %0d is not for EX's operands", ex_ffast);
     end
 `endif
@@ -3586,6 +3714,13 @@ module ppc_core
   always_ff @(posedge clk)
     if (!rst && ex_valid && ex_adv && ex_u.op == OP_BRANCH && ex_lar && br_mis && !ex_xcm)
       $fatal(1, "branch at %08X resolved at fetch, mispredicted in EX", ex_u.pc);
+`ifdef R104_CHECK
+  // a register target fetch knew (LRA) is the register EX reads
+  always_ff @(posedge clk)
+    if (!rst && LRA && ex_valid && ex_adv && ex_u.op == OP_BRANCH && ex_pred && rp_lq && !ex_xcm &&
+        (ex_u.bkind == BR_BCLR || ex_u.bkind == BR_BCCTR) && br_taken && !rt_eq)
+      $fatal(1, "LRA: branch at %08X: the look-ahead's target %08X is not the register's", ex_u.pc, {rp_tgt, 2'b00});
+`endif
 `endif
   (* keep = 1 *) wire redirect_f = redirect_c || (br_go && br_mis);
   // fetch's own three registers (redir_q, redir_hard_q, redir_k_q) take the
@@ -4072,6 +4207,8 @@ module ppc_core
       m.valid <= 1'b0;
     end else if (!mem_hold) begin
       m <= mx;
+      m_xpg <= ea_x[31:12];
+      m_x4  <= ex_s0ok;
       for (int r = 0; r < 4; r++) mbx_q[r] <= mg_ix(r[1:0], mx.msize, mx.boff, mx.brev);
       for (int r = 0; r < 4; r++) e_jq[r] <= la_ix(r[1:0], mx.msize, mx.boff, mx.brev);
       for (int r = 0; r < 4; r++) e_dq[r] <= mg_isd(r[1:0], mx.msize);
@@ -4103,10 +4240,13 @@ module ppc_core
   // Two cycles: MEM holds the replay one cycle while the lookup's outcome is
   // registered (sl_*_q), then acts on it, so the arrays and compares feed
   // flip-flops only.
-  wire [31:0] sl_ea   = m.result;                      // a load's or store's EA
+  // (a load's or store's EA, or for a split's second word that page's first byte; the page from EX's ea_x,
+  // m_xpg, and DMISS / DAR from m_xea)
+  wire [31:0] sl_ea   = {m_xpg, m.result[11:0]};
+  wire [31:0] m_xea   = {m_xpg, m.result[11:0] & {12{!m_x4}}};
   wire [31:0] sl_sr   = dsr_mem[sl_ea[31:28]];
-  wire [62:0] sl_t0   = dtlb0[sl_ea[16:12]];
-  wire [62:0] sl_t1   = dtlb1[sl_ea[16:12]];
+  wire [62:0] sl_t0   = dt0_q;
+  wire [62:0] sl_t1   = dt1_q;
   wire        sl_h0   = sl_t0[62] && sl_t0[61:38] == sl_sr[23:0] && sl_t0[37:27] == sl_ea[27:17];
   wire        sl_h1   = sl_t1[62] && sl_t1[61:38] == sl_sr[23:0] && sl_t1[37:27] == sl_ea[27:17];
   wire        sl_hit  = sl_h0 || sl_h1;
@@ -4160,7 +4300,7 @@ module ppc_core
   logic [23:0] sl_vsid_q;
   always_ff @(posedge clk) begin
     if (rst || mem_adv) sl_done <= 1'b0;
-    else if (m.valid && m.rp) sl_done <= 1'b1;
+    else if (m.valid && m.rp && !dtw_q) sl_done <= 1'b1;   // (a DTLB write on the edge into it: read again)
     if (!sl_done) begin
       sl_t_q    <= !sl_bat && sl_t;
       sl_prot_q <= sl_prot_n;
@@ -4278,6 +4418,26 @@ module ppc_core
     if (m_ok && (m.tlbie || (m.tlbl &&  m.insn[6] && !m_tway))) itlb0[m.ya[4:0]] <= m_tlbe;
     if (m_ok && (m.tlbie || (m.tlbl &&  m.insn[6] &&  m_tway))) itlb1[m.ya[4:0]] <= m_tlbe;
   end
+  // the TLB blocks' reads, every cycle at the set the next cycle's lookup uses (f_rsp_pc's, as it loads; MEM's
+  // page, as m_xpg loads or holds), and the write flags for the lookup cycle
+  wire [4:0] itr_n = f_issue ? fetch_pc[16:12] : f_rsp_pc[16:12];
+  wire [4:0] dtr_n = mem_hold ? m_xpg[4:0] : ea_x[16:12];
+  always_ff @(posedge clk) begin
+    it0_q <= itlb0[itr_n];
+    it1_q <= itlb1[itr_n];
+    dt0_q <= dtlb0[dtr_n];
+    dt1_q <= dtlb1[dtr_n];
+    itw_q <= m_ok && (m.tlbie || (m.tlbl && m.insn[6]));
+    dtw_q <= m_ok && (m.tlbie || (m.tlbl && !m.insn[6]));
+  end
+`ifdef VERILATOR
+  logic tq_v;                                          // (a cycle after reset or a checkpoint's restore)
+  always_ff @(posedge clk) tq_v <= !rst;
+  always_ff @(posedge clk)
+    if (!rst && tq_v && ((!itw_q && (it0_q != itlb0[f_rsp_pc[16:12]] || it1_q != itlb1[f_rsp_pc[16:12]])) ||
+                 (m.valid && (!dtw_q && (dt0_q != dtlb0[m_xpg[4:0]] || dt1_q != dtlb1[m_xpg[4:0]])))))
+      $fatal(1, "TLB block reads against the arrays at f_rsp_pc's set and MEM's page");
+`endif
   always_ff @(posedge clk) begin
     if (rst) begin
       dlru <= 32'd0;
@@ -4302,7 +4462,7 @@ module ppc_core
     end else if (mem_adv) begin
       if (m_dsi) begin                                  // table 4-12
         dsisr_q <= {4'd0, m_dsb, 25'd0};
-        dar_q   <= m.result;
+        dar_q   <= m_xea;                                 // a crossing's second page: its first byte (4.5.3)
       end
       if (m_alg) begin                                  // table 4-14, X form; [22-26] from the field
         dsisr_q <= (m.insn[31:26] == 6'd31)
@@ -4315,8 +4475,8 @@ module ppc_core
           imiss_q <= m.pc;
           icmp_q  <= {1'b1, m_vsid, 1'b0, m.pc[27:22]};
         end else begin
-          dmiss_q <= m.result;
-          dcmp_q  <= {1'b1, m_vsid, 1'b0, m.result[27:22]};
+          dmiss_q <= m_xea;
+          dcmp_q  <= {1'b1, m_vsid, 1'b0, m_xea[27:22]};
         end
         last_i_q <= m.imiss;
       end
@@ -4338,7 +4498,7 @@ module ppc_core
   // registers give now: its set's way that hits for the page (way 0 first, as a lookup) has its RPN
   always_ff @(posedge clk)
     if (!rst) begin
-      for (int k = 0; k < 4; k++)
+      for (int k = 0; k < DUN; k++)
         if (du_v[k]) begin
           automatic logic [31:0] sr = dsr_mem[du_pg[k][19:16]];
           automatic logic [62:0] t0 = dtlb0[du_pg[k][4:0]], t1 = dtlb1[du_pg[k][4:0]];
@@ -4347,7 +4507,7 @@ module ppc_core
           if (!(h0 ? t0[26:7] == du_pa[k] : h1 && t1[26:7] == du_pa[k]))
             $fatal(1, "data micro-TLB %0d (page %05X) is not the TLB's translation", k, du_pg[k]);
         end
-      for (int e = 0; e < 2; e++)
+      for (int e = 0; e < IUN; e++)
         if (iu_v[e]) begin
           automatic logic [31:0] sr = isr_mem[iu_pg[e][19:16]];
           automatic logic [62:0] t0 = itlb0[iu_pg[e][4:0]], t1 = itlb1[iu_pg[e][4:0]];
@@ -4360,22 +4520,72 @@ module ppc_core
 `endif
   // the data micro-TLB: filled by a replay's translation, emptied by a write to the MMU's state (with UTS
   // only the entries it can change; its entries carry the MSR[PR] they were made under)
+  //
+  // Replacement (DRP). 0: in turn, du_nx. 1: least recently used, an empty entry first (the lowest). The
+  // use order is a matrix of DUN x DUN bits, du_ord[i][j] = entry i was used after entry j (i != j): a use
+  // of entry i sets its row and clears its column, and the oldest entry is the one whose row is all zero.
+  // An entry is used by a page-translated access that leaves EX with its page matched (du_hit, registered as
+  // MEM takes the uop, du_hq, and applied while MEM holds it, so nothing of it is in front of EX's request)
+  // and by its fill.
+  // Only the choice of entry changes; what an entry holds, and when it is emptied, is as with DRP = 0
+  logic [DUN-1:0]          du_hq;                      // the entries the uop in MEM matched in EX
+  logic [DUN-1:0][DUN-1:0] du_ord;
+  logic [DUW-1:0]          du_fx;                      // the entry the next fill takes
+  always_comb begin
+    du_fx = du_nx;
+    if (DRP) begin
+      for (int k = DUN - 1; k >= 0; k--)
+        if (!(|(du_ord[k] & ~(DUN'(1) << k)))) du_fx = DUW'(k);   // the oldest
+      for (int k = DUN - 1; k >= 0; k--)
+        if (!du_v[k]) begin du_fx = DUW'(k); end                 // an empty one before it
+    end
+  end
+  always_ff @(posedge clk) if (!mem_hold) du_hq <= du_hit;
+  wire              du_fill = mem_adv && m.rp && !sl_flt && !tnop;
+  generate if (DRP) begin : g_drp
+    always_ff @(posedge clk) begin
+      if (rst) du_ord <= '0;
+      else begin
+        automatic logic [DUN-1:0] u = du_fill ? (DUN'(1) << du_fx) :
+                                      (m.valid && (m.req || m.rp) && msr_q[MSR_DR]) ? du_hq : '0;
+        for (int i = 0; i < DUN; i++)
+          if (u[i])
+            for (int j = 0; j < DUN; j++) begin
+              du_ord[i][j] <= (i != j);
+              du_ord[j][i] <= 1'b0;
+            end
+      end
+    end
+  end else begin : g_drn
+    always_ff @(posedge clk) du_ord <= '0;
+  end endgenerate
+`ifdef VERILATOR
+  // (DRP) the use order is an order: no two entries each used after the other, and some entry is the oldest
+  always_ff @(posedge clk)
+    if (!rst && DRP) begin
+      automatic int n = 0;
+      for (int k = 0; k < DUN; k++) if (!(|(du_ord[k] & ~(DUN'(1) << k)))) n++;
+      for (int i = 0; i < DUN; i++) for (int j = 0; j < DUN; j++)
+        if (i != j && du_ord[i][j] && du_ord[j][i]) $fatal(1, "data micro-TLB use order %0d %0d", i, j);
+      if (n == 0) $fatal(1, "data micro-TLB use order: no oldest entry");
+    end
+`endif
   always_ff @(posedge clk) begin
     if (rst || (m_ok && (m_bat || (!UTS && (m.srw || m.tlbie || m.tlbl))))) begin
-      du_v  <= 4'd0;
-      du_nx <= 2'd0;
+      du_v  <= '0;
+      du_nx <= '0;
     end else if (UTS && m_ok && (m.srw || m.tlbie || (m.tlbl && !m.insn[6]))) begin
       // (micro-TLB invalidation, above "fetch": that segment's entries, or that TLB set's)
-      for (int k = 0; k < 4; k++)
+      for (int k = 0; k < DUN; k++)
         if (m.srw ? du_pg[k][19:16] == m.ya[19:16] : du_pg[k][4:0] == m.ya[4:0]) du_v[k] <= 1'b0;
-    end else if (mem_adv && m.rp && !sl_flt && !tnop) begin
-      du_v[du_nx]  <= 1'b1;
-      du_wimg[du_nx] <= sl_h0_q ? sl_wimg0_q : sl_wimg1_q;
-      du_pg[du_nx] <= sl_ea[31:12];
-      du_pa[du_nx] <= sl_h0_q ? sl_pa0_q : sl_pa1_q;
-      du_wr[du_nx] <= sl_w_q;
-      du_pr[du_nx] <= msr_q[MSR_PR];
-      du_nx        <= du_nx + 2'd1;
+    end else if (du_fill) begin
+      du_v[du_fx]  <= 1'b1;
+      du_wimg[du_fx] <= sl_h0_q ? sl_wimg0_q : sl_wimg1_q;
+      du_pg[du_fx] <= sl_ea[31:12];
+      du_pa[du_fx] <= sl_h0_q ? sl_pa0_q : sl_pa1_q;
+      du_wr[du_fx] <= sl_w_q;
+      du_pr[du_fx] <= msr_q[MSR_PR];
+      du_nx        <= ((DUN & (DUN - 1)) != 0 && du_nx == DUW'(DUN - 1)) ? '0 : DUW'(du_nx + 1'b1);   // (6: wraps at 6)
     end
   end
 
@@ -4541,6 +4751,7 @@ module ppc_core
   assign ev[6] = redirect;
   assign ev[7] = f_out && !i_valid;
   assign ev_mmu = {f_slow, wb_evm};
+  always_ff @(posedge clk) ev_xrf <= !rst && mem_adv && m.rp && m_x4 && !sl_flt && !tnop;
 
   // ==================================================================== trace
   logic [31:0] tr_cr, tr_xer, tr_lr, tr_ctr, tr_msr, tr_srr0, tr_srr1;

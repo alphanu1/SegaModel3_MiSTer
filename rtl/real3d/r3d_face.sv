@@ -36,7 +36,9 @@
 //
 // LOD = 1 (study D-33, R67): the polygon's LOD word B = d x (NP x C) in the
 // idle slots of round 3, FP32 with flush to zero as the model has it
-// (sim/real3d/r3d_geo.cpp lod_word). NP is header word 5 bits 8-31 (u12.12),
+// (sim/real3d/r3d_geo.cpp lod_word). NP is header word 5 bits 8-31, u12.12 on
+// Step 1.0 and u10.14 from Step 1.5 (step15; Supermodel's m_textureNPFactor,
+// 1/4096 against 1/16384: study D-46),
 // written raw at slot word 7 and converted by the same converter; C = -cota
 // kz^2 is a register loaded once a viewport (c_we, while the unit is idle).
 // Round 3 slot 3 forms Q = NP x C for the polygon in hand, into B at {its N
@@ -229,7 +231,7 @@ module r3d_face #(
     ar_q <= a_q; br_q <= b_q; ak_q <= op_ak; bc_q <= op_bc;
     sg = !(LOD && op_ak == A_NP) && a_q[23];
     ar_s <= sg; ar_m <= sg ? (~a_q[23:0] + 24'd1) : a_q[23:0];
-    eb = (ak_q == A_NRM) ? 8'd105 : (LOD && ak_q == A_NP) ? 8'd115 : step15 ? 8'd116 : 8'd120;
+    eb = (ak_q == A_NRM) ? 8'd105 : (LOD && ak_q == A_NP) ? (step15 ? 8'd113 : 8'd115) : step15 ? 8'd116 : 8'd120;
     case (ak_q)
       A_ONE: opa <= F_ONE;
       A_RAW: opa <= ar_q;

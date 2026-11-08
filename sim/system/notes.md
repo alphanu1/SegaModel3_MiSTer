@@ -66,7 +66,7 @@ VF3 from a fresh boot, 1,500 frames, 14.5 M records:
 | EEPROM busy after a write | never | 5 reads | the datasheet: 2 ms (`T_WP`) |
 | EEPROM DO with CS low | 1 (pull-up) | 0 | MAME's 1; the game polls inputs so and ignores bit 5 |
 | EEPROM data shift | falling SK, a dummy 0 first | rising SK, no dummy bit | MAME's (Model 2's copy, board-proven there); VF3 reads identical words either way |
-| DIP bank (port G) | FF | 7F | 7F, to match the oracle trace; open |
+| DIP bank (port G) | FF (all OFF) | 7F (an Ocean Hunter workaround) | by MRA (`<switches>`, index 254, the OSD's DIP Switches page): 7F unless set; Lost World FF, since it reads SW1 ON as "leave the I-cache off" (study R133); the other games 7F |
 | MIDI IRQ 0x40 | 1 ms timer while control bit 5 | in blanking, at most 128 a frame | TxRDY: 320 us (one byte at 31.25 kbaud) after the last byte, while bit 5 |
 | PCI read of an absent device | 0 | 0 | FFFFFFFF (the PCI master abort); VF3 reads none |
 
@@ -774,8 +774,10 @@ viewer already carries one (`m3v_ddr_arb`, six ports).
      | 0x000000-0x07FFFF | layer buffers k = 0-3 at 0x20000 k |
      | 0x100000, 0x180000 | polygon RAM copies |
      | 0x200000 | the texture ring (0x20000 beats) |
-     | 0x400000 | the rasteriser's store, two 16 MiB banks (`store_base`) |
+     | 0x400000 | the rasteriser's store: records, two 32 MiB banks to 0xBFFFFF (`store_base`; study R136) |
      | 0xC00000 | texture sheets (`tex_base`) |
+     | 0x1000000 | the extra memory (VROM, R100), 64 MiB |
+     | 0x1800000 | the store's run lists, 32 MiB to 0x1BFFFFF (`RUNO` 0x1400000 from `store_base`; study R136) |
 
    - **R71:** gate the arbiter's `m_req` (and `m3_compose`'s `ddr_ok`) on
      hps_io's first command plus `RESET` low for 100 ms, as `m3_viewer`

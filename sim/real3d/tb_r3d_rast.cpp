@@ -37,6 +37,14 @@
 //   Vr3d_rast --tris DIR --dumps DIR [--frames N] [--first K] [--seed S]
 //             [--ack LO HI PCT] [--tack LO HI PCT] [--busy PCT] [--lat LO HI]
 //             [--gap PCT] [--maxrd K] [--igap PCT] [--mip] [--geo-lod VROM] [--out DIR]
+//             [--l8key 0|1] [--sm 0|1] [--step HEX]
+//
+// --out DIR: each frame's layer as the RTL wrote it and as the model drew it, DIR/<frame>_rtl.ppm and
+// _model.ppm (unpainted black). --l8key: the model's L8 key (texram::l8_key, default 1), to match an
+// RTL built with -GL8K=0. --sm: the model's Supermodel decode, contour and texture alpha (texram::sm_tex,
+// default 1, study R135), to match an RTL built with -GSMTX=0. --step: the game's step (10, 15, 20, 21):
+// the record's param bit 0 is texture alpha (header[6] bits 2:0 from Step 1.5, bit 0 on 1.0), set from each
+// polygon's header; lists made before R135 carry MAME's page bit there. Without --step the list's bit is sent.
 
 #include "Vr3d_rast.h"
 #include "Vr3d_rast___024root.h"
@@ -62,7 +70,9 @@ namespace fs = std::filesystem;
 
 static uint32_t fb(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
-static constexpr uint64_t FB0 = 0x000000, FB1 = 0x020000, TEX = 0x100000, STORE = 0x200000, MEMW = 0x600000;
+// the store (study R136, defaults LB 19, BB 12, RUNO = the records' end): records 2^(LB+4) words, then the
+// two banks' run lists, 2^(BB+10) words
+static constexpr uint64_t FB0 = 0x000000, FB1 = 0x020000, TEX = 0x100000, STORE = 0x200000, STOREW = 0xC00000, MEMW = STORE + STOREW;
 
 static int g_px = -1, g_py = -1;       // R3D_PIX=x,y: trace that pixel, model and RTL
 struct hook : d25_hook {
@@ -97,6 +107,8 @@ int main(int argc, char **argv) {
   int ack_lo = 1, ack_hi = 3, ack_p = 0, tack_lo = 1, tack_hi = 3, tack_p = 0, busy = 20, lat_lo = 13, lat_hi = 40, gap = 10, igap = 10;
   unsigned maxrd = 16;
   bool mip = false;
+  bool l8key = true, smtx = true;
+  unsigned gstep = 0;
   if (char const *e = std::getenv("R3D_PIX")) { g_px = std::atoi(e); if (char const *c = std::strchr(e, ',')) g_py = std::atoi(c + 1); }
   for (int i = 1; i < argc; i++) {
     std::string const a = argv[i];
@@ -111,6 +123,9 @@ int main(int argc, char **argv) {
     else if (a == "--gap") gap = std::atoi(nx().c_str()); else if (a == "--igap") igap = std::atoi(nx().c_str());
     else if (a == "--maxrd") maxrd = unsigned(std::atoi(nx().c_str()));
     else if (a == "--mip") mip = true;
+    else if (a == "--l8key") l8key = std::atoi(nx().c_str()) != 0;
+    else if (a == "--sm") smtx = std::atoi(nx().c_str()) != 0;
+    else if (a == "--step") gstep = unsigned(std::strtoul(nx().c_str(), nullptr, 16));
     else if (a == "--geo-lod") geo_vrom = nx();
   }
   Verilated::commandArgs(argc, argv);
@@ -137,7 +152,9 @@ int main(int argc, char **argv) {
   auto build = [&](std::string const &nm, frame_in &fi) -> bool {
     rframe f;
     if (!read_rframe(tris + "/" + nm + ".tri", f)) return false;
+    if (gstep) set_talpha(f, gstep);
     texram tex; std::vector<uint32_t> dl(0x40000);
+    tex.l8_key = l8key; tex.sm_tex = smtx;
     gzFile gz = gzopen((dumps + "/" + nm + ".bin.gz").c_str(), "rb");
     bool ok = gz && gzseek(gz, 0x400000, SEEK_SET) == 0x400000 && gzread(gz, dl.data(), 0x100000) == 0x100000 &&
               gzseek(gz, 0x900000, SEEK_SET) == 0x900000 && gzread(gz, tex.t.data(), 0x800000) == 0x800000;
@@ -182,7 +199,9 @@ int main(int argc, char **argv) {
       uint32_t const w0 = (t.pass & 3) | ((t.alpha & 1) << 2) | (tex_on << 4) | ((t.page & 1) << 5) | ((t.tex_w & 7) << 6) |
                           ((t.tex_h & 7) << 9) | ((t.fmt & 7) << 12) | ((t.param & 63) << 15) | ((t.trans & 63) << 21) | (3u << 27);
       uint32_t const w1 = (t.poly & 0xfffff) | ((t.tex_x & 63) << 20) | ((t.tex_y & 31) << 26);
-      uint32_t const w3 = (t.vp >= 0 ? ((t.hdr[6] >> 11) & 31) : 0u) | (((t.hdr[6] >> 17) & 1) << 5);
+      // bit 7: texture inversion (study R135), as r3d_geo sends it
+      uint32_t const w3 = (t.vp >= 0 ? ((t.hdr[6] >> 11) & 31) : 0u) | (((t.hdr[6] >> 17) & 1) << 5) |
+                          ((tex_on && ((t.hdr[6] >> 24) & 0x7f) == 2) ? 0x80u : 0u);
       put(w0, false); put(w1, false); put(t.color & 0xffffff, false); put(w3, false);
       if (mip) {
         double dv; uint32_t bw = 0;
@@ -236,7 +255,7 @@ int main(int argc, char **argv) {
     std::deque<uint64_t> due;      // read beats: the cycle each may come
     uint64_t rbytes = 0, wbytes = 0, reqs = 0, rbytes_f = 0, wbytes_f = 0, reqs_f = 0;
   };
-  mport sp{"store", STORE, STORE + 0x400000}, lp{"layer", FB0, FB1 + 0x20000};
+  mport sp{"store", STORE, STORE + STOREW}, lp{"layer", FB0, FB1 + 0x20000};
   // the texture port
   struct tline { uint64_t at, addr; };
   std::deque<tline> tq;            // lines acknowledged, in order
@@ -350,7 +369,7 @@ int main(int argc, char **argv) {
   };
 
   // ---- frames ---------------------------------------------------------------------------
-  uint64_t px_bad = 0, nfr = 0, npx = 0, nfail = 0;
+  uint64_t px_bad = 0, nfr = 0, npx = 0, nfail = 0, n_ovf = 0;   // n_ovf: frames whose binning overflowed the store (study R136)
   std::vector<uint64_t> fcyc, bcyc, sbytes, eobw, rd_f;
   std::deque<frame_in> pending;          // given to the RTL, waiting their done
   size_t next = 0;
@@ -383,6 +402,13 @@ int main(int argc, char **argv) {
       }
     } else if (fst == 2 && !t->f_binning) {
       bcyc.push_back(cyc - bin_c0); wr_of.push_back(sp.wbytes - w0); fst = 0;
+      // study R136: a record the store could not keep (a list region, a bin's run list or the bin table
+      // full) is lost from the picture; the model has no such limit, so it is a failure by itself
+      if (t->st_ovf) {
+        n_ovf++;
+        std::printf("  %s: store overflow %u (bit 0 table, 1 list region, 2 run list), %u records not stored\n",
+                    pending.back().name.c_str(), unsigned(t->st_ovf), unsigned(t->st_drop));
+      }
     }
     t->clk = 0; t->eval();
     bool const took = t->i_valid && t->i_ready;
@@ -401,6 +427,20 @@ int main(int argc, char **argv) {
           if (p != w) { if (b++ < 5) std::printf("  %s (%d,%d): rtl %08X model %08X\n", fi.name.c_str(), x, y, p, w); }
         }
       if (b) { std::printf("  %s: %" PRIu64 " pixels wrong\n", fi.name.c_str(), b); nfail++; }
+      if (!out.empty()) {
+        for (int m = 0; m < 2; m++)
+          if (std::FILE *o = std::fopen((out + "/" + fi.name + (m ? "_model.ppm" : "_rtl.ppm")).c_str(), "wb")) {
+            std::fprintf(o, "P6\n%d %d\n255\n", SCR_W, SCR_H);
+            for (int y = 0; y < SCR_H; y++)
+              for (int x = 0; x < SCR_W; x++) {
+                uint64_t const q = mem[base + uint64_t(y) * 256 + uint64_t(x >> 1)];
+                uint32_t const p = m ? fi.want[size_t(y) * SCR_W + size_t(x)] : uint32_t((x & 1) ? q >> 32 : q) & 0x01ffffffu;
+                uint8_t const c[3] = {uint8_t(p >> 16), uint8_t(p >> 8), uint8_t(p)};
+                std::fwrite(c, 1, 3, o);
+              }
+            std::fclose(o);
+          }
+      }
       px_bad += b; npx += fi.shaded;
       fcyc.push_back(t->f_cycles);
       eobw.push_back(t->f_eobw);
@@ -428,6 +468,8 @@ int main(int argc, char **argv) {
   std::printf("r3d_rast: %" PRIu64 " frames, %" PRIu64 " shaded pixels, %" PRIu64 " pixels wrong in %" PRIu64 " frames; "
               "%" PRIu64 " port-rule violations, %" PRIu64 " bad addresses, %" PRIu64 " out of order; %" PRIu64 " cycles\n",
               nfr, npx, px_bad, nfail, viol, bad_addr, order_bad, cyc);
+  std::printf("  store overflows: %" PRIu64 " frames (the RTL's count %u)\n", n_ovf, unsigned(t->st_novf));
+  if (uint64_t(t->st_novf) != std::min<uint64_t>(n_ovf, 0xffff)) { std::printf("  store overflow count differs\n"); n_ovf++; }
   std::printf("  replay cycles p50 %" PRIu64 " p99 %" PRIu64 " max %" PRIu64 " (p99 %.1f%% of a frame); binning p50 %" PRIu64 " p99 %" PRIu64
               "; end-of-band drain p99 %" PRIu64 "\n",
               pc(fcyc, 50), pc(fcyc, 99), pc(fcyc, 100), 100.0 * double(pc(fcyc, 99)) / F, pc(bcyc, 50), pc(bcyc, 99), pc(eobw, 99));
@@ -437,7 +479,6 @@ int main(int argc, char **argv) {
   std::printf("  totals: store read %" PRIu64 " written %" PRIu64 " bytes, layer written %" PRIu64 " (profile ack %d-%d@%d%% tack %d-%d@%d%% busy %d lat %d-%d gap %d maxrd %u)\n",
               sp.rbytes, sp.wbytes, lp.wbytes, ack_lo, ack_hi, ack_p, tack_lo, tack_hi, tack_p, busy, lat_lo, lat_hi, gap, maxrd);
   if (gm) std::printf("  geometry's B: %" PRIu64 " of %" PRIu64 " textured records given by the geometry model\n", geo_given, geo_tex);
-  bool const fail = px_bad || viol || bad_addr || nfr != names.size();
-  (void)out;
+  bool const fail = px_bad || viol || bad_addr || n_ovf || nfr != names.size();
   return fail ? 1 : 0;
 }

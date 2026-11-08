@@ -51,15 +51,35 @@
 // cannot be refused). After the band's passes a BANDEND marker. The FIFO's
 // reader rebuilds each record as r3d_rast_intake takes it (SETUP4: words
 // 0-3, [B], 6 vertex words, det = 0, the planes). Word 3 comes back as
-// {0, viewport [13:8], new generation [7], word 3 [6:0]}: bit 7 (and o_new,
+// {0, word 3 [7] at [14] (texture inversion, study R135), viewport [13:8],
+// new generation [7], word 3 [6:0]}: bit 7 (and o_new,
 // on the first word) marks a pass's first record. At BANDEND the reader stops
 // (o_eob) until o_next.
 //
-// DDR3 layout, 64-bit words from base, per bank k (2^(LB+4) words):
-//   records  {k, 0, list[2:0], beat[LB-1:0]}
-//   runs     {k, 1, 0.., bin[8:0], beat[BB-1:0]}, bin = band 8 + list, two
-//            runs a beat (entry n in lane n[0])
-// Defaults (LB 17, BB 11): 1 MiB a list, 4,096 runs a bin, 16 MiB a bank.
+// DDR3 layout, 64-bit words from base (study R136):
+//   records  {k, pass[1:0], beat[LB:0]} with PAIR: a pass's opaque list grows
+//            up from its region's base and its alpha list down from the top,
+//            so either may use what the other leaves (2^(LB+1) beats a pass);
+//            {k, list[2:0], beat[LB-1:0]} without (2^LB beats a list). Both
+//            2^(LB+3) words a bank, 2^(LB+4) for the two.
+//   runs     RUNO + {k, bin[8:0], beat[BB-1:0]}, bin = band 8 + list, two
+//            runs a beat (entry n in lane n[0]); 2^(BB+10) words for the two banks.
+//            RUNO defaults to the end of the records; the core puts the runs
+//            in DDR3's top 64 MiB (m3_system).
+// Defaults (LB 19, PAIR, BB 12): 8 MiB a pass (1,048,575 beats, 95,325
+// textured records), 8,190 runs a bin, 64 MiB of records and 32 MiB of runs.
+// Study R136: at LB 17 without PAIR (1 MiB a list, 131,072 beats) Daytona 2's
+// opaque list of pass 0 overflowed in 39 of 400 attract frames (Supermodel's
+// rows, as the geometry sends them; up to 158,644 beats) and the newest
+// records, the player's car, were dropped; Scud Race needs up to 283,335 in
+// one list and 2,570 runs in one bin. Nothing bounds a frame's records (the
+// core's geometry has no limit, and the Pro-1000's rated 750,000 polygons a
+// second is passed by Scud Race's attract), so the sizes are three times the
+// heaviest of 5,143 frames of five games: 311,849 beats in a pass, 2,570 runs
+// in a bin. A run-list entry carries a 25-bit start beat. A record or a pair
+// still refused for room is dropped (the newest, as MAME's buffers and
+// Supermodel's guess at the hardware's overload) and counted: n_ovff, frames
+// with an overflow, for the overlay.
 //
 // Memory port: m2_ddr3's request contract, which m2_sdram's ports share
 // (D-20, D-34): req held to ack, a write beat per wacc (din and be live),
@@ -69,8 +89,10 @@
 /* verilator lint_off UNUSEDSIGNAL */
 module r3d_rast_store #(
   parameter bit MIP    = 1'b0,    // a fifth header word (the LOD word B)
-  parameter int LB     = 17,      // log2 beats a list's record region
-  parameter int BB     = 11,      // log2 beats a bin's run list
+  parameter int LB     = 19,      // log2 beats a list's share of the records (study R136)
+  parameter bit PAIR   = 1'b1,    // study R136: a pass's two lists share one region of 2^(LB+1) beats
+  parameter logic [24:0] RUNO = 25'(1 << (LB + 4)),   // the run lists' offset from base (words)
+  parameter int BB     = 12,      // log2 beats a bin's run list (study R136: 12, 8,190 runs; was 11)
   parameter int RUNMAX = 64,      // beats a run (a read burst) at most
   parameter int FB     = 8        // log2 beats of the replay FIFO
 ) (
@@ -123,13 +145,17 @@ module r3d_rast_store #(
   output logic [17:0] n_pair,      // (record, band) pairs
   output logic [15:0] n_run,       // runs closed to DDR3
   output logic [15:0] n_drop,      // records dropped: no band, faces away, or no room
-  output logic [2:0]  ovf          // {a bin's run list full, a list region full, the bin table}
+  output logic [2:0]  ovf,         // {a bin's run list full, a list region full, the bin table}
+  output logic [15:0] n_ovff       // study R136: frames binned with an overflow since reset (saturating)
 );
 
   localparam int H   = MIP ? 5 : 4;               // header words
-  localparam int AW  = LB + 5;                     // bank-relative address bits
-  localparam int NRB = BB + 2;                     // closed-run count (0 .. 2^(BB+1))
-  localparam int EW  = NRB + 1 + LB + 7;           // table entry {nr, ov, ost, onb}
+  localparam int RB  = PAIR ? LB + 1 : LB;         // a record's start beat in its region
+  // study R136: the entry kept at 40 bits (the table's four M10K) at RB 20 and BB 12: the closed-run count
+  // is 0 .. 2^(BB+1) - 2 (one bit narrower; a run list holds 8,190 runs, and the replay's count of items,
+  // the closed runs and the open one, still fits), and the open run's valid bit is its beats being nonzero
+  localparam int NRB = BB + 1;                     // closed-run count
+  localparam int EW  = NRB + RB + 7;               // table entry {nr, ost, onb}
   localparam int FW  = 1 << FB;
 
   // ===========================================================================
@@ -148,11 +174,11 @@ module r3d_rast_store #(
   wire  p_trd  = (ps == P_TO) || (ps == P_TA);     // the replay reads the table this cycle
 
   // addresses in a bank
-  function automatic logic [AW-1:0] rec_a(input logic bk, input logic [2:0] l, input logic [LB-1:0] b);
-    rec_a = {bk, 1'b0, l, b};
+  function automatic logic [24:0] rec_a(input logic bk, input logic [2:0] l, input logic [RB-1:0] b);
+    rec_a = PAIR ? 25'({bk, l[2:1], b}) : 25'({bk, l, b});
   endfunction
-  function automatic logic [AW-1:0] run_a(input logic bk, input logic [8:0] bin, input logic [BB-1:0] b);
-    run_a = {bk, 1'b1, (LB+3)'(0)} + AW'({bin, b});
+  function automatic logic [24:0] run_a(input logic bk, input logic [8:0] bin, input logic [BB-1:0] b);
+    run_a = RUNO + 25'({bk, bin, b});
   endfunction
 
   // ===========================================================================
@@ -173,8 +199,8 @@ module r3d_rast_store #(
     tidx = bk ? 10'({1'b0, bin} + 10'd384) : {1'b0, bin};
   endfunction
   function automatic logic [NRB-1:0] e_nr(input logic [EW-1:0] e);  e_nr = e[EW-1 -: NRB];   endfunction
-  function automatic logic           e_ov(input logic [EW-1:0] e);  e_ov = e[LB+7];          endfunction
-  function automatic logic [LB-1:0]  e_st(input logic [EW-1:0] e);  e_st = e[LB+6:7];        endfunction
+  function automatic logic           e_ov(input logic [EW-1:0] e);  e_ov = e[6:0] != 7'd0;    endfunction
+  function automatic logic [RB-1:0]  e_st(input logic [EW-1:0] e);  e_st = e[RB+6:7];        endfunction
   function automatic logic [6:0]     e_nb(input logic [EW-1:0] e);  e_nb = e[6:0];           endfunction
 
   // ===========================================================================
@@ -237,12 +263,19 @@ module r3d_rast_store #(
   // record's first word and read in W_ADDR at least H + 6 words later, and the last write to it was the
   // record before's W_ADDR, so the registered word is the live one (checked below). It was eight
   // registers and an 8-way select in front of the fit test and the address.
-  (* ramstyle = "MLAB, no_rw_check" *) logic [LB:0] nx [8];
-  logic [LB:0]   nx_q;
+  // Study R136: RB bits a pointer (one MLAB wide at RB 20). An opaque list keeps its next beat O, an alpha
+  // list its start S modulo 2^RB (0 when empty: the region's top). A record fits when O + beats < S (S = 0
+  // read as 2^RB): the region's last beat is never used, which is what keeps O below 2^RB. The sweep
+  // clears every pointer to 0.
+  (* ramstyle = "MLAB, no_rw_check" *) logic [RB-1:0] nx [8];
+  logic [RB-1:0] nx_q;
+  // (PAIR) a copy of nx read at the pass's other list, the bound the record must not cross
+  (* ramstyle = "MLAB, no_rw_check" *) logic [RB-1:0] nxp [8];
+  logic [RB-1:0] nxp_q;
   logic          nx_we;
   logic [2:0]    nx_wa;
-  logic [LB:0]   nx_wd;
-  logic [LB-1:0] wa;                                // the record's start beat
+  logic [RB-1:0] nx_wd;
+  logic [RB-1:0] wa;                                // the record's start beat
   logic [3:0]    wnb;                               // its beats
   logic [5:0]    bc, bhi;                           // band in hand, last band
   logic [3:0]    wbt;                               // beat being written
@@ -257,8 +290,8 @@ module r3d_rast_store #(
   wire  [3:0]  rb_ra = (ws != W_WR) ? 4'd0 : w_wacc ? wbt + 4'd1 : wbt;
   always_ff @(posedge clk) begin rqe <= rbe[rb_ra]; rqo <= rbo[rb_ra]; end
 
-  // the word as stored: word 3 becomes {0, word 1 [30:20], 0, viewport, 0, word 3 [6:0]}
-  wire [31:0] w3p = {1'b0, w1q, 6'd0, w_vp, 1'b0, w_data[6:5], w_vpv ? w_data[4:0] : 5'd0};
+  // the word as stored: word 3 becomes {0, word 1 [30:20], 0, word 3 [7], viewport, 0, word 3 [6:0]}
+  wire [31:0] w3p = {1'b0, w1q, 5'd0, w_data[7], w_vp, 1'b0, w_data[6:5], w_vpv ? w_data[4:0] : 5'd0};
   wire [31:0] wsd = (wk == 5'd3) ? w3p : w_data;
   wire        wkeep = (wk != 5'd1) && (wk != 5'(H + 6));
   wire [11:0] frq = frow(w_data);
@@ -286,30 +319,35 @@ module r3d_rast_store #(
     if (!rst && ws == W_ADDR && {nob_q, blo_q, bhi_q} != {nob, blo_w, bhi_w}) $fatal(1, "store: nob registered");
 `endif
   wire        walpha = wl[0];
-  wire [LB:0] nxl    = nx_q;
-  wire        wfit   = walpha ? (nxl >= (LB+1)'(wnb)) : (nxl + (LB+1)'(wnb) <= (LB+1)'(1 << LB));
-  wire [LB-1:0] wa_n = walpha ? LB'(nxl - (LB+1)'(wnb)) : LB'(nxl);
+  // the region's free space is [O, S): O the opaque list's next beat, S the alpha list's start; a list
+  // without PAIR is bounded by its own region's end (opaque) or base (alpha)
+  wire [RB-1:0] nxl  = nx_q;
+  wire [RB-1:0] nlo  = walpha ? (PAIR ? nxp_q : '0) : nxl;
+  wire [RB-1:0] nhs  = walpha ? nxl : (PAIR ? nxp_q : '0);
+  wire [RB:0]   nhi  = {nhs == '0, nhs};
+  wire        wfit   = (RB+1)'(nlo) + (RB+1)'(wnb) < nhi;
+  wire [RB-1:0] wa_n = walpha ? nxl - RB'(wnb) : nxl;
   wire [8:0]  wbin   = {bc, wl};
   // the entry read for (bc, wl): extend its open run, or close it and open one
   wire [NRB-1:0] q_nr = e_nr(t_q);
   wire           q_ov = e_ov(t_q);
-  wire [LB-1:0]  q_st = e_st(t_q);
+  wire [RB-1:0]  q_st = e_st(t_q);
   wire [6:0]     q_nb = e_nb(t_q);
   // q_ext without an adder on the table's output (study R109): q_nb + wnb <= RUNMAX against a registered
   // RUNMAX - wnb; wa + wnb == q_st against a registered wa + wnb; q_st + q_nb == wa by the carry-save test
   // (a + b == c iff a ^ b ^ c is the carries (a & b) | ((a | b) & ~c), one place up). wnb is set at a
   // record's last word and wa in W_ADDR, at least a cycle before W_BQ, so the registers hold them.
   logic [6:0]    rmw;
-  logic [LB-1:0] wae;
-  always_ff @(posedge clk) begin rmw <= 7'(RUNMAX) - 7'(wnb); wae <= wa + LB'(wnb); end
-  wire  [LB-1:0] q_nbx = LB'(q_nb);
-  wire  [LB-1:0] q_cs  = (q_st & q_nbx) | ((q_st | q_nbx) & ~wa);
+  logic [RB-1:0] wae;
+  always_ff @(posedge clk) begin rmw <= 7'(RUNMAX) - 7'(wnb); wae <= wa + RB'(wnb); end
+  wire  [RB-1:0] q_nbx = RB'(q_nb);
+  wire  [RB-1:0] q_cs  = (q_st & q_nbx) | ((q_st | q_nbx) & ~wa);
   wire           q_ext = q_ov && (q_nb <= rmw) &&
-                         (walpha ? (wae == q_st) : ((q_st ^ q_nbx ^ wa) == {q_cs[LB-2:0], 1'b0}));
+                         (walpha ? (wae == q_st) : ((q_st ^ q_nbx ^ wa) == {q_cs[RB-2:0], 1'b0}));
 `ifdef VERILATOR
   always_ff @(posedge clk)
     if (!rst && ws == W_BQ && q_ext != (q_ov && (7'(q_nb) + 7'(wnb) <= 7'(RUNMAX)) &&
-                                        (walpha ? (wa + LB'(wnb) == q_st) : (q_st + LB'(q_nb) == wa))))
+                                        (walpha ? (wa + RB'(wnb) == q_st) : (q_st + RB'(q_nb) == wa))))
       $fatal(1, "store: q_ext");
 `endif
   // W_BQ's table write a cycle later (study R109): the new entry's adds (the run's beats, the closed-run
@@ -322,27 +360,32 @@ module r3d_rast_store #(
   logic [EW-1:0] bq_chk;
   always_ff @(posedge clk) if (!rst && t_we && $past(bq_v) && t_wd != bq_chk) $fatal(1, "store: the entry a cycle on");
 `endif
-  wire           q_full = q_nr == NRB'(1 << (BB + 1));
+  wire           q_full = q_nr == NRB'((1 << (BB + 1)) - 2);
 
   // nx's port: the sweep's first eight cycles set every list's start (odd lists, alpha, at the top);
   // W_ADDR writes the record's list
   always_comb begin
-    nx_we = 1'b0; nx_wa = wl; nx_wd = walpha ? (LB+1)'(wa_n) : nxl + (LB+1)'(wnb);
+    nx_we = 1'b0; nx_wa = wl; nx_wd = walpha ? wa_n : nxl + RB'(wnb);
     if (ws == W_SWEEP && sw < 9'd8) begin
-      nx_we = 1'b1; nx_wa = sw[2:0]; nx_wd = sw[0] ? (LB+1)'(1 << LB) : '0;
+      nx_we = 1'b1; nx_wa = sw[2:0]; nx_wd = '0;
     end else if (ws == W_ADDR && !nob_q && wfit) nx_we = 1'b1;
   end
   always_ff @(posedge clk) begin
-    if (nx_we) nx[nx_wa] <= nx_wd;
+    if (nx_we) begin nx[nx_wa] <= nx_wd; nxp[nx_wa] <= nx_wd; end
     nx_q <= nx[wl];
+    nxp_q <= nxp[wl ^ 3'd1];
   end
 `ifdef VERILATOR
-  logic [LB:0] nx_chk [8];
+  logic [RB-1:0] nx_chk [8];
   always_ff @(posedge clk) begin
     if (!rst && ws == W_IDLE && b_begin && bst[wbk] == B_FREE)
-      for (int l = 0; l < 8; l++) nx_chk[l] <= ((l & 1) != 0) ? (LB+1)'(1 << LB) : '0;
+      for (int l = 0; l < 8; l++) nx_chk[l] <= '0;
     if (!rst && nx_we && ws == W_ADDR) nx_chk[nx_wa] <= nx_wd;
     if (!rst && ws == W_ADDR && nx_q != nx_chk[wl]) $fatal(1, "store: nx registered");
+    if (!rst && ws == W_ADDR && PAIR && nxp_q != nx_chk[wl ^ 3'd1]) $fatal(1, "store: nxp registered");
+    // a pass's opaque list never reaches its alpha list's start (O < S, S = 0 the top)
+    if (!rst && ws == W_ADDR && PAIR && nx_chk[{wl[2:1], 1'b1}] != '0 && nx_chk[{wl[2:1], 1'b0}] >= nx_chk[{wl[2:1], 1'b1}])
+      $fatal(1, "store: lists crossed");
   end
 `endif
 
@@ -350,7 +393,7 @@ module r3d_rast_store #(
     if (rst) begin
       ws <= W_IDLE; end_pend <= 1'b0; wq_req <= 1'b0; t_we <= 1'b0; bq_v <= 1'b0;
       bst[0] <= B_FREE; bst[1] <= B_FREE; wbk <= 1'b0;
-      n_rec <= '0; n_pair <= '0; n_run <= '0; n_drop <= '0; ovf <= '0;
+      n_rec <= '0; n_pair <= '0; n_run <= '0; n_drop <= '0; ovf <= '0; n_ovff <= '0;
     end else begin
       t_we <= 1'b0; bq_v <= 1'b0;
       if (b_end) end_pend <= 1'b1;
@@ -389,7 +432,10 @@ module r3d_rast_store #(
         end
         W_ADDR: begin
           if (nob_q) begin n_drop <= n_drop + 16'd1; ws <= W_REC; end
-          else if (!wfit) begin n_drop <= n_drop + 16'd1; ovf[1] <= 1'b1; ws <= W_REC; end
+          else if (!wfit) begin
+            n_drop <= n_drop + 16'd1; ovf[1] <= 1'b1; ws <= W_REC;
+            if (ovf == 3'd0 && n_ovff != 16'hffff) n_ovff <= n_ovff + 16'd1;   // the frame's first overflow
+          end
           else begin
             wa <= wa_n;
             bc <= blo_q; bhi <= bhi_q;
@@ -413,19 +459,22 @@ module r3d_rast_store #(
           close = q_ov && !q_ext;
           keep  = !(close && q_full);
           ne = t_q;
-          if (!keep) ovf[2] <= 1'b1;
+          if (!keep) begin
+            ovf[2] <= 1'b1;
+            if (ovf == 3'd0 && n_ovff != 16'hffff) n_ovff <= n_ovff + 16'd1;
+          end
           else n_pair <= n_pair + 18'd1;
           bq_v <= keep; bq_wa <= tidx(wb, wbin); bq_e <= t_q; bq_ext <= q_ext; bq_cl <= close;
 `ifdef VERILATOR
           if (keep) begin
-            if (q_ext) ne = {q_nr, 1'b1, walpha ? wa : q_st, 7'(q_nb) + 7'(wnb)};
-            else       ne = {close ? q_nr + NRB'(1) : q_nr, 1'b1, wa, 7'(wnb)};
+            if (q_ext) ne = {q_nr, walpha ? wa : q_st, 7'(q_nb) + 7'(wnb)};
+            else       ne = {close ? q_nr + NRB'(1) : q_nr, wa, 7'(wnb)};
           end
           bq_chk <= ne;
 `endif
           if (close && keep) begin
             // the old open run to the bin's run list, entry q_nr
-            wrun <= {7'd0, 18'(q_st), q_nb};
+            wrun <= {(25-RB)'(0), q_st, q_nb};
             wq_req <= 1'b1; wq_we <= 1'b1; wq_be <= q_nr[0] ? 8'hf0 : 8'h0f;
             wq_addr <= 25'(run_a(wb, wbin, q_nr[BB:1]));
             wq_blen <= 8'd1;
@@ -444,8 +493,8 @@ module r3d_rast_store #(
       // W_BQ's entry, written a cycle on
       if (bq_v) begin
         t_we <= 1'b1; t_wa <= bq_wa;
-        if (bq_ext) t_wd <= {e_nr(bq_e), 1'b1, walpha ? wa : e_st(bq_e), 7'(e_nb(bq_e)) + 7'(wnb)};
-        else        t_wd <= {bq_cl ? e_nr(bq_e) + NRB'(1) : e_nr(bq_e), 1'b1, wa, 7'(wnb)};
+        if (bq_ext) t_wd <= {e_nr(bq_e), walpha ? wa : e_st(bq_e), 7'(e_nb(bq_e)) + 7'(wnb)};
+        else        t_wd <= {bq_cl ? e_nr(bq_e) + NRB'(1) : e_nr(bq_e), wa, 7'(wnb)};
       end
       // the replay's bank states
       if (p_take) bst[pbk] <= B_PLAY;
@@ -471,7 +520,7 @@ module r3d_rast_store #(
   logic          popen;                             // the item in hand is the open run
   logic          ck_v;                              // the run buffer holds the chunk of pr
   logic [NRB-1:0] ck_c;                             // that chunk (pr >> 5)
-  logic [LB-1:0] rst_b;                             // the run to read: start, beats
+  logic [RB-1:0] rst_b;                             // the run to read: start, beats
   logic [6:0]    rnb;
   wire [EW-1:0]  ecur = pal ? ea : eo;
   wire [8:0]     pbin = {pband, pp, pal};
@@ -578,7 +627,7 @@ module r3d_rast_store #(
           if (p_rv) rr_wa <= rr_wa + 4'd1;
           if (p_ack) begin pq_req <= 1'b0; ck_v <= 1'b1; ps <= P_RE; end
         end
-        P_CK: begin rst_b <= rr_q[7 +: LB]; rnb <= rr_q[6:0]; ps <= P_RQ; end
+        P_CK: begin rst_b <= rr_q[7 +: RB]; rnb <= rr_q[6:0]; ps <= P_RQ; end
         P_RQ: if (f_free > (FB+1)'(rnb) && !mk_we) begin
           pq_req <= 1'b1;
           pq_addr <= 25'(rec_a(pb, {pp, pal}, rst_b));
@@ -704,7 +753,7 @@ module r3d_rast_store #(
         logic [31:0] d;
         case (y_op)
           O_C1:  d = {1'b0, s1[30:20], 20'd0};
-          O_C3:  d = {16'd0, 2'd0, s1[13:8], rec_new, s1[6:0]};
+          O_C3:  d = {16'd0, 1'b0, s1[14], s1[13:8], rec_new, s1[6:0]};
           O_DET: d = 32'd0;
           default: d = y_w[31:0];
         endcase

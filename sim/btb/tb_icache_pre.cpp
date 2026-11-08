@@ -28,6 +28,9 @@
 #include <cstdlib>
 #include <map>
 #include <random>
+#ifdef TB_ISB
+static unsigned ea19(uint32_t a) { uint32_t pg = a >> 12; return ((a >> 12) & 1) ^ (((pg * 0x9E37u) >> 7) & 1); }
+#endif
 #include "Vppc_icache.h"
 #include "verilated.h"
 #include "cache_mem.h"
@@ -66,6 +69,11 @@ int main(int argc, char **argv)
 	auto issue = [&](uint32_t a, bool seq, bool pv, uint32_t tgt, int pway, uint32_t ppa, bool pre, unsigned wimg = 0) -> int {
 		t->i_req = 1; t->i_addr = a; t->i_seq = seq; t->i_wimg = wimg;
 		t->i_pv = pv; t->i_pidx = (tgt >> 2) & 0x3FF; t->i_pway = pway; t->i_ppa = ppa; t->i_pre = pre;
+#ifdef TB_ISB
+		// ISB: EA[19] of the request and of T, from a per-page alias bit (fe119), so some pages are indexed by
+		// EA[19] != PA[19]; the same page always gives the same EA[19], as one translation does
+		t->i_eix = ea19(a); t->i_pidx = (ea19(tgt) << 10) | ((tgt >> 2) & 0x3FF);
+#endif
 		tick();
 		t->i_req = 0; t->i_pv = 0; t->i_pre = 0;
 		int n = 1;

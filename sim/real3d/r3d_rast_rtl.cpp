@@ -294,12 +294,15 @@ uint32_t fetch_texel(rtri const &t, texram const &tex, uint32_t u, uint32_t v, b
   uint32_t const u1 = (u >> 8) & umask, v1 = (v >> 8) & vmask;
   uint32_t const u2 = (u1 + 1) & umask, v2 = (v1 + 1) & vmask;
   bool oo[4];
-  uint32_t const c00 = tex.texel(t.page, t.tex_x, t.tex_y, t.tex_w, t.tex_h, t.fmt, u1, v1, &oo[0]);
-  uint32_t const c01 = tex.texel(t.page, t.tex_x, t.tex_y, t.tex_w, t.tex_h, t.fmt, u2, v1, &oo[1]);
-  uint32_t const c10 = tex.texel(t.page, t.tex_x, t.tex_y, t.tex_w, t.tex_h, t.fmt, u1, v2, &oo[2]);
-  uint32_t const c11 = tex.texel(t.page, t.tex_x, t.tex_y, t.tex_w, t.tex_h, t.fmt, u2, v2, &oo[3]);
+  bool const ctr = (t.param & TP_CONTOUR) != 0;
+  uint32_t c[4];
+  c[0] = tex.texel(t.page, t.tex_x, t.tex_y, t.tex_w, t.tex_h, t.fmt, u1, v1, &oo[0], ctr);
+  c[1] = tex.texel(t.page, t.tex_x, t.tex_y, t.tex_w, t.tex_h, t.fmt, u2, v1, &oo[1], ctr);
+  c[2] = tex.texel(t.page, t.tex_x, t.tex_y, t.tex_w, t.tex_h, t.fmt, u1, v2, &oo[2], ctr);
+  c[3] = tex.texel(t.page, t.tex_x, t.tex_y, t.tex_w, t.tex_h, t.fmt, u2, v2, &oo[3], ctr);
+  if (tex.sm_tex && ctr && (t.fmt & 7) != 7) sm_dilate(c);
   outside = oo[0] || oo[1] || oo[2] || oo[3];
-  return bilinear_filter(c00, c01, c10, c11, u & 0xff, v & 0xff);
+  return bilinear_filter(c[0], c[1], c[2], c[3], u & 0xff, v & 0xff);
 }
 
 // Mip levels at Supermodel's sheet bases (r3d_rast_sm.cpp, Real3D.cpp's
@@ -331,8 +334,11 @@ uint32_t fetch_texel_lv(rtri const &t, texram const &tex, uint32_t u, uint32_t v
   uint32_t a[4];
   texel_addr4(t, u, v, L, a);
   int const fm = int(t.fmt & 7);
-  return bilinear_filter(mame_decode(fm, tex.t[a[0]]), mame_decode(fm, tex.t[a[1]]), mame_decode(fm, tex.t[a[2]]),
-                         mame_decode(fm, tex.t[a[3]]), (u >> L) & 0xff, (v >> L) & 0xff);
+  bool const ctr = (t.param & TP_CONTOUR) != 0;
+  uint32_t c[4];
+  for (int k = 0; k < 4; k++) c[k] = tex.decode(fm, tex.t[a[k]], ctr);
+  if (tex.sm_tex && ctr && fm != 7) sm_dilate(c);   // study R135
+  return bilinear_filter(c[0], c[1], c[2], c[3], (u >> L) & 0xff, (v >> L) & 0xff);
 }
 
 void draw_tri_rtl(rtri const &t, int32_t idx, rkind kind, texram const &tex, rtl_opts const &o,
@@ -427,8 +433,39 @@ inline void bl(rgb4 &c, rgb4 const &o, uint8_t f) {
 
 // MAME's shading split at the point fog goes in: the unblended colour, then the
 // blend factor (-1: none). False: the alpha test discards the pixel.
-bool frag(rtri const &t, rkind k, uint32_t texel, int32_t ii, rgb4 &col, int &f, bool &zw) {
+//
+// sm (texram::sm_tex, study R135): contour and texture alpha as Supermodel's GetTextureValue and main
+// (R3DShaderCommon.h, R3DShaderTriangles.h), with am = d25_am(t) = {inv, at, ta, cm}:
+//   inv texture inversion (header[6] bits 30:24 = 2, New3D.cpp's TranslatorMapOffset): the filtered texel's
+//       RGB is 255 - RGB on every textured kind, before the tests and the colour (alpha stays)
+//   at  the alpha test, contour on a format other than 7 (New3D.cpp SetMeshValues turns it off for 7)
+//   ta  texture alpha (header[6] bits 2:0 from Step 1.5, bit 0 on 1.0: the record's param bit 0)
+//   cm  colour modulation (header[3] bit 7)
+// A the filtered texel alpha. Contour: discarded when at and A < 32 (32/255), else written opaque (no
+// blend) with Z, colour modulated as before. The alpha list (texture alpha or polygon translucency):
+// discarded when at and A < 32; a = (ta or at ? A : 255) x P / 255, P the polygon's translucency factor
+// (t << 3 | t >> 2 as the solid kind, 255 when opaque), rounded as (m + (m >> 8) + 128) >> 8; discarded
+// when a < 8 (Supermodel's 1/32); blended by a, or written without a blend when a is 255; no Z write
+// (D-29: Supermodel's opaque pass for texture-alpha polygons is not built); colour modulated when cm.
+bool frag(rtri const &t, rkind k, uint32_t texel, int32_t ii, rgb4 &col, int &f, bool &zw, bool sm = false, uint32_t am = 0) {
   f = -1;
+  if (sm && k >= K_TEX && (am & 8)) texel ^= 0x00ffffffu;
+  if (sm && (k == K_CONTOUR || k == K_TEX_ALPHA)) {
+    bool const at = am & 4, ta = am & 2, cm = am & 1;
+    uint32_t const A = texel >> 24;
+    if (at && A < 32) return false;
+    col = un4(texel);
+    if (k == K_CONTOUR) { sc_rgba(col, un4(t.color)); sc_imm(col, ii); zw = true; return true; }
+    uint32_t const at8 = (ta || at) ? A : 255u;
+    uint32_t const P = t.trans >= 32 ? 255u : (((t.trans << 3) | (t.trans >> 2)) & 255u);
+    uint32_t const m = at8 * P, a = (m + (m >> 8) + 128) >> 8;
+    if (a < 8) return false;
+    if (cm) sc_rgba(col, un4(t.color));
+    sc_imm(col, ii);
+    if (a != 255) f = int(a);
+    zw = false;
+    return true;
+  }
   switch (k) {
   case K_SOLID: col = un4(t.color); sc_imm(col, ii); zw = true; return true;
   case K_SOLID_TRANS: {
@@ -602,13 +639,19 @@ bool d25_lod_terms(rframe const &f, rtri const &t, double &dv, uint32_t &bw) {
 
 int64_t d25_fog_p(__int128 o2, int eo, float K) { return fog_p(o2, eo, K, 24); }
 
+uint32_t d25_am(rtri const &t) {
+  bool const at = (t.param & TP_CONTOUR) && (t.fmt & 7) != 7;
+  bool const inv = (t.param & TP_TEXTURE) && ((t.hdr[6] >> 24) & 0x7f) == 2;
+  return (inv ? 8u : 0u) | (at ? 4u : 0u) | ((t.param & TP_TALPHA) ? 2u : 0u) | ((t.param & TP_COLORMOD) ? 1u : 0u);
+}
+
 bool d25_colour(rkind k, uint32_t texel, uint32_t color, uint32_t trans, int32_t shade, uint32_t fogint,
-                int32_t const fc[3], int32_t S, int32_t P, uint32_t &rgb, int &fb, bool &zw) {
+                int32_t const fc[3], int32_t S, int32_t P, uint32_t &rgb, int &fb, bool &zw, bool sm, uint32_t am) {
   rtri t{};
   t.color = color; t.trans = trans;
   rgb4 col;
   zw = false;
-  if (!frag(t, k, texel, shade, col, fb, zw)) return false;
+  if (!frag(t, k, texel, shade, col, fb, zw, sm, am)) return false;
   if (fogint) {
     fogvp q;
     q.S = S;
@@ -782,7 +825,7 @@ void render_d25(rframe const &f, texram const &tex, rtl_opts const &o, d25_opts 
           }
           ev.texel = texel;
           rgb4 col; int fb; bool zw = false;
-          if (!frag(t, k, texel, p.shade, col, fb, zw)) continue;
+          if (!frag(t, k, texel, p.shade, col, fb, zw, tex.sm_tex, d25_am(t))) continue;
           ev.ok = true; ev.zw = zw; ev.fb = fb; ev.col_raw = pk4(col);
           if (q) {
             int32_t P;
@@ -801,7 +844,7 @@ void render_d25(rframe const &f, texram const &tex, rtl_opts const &o, d25_opts 
           if (layer) {
             // layer fragment: unblended colour, alpha = transparency (x texel alpha)
             int32_t la = int32_t((t.trans * 255) / 32);
-            if (k == K_TEX_ALPHA) la = (la * (fb + (fb >> 7))) >> 8;
+            if (k == K_TEX_ALPHA) { int const fa = fb < 0 ? 255 : fb; la = (la * (fa + (fa >> 7))) >> 8; }
             col.a = la;
             (layer == 1 ? t1 : t2)[i] = pk4(col);
             zt[i] = p.z; ztg[i] = gen;

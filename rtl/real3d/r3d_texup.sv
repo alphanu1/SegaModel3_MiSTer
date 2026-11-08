@@ -60,7 +60,10 @@
 // Ports: SDRAM m2_sdram's p_ contract (VROM reads); DDR3 m2_ddr3's contract
 // with byte enables.
 //
-// STEP2_PORT (study R100; run time: step2): the Step 2.x texture port. There
+// STEP2_PORT (study R100; run time: port3w): the three-word texture port of
+// Step 1.5 and later (study D-46: Supermodel's singleWordTexturePort is Step
+// 1.0 only; Scud Race's attract never writes the port, so on Step 1.5 it is
+// benched here, not on a game). There
 // the VROM port takes three words, a VROM word address, a header and a third
 // word that starts the upload (Daytona 2 writes all three by DMA, 90000000-08;
 // Supermodel keeps the first two and uploads on the third, discarding it; MAME
@@ -75,7 +78,9 @@
 // 1 x 1; 1: level 0; 2: from level 1; others none, and the decode skips it).
 // The size word is 8 (n + 2) - 4, so the next texture starts n + 2 words on.
 // A texture of 2^19 words or more is cut there (the ring is 2^18). VROM word
-// addresses are 24 bits (64 MiB; four 16 MiB blocks). Supermodel's polygon-RAM
+// addresses are 24 bits with vrom64 (64 MiB, four 16 MiB blocks: Daytona 2), 23
+// otherwise (32 MiB, four 8 MiB blocks: VF3, Scud Race), on both ports alike
+// (the block size follows the set's VROM, not the port). Supermodel's polygon-RAM
 // source (addresses below 0x100000, Daytona 2 Power Edition only) is not built.
 
 `timescale 1ns/1ps
@@ -87,11 +92,12 @@ module r3d_texup #(
   parameter logic [24:0] DDR_TEX  = 25'hC0_0000,
   parameter int          RW       = 18,            // log2 ring words (2^18: the FIFO's 1 MiB)
   parameter int          FB       = 4,             // log2 beats a ring read burst
-  parameter bit          STEP2_PORT = 1'b0         // the Step 2.x texture port (step2)
+  parameter bit          STEP2_PORT = 1'b0         // the three-word texture port (port3w)
 ) (
   input  logic          clk,
   input  logic          rst,
-  input  logic          step2,           // run time: the VROM port is Step 2.x's (STEP2_PORT)
+  input  logic          port3w,          // run time: the VROM port takes three words (STEP2_PORT; Step 1.5 and later)
+  input  logic          vrom64,          // run time: VROM is 64 MiB in 16 MiB blocks (else 32 MiB in 8 MiB blocks)
 
   // words in: t_vrom 0 the FIFO (94), 1 the VROM port (90)
   input  logic          t_valid,
@@ -145,9 +151,9 @@ module r3d_texup #(
   logic [23:0]   v_a;                    // the next VROM word
   logic [18:0]   v_n;                    // words left
 
-  // the Step 2.x port (STEP2_PORT): address, then header; then the size word and
+  // the three-word port (STEP2_PORT): address, then header; then the size word and
   // the header into the ring, then the copy
-  wire           s2p = STEP2_PORT && step2;
+  wire           s2p = STEP2_PORT && port3w;
   logic [1:0]    p2_w;                   // the port's words come: 0 address, 1 header, 2 the start
   logic [2:0]    p2_st;                  // 0 idle, 1 counting, 2 the size word, 3 the header, 4 the copy
   logic [23:0]   p2_addr;
@@ -335,8 +341,8 @@ module r3d_texup #(
       if (v_on && !a_v) begin
         if (!s_req && !v_sgap && !s_ack && room) begin
           s_req <= 1'b1;
-          // (Step 2.x: 24-bit word addresses, 16 MiB blocks)
-          s_addr <= AW'(SDR_VROM[26:1]) + (s2p ? AW'({v_a[2:1], v_a[23:3], 2'b00}) : AW'({v_a[2:1], v_a[22:3], 2'b00}));
+          // (64 MiB VROM: 24-bit word addresses, 16 MiB blocks; 32 MiB: 23 bits, 8 MiB blocks)
+          s_addr <= AW'(SDR_VROM[26:1]) + (vrom64 ? AW'({v_a[2:1], v_a[23:3], 2'b00}) : AW'({v_a[2:1], v_a[22:3], 2'b00}));
         end
         if (s_ack) begin
           logic [31:0] w;

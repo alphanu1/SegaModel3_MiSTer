@@ -12,11 +12,13 @@
 //              [--save FILE] [--restore FILE] [--r3d DIR --r3d-at F,F..]
 //              [--ddr-busy PCT] [--ddr-lat LO HI]
 //              [--cfg FILE] [--xmem FILE] [--fix8 FILE] [--nvram FILE] [--prof-vrom FILE]   (study R100)
+//              [--sw FILE]   (the MRA's <switches> as index 254, after the rest as Main sends it: IMG.i254.bin; R133)
 //
 // --sdr-bxor: the model was built with SDR_BXOR (study R107); sdram_dev applies the same bank hash.
 // --prof2 FILE: the CPU's cycles by cause, its memory port and the SDRAM ports, a line a frame (prof2.h).
 // --prof-vrom appends a line a frame: frame, cycles the geometry was busy, VROM
-// requests, VROM words, cycles a VROM request was waiting (raised to its last word).
+// requests, VROM words, cycles a VROM request was waiting (raised to its last word), and (s15)
+// the rasteriser's busy cycles, the texture upload's, the CPU's cycles in the M3_IDLE wait loops.
 //
 // VROM placement (R100, m3_system VROM_LOC): a VF3-size image's VROM (bytes
 // 0x4000000-0x5FFFFFF) is also put into the DDR3 model's extra memory, and a
@@ -86,7 +88,7 @@ static uint64_t cyc;
 
 // DDR3 at the framework's DDRAM pins (64-bit words from the core's base)
 struct ddr_dev {
-  static constexpr uint64_t BASE = 0x06000000, SIZE = 0x1800000;   // to the end of the extra memory (R100)
+  static constexpr uint64_t BASE = 0x06000000, SIZE = 0x2000000;   // the whole 256 MiB window: the store's run lists sit at 0x1800000 (study R136)
   std::vector<uint64_t> m = std::vector<uint64_t>(SIZE);
   int busy_pct = 10, lat_lo = 12, lat_hi = 40;
   uint32_t wr_left = 0; uint64_t wr_addr = 0;
@@ -97,6 +99,9 @@ struct ddr_dev {
   uint64_t &at(uint64_t a) { static uint64_t s; if (a < BASE || a >= BASE + SIZE) { bad++; return s; } return m[a - BASE]; }
 };
 static ddr_dev dd;
+// R127 VROM_LIN: the MRA layout's region beat {blk, g} (g 21 bits for 64 MiB, 20 for 32 MiB) is at {g, blk}
+static bool xlin = false;
+static size_t xl(size_t b, bool v64) { if (!xlin) return b; unsigned const gb = v64 ? 21 : 20; return ((b & ((size_t(1) << gb) - 1)) << 2) | (b >> gb); }
 static Prof2 p2;
 // --check-lw (study R107): every work-RAM line write (cast-out, a push, a 53C810 line write) is
 // recorded beat by beat as its master hands each beat over on m_wnext, by line, and checked against
@@ -120,22 +125,27 @@ int main(int argc, char **argv) {
   bool prof = false, pf_req = false;
   uint32_t pf_last = 0;
   uint64_t pf_cyc = 0, pf_ins = 0, pf_w[256] = {}, pf_n[256][4] = {}, pf_inf[6] = {}, pf_infw[6] = {}, pf_pndw[6] = {};
-  std::string img_fn, trace_fn, dump_dir, ppm_dir, save_fn, restore_fn, cfg_fn, xmem_fn, fix8_fn, nvram_fn, pv_fn;
+  std::string img_fn, trace_fn, dump_dir, ppm_dir, save_fn, restore_fn, cfg_fn, xmem_fn, fix8_fn, nvram_fn, pv_fn, sw_fn;
   long nframes = 10, window = 0x10000;
   std::set<long> dump_at, ppm_at, r3d_at;
   std::string r3d_dir;
   bool quiet = false, tb_fast = false, fatal_stop = true;
   uint32_t tb_pc = 0xFFF00198;          // where --tb-fast ends (0: the first instruction in RAM)
   int vrom_x = -1;
+  bool save_idle = false; std::string vt_fn;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto nx = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
     if (a == "--image") img_fn = nx();
     else if (a == "--cfg") cfg_fn = nx();
+    else if (a == "--sw") sw_fn = nx();
     else if (a == "--xmem") xmem_fn = nx();
     else if (a == "--fix8") fix8_fn = nx();
     else if (a == "--nvram") nvram_fn = nx();
     else if (a == "--prof-vrom") pv_fn = nx();
+    else if (a == "--xlin") xlin = true;
+    else if (a == "--save-idle") save_idle = true;
+    else if (a == "--vtrace") vt_fn = nx();
     else if (a == "--vrom-x") vrom_x = std::atoi(nx().c_str());
     else if (a == "--frames") nframes = std::atol(nx().c_str());
     else if (a == "--trace") trace_fn = nx();
@@ -177,7 +187,7 @@ int main(int argc, char **argv) {
     std::fclose(f);
     return v;
   };
-  std::vector<uint8_t> cfg_img = slurp(cfg_fn), xmem_img = slurp(xmem_fn), fix8_img = slurp(fix8_fn), nvram_img = slurp(nvram_fn);
+  std::vector<uint8_t> cfg_img = slurp(cfg_fn), xmem_img = slurp(xmem_fn), fix8_img = slurp(fix8_fn), nvram_img = slurp(nvram_fn), sw_img = slurp(sw_fn);
   std::FILE *trf = trace_fn.empty() ? nullptr : std::fopen(trace_fn.c_str(), restore_fn.empty() ? "wb" : "ab");
 
   t = new Vm3_system;
@@ -289,6 +299,14 @@ int main(int argc, char **argv) {
     for (uint64_t i = 0; i < n; i++) { ddr_dev::burst b; is.read(&b, sizeof b); dd.rq.push_back(b); }
     is.close();
     std::printf("restored %s: frame %u, cycle %" PRIu64 "\n", restore_fn.c_str(), t->frame, cyc);
+    // --tb-set V (study D-46, Scud Race's crash after about 5 minutes on the board): the CPU's timebase set to V
+    // after the restore, to run the TBL wrap (2^32 counts at 16.5 MHz, 260 s) from a checkpoint
+    if (const char *e = std::getenv("M3_TB_SET")) {
+      uint64_t const v = std::strtoull(e, nullptr, 0);
+      t->rootp->m3_system__DOT__u_cpu__DOT__u_core__DOT__tb_q = v;
+      t->rootp->__Vdly__m3_system__DOT__u_cpu__DOT__u_core__DOT__tb_q = v;
+      std::printf("timebase set to %016" PRIx64 "\n", v);
+    }
   } else {
   // 0. the other indexes, in the MRA's order (R100): the configuration, the
   // extra memory, the fixed CROM; each a window through ioctl, checked, and the
@@ -321,10 +339,11 @@ int main(int argc, char **argv) {
   }
   if (!xmem_img.empty()) {
     size_t const n = std::min(size_t(window), xmem_img.size());
+    bool const x64 = (t->rootp->m3_system__DOT__cfg_flags >> 2) & 1;
     // windows at the start, the middle and the end of the region (R100: the second 32 MiB too)
     std::vector<size_t> at = {0};
     if (xmem_img.size() >= 2 * n) { at.push_back(xmem_img.size() / 2); at.push_back(xmem_img.size() - n); }
-    for (size_t o : at) for (size_t b = 0; b < n / 8; b++) dd.m[0x1000000 + o / 8 + b] = 0xA55AA55AA55AA55Aull;
+    for (size_t o : at) for (size_t b = 0; b < n / 8; b++) dd.m[0x1000000 + xl(o / 8 + b, x64)] = 0xA55AA55AA55AA55Aull;
     t->ioctl_index = 1; t->ioctl_download = 1;
     for (size_t o : at)
       for (size_t a = o; a < o + n; a += 2) {
@@ -339,10 +358,10 @@ int main(int argc, char **argv) {
     t->ioctl_index = 0;
     long bad = 0;
     for (size_t o : at)
-      for (size_t b = 0; b < n / 8; b++) { uint64_t v; std::memcpy(&v, &xmem_img[o + 8 * b], 8); if (dd.m[0x1000000 + o / 8 + b] != v) bad++; }
+      for (size_t b = 0; b < n / 8; b++) { uint64_t v; std::memcpy(&v, &xmem_img[o + 8 * b], 8); if (dd.m[0x1000000 + xl(o / 8 + b, x64)] != v) bad++; }
     std::printf("loader: extra memory, %zu windows of %zu bytes through ioctl, %ld beats wrong\n", at.size(), n, bad);
     if (bad) { std::printf("FAIL\n"); return 1; }
-    for (size_t b = 0; b < xmem_img.size() / 8; b++) std::memcpy(&dd.m[0x1000000 + b], &xmem_img[8 * b], 8);
+    for (size_t b = 0; b < xmem_img.size() / 8; b++) std::memcpy(&dd.m[0x1000000 + xl(b, x64)], &xmem_img[8 * b], 8);
   }
   if (!fix8_img.empty()) {
     size_t const n = std::min(size_t(window), fix8_img.size());
@@ -367,7 +386,7 @@ int main(int argc, char **argv) {
   bool const vf3_vrom = img.size() >= 0x6000000 && xmem_img.empty();
   bool const vr_win = img.size() >= 0x4000000 + size_t(window);   // the window at 0x4000000: VROM (Step 1.x) or CROM (Step 2)
   if (vr_win) {
-    if (xmem_img.empty()) for (long b = 0; b < window / 8; b++) dd.m[0x1000000 + b] = 0xA55AA55AA55AA55Aull;
+    if (xmem_img.empty()) for (long b = 0; b < window / 8; b++) dd.m[0x1000000 + xl(b, false)] = 0xA55AA55AA55AA55Aull;
     for (long a = 0x4000000; a < 0x4000000 + window; a += 2) {
       while (t->ioctl_wait) tick();
       t->ioctl_wr = 1; t->ioctl_addr = uint32_t(a); t->ioctl_dout = uint16_t(img[a] | (img[a + 1] << 8));
@@ -383,7 +402,7 @@ int main(int argc, char **argv) {
     long in_sdr = 0, in_ddr = 0;
     for (long a = 0; a < window; a += 8) {
       uint64_t v; std::memcpy(&v, &img[0x4000000 + a], 8);
-      if (dd.m[0x1000000 + a / 8] == v) in_ddr++;
+      if (dd.m[0x1000000 + xl(a / 8, false)] == v) in_ddr++;
       bool ok = true;
       for (int k = 0; k < 4; k++) if (sd.m[(0x4000000 + a) / 2 + k] != uint16_t(img[0x4000000 + a + 2 * k] | (img[0x4000000 + a + 2 * k + 1] << 8))) ok = false;
       if (ok) in_sdr++;
@@ -394,7 +413,7 @@ int main(int argc, char **argv) {
     // builds sent CROM slots 8-11 over VROM)
     long clob = 0;
     if (!xmem_img.empty())
-      for (long b = 0; b < window / 8; b++) { uint64_t v; std::memcpy(&v, &xmem_img[8 * b], 8); if (dd.m[0x1000000 + b] != v) clob++; }
+      for (long b = 0; b < window / 8; b++) { uint64_t v; std::memcpy(&v, &xmem_img[8 * b], 8); if (dd.m[0x1000000 + xl(b, (t->rootp->m3_system__DOT__cfg_flags >> 2) & 1)] != v) clob++; }
     if (!xmem_img.empty()) std::printf("loader: VROM beats overwritten in DDR3: %ld\n", clob);
     if ((!xmem_img.empty() && (in_sdr != window / 8 || clob)) || (in_ddr != window / 8 && in_sdr != window / 8)) { std::printf("FAIL\n"); return 1; }
   }
@@ -413,7 +432,7 @@ int main(int argc, char **argv) {
   // 2. the rest straight into the model (the game is still in reset this cycle); a VF3-size
   // image's VROM into both memories (the build or --vrom-x picks the one read)
   for (size_t a = 0; a + 1 < img.size(); a += 2) sd.m[a >> 1] = uint16_t(img[a] | (img[a + 1] << 8));
-  if (vf3_vrom) for (size_t b = 0; b < 0x2000000 / 8; b++) std::memcpy(&dd.m[0x1000000 + b], &img[0x4000000 + 8 * b], 8);
+  if (vf3_vrom) for (size_t b = 0; b < 0x2000000 / 8; b++) std::memcpy(&dd.m[0x1000000 + xl(b, false)], &img[0x4000000 + 8 * b], 8);
   // 3. the NVRAM file (index 2), all through ioctl: the game is held in reset again meanwhile
   if (!nvram_img.empty()) {
     download(2, nvram_img, nvram_img.size());
@@ -422,6 +441,11 @@ int main(int argc, char **argv) {
       if (sd.m[(0x6200000 + a) >> 1] != uint16_t(nvram_img[a] | (nvram_img[a + 1] << 8))) bad++;
     std::printf("loader: NVRAM, %zu bytes through ioctl, %ld backup RAM words wrong, rom_loaded %d\n", nvram_img.size(), bad, int(t->rom_loaded));
     if (bad) { std::printf("FAIL\n"); return 1; }
+  }
+  // 4. the MRA's <switches> (index 254), last, as Main sends them: byte 0 the DIP bank
+  if (!sw_img.empty()) {
+    download(254, sw_img, sw_img.size());
+    std::printf("loader: switches, DIP bank %02X\n", unsigned(t->rootp->m3_system__DOT__cfg_dsw));
   }
   }
 
@@ -468,20 +492,66 @@ int main(int argc, char **argv) {
   p2.dt2 = t->rootp->m3_system__DOT__cfg_step >= 0x20;
   std::FILE *pvf = pv_fn.empty() ? nullptr : std::fopen(pv_fn.c_str(), "a");
   uint64_t pv_busy = 0, pv_req = 0, pv_words = 0, pv_wait = 0;
+  // s15 (study D-46): also the rasteriser's busy cycles (a frame replayed), the texture upload's, and the CPU's
+  // cycles inside the wait loops listed in M3_IDLE ("lo-hi,lo-hi", hex PCs, the last retired PC)
+  uint64_t pv_rbusy = 0, pv_tbusy = 0, pv_idle = 0;
+  uint64_t pv_vm = 0, pv_pm = 0, pv_s0 = 0, pv_s1 = 0, pv_sd = 0; bool pv_act = false;
+  std::FILE *vtf = vt_fn.empty() ? nullptr : std::fopen(vt_fn.c_str(), "ab");
+  int idle_n = 0;
+  std::vector<std::pair<uint32_t, uint32_t>> idle_w;
+  if (const char *e = std::getenv("M3_IDLE")) {
+    std::string w(e); size_t p0 = 0;
+    while (p0 < w.size()) {
+      size_t c = w.find(',', p0); if (c == std::string::npos) c = w.size();
+      std::string it = w.substr(p0, c - p0); size_t d = it.find('-');
+      if (d != std::string::npos) idle_w.push_back({uint32_t(std::stoul(it.substr(0, d), nullptr, 16)), uint32_t(std::stoul(it.substr(d + 1), nullptr, 16))});
+      p0 = c + 1;
+    }
+  }
+  uint32_t pv_lpc = 0;
   int pv_left = 0; bool pv_on = false; uint32_t pv_frame = t->frame;
-  while (t->frame < uint32_t(nframes)) {
+  while (t->frame < uint32_t(nframes) || (save_idle && idle_n < 8)) {
     tick();
+    {
+      auto *q = t->rootp;
+      bool const msa = q->m3_system__DOT__u_geo__DOT__u_ms__DOT__active, msv = q->m3_system__DOT__u_geo__DOT__u_ms__DOT__in_vrom;
+      if (save_idle && t->frame >= uint32_t(nframes)) {
+        bool const idle = !q->m3_system__DOT__geo_busy && !q->m3_system__DOT__t3_busy && !q->m3_system__DOT__vr_req && !msa &&
+                          !q->m3_system__DOT__u_geo__DOT__u_ms__DOT__draining && q->m3_system__DOT__u_geo__DOT__u_ms__DOT__outst == 0;
+        idle_n = idle ? idle_n + 1 : 0;
+      }
+      if (vtf && q->m3_system__DOT__vr_req && q->m3_system__DOT__vr_ack) {
+        uint32_t const r[3] = {t->frame, uint32_t(q->m3_system__DOT__vr_addr), uint32_t(q->m3_system__DOT__vr_len)};
+        std::fwrite(r, 4, 3, vtf);
+      }
+      if (pvf) {
+        if (msa && !pv_act) { if (msv) pv_vm++; else pv_pm++; }
+        pv_act = msa;
+        uint8_t const ds = q->m3_system__DOT__u_geo__DOT__dst;
+        if ((ds == 1 || ds == 4) && msa && msv && !q->m3_system__DOT__u_geo__DOT__ms_wv) {
+          if (ds == 1 && q->m3_system__DOT__u_geo__DOT__hk == 0 && q->m3_system__DOT__u_geo__DOT__md_first) pv_s0++; else pv_s1++;
+        }
+        if (ds == 0 && q->m3_system__DOT__u_geo__DOT__d_req != q->m3_system__DOT__u_geo__DOT__d_ack && !q->m3_system__DOT__u_geo__DOT__ms_ready) pv_sd++;
+      }
+    }
     if (pvf) {
       auto *q = t->rootp;
       if (q->m3_system__DOT__geo_busy) pv_busy++;
+      if (q->m3_system__DOT__u_rast__DOT__q != 0) pv_rbusy++;
+      if (q->m3_system__DOT__t3_busy) pv_tbusy++;
+      if (t->rt_valid_o) pv_lpc = t->rt_pc_o;
+      for (auto &w : idle_w) if (pv_lpc >= w.first && pv_lpc <= w.second) { pv_idle++; break; }
       if (q->m3_system__DOT__vr_req && !pv_on) { pv_on = true; pv_left = -1; }
       if (pv_on) pv_wait++;
       if (q->m3_system__DOT__vr_ack && pv_left < 0) { pv_left = q->m3_system__DOT__vr_len + 1; pv_req++; }
       if (q->m3_system__DOT__vr_rv && pv_on) { pv_words++; if (pv_left > 0 && --pv_left == 0) pv_on = false; }
       if (t->frame != pv_frame) {
-        std::fprintf(pvf, "%u %llu %llu %llu %llu\n", pv_frame, (unsigned long long)pv_busy, (unsigned long long)pv_req,
-                     (unsigned long long)pv_words, (unsigned long long)pv_wait);
-        pv_busy = pv_req = pv_words = pv_wait = 0; pv_frame = t->frame;
+        std::fprintf(pvf, "%u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %u\n", pv_frame, (unsigned long long)pv_busy, (unsigned long long)pv_req,
+                     (unsigned long long)pv_words, (unsigned long long)pv_wait, (unsigned long long)pv_rbusy,
+                     (unsigned long long)pv_tbusy, (unsigned long long)pv_idle, (unsigned long long)pv_vm, (unsigned long long)pv_pm,
+                     (unsigned long long)pv_s0, (unsigned long long)pv_s1, (unsigned long long)pv_sd, unsigned(q->m3_system__DOT__n_draw));
+        pv_busy = pv_req = pv_words = pv_wait = pv_rbusy = pv_tbusy = pv_idle = 0; pv_frame = t->frame;
+        pv_vm = pv_pm = pv_s0 = pv_s1 = pv_sd = 0;
       }
     }
     if (t->rt_valid_o) {
@@ -743,6 +813,7 @@ int main(int argc, char **argv) {
   if (trf) std::fclose(trf);
   if (p2.f) { p2.report(); std::fclose(p2.f); }
   if (lwc.on) std::printf("check-lw: %llu work-RAM line writes checked, %llu words wrong, %llu not seen handed over\n", (unsigned long long)lwc.n, (unsigned long long)lwc.bad, (unsigned long long)lwc.lost);
+  if (vtf) std::fclose(vtf);
   if (!save_fn.empty()) {
     VerilatedSave os;
     os.open(save_fn.c_str());

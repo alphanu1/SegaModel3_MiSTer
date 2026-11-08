@@ -86,6 +86,8 @@ assign VIDEO_ARY = (!ar) ? 12'd3 : 12'd0;
 localparam CONF_STR = {
 	"Model3;;",
 	"-;",
+	"DIP;",                                  // the MRA's <switches>: the CPU board's DIP bank (index 254, m3_loader)
+	"-;",
 	"O[4],Debug overlay,On,Off;",
 	"O[5],FPS counter,Off,On;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
@@ -173,7 +175,7 @@ end
 m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .SDR_BXOR(1'b1), .SDR_L16(1'b1), .SDR_LW1(1'b1),
             .SDR_PAIR(1'b1), .SDR_PW(1'b1),
             .BUS_FAST(1'b1), .BUS_R3P(1'b1), .SDR_FREQ(1'b1), .SDR_FWD(1'b1), .SDR_FDSP(1'b1),
-            .SDR_PW_DLY(8)) sys3
+            .SDR_PW_DLY(8), .ISB(1'b1)) sys3
 (
 	.clk(clk_sys), .mem_rst_n(mem_rst_n), .reset(RESET | status[0] | buttons[1]),
 	.ioctl_download(ioctl_download), .ioctl_index(ioctl_index), .ioctl_wr(ioctl_wr),

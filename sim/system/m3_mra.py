@@ -81,7 +81,45 @@ DAYTONA2 = {
     'fixed': [('epr-20861a.17', 6), ('epr-20862a.18', 4), ('epr-20863a.19', 2), ('epr-20864a.20', 0)],
     'vrom': ['mpr-%d.%d' % (20870 + k, 26 + k) for k in range(16)],
 }
-SETS = {'vf3': VF3, 'bassdx': BASSDX, 'daytona2': DAYTONA2}
+# ROM_START(scuddxo) (Step 1.5, study D-46): VF3's layout, three CROM banks (CROM3 unpopulated,
+# 00 as MAME's region), sixteen 2 MiB VROMs. The step goes in an index-4 configuration; the
+# rest of it is the Step 1.0 default (banks 0-7 in slots 0-7). Port C rests at AF as on
+# Daytona 2 (the 4-speed shifter in first gear; Supermodel's trace of scuddxo reads AF).
+SCUDDXO = {
+    'setname': 'scuddxo', 'name': 'Scud Race - Sega Super GT - Deluxe', 'year': '1996', 'zip': 'scuddxo.zip',
+    'category': 'Driving', 'step': 0x15, 'idle_in': [0xAF, 0xFF],
+    'crom': [
+        [('mpr-19592.1', 6), ('mpr-19591.2', 4), ('mpr-19590.3', 2), ('mpr-19589.4', 0)],
+        [('mpr-19596.5', 6), ('mpr-19595.6', 4), ('mpr-19594.7', 2), ('mpr-19593.8', 0)],
+        [('mpr-19600.9', 6), ('mpr-19599.10', 4), ('mpr-19598.11', 2), ('mpr-19597.12', 0)],
+        None,
+    ],
+    'fixed': [('epr-19610.17', 6), ('epr-19609.18', 4), ('epr-19608.19', 2), ('epr-19607.20', 0)],
+    # by IC position, .26 to .41, as VF3's (MAME offsets 2, 0, 6, 4, ...): the part numbers run in swapped pairs
+    'vrom': ['mpr-19574.26', 'mpr-19573.27', 'mpr-19576.28', 'mpr-19575.29', 'mpr-19578.30', 'mpr-19577.31',
+             'mpr-19580.32', 'mpr-19579.33', 'mpr-19582.34', 'mpr-19581.35', 'mpr-19584.36', 'mpr-19583.37',
+             'mpr-19586.38', 'mpr-19585.39', 'mpr-19588.40', 'mpr-19587.41'],
+}
+# ROM_START(lostwsga) (Step 1.5): VF3's layout with all four CROMs (64 MiB, banks 0-7) and sixteen 2 MiB
+# VROMs in IC order. The game selects banks 8-15 only (F0100008 written F0-F7 in Supermodel's trace),
+# which both emulators mirror onto 0-7 (MAME's ROM_COPY into the upper 64 MiB, Supermodel's banked CROM
+# copied twice): the bank map puts banks 8-15 in slots 0-7 too. Ports C and D read FF (Supermodel).
+# Its DIP bank defaults to FF, all eight OFF (MAME's default): the game reads SW1 at start-up and leaves
+# its I-cache off when it is ON, as Supermodel's 7F has it (study R133).
+# Not loaded: the billboard's Z80 ROM (epr-18022.ic2), the 68000 program and the samples (D-8).
+LOSTWSGA = {
+    'setname': 'lostwsga', 'name': 'The Lost World - Jurassic Park (Revision A)', 'year': '1997', 'zip': 'lostwsga.zip',
+    'category': 'Shooter', 'step': 0x15, 'crom_mirror': True, 'dsw': 0xFF,
+    'crom': [
+        [('mpr-19918.1', 6), ('mpr-19919.2', 4), ('mpr-19920.3', 2), ('mpr-19921.4', 0)],
+        [('mpr-19922.5', 6), ('mpr-19923.6', 4), ('mpr-19924.7', 2), ('mpr-19925.8', 0)],
+        [('mpr-19926.9', 6), ('mpr-19927.10', 4), ('mpr-19928.11', 2), ('mpr-19929.12', 0)],
+        [('mpr-19930.13', 6), ('mpr-19931.14', 4), ('mpr-19932.15', 2), ('mpr-19933.16', 0)],
+    ],
+    'fixed': [('epr-19939a.17', 6), ('epr-19938a.18', 4), ('epr-19937a.19', 2), ('epr-19936a.20', 0)],
+    'vrom': ['mpr-%d.%d' % (19902 + k, 26 + k) for k in range(16)],
+}
+SETS = {'vf3': VF3, 'bassdx': BASSDX, 'daytona2': DAYTONA2, 'scuddxo': SCUDDXO, 'lostwsga': LOSTWSGA}
 
 # game configuration (index 4) flags, m3_loader.sv
 CF_VROM_X, CF_FIXED8, CF_VROM64 = 1, 2, 4
@@ -117,9 +155,21 @@ def mra(args):
     w('      Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1')
     w('      SPDX-License-Identifier: GPL-3.0-or-later')
     w('')
-    w('      %s. Stage A of study D-37: CPU, bus, tile generator, no sound,' % s['name'])
-    w('      no 3D. From MAME 0.289 model3.cpp ROM_START(%s); sim/system/m3_mra.py' % s['setname'])
-    w('      writes it, and packs the same image for the system bench.')
+    step = s.get('step', 0x10)
+    if step == 0x10:
+        w('      %s. Stage A of study D-37: CPU, bus, tile generator, no sound,' % s['name'])
+        w('      no 3D. From MAME 0.289 model3.cpp ROM_START(%s); sim/system/m3_mra.py' % s['setname'])
+        w('      writes it, and packs the same image for the system bench.')
+    else:
+        w('      %s. Step %X.%X (study D-46): attract mode, no sound, I/O stubbed' % (s['name'], step >> 4, step & 15))
+        w('      (D-37). From MAME 0.289 model3.cpp ROM_START(%s); sim/system/m3_mra.py' % s['setname'])
+        w('      writes it, and packs the same image for the system bench. Index 4, the')
+        w('      game configuration (rtl/sys/m3_loader.sv), gives the step; the rest of it')
+        if s.get('crom_mirror'):
+            w('      is the Step 1.0 default but for CROM banks 8-15, which mirror 0-7, and')
+            w('      index 0 is laid out as VF3\'s.')
+        else:
+            w('      is the Step 1.0 default, and index 0 is laid out as VF3\'s.')
     w('')
     w('      SDRAM (bytes): 0x0000000 banked CROM, 64 MiB; 0x4000000 VROM, 32 MiB;')
     w('      0x6000000 fixed CROM, 2 MiB; 0x6200000 backup RAM, 128 KiB of 00.')
@@ -133,7 +183,16 @@ def mra(args):
     w('    <year>%s</year>' % s['year'])
     w('    <manufacturer>Sega</manufacturer>')
     w('    <category>%s</category>' % s.get('category', 'Fighter'))
+    switches(w, s)
     w('')
+    if step != 0x10:
+        mirror = s.get('crom_mirror', False)
+        cfg = [step, 0x00] + [b & 7 if mirror else b if b < 8 else 0x80 for b in range(16)] + s.get('idle_in', [0xFF, 0xFF])
+        w('    <!-- game configuration: step %02X, flags 00, banks 0-7 %sin slots 0-7, idle ports C and D -->'
+          % (step, 'and their mirror 8-15 ' if mirror else ''))
+        w('    <rom index="4" md5="none">')
+        w('        <part>%s</part>' % ' '.join('%02X' % b for b in cfg))
+        w('    </rom>')
     w('    <rom index="0" zip="%s" md5="none">' % s['zip'])
     for b, bank in enumerate(s['crom']):
         w('        <!-- 0x%07x  CROM%d, 16 MiB (banks %d-%d) -->' % (b * 0x1000000, b, 2 * b, 2 * b + 1))
@@ -164,6 +223,18 @@ def mra(args):
         f.write('\n'.join(L) + '\n')
     print('wrote', args.out)
 
+
+
+def switches(w, s):
+    """The CPU board's DIP bank (315-5649 port G) as MiSTer's DIP Switches page: index 254, byte 0, bit 7
+    SW1 ... bit 0 SW8 (MAME's DIP locations), 0 = ON. The default is the game's 'dsw', else 7F
+    (Supermodel's, SW1 ON); MAME's is FF. SW1 ON is a debug setting (MAME: vs215o's debug stats; Lost World
+    leaves its I-cache off), the other seven have no known use (study R133)."""
+    w('    <!-- the CPU board\'s DIP bank, 315-5649 port G (index 254); Reset & apply after a change -->')
+    w('    <switches default="%02X">' % s.get('dsw', 0x7F))
+    for n in range(1, 9):
+        w('        <dip name="SW%d%s" bits="%d" ids="On,Off"/>' % (n, ' (debug)' if n == 1 else '', 8 - n))
+    w('    </switches>')
 
 def mra_step2(args, s, crc):
     L = []
@@ -199,6 +270,7 @@ def mra_step2(args, s, crc):
     w('    <year>%s</year>' % s['year'])
     w('    <manufacturer>Sega</manufacturer>')
     w('    <category>%s</category>' % s.get('category', 'Fighter'))
+    switches(w, s)
     w('')
     w('    <!-- game configuration: step %02X, flags %02X (VROM in the extra memory, fixed CROM 8 MiB, VROM 64 MiB), bank map, idle ports C and D -->' % (cfg[0], cfg[1]))
     w('    <rom index="4" md5="none">')
@@ -290,6 +362,14 @@ def pack(args):
         with open(fn, 'wb') as f:
             f.write(out)
         print('index %d:' % ix, fn, len(out), 'bytes, md5', hashlib.md5(out).hexdigest())
+    # <switches>: Main's 8 bytes (its 64-bit dip_cur, little-endian) at their default, as index 254
+    sw = root.find('switches')
+    if sw is not None:
+        out = bytes.fromhex(sw.get('default', '').replace(',', '')).ljust(8, b'\0')[:8]
+        fn = '%s.i254.bin' % (args.out[:-4] if args.out.endswith('.bin') else args.out)
+        with open(fn, 'wb') as f:
+            f.write(out)
+        print('index 254:', fn, 'switches', out.hex())
 
 
 def nvram(args):

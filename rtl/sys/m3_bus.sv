@@ -416,7 +416,7 @@ module m3_bus
       X_PCIA:  rd_int = bswap(pci_addr);
       X_PCID:  rd_int = (pci_dev == 5'd13) ? bswap((pci_reg == 6'd0) ? (s2 ? 32'h1786_11DB : R3D_ID) : 32'd0)
                       : (s2 && pci_dev == 5'd0) ? (be_byte ? 32'hFFFF_FFFF : (pci_reg == 6'd0) ? 32'h5710_0200
-                                                   : c106_w[pci_reg] ? c106[pci_reg] : c106_def)
+                                                   : cq)
                       : (pci_dev == 5'd0)  ? ((pci_reg == 6'd0) ? 32'h5710_0100 : 32'd0)
                       : (s2 && pci_dev == 5'd16) ? (((be == 4'hF) && pci_reg == 6'd0) ? bswap(32'h1827_11DB) : 32'd0)
                       : 32'hFFFF_FFFF;                                             // no device: master abort

@@ -80,6 +80,11 @@ bool read_rframe(std::string const &fn, rframe &out) {
   return true;
 }
 
+void set_talpha(rframe &f, unsigned step) {
+  uint32_t const gate = step >= 0x15 ? 7u : 1u;
+  for (auto &t : f.tris) t.param = (t.param & ~uint32_t(TP_TALPHA)) | ((t.hdr[6] & gate) ? uint32_t(TP_TALPHA) : 0u);
+}
+
 // ---- texels ------------------------------------------------------------------
 
 namespace {
@@ -98,13 +103,39 @@ inline uint32_t argb(uint32_t a, uint32_t r, uint32_t g, uint32_t b) {
 // runs past row 1023 reads outside the page (MAME reads past its array;
 // counted, and read from the dump's next page here).
 uint32_t texram::texel(uint32_t page, uint32_t tx, uint32_t ty, uint32_t tw, uint32_t th, uint32_t fmt,
-                       uint32_t u, uint32_t v, bool *outside) const {
+                       uint32_t u, uint32_t v, bool *outside, bool ctr) const {
   uint32_t const pw = 32u << tw, ph = 32u << th;
   uint32_t const uu = u < pw ? u : 2 * pw - 1 - u;
   uint32_t const vv = v < ph ? v : 2 * ph - 1 - v;
   uint32_t const a = (ty * 32 + vv) * 2048 + tx * 32 + uu;
   if (outside) *outside = a >= 2048u * 1024u;
-  return mame_decode(int(fmt & 7), t[(page * 2048u * 1024u + a) & (2048u * 2048u - 1)]);
+  return decode(int(fmt & 7), t[(page * 2048u * 1024u + a) & (2048u * 2048u - 1)], ctr);
+}
+
+uint32_t texram::decode(int fmt, uint32_t p, bool ctr) const {
+  fmt &= 7;
+  if (sm_tex && fmt >= 1 && fmt <= 4) {
+    // Supermodel's ExtractColour: the luminance nibble of formats 1-4 is bits 3:0, 7:4, 11:8, 15:12 and the alpha
+    // nibble the other half of the byte (format 2 the swap of MAME's, which reads it as format 1); under contour
+    // (types 8-11) the alpha nibble is ignored and luminance 15 is transparent
+    uint32_t const sh = 4u * uint32_t(fmt - 1);
+    uint32_t const l = (p >> sh) & 0xf, a = (p >> (sh ^ 4u)) & 0xf;
+    uint32_t const g = (l << 4) | l;
+    uint32_t const al = ctr ? (l == 15 ? 0u : 0xffu) : ((a << 4) | a);
+    return (al << 24) | (g << 16) | (g << 8) | g;
+  }
+  uint32_t const c = mame_decode(fmt, p);
+  bool const key = l8_key && ((fmt == 5 && (p & 0xff) == 0xff) || (fmt == 6 && (p & 0xff00) == 0xff00));
+  return key ? (c & 0x00ffffffu) : c;
+}
+
+void sm_dilate(uint32_t c[4]) {
+  // corners 0 (u1, v1), 1 (u2, v1), 2 (u1, v2), 3 (u2, v2): Supermodel's p0q0, p1q0, p0q1, p1q1
+  auto take = [&](int s, int d) { if ((c[s] >> 24) > (c[d] >> 24)) c[d] = (c[d] & 0xff000000u) | (c[s] & 0x00ffffffu); };
+  take(0, 1); take(0, 2);
+  take(1, 0); take(1, 3);
+  take(2, 0); take(2, 3);
+  take(3, 2); take(3, 1);
 }
 
 // MAME get_texture's decode of one 16-bit texel, ARGB8888

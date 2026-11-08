@@ -20,24 +20,37 @@
 //   - port B is MAME's model3 input_r: PA bit 0 selects bank 1 (IN1: test B
 //     bit 7, service B bit 6, the EEPROM's DO in bit 5, bits 4:0 unused and
 //     high) or bank 0 (IN0: coins, test A, service A, starts);
-//   - port G is the DIP bank. MAME's default is 0xFF; Supermodel returns 0x7F
-//     (its comment: a side effect on Ocean Hunter otherwise). The bench's
-//     oracle is a Supermodel trace, so the parameter's default is 0x7F
-//     (sim/system/notes.md);
+//   - port G is the CPU board's DIP bank (dsw: the MRA's <switches>, index
+//     254, the OSD's DIP Switches page, m3_loader). MAME's default is 0xFF
+//     (all eight OFF); Supermodel returns 0x7F (its comment: a side effect on
+//     Ocean Hunter otherwise), and that stays the default for an MRA that
+//     does not set it. Lost World reads SW1 (bit 7) at start-up and, when it
+//     is ON (0), never enables its I-cache (study R133), so its MRA's default
+//     is 0xFF;
 //   - the analog channels read 0x00, as Supermodel gives VF3 (the trace's
 //     F004003C reads); MAME has the AN ports at their defaults;
 //   - no gun board, no lamps or billboard outputs (written, not driven).
 // Port semantics (MAME sega/315_5649.cpp): offsets 0-6 ports A-G, a read is
 // the input when the direction bit is 1, else the latch; 8 direction (0xFF
-// at reset); 0xB 0x00, 0xD 0x0C (MAME's serial hack); 0xE mode; 0xF analog:
+// at reset); 0xB 0x00, 0xD SER_ST; 0xE mode; 0xF analog:
 // a read returns the channel and steps it, a write selects it. Other reads
 // 0xFF. Direction and mode reset with the game; the latches, the analog
 // channel and the EEPROM only at power-on.
+//
+// SER_ST, the serial ports' status (offset 0xD, F0040034): no serial device is
+// built, so it reads 0x00, Supermodel's value when no serial gun is attached.
+// MAME returns 0x0C always (its "serial hack") and answers The Lost World's
+// gun-board conversation. Lost World is the only dumped game seen to read it
+// (Supermodel traces of VF3, Bass Fishing, Daytona 2 and Scud Race never touch
+// F0040024-37): it sends a command and polls for (status & 0x0C) == 0x0C 120
+// times; with 0x0C it goes on to talk to a serial gun board and keeps a flag
+// that it found one (RAM 0x1A3474 = 0), with 0 it falls back to its analog
+// guns on the ADC (flag 1), as Supermodel runs it. SER_ST = 8'h0C is MAME's.
 
 module m3_io #(
-  parameter logic [7:0] DSW = 8'h7F,
   parameter int         EE_TWP = 200000,  // the EEPROM's busy time after a write, clocks (m3_93c46)
-  parameter bit         EE_LOAD = 1'b0    // the 93C46's load port (the MRA's <nvram>, study R100)
+  parameter bit         EE_LOAD = 1'b0,   // the 93C46's load port (the MRA's <nvram>, study R100)
+  parameter logic [7:0] SER_ST = 8'h00    // the serial status at 0xD (no serial device; MAME 0x0C)
 ) (
   input  logic        clk,
   input  logic        por_n,
@@ -52,6 +65,7 @@ module m3_io #(
   input  logic        service_b_n,
   input  logic [7:0]  in2,          // player 1
   input  logic [7:0]  in3,          // player 2
+  input  logic [7:0]  dsw,          // the DIP bank, port G (active low: 0 is ON)
   output logic [7:0]  pa_q,         // port A's latch (the overlay)
   input  logic        ee_ld_we,     // the 93C46's load port (EE_LOAD), the game in reset
   input  logic [5:0]  ee_ld_a,
@@ -79,13 +93,13 @@ module m3_io #(
       3'd1:    pin = pb_in;
       3'd2:    pin = in2;
       3'd3:    pin = in3;
-      3'd6:    pin = DSW;
+      3'd6:    pin = dsw;
       default: pin = 8'hff;
     endcase
     if (off <= 4'd6) rbyte = dir[off[2:0]] ? pin : pv[off[2:0]];
     else case (off)
       4'hb:    rbyte = 8'h00;
-      4'hd:    rbyte = 8'h0c;
+      4'hd:    rbyte = SER_ST;
       4'hf:    rbyte = 8'h00;
       default: rbyte = 8'hff;
     endcase

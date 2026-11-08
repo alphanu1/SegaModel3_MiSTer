@@ -23,14 +23,15 @@
 // each) were two thirds of the front's area.
 //
 // The vertices pass through beside the quotients, so this block sits directly
-// in front of the edge walker.
+// in front of the edge walker. The pair's tag rides with them (study R131).
 
 module r3d_rast_div #(
   // PRE = 1 (study R109; the rasteriser's own instance): the inputs hold for at least a cycle before
   // they are taken (r3d_rast's triangle registers are written beats before the record ends and hold
   // until t_go), so the differences' magnitudes and the flags are registered and only taken at go: the
   // subtract, the negate and the select were in front of the lanes' n_r.
-  parameter bit PRE = 1'b0
+  parameter bit PRE = 1'b0,
+  parameter int TGW = 8
 ) (
   input  logic               clk,
   input  logic               rst,
@@ -38,10 +39,12 @@ module r3d_rast_div #(
   input  logic               i_valid,
   output logic               i_ready,
   input  logic signed [31:0] i_x1, i_y1, i_x2, i_y2, i_x3, i_y3,
+  input  logic     [TGW-1:0] i_tag,
 
   output logic               o_valid,
   input  logic               o_ready,
   output logic signed [31:0] o_x1, o_y1, o_x2, o_y2, o_x3, o_y3,
+  output logic     [TGW-1:0] o_tag,
   output logic signed [53:0] o_s12, o_s13, o_s23   // held while o_valid
 );
 
@@ -147,7 +150,7 @@ module r3d_rast_div #(
       if (o_valid && o_ready) o_valid <= 1'b0;
       if (go) begin
         busy    <= 1'b1;
-        o_x1 <= i_x1; o_y1 <= i_y1; o_x2 <= i_x2; o_y2 <= i_y2; o_x3 <= i_x3; o_y3 <= i_y3;
+        o_x1 <= i_x1; o_y1 <= i_y1; o_x2 <= i_x2; o_y2 <= i_y2; o_x3 <= i_x3; o_y3 <= i_y3; o_tag <= i_tag;
         for (int j = 0; j < 3; j++) begin
           neg[j]  <= h_neg[j];
           zero[j] <= h_zero[j];

@@ -127,7 +127,7 @@ public:
   // The per-polygon LOD word (study D-33, R67; r3d_geo.sv LOD_WORD): with
   // sm_cull, each 'T' record ends with two more words, the facing dot d and
   // B = d x (NP x C) in FP32 with flush to zero (r3d_face.sv's order), NP =
-  // header[5] bits 8-31 / 4096, C = -cota kz^2 a viewport (cota viewport word
+  // header[5] bits 8-31 / 4096 (/ 16384 from Step 1.5), C = -cota kz^2 a viewport (cota viewport word
   // 3; kz^2 = 1 with Supermodel's frustum, else the product kz kz). The
   // inverted copy of a double-sided polygon carries -d and -B.
   bool lod_word = false;

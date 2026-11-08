@@ -70,13 +70,17 @@ module m3_compose #(
   output logic [15:0] n_late          // lines shown before they landed
 );
 
-  // the buffer: taken at the line-384 start; its high bit is an offset
+  // the buffer: taken through line 384; its high bit is an offset. r3d_cmd
+  // moves show_buf at the line-384 start (its vbl, a clock after vcnt reaches
+  // 384), so a take on vcnt's first clock at 384 got the buffer before it, the
+  // one r3d_cmd had already freed: the scan-out showed a frame late, and a
+  // frame ending in the next one could be drawn into the buffer on screen.
   logic [1:0] buf_q;
   logic [9:0] vq;
   always_ff @(posedge clk) begin
     vq <= vcnt;
     if (!rst_n) buf_q <= 2'd0;
-    else if (vcnt == 10'd384 && vq != 10'd384) buf_q <= show_buf;
+    else if (vcnt == 10'd384) buf_q <= show_buf;
   end
 
   // the line three ahead of the beam (m3v_core, Model 2 R655 / R657)

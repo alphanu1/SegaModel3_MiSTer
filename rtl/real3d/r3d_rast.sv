@@ -61,8 +61,16 @@
 module r3d_rast #(
   parameter bit MIP = 1'b0,         // nearest mip level (study D-33): a fifth header word
   parameter int SB  = 8,            // texture cache sets: 8 = 32 KiB, 9 = 64 KiB
-  parameter int LB  = 17,           // store: log2 beats a list region
-  parameter int BB  = 11            // store: log2 beats a bin's run list
+  parameter int LB  = 19,           // store: log2 beats a list's share (study R136: 17 dropped Daytona 2's records)
+  parameter bit PAIR = 1'b1,        // store: a pass's opaque and alpha lists share 2^(LB+1) beats (study R136)
+  parameter logic [24:0] RUNO = 25'(1 << (LB + 4)),   // store: the run lists, words from store_base
+  parameter int BB  = 12,           // store: log2 beats a bin's run list (study R136: 12)
+  parameter bit FOV = 1'b1,         // study R131: a pair enters the front while the one before it walks
+  parameter bit TSPLIT = 1'b1,      // study R131: ring A carries the texel's stage-2 banks and fractions
+  parameter bit L8K = 1'b1,         // study R134: an L8 texel of 0xFF has alpha 0 (Supermodel); 0: MAME's decode
+  // study R135: Supermodel's texture decode (format 2, contour on formats 1-4), contour's dilation and test,
+  // texture alpha and translucency on textured polygons (r3d_rast_texel, r3d_rast_colour); 0: MAME's
+  parameter bit SMTX = 1'b1
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -120,6 +128,7 @@ module r3d_rast #(
   output logic [15:0] st_rec, st_drop, st_run,
   output logic [17:0] st_pair,
   output logic [2:0]  st_ovf,
+  output logic [15:0] st_novf,      // study R136: frames whose binning overflowed the store, since reset
   output logic        vp_ovf        // more than 64 viewports in a frame
 );
 
@@ -179,7 +188,7 @@ module r3d_rast #(
   logic        r_valid, r_ready, r_last, r_new, st_eob, st_next;
   logic [31:0] r_data;
   logic [5:0]  band;
-  r3d_rast_store #(.MIP(MIP), .LB(LB), .BB(BB)) u_store (
+  r3d_rast_store #(.MIP(MIP), .LB(LB), .PAIR(PAIR), .RUNO(RUNO), .BB(BB)) u_store (
     .clk, .rst, .base(store_base),
     .b_ready(f_ready), .b_begin(f_begin), .b_end(f_end), .b_bank(st_bbank), .b_busy(f_binning),
     .w_valid(i_valid && !i_isvp), .w_ready(st_wready), .w_data(i_data), .w_last(i_last),
@@ -189,7 +198,7 @@ module r3d_rast #(
     .o_band(band), .o_eob(st_eob), .o_next(st_next), .p_busy(st_pbusy),
     .m_req(s_req), .m_we(s_we), .m_addr(s_addr), .m_blen(s_blen), .m_din(s_din), .m_be(s_be),
     .m_wacc(s_wacc), .m_rvalid(s_rvalid), .m_ack(s_ack), .m_dout(s_dout),
-    .n_rec(st_rec), .n_pair(st_pair), .n_run(st_run), .n_drop(st_drop), .ovf(st_ovf));
+    .n_rec(st_rec), .n_pair(st_pair), .n_run(st_run), .n_drop(st_drop), .ovf(st_ovf), .n_ovff(st_novf));
 
   // the frame's layer and scroll fog, by bank
   logic [24:0] bk_fb [2];
@@ -260,6 +269,10 @@ module r3d_rast #(
 
   // kind (r3d_rast.h kind_of): w0[20:15] = {colormod, contour, texture, mirror v, mirror u, page}
   wire       k_tex = th0[18], k_ctr = th0[19], k_cm = th0[20], t_alpha = th0[2];
+  // study R135: the record's param bit 0 (th0[15]) is texture alpha alone, word 3 bit 14 (th3) texture
+  // inversion; the colour's alpha mode {inversion, alpha test (contour, not format 7), texture alpha,
+  // colour modulation}
+  wire [3:0] t_am = {th3[14], k_ctr && th0[14:12] != 3'd7, th0[15], k_cm};
   wire [2:0] kind = k_tex ? (t_alpha ? K_TEX_ALPHA : k_ctr ? K_CONTOUR : k_cm ? K_TEX_CM : K_TEX)
                           : (t_alpha ? K_SOLID_TRANS : K_SOLID);
   wire [1:0] kind_zk = (kind == K_CONTOUR) ? 2'd2 :
@@ -273,21 +286,39 @@ module r3d_rast #(
   // ===========================================================================
   logic        f_tready, f_busy, f_svalid, f_sready;
   logic [8:0]  f_sy, f_sx0, f_sx1;
-  logic [7:0]  tag_n, cur_tag;
+  logic [7:0]  tag_n, cur_tag, f_stag, f_stag_n;
   logic [1:0]  cur_zk;
   logic signed [39:0] zc, zdx, zdy;
   logic signed [8:0]  ze;
 
-  assign t_go = t_full && f_tready && !f_busy && !f_svalid;
+  // FOV (study R131): the pair's tag goes with it through the front, and what the span path takes at
+  // s_take (the Z plane, the Z kind) waits in table Z by that tag, so the next pair enters the divider
+  // while this one walks. A pass's first record (a new Z generation) still waits for the front to empty,
+  // so the generation lands on the first span taken after it, as before.
+  assign t_go = t_full && f_tready && ((FOV && !t_gen) || (!f_busy && !f_svalid));
 
   // the triangle's words are in tv beats before the record ends and hold until t_go (PRE_DIV, study R109)
-  r3d_rast_front #(.PRE_DIV(1'b1)) u_front (
+  r3d_rast_front #(.PRE_DIV(1'b1), .TGW(8)) u_front (
     .clk, .rst,
     .t_valid(t_go), .t_ready(f_tready),
     .t_x1(tv[0]), .t_y1(tv[1]), .t_x2(tv[2]), .t_y2(tv[3]), .t_x3(tv[4]), .t_y3(tv[5]),
-    .t_b0({band, 3'd0}), .t_b1({band, 3'd0} + 9'd8),
+    .t_b0({band, 3'd0}), .t_b1({band, 3'd0} + 9'd8), .t_tag(tag_n),
     .s_valid(f_svalid), .s_ready(f_sready), .s_y(f_sy), .s_x0(f_sx0), .s_x1(f_sx1),
+    .s_tag(f_stag), .s_tag_n(f_stag_n),
     .busy(f_busy));
+
+  // table Z: {Z kind, the 1/w plane} by tag, written at t_go, read registered at the tag the span
+  // register will hold, so its word is the span's whenever the Z walk takes it
+  (* ramstyle = "M10K, no_rw_check" *) logic [130:0] tabz [256];
+  logic [130:0] tz_q;
+  always_ff @(posedge clk) begin
+    if (t_go) tabz[tag_n] <= {kind_zk, pc[0], pdx[0], pdy[0], pe[0]};
+    tz_q <= tabz[f_stag_n];
+  end
+  always_comb begin
+    {cur_zk, zc, zdx, zdy, ze} = tz_q;
+    cur_tag = f_stag;
+  end
 
   // table 1, read as the pixel enters the interpolants: shade, u, v (c 40,
   // dx and dy [30:0], e 9), the 1/w plane's e, textured; MIP the LOD terms
@@ -296,8 +327,9 @@ module r3d_rast #(
   (* ramstyle = "M10K, no_rw_check" *) logic [T1W-1:0] tab1 [256];
   // table 2, read as the pixel leaves them: the texture's words {page, x / 32,
   // y / 32, w, h, mirror u, mirror v, format}, the colour's {kind,
-  // transparency, colour}, fog's {viewport, intensity}
-  localparam int T2W = 23 + 3 + 6 + 24 + 6 + 5;
+  // transparency, colour}, fog's {viewport, intensity}; then (study R135) the
+  // contour bit and the alpha mode (two M10K as before: 72 of 80 bits)
+  localparam int T2W = 23 + 3 + 6 + 24 + 6 + 5 + 5;
   (* ramstyle = "M10K, no_rw_check" *) logic [T2W-1:0] tab2 [256];
   function automatic logic [110:0] pl(input logic [39:0] c, input logic [39:0] dx, input logic [39:0] dy, input logic [8:0] e);
     pl = {c, dx[30:0], dy[30:0], e};
@@ -318,7 +350,7 @@ module r3d_rast #(
     if (t_go) begin
       tab1[tag_n] <= t1_wd;
       tab2[tag_n] <= {th0[5], th1[25:20], th1[30:26], th0[8:6], th0[11:9], th0[16], th0[17], th0[14:12],
-                      kind, th0[26:21], th2[23:0], t_vp, t_fogint};
+                      kind, th0[26:21], th2[23:0], t_vp, t_fogint, k_ctr, t_am};
     end
     t1_q <= tab1[t1_ra];
     t2_q <= tab2[t2_ra];
@@ -327,11 +359,7 @@ module r3d_rast #(
   logic gen_carry;                          // a new generation waits for the next span
   always_ff @(posedge clk) begin
     if (rst) tag_n <= 8'd0;
-    else if (t_go) begin
-      tag_n <= tag_n + 8'd1;
-      cur_tag <= tag_n; cur_zk <= kind_zk;
-      zc <= pc[0]; zdx <= pdx[0]; zdy <= pdy[0]; ze <= pe[0];
-    end
+    else if (t_go) tag_n <= tag_n + 8'd1;
   end
 
   // ===========================================================================
@@ -499,17 +527,19 @@ module r3d_rast #(
     end
   end
   // table 2's fields
-  wire        a_page = t2_q[66];
-  wire [5:0]  a_tx = t2_q[65:60];
-  wire [4:0]  a_ty = t2_q[59:55];
-  wire [2:0]  a_tw = t2_q[54:52], a_th = t2_q[51:49];
-  wire        a_mu = t2_q[48], a_mv = t2_q[47];
-  wire [2:0]  a_fmt = t2_q[46:44];
-  wire [2:0]  a_kind = t2_q[43:41];
-  wire [5:0]  a_trans = t2_q[40:35];
-  wire [23:0] a_col = t2_q[34:11];
-  wire [5:0]  a_vp = t2_q[10:5];
-  wire [4:0]  a_fogint = t2_q[4:0];
+  wire        a_page = t2_q[71];
+  wire [5:0]  a_tx = t2_q[70:65];
+  wire [4:0]  a_ty = t2_q[64:60];
+  wire [2:0]  a_tw = t2_q[59:57], a_th = t2_q[56:54];
+  wire        a_mu = t2_q[53], a_mv = t2_q[52];
+  wire [2:0]  a_fmt = t2_q[51:49];
+  wire [2:0]  a_kind = t2_q[48:46];
+  wire [5:0]  a_trans = t2_q[45:40];
+  wire [23:0] a_col = t2_q[39:16];
+  wire [5:0]  a_vp = t2_q[15:10];
+  wire [4:0]  a_fogint = t2_q[9:5];
+  wire        a_ctr = t2_q[4];
+  wire [3:0]  a_am = t2_q[3:0];
   // the fog table, read R to F1 (on en_f, so it holds with the pixel)
   assign tf_ra = {st_pbank, a_vp};
 
@@ -518,7 +548,10 @@ module r3d_rast #(
   logic [6:0] pn;                           // the next pixel number
   wire        r_go = en_f && r_v;
   localparam int LVW = 4;                  // the level (0 without MIP; ring A has the room)
-  localparam int RAW = 21 + 21 + 23 + LVW, RBW = 3 + 6 + 24 + 32 + 5, RCW = 9 + 9 + 1;
+  // ring A: the filter's inputs. TSPLIT: {banks, fu, fv, format, contour}, written at F2 from the address
+  // instance and read at the filter's stage 1 (SMTX: going into stage 1); else {u, v, the texture's words,
+  // contour, level} at R. Ring B: the colour's {kind, transparency, colour, shade, fog intensity, alpha mode}.
+  localparam int RAW = TSPLIT ? 8 + 8 + 8 + 3 + 1 : 21 + 21 + 23 + 1 + LVW, RBW = 3 + 6 + 24 + 32 + 5 + 4, RCW = 9 + 9 + 1;
   (* ramstyle = "M10K, no_rw_check" *) logic [RAW-1:0] ring_a [128];
   (* ramstyle = "M10K, no_rw_check" *) logic [RBW-1:0] ring_b [128];
   (* ramstyle = "M10K, no_rw_check" *) logic [RCW-1:0] ring_c [128];
@@ -526,14 +559,24 @@ module r3d_rast #(
   logic [RAW-1:0] rq_a, ra_wd;
   logic [RBW-1:0] rq_b;
   logic [RCW-1:0] rq_c;
-  always_comb begin
-    ra_wd[RAW-1 -: 65] = {r_u[20:0], r_vv[20:0], a_page, a_tx, a_ty, a_tw, a_th, a_mu, a_mv, a_fmt};
-    ra_wd[LVW-1:0] = r_lv;
-  end
+  logic [7:0]  tf_bk, tf_fu, tf_fv;
+  logic [2:0]  tf_fmt;
+  logic        tf_ctr;
+  logic        f2_v;
+  logic [6:0]  f2_n;
+  generate if (TSPLIT) begin : g_raw
+    always_comb ra_wd = {tf_bk, tf_fu, tf_fv, tf_fmt, tf_ctr};
+    always_ff @(posedge clk) if (f2_v && en_f) ring_a[f2_n] <= ra_wd;
+  end else begin : g_raw0
+    always_comb begin
+      ra_wd[RAW-1 -: 66] = {r_u[20:0], r_vv[20:0], a_page, a_tx, a_ty, a_tw, a_th, a_mu, a_mv, a_fmt, a_ctr};
+      ra_wd[LVW-1:0] = r_lv;
+    end
+    always_ff @(posedge clk) if (r_go) ring_a[pn] <= ra_wd;
+  end endgenerate
   always_ff @(posedge clk) begin
     if (r_go) begin
-      ring_a[pn] <= ra_wd;
-      ring_b[pn] <= {a_kind, a_trans, a_col, r_shade, a_fogint};
+      ring_b[pn] <= {a_kind, a_trans, a_col, r_shade, a_fogint, a_am};
       ring_c[pn] <= {r_x, r_y, r_ctr && (a_kind == K_CONTOUR)};
     end
     rq_a <= ring_a[ra_a];
@@ -543,16 +586,18 @@ module r3d_rast #(
 
   // F: the texel path's address stages (its filter is not used)
   logic [19:0] fa0, fa1, fa2, fa3;
-  r3d_rast_texel #(.TW(1), .MIP(MIP)) u_tf (
+  r3d_rast_texel #(.TW(1), .MIP(MIP), .PART(TSPLIT ? 1 : 0), .L8K(L8K), .SMTX(SMTX)) u_tf (
     .clk, .rst, .en(en_f),
     .i_valid(r_v), .i_tag(1'b0), .i_u(r_u), .i_v(r_vv), .i_page(a_page), .i_tx(a_tx), .i_ty(a_ty),
-    .i_tw(a_tw), .i_th(a_th), .i_mu(a_mu), .i_mv(a_mv), .i_fmt(a_fmt), .i_lv(r_lv),
+    .i_tw(a_tw), .i_th(a_th), .i_mu(a_mu), .i_mv(a_mv), .i_fmt(a_fmt), .i_ctr(a_ctr), .i_lv(r_lv),
     .m_a0(fa0), .m_a1(fa1), .m_a2(fa2), .m_a3(fa3), .m_re(),
     .m_q0(16'd0), .m_q1(16'd0), .m_q2(16'd0), .m_q3(16'd0),
+    .o2_bk(tf_bk), .o2_fu(tf_fu), .o2_fv(tf_fv), .o2_fmt(tf_fmt), .o2_ctr(tf_ctr), .o_tagr(),
+    .i3_bk(8'd0), .i3_fu(8'd0), .i3_fv(8'd0), .i3_fmt(3'd0), .i3_ctr(1'b0), .i1_f(20'd0),
     .o_valid(), .o_tag(), .o_tag_e(), .o_texel());
   // its two stages' valid, pixel number and texture flag; F1 also holds fog's inputs
-  logic       f1_v, f2_v, f1_t, f2_t, f1_pos;
-  logic [6:0] f1_n, f2_n;
+  logic       f1_v, f1_t, f2_t, f1_pos;
+  logic [6:0] f1_n;
   logic [24:0] f1_r;
   logic [5:0]  f1_nn;
   logic signed [8:0] f1_eo;
@@ -621,7 +666,8 @@ module r3d_rast #(
   // the back domain: never stalls
   // ===========================================================================
   wire tc_pop = tc_ovalid && tc_oready;
-  assign ra_a = tc_pay;
+  logic [6:0] tb_n2;                       // the filter's stage-1 pixel (TSPLIT: ring A's read, registered into its stage 3)
+  assign ra_a = TSPLIT ? tb_n2 : tc_pay;
   // the cache's words wait four cycles for the filter's stage 3 (an MLAB line,
   // read synchronously: the word written four cycles ago, registered; in M10K,
   // study R98: -40 ALM of MLAB, +2 M10K; the read is never at the written address)
@@ -636,6 +682,22 @@ module r3d_rast #(
     wq_m <= wdl[3'(wdp - 3'd2)];
     wq <= wq_m;
   end
+  // study R135: each word's {bit 15, nibbles all ones}, for the filter's dilation selects in its stage 2:
+  // a copy of the line's flags read a cycle earlier (the word the filter's stage 1 holds), so its stage 2
+  // forms the selects from registers. 8 x 20 bits.
+  logic [19:0] wf_m;
+  generate if (TSPLIT && SMTX) begin : g_wdf
+    function automatic logic [4:0] flw(input logic [15:0] w);
+      flw = {w[15], &w[15:12], &w[11:8], &w[7:4], &w[3:0]};
+    endfunction
+    (* ramstyle = "MLAB, no_rw_check" *) logic [19:0] wdf [8];   // the read is never at the written address
+    always_ff @(posedge clk) begin
+      wdf[wdp] <= {flw(tq3), flw(tq2), flw(tq1), flw(tq0)};
+      wf_m <= wdf[3'(wdp - 3'd1)];
+    end
+  end else begin : g_nowdf
+    assign wf_m = '0;
+  end endgenerate
 
   logic       b_in_v;
   logic [6:0] b_in_n;
@@ -644,19 +706,33 @@ module r3d_rast #(
     else b_in_v <= tc_pop;
     b_in_n <= tc_pay;
   end
-  wire [20:0] b_u = rq_a[RAW-1 -: 21], b_v = rq_a[RAW-22 -: 21];
-  wire [22:0] b_t = rq_a[RAW-43 -: 23];
-  wire [3:0]  b_lv = MIP ? rq_a[3:0] : 4'd0;
+  logic [20:0] b_u, b_v;
+  logic [22:0] b_t;
+  logic        b_ctr;
+  logic [3:0]  b_lv;
+  generate if (TSPLIT) begin : g_rqa
+    always_comb begin b_u = '0; b_v = '0; b_t = '0; b_ctr = 1'b0; b_lv = '0; end    // the filter takes stage 3 from ring A
+  end else begin : g_rqa0
+    always_comb begin
+      b_u = rq_a[RAW-1 -: 21]; b_v = rq_a[RAW-22 -: 21];
+      b_t = rq_a[RAW-43 -: 23];
+      b_ctr = rq_a[LVW];
+      b_lv = MIP ? rq_a[3:0] : 4'd0;
+    end
+  end endgenerate
   logic        tb_valid;
   logic [6:0]  tb_n;
   logic [31:0] tb_texel;
-  r3d_rast_texel #(.TW(7), .MIP(MIP)) u_tb (
+  r3d_rast_texel #(.TW(7), .MIP(MIP), .PART(TSPLIT ? 2 : 0), .L8K(L8K), .SMTX(SMTX)) u_tb (
     .clk, .rst, .en(1'b1),
     .i_valid(b_in_v), .i_tag(b_in_n), .i_u({11'd0, b_u}), .i_v({11'd0, b_v}),
     .i_page(b_t[22]), .i_tx(b_t[21:16]), .i_ty(b_t[15:11]), .i_tw(b_t[10:8]), .i_th(b_t[7:5]),
-    .i_mu(b_t[4]), .i_mv(b_t[3]), .i_fmt(b_t[2:0]), .i_lv(b_lv),
+    .i_mu(b_t[4]), .i_mv(b_t[3]), .i_fmt(b_t[2:0]), .i_ctr(b_ctr), .i_lv(b_lv),
     .m_a0(), .m_a1(), .m_a2(), .m_a3(), .m_re(),
     .m_q0(wq[15:0]), .m_q1(wq[31:16]), .m_q2(wq[47:32]), .m_q3(wq[63:48]),
+    .o2_bk(), .o2_fu(), .o2_fv(), .o2_fmt(), .o2_ctr(), .o_tagr(tb_n2),
+    .i3_bk(rq_a[RAW-1 -: 8]), .i3_fu(rq_a[RAW-9 -: 8]), .i3_fv(rq_a[RAW-17 -: 8]), .i3_fmt(rq_a[3:1]),
+    .i3_ctr(rq_a[0]), .i1_f(wf_m),
     .o_valid(tb_valid), .o_tag(tb_n), .o_tag_e(tb_ne), .o_texel(tb_texel));
 
   // the colour's inputs from rings B, D1 and D2, a cycle on
@@ -672,11 +748,11 @@ module r3d_rast #(
   logic [6:0]  co_n;
   logic [7:0]  co_fb;
   logic [23:0] co_rgb;
-  r3d_rast_colour #(.TW(7)) u_col (
+  r3d_rast_colour #(.TW(7), .SMTX(SMTX)) u_col (
     .clk, .rst, .en(1'b1),
     .i_valid(cb_v), .i_tag(cb_n), .i_kind(rq_b[RBW-1 -: 3]), .i_texel(cb_texel),
-    .i_color(rq_b[60:37]), .i_trans(rq_b[66:61]), .i_shade(rq_b[36:5]),
-    .i_fogint(rq_b[4:0]), .i_fc(rq_d1[23:0]), .i_fs({{4{rq_d1[37]}}, rq_d1[37:24]}), .i_fp(rq_d2),
+    .i_color(rq_b[64:41]), .i_trans(rq_b[70:65]), .i_shade(rq_b[40:9]),
+    .i_fogint(rq_b[8:4]), .i_am(rq_b[3:0]), .i_fc(rq_d1[23:0]), .i_fs({{4{rq_d1[37]}}, rq_d1[37:24]}), .i_fp(rq_d2),
     .o_valid(co_v), .o_tag(co_n), .o_ok(co_ok), .o_zw(co_zw), .o_fbv(co_fbv), .o_fb(co_fb), .o_rgb(co_rgb));
 
   // ring C a cycle on: the pixel's place; the contour verdict

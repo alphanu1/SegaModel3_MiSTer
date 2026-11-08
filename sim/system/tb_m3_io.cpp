@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
   while (std::fread(&r, sizeof r, 1, f) == 1) tr.push_back(r);
   std::fclose(f);
   t = new Vm3_io;
-  t->in0 = 0xff; t->test_b_n = 1; t->service_b_n = 1; t->in2 = 0xff; t->in3 = 0xff;
+  t->in0 = 0xff; t->test_b_n = 1; t->service_b_n = 1; t->in2 = 0xff; t->in3 = 0xff; t->dsw = 0x7f;
   t->por_n = 0; t->rst_n = 0; t->sel = 0; t->clk = 0; t->eval();
   tick(); t->por_n = 1; t->rst_n = 1; tick(); tick();
   long rd = 0, wr = 0, bad = 0, ee_rd = 0, busy_runs = 0, polls = 0;

@@ -1095,7 +1095,7 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-36 | Two-word fetch (`FETCH2`) is turned off, and the BTB and the 603e look-ahead stay. The projection (R81) is about 41.4K ALM with it, over the 41,000 ceiling, and about 40.6K without. It costs about 880 ALM for 5 frames lost in 56,700 (R78). It stays a parameter. The default changes only after the core regression has passed with `FETCH2 = 0`, `BTB = LA = 1`, a combination not yet benched on its own. Built 2026-11-01 (R83): the saving measured about 520 ALM, not 880. |
 | D-37 | The first proof of concept is VF3's attract mode, without I/O or sound. Sound stays out (D-8). I/O is a stub: no coin, no buttons, service and test off, and the JVS/I/O board reads as idle, so the game runs its attract loop. Staged: (A) CPU, MPC105 bridge and memory map, board RAM, ROMs in SDRAM from the MRA, interrupts, the 53C810, the tile generator and video out, with the Real3D as a status-handshake stub. Pass: the warning and SEGA logo screens, which are tile layers (R84). (B) The Real3D fed live by the CPU and the 53C810: polygon RAM, textures and culling through the real geometry and rasteriser, composited with the tiles. Pass: the attract fights drawn. |
 | D-38 | The CPU's long-term target is 110 MHz, closing at every corner, rather than buying back frames with area. At 110 MHz the CPI model loses 0 frames at singles-at-4 and 3 at the built fast path (R83). That is what two-word fetch (about 520 ALM) would buy at 100 MHz, so it stays off (D-36). The release keeps 100 MHz until 110 closes. Every CPU timing fix now aims for margin toward 9.09 ns, not just closure at 10 ns. This revises R58's 110 MHz from an aim to the target, after D-30. |
-| D-39 | A misaligned integer access that crosses a 4 KB page is split in hardware inside a BAT block. It takes the alignment exception only when page-translated (MSR[DR]=1, no BAT hit) or when the crossing leaves the BAT block. The 603e manual's §4.5.6.1.1 is ambiguous for BAT regions; MAME splits and never traps; Supermodel has no MMU. Model 3's boot ROM treats every alignment exception as fatal, so no game relies on the trap: if the chip traps, games never do this, and if it splits, games that do it keep working. Misaligned accesses within a page are split in hardware as the manual says (R85). |
+| D-39 | A misaligned integer access that crosses a 4 KB page is split in hardware inside a BAT block. It takes the alignment exception only when page-translated (MSR[DR]=1, no BAT hit) or when the crossing leaves the BAT block. The 603e manual's §4.5.6.1.1 is ambiguous for BAT regions; MAME splits and never traps; Supermodel has no MMU. Model 3's boot ROM treats every alignment exception as fatal, so no game relies on the trap: if the chip traps, games never do this, and if it splits, games that do it keep working. Misaligned accesses within a page are split in hardware as the manual says (R85). *Amended by R124 (2026-11-07): Scud Race and Bass Fishing both make this access under page translation, so the 603e splits it in every mode; the trap is kept only for 4.5.6's list and an FP double crossing a page outside a BAT.* |
 | D-40 | Test builds may run up to about 41,500 ALM with loose slack; a release must close every corner and come in under budget, which may need optimisation. The attract proof of concept (D-37) has no sound (about 4,360 ALM, R81) and no real I/O, so it projects at about 22K (stage A, R85) + geometry 7.9K + rasteriser about 8K + stage B about 1K, about 39K: well under. |
 | D-41 | The CPU reports PVR 0x00060103 (603e rev 1.3, "Stretch") on Step 1.0, as MAME does; Supermodel uses 0x00071202 (603r). VF3's boot code and miss handler test the PVR. With version 6 and revision below 0x0103 they set W in every BAT and in the RPA, working round an early 603e bug, so the core's former 0x00060101 ran RAM write-through on a path neither emulator takes. At 1.3, RAM is copy-back. The board's real revision is unknown. The value is a parameter of `ppc_cpu`, set per step in the system (D-14). The CPU test harness keeps its own default, so its signatures do not move. Revised the same day: VF3 never flushes the D-cache before the 53C810 reads RAM. Its SCRIPTS lists and DMA sources can sit dirty, and the real board stays coherent only because the MPC105 snoops PCI master cycles and the 603e casts out the dirty line. Our D-cache has no snoop port. So board builds stay on 0x00060101 (write-through, DMA correct) until a snoop port is built and proven: DMA reads cast out dirty lines first, DMA writes invalidate. Then the system moves to 0x00060103. Done in R101: the snoop is wired in `m3_bus` and `m3_system`'s default is 0x00060103. |
 | D-42 | Daytona 2's proof of concept accepts its geometry at about 118% of a frame (R76). Heavy frames then take two frames to draw, about 30 fps there, which is fine for a proof of concept. Its ROM beyond the 128 MiB SDRAM (about 200 MiB in all) goes to DDR3 while the second SDRAM is awaited: video ROM first, since it is read model by model and prefetchable (R82's numbers leave room). I want one core for every step, as D-14 says, not separate RBFs as on Model 2. Per-step hardware is selected at run time from the game ID wherever area allows. |
@@ -1103,6 +1103,9 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-44 | (2026-11-06) The clock is 110 MHz across the board, superseding D-43's 120. R113 priced 120 MHz for the CPU: at best 3-4% more instructions a second than 110, and 1-4% fewer if the load request needs its own stage, with nothing shown to close; load-use 2 and single latency 4 at 110 (up to 8.5% / 5.5%) collide with it on the same paths. So the CPU's speed comes from cycles at 110: the core's latencies toward the 603e manual and the miss path (R112). The rest of D-43 stands with 110 in place of 120: a throughput trade must hold each frame's budget at 110 MHz, no block's standalone Fmax may drop, and the area target is unchanged. At 110 the Daytona 2 rasteriser's p99 is about 94% of a frame and its worst about 104% (R109's 86.4% / 95.2% at 120), so the Real3D has no cycles left to trade there. |
 | D-45 | (2026-11-06) Sound stays in the FPGA if it fits; that is the plan and what I would rather do. The fallback, if the area runs out, is sound on the HPS's ARM: the 68000 and the two SCSPs emulated there, with the samples streamed to the FPGA's audio out. The area plan (R105, R110: about 4,500 ALM for sound, 1,000 for I/O) keeps aiming at the FPGA. The ARM route is only a backstop, and it would have to meet the zero-added-latency rule and leave MiSTer Main its share of the CPU. |
 | D-46 | (2026-11-06) Step 1.5 comes into scope, superseding §12's "follow-on, not in scope". Scud Race goes first, from the `scuddxo` set (Scud Race Deluxe), and then its speed is measured on the board. §12's list is the starting point: the 13.11 position format and culling-node layout, the texture port, and the CPU clock (`[OPEN]`). The MPEG sound board (DSB) stays out until sound goes in (D-45). |
+| D-47 | (2026-11-07) The instruction cache is 32 KB, twice the 603e's 16 KB, behind `m3_system`'s `ISB` parameter (on in `Model3.sv`; 0 builds the 603e's 16 KB). It costs 12 M10K (324 to 336 of 553) and about 64 ALM, and takes Daytona 2's work CPI down 8.7% and VF3's 1.9% with R121's other two changes, halving Daytona 2's instruction fills. On the `ppc_cpu` spike it costs about 1.7 MHz at slow −40 °C, inside D-44's margin as far as five seeds resolve. It is a step away from the 603e's size taken for speed, not accuracy: the cache's behaviour (physically tagged, icbi clearing both possible sets) is unchanged, and so is anything a program can observe except timing. If M10K runs short for sound (D-45), this is the first thing to give back. |
+| D-48 | (2026-11-08) No area change may cost a game any cycles, even inside a frame's budget, and none that could make a game slower; this narrows D-43 / D-44's "a throughput trade must hold each frame's budget". The room for sound (D-45) has to come from cycle-free changes: shared logic, storage moved to M10K, dead logic removed, per-board parameters. Under it R131's edge product on the walk's adders (`PB` = 1) is left off, and R129's iterative double front, R129's speed-feature switches and R130's DSP alignment shift (a standalone Fmax drop) are not taken. A change that makes a game faster and saves area, as R131's overlapped front, is welcome. |
+| D-49 | (2026-11-08) Texture decode, contour and texture alpha follow Supermodel's New3D renderer, not MAME's, wherever nothing from the hardware says otherwise (R134, R135). It supersedes the MAME-style decode the core had for formats 1-6 and the texture-alpha kind. Where the board or the real cabinet shows the hardware differs from Supermodel (Daytona 2's car shadow, R137), the hardware wins and Supermodel is no evidence for that case. |
 
 ### Open
 
@@ -8402,4 +8405,3637 @@ neither spike carried the pair through the integrated placement.
 
 *Board:* `r7f1` on VF3 on 2026-11-06 runs correctly. By eye the FPS counter shows more moments at 58 in the middle of scenes than `r7c2` and `r7e1` did. That is the first R117 + R118 change you can see.
 
-*Board, open:* on `r7f1`, some VF3 scenes show horizontal tearing across the stage and fighters, not all the time. I may simply not have noticed it on earlier builds, so it is not established that it is new. A 3D frame is swapped only at line 384 (`r3d_cmd` show_buf), so a half-drawn frame cannot be shown. I suspect two causes: scan-out lines landing late from DDR3, which `m3_compose`'s `n_late` counts but release builds do not show; or a frame drawn from Real3D memory the game has already begun to rewrite for the next frame, which a faster CPU makes more likely. Not reproduced yet. Next: show `n_late` and a frame-overlap counter beside the FPS counter, an A/B against `r7c2` in the same scenes, and a video of a tear.
+*Board, later the same day (`r7f1`, FPS counter):* Daytona 2 holds 29. VF3 mostly reads 29, now peaking at 34 in scenes where it did not before (a one-second count that mixes the 58 and 29 steps), and up to 58-60 in some scenes. Sega Bass Fishing Deluxe, loaded for the first time on this build, gets past the blue warning screen and then crashes (R96's crash, not yet looked at again). Scud Race Deluxe, loaded for the first time with s15's MRA on `r7f1` (which has none of s15's Step 1.5 RTL changes), boots and runs its attract at a steady 58 fps. By eye it looks good, with possibly some visual problems and some 3D missing. I have never played Scud Race, so I cannot yet tell what is wrong without a reference (Supermodel's frames, s15). A video (`ScudRace_M3_Mister.mp4`, 123 s, FPS counter on) shows the BPR splash, the ranking, the View Change screens and both attract courses in full textured 3D. Most scenes read 57-58 fps, with drops to 53, 29, 27 and 20 in long views, worst in the second attract course. One wide view is green-tinted; I do not yet know whether that is correct. After about 5 minutes the game crashes, and the cause is not known yet. *Found in R122: an alignment exception the core takes and the 603e does not.*
+
+*Board, open:* on `r7f1`, some VF3 scenes show horizontal tearing across the stage and fighters, not all the time. I may simply not have noticed it on earlier builds, so it is not established that it is new. A 3D frame is swapped only at line 384 (`r3d_cmd` show_buf), so a half-drawn frame cannot be shown. I suspect two causes: scan-out lines landing late from DDR3, which `m3_compose`'s `n_late` counts but release builds do not show; or a frame drawn from Real3D memory the game has already begun to rewrite for the next frame, which a faster CPU makes more likely. Not reproduced yet. Next: show `n_late` and a frame-overlap counter beside the FPS counter, an A/B against `r7c2` in the same scenes, and a video of a tear. *Resolved in R123: it was neither. The scan-out took the layer buffer a clock too early.*
+
+**R119 — Step 1.5 with Scud Race Deluxe (`scuddxo`): the bus is VF3's, the 53C810 sits at C0 by its BAR,
+the game never writes the texture port and never reads HID1; six Real3D rules differ from Step 1.0 in Supermodel,
+of which the core had three and now has five (NP's format moves every Step 1.5 and 2.x picture two mip levels
+coarser, to Supermodel's); the sixth, Step 1.5's luminous polygons, is not built. On the bench the game boots and
+draws its first attract race in 3D; on the board (`r7f1`) it runs both attract courses.** D-46 brings
+Step 1.5 into scope with Scud Race first, from §12's list: the 13.11 position format and culling-node layout, the
+texture port, the CPU clock (`[OPEN]`). Work in `sm3-builds/s15/`. Supermodel (the bus-trace build
+`sm3-builds/dt2/supermodel`, `supermodel-sb` for finished frames, and a copy of the former with the attribute census
+widened, `s15/supermodel-attr`) on `scuddxo` from a fresh NVRAM for 3,000 frames (and 20,000 for the crash question); MAME 0.289's `model3.cpp` read.
+
+*What I believed* (§2's table, §12, R1, R100):
+- Step 1.5 is Step 1.0's board with a 100 MHz CPU (or 66 MHz, PCB notes), the 13.11 format, ten-word culling nodes
+  and the three-word texture port; Scud Race adds the MPEG board (DSB) and the comm board.
+- The core already had the 13.11 format, the ten-word nodes (`step15` in `r3d_geo`, R100), the three-bit texture alpha
+  from Step 1.5 (R106) and the Step 1.5 JTAG ID codes (`m3_jtag` `jstep` 1, R100); the texture port's three-word form
+  was built for Step 2 only.
+- MAME's `init_scud` maps the 53C810 at F9000000; I expected Scud Race to need a second 53C810 window.
+
+*What I know now:*
+
+**1. The ROM (MAME `ROM_START(scuddxo)`, Supermodel `Games.xml` agree).** VF3's layout: fixed CROM 2 MiB (four 512 KiB
+ROMs, `epr-19607`..`19610`) at FFE00000, the low 6 MiB of FF800000 a mirror of CROM0; banked CROM 48 MiB (CROM0-2,
+twelve 4 MiB ROMs, banks 0-5; CROM3 unpopulated, read as 0 as MAME's region); VROM 32 MiB (sixteen 2 MiB ROMs, in
+IC order .26-.41 the part numbers run in swapped pairs, 19574, 19573, 19576, 19575, ...); 68000 program 256 KiB, SCSP
+samples 8 MiB, DSB Z80 128 KiB and MPEG 8 MiB, drive board 64 KiB (none loaded, D-8 / D-46). Without sound: 82 MiB, in
+the same SDRAM image as VF3 (`m3_mra.py`'s Step 1.x writer). The zip is a complete set: no parent needed.
+Supermodel calls the set Step 1.5, MPEG board DSB1, drive board Wheel, `netboard false` ("Single DX cabinet only" in
+the CROM's comment).
+
+**2. The bus: nothing new.** The Supermodel trace (51.5 M records, frames 1-3,000) touches exactly VF3's map:
+- MPC105 at F0800CF8 / F0C00CFC and F8FFF0xx (23 register writes at reset, then PICR1 again at frame 59);
+- the 53C810 at C0000000: the boot ROM writes BAR1 = C0000000 at device 14 (the same nine PCI writes as VF3's, in the
+  same order), and the Real3D's ID and BAR at device 13 from frame 167;
+- no access to F9, C1 or C2, so no comm board probe and no DMA device; no 90 (texture port) write at all: every
+  texture comes through the FIFO (94), from the 53C810 (master 1), which also moves 88, 8C, 8E, 98 and 9C;
+- the RTC read four times (VF3's two control registers), the security board never;
+- I/O as VF3 plus: port C reads AF (the shifter in first gear, as Daytona 2), port D FF (the drive board disabled, as
+  Supermodel runs it by default), and the analog channels with channel 0 at 0x80 (the wheel centred) and 1-7 at 0.
+MAME's F9000000 mapping is not what this set does: its program writes C0 into BAR1, and the core decodes the window
+from the BAR (`m3_scripts` `win_base`), so either address works with no change. (MAME notes `scuddxo` as "lots of GFX
+problems, hangs"; the fixed F9 window may be part of why.) **Wrong turn:** I took MAME's `init_scud` as the map and
+expected a new window before reading the trace.
+
+**3. The CPU clock is invisible to the program.** Neither Scud Race's nor VF3's ROMs contain `mfspr` of HID1 (the
+PLL configuration Supermodel sets per multiplier); both read HID0 and the PVR only. The timebase counts the 66 MHz
+bus / 4 on every step (D-14). So the `[OPEN]` 66-against-100 MHz question changes speed only; the core runs Step 1.5 at
+its own 110 MHz (D-44) with no change, and the board's frame rate is the measurement.
+
+**4. Real3D: where Supermodel's Step 1.5 differs from Step 1.0** (`CNew3D::SetStepping`, `Real3DConfig::Model3`):
+
+| Rule | Supermodel | Core before | Now |
+|---|---|---|---|
+| vertex positions | 13.11 from 1.5 | built (`step15`, R100) | unchanged |
+| culling nodes | ten words from 1.5 | built (`r3d_walker`) | unchanged |
+| texture alpha | `(h6 & 7) > 0` | built from 1.5 (R106) | unchanged |
+| texture NP (LOD) | u10.14 (/ 16384) from 1.5, u12.12 on 1.0 | u12.12 on every step | **u10.14 from 1.5** (`r3d_face`, `step15`) |
+| texture port (90) | three words from 1.5 (`singleWordTexturePort` is 1.0 only) | three words on Step 2 only | **three words from 1.5** |
+| luminous polygons | Step 1.5 only: with fixed shading the colour times 1 + fixed shade + ambient, else times 1.5 | as Step 1.0 (times 1) | **not built** |
+
+- *NP.* R67's LOD word took NP as u12.12 on every step, from VF3. On Daytona 2 (and Scud Race) it was four times
+  Supermodel's. The rasteriser's level is -log2((kz/w)^2 B) (`r3d_rast_rtl.cpp`), so B four times too large is exactly
+  two levels finer than Supermodel's on every textured polygon of every Step 1.5 and 2.x set: sharper and shimmering in
+  the distance, and more texture-cache fills. `r3d_face`'s converter now takes exponent base 113 for NP on Step 1.5
+  and later (115 on 1.0); `r3d_geo.cpp`'s model the same. This moves Daytona 2's pictures too (two levels coarser
+  than the board has shown), by design: it is Supermodel's rule for every step after 1.0. **Wrong turn:** I first
+  wrote this down as "a coarser mip" before reading the level formula.
+  Measured on the bench, frames 904-999 of the first attract from the same checkpoint, the unchanged tree's model
+  (r7f1's RTL) against the changed one: 12-16% of the pixels differ (mean 1.3-2.3 levels of 255), every frame's upper
+  screen (the buildings, clear of Supermodel's wedges, 2-row grab offset taken out) is closer to Supermodel's with
+  u10.14 (+0.07 to +0.15 dB PSNR, all 48 frames), and the rasteriser's busy time falls 5.3% (1,000,856 -> 948,291
+  clocks a frame, worst 1,056,951 -> 1,005,240) with fewer fine-level texture fills; the geometry is unchanged
+  (-1%). The face bench now runs Step 1.5 (`FACE_STEP15=1`): two
+  seeds x 300,000 polygons for each of the plain and the two LOD builds, 0 wrong; the old file fails the Step 1.5 LOD
+  run (22,778 of 30,000 B words wrong) and passes Step 1.0.
+- *Texture port.* The port's word count follows the step (`port3w`), and the VROM block size follows the set
+  (`vrom64`: 16 MiB blocks for Daytona 2's 64 MiB, 8 MiB for a 32 MiB set). Before, the three-word path also chose the
+  16 MiB form, which on a 32 MiB set would read the wrong VROM; a 32 MiB set's port address may carry bit 23 (MAME
+  puts 32 MiB of VROM in the upper half of the space) and it is ignored, as the one-word path does. VF3 (port3w 0,
+  vrom64 0) and Daytona 2 (1, 1) take exactly the old expressions. Benched by `test_texup2` against the FIFO path: 64 MiB, seeds 1 and 2, 100 batches each
+  (598 textures, 1.03 M texel words), 0 differ; 32 MiB (`--v32`, address bit 23 set at random), seeds 3 and 4, 100
+  batches each (630 textures, 1.09 M texel words), 0 differ; the planted fault (the 16 MiB form on a 32 MiB set)
+  fails 20 of 20 batches.
+  Scud Race never writes the port, so on Step 1.5 this is benched, not run by a game.
+- *Luminous.* The census (Supermodel with `M3ATTR` widened to the shading bits, frames 1-3,000): 3,270 of 55,897 mesh
+  builds are luminous, and 3,258 of them use fixed shading (textured, h6 0x04818400): so the Step 1.5 rule that
+  matters here is colour x (1 + fixed shade + ambient), per vertex, not the plain 1.5. In `r3d_geo` a luminous
+  polygon's shade is forced to 255 at assembly; its T&L shade, min(sf d + a, 1) x 255, cannot give 255 (1 + fs + a), and
+  the fixed shade is not kept past the T&L. Building it needs the T&L kernel (or the assembly) to form the unclamped
+  sum for those vertices; not done. Until then Scud Race's luminous scenery draws darker than Supermodel's.
+
+**5. Everything else Step 1.5 needs was already there.** The loader takes the step from an index-4 configuration
+(`cfg_step` 0x15; flags 0, banks 0-7 in slots 0-7, idle ports C and D AF FF); `step15` selects the geometry rules;
+`jstep` = 1 gives Step 1.5's ID codes (Jupiter 3, Mercury 3, Venus 2, Earth 3, Mars 2: Supermodel's
+`CJTAG::SetStepping`); the MPC105 map, the Real3D ID 0x16C311DB, the 53C810, the tile generator and the interrupts are
+Step 1.0's. `STEP2` (the Step 2 hardware) is not involved: `step2` stays low below 0x20.
+
+**6. The bench** (`sim/system`, `tb_m3_system` with `--cfg`, R112's options as `Model3.sv` builds; `--tb-fast` to the
+first instruction in RAM): from reset (frames 1-100 on the unchanged tree's model, then its
+checkpoint carried into the changed one: the same 7,754 members in the same order), in 100-frame segments with
+checkpoints (about 30-40 minutes each on a loaded machine), Supermodel's trace and grabs as the oracle:
+- **Boot.** The boot ROM's MPC105 set-up, the 53C810's BAR, the Real3D's PCI set-up, MIDI, the RTC, the JTAG chain
+  and the tile generator's palette and VRAM writes are identical to Supermodel's as far as compared (to frame 300:
+  8C 106,090 words, 94 400,000, 98 161,178, VRAM 14,373, palette 257, all identical in order); the rest differs in
+  timing only (interrupt status reads, the order of backup RAM clears).
+- **Screens.** The warning screen and the BPR splash are pixel-identical to Supermodel's tile renderer (tg_tool of
+  Supermodel's own surfaces) and to its grabs once Supermodel's GL grab offset is taken out (below). The bench runs
+  about 12 frames behind Supermodel at the warning, 60 at the BPR splash and 112 at the race: it loads the boot's
+  1.05 M and the second course's 1.44 M texture words through the FIFO at one texture (43,692 words) every 3-4 frames,
+  where Supermodel takes one every 2 (the texture ring's upload pace, as R106 saw on Daytona 2's boot), and draws
+  meanwhile at 15-30 fps; once loaded it draws every frame (60 fps), as Supermodel.
+- **3D.** From bench frame 880 (Supermodel 768) the first attract race is drawn: the Gulf car, the town, the
+  chequered start, textured and lit. Aligned by draw count (bench frame f is Supermodel's f - 112), the scenes match in
+  geometry, texture, camera and colour by eye (`runs/s2/cmpb`, side by side). The large differences are Supermodel's:
+  near-camera road polygons drawn as black-and-grey wedges across the lower screen, which neither the bench nor
+  the board's footage shows; and the blink phase of INSERT COIN(S). PSNR over the frame is low (10-14 dB) because of
+  those wedges, so I judge by eye here.
+- **Supermodel's GL grab sits 2 rows and 2 columns off its own tile surfaces**: the bench's warning screen is equal to
+  `tg_tool ppm` of Supermodel's dump at (0, 0) and to the GL grab only at (-2, -2). `sb_grabcmp.py` compared
+  unshifted; my `s15/tools/grabcmp2.py` shifts.
+- **Where a race frame's time goes on the bench** (100 MHz, the bench's DDR3 model at 12-40 clocks; frames 882-999 of
+  the first attract, `runs/s2/prof.txt`; `--prof-vrom` now also counts the rasteriser's busy clocks, the texture
+  upload's and the CPU's clocks in Scud Race's four wait loops, `M3_IDLE`):
+
+  | per 1,738,400-clock frame | mean | worst |
+  |---|---|---|
+  | geometry busy | 1,284,525 (74%) | 1,547,995 (89%) |
+  | of it, a VROM request waiting (9,497 requests, 75,980 words a frame) | 548,854 (43% of the geometry's time) | |
+  | rasteriser busy (a frame replayed) | 940,971 (54%) | 1,005,240 (58%) |
+  | CPU in its wait loops | 461,614 (27%) | at least 279,647 (16%) |
+
+  So in the first course the geometry is the longest stage, and 43% of its time is VROM latency in DDR3, one request
+  at a time (R100 found the same on Daytona 2). At 110 MHz its worst is 81% of a frame, which fits the board's 57-58
+  fps there; the CPU has 16-27% to spare and the rasteriser more. A long view puts more models in range, so more
+  VROM requests: the 20-29 fps views are most likely the geometry over a frame, waiting on VROM. Not measured in
+  those scenes (4,600 frames in); the lever is R100's: requests overlapped in `m3_xmem`, or a VROM cache.
+
+**7. The fit** (`sm3-builds/s15a_s1`, seed 1, 110 MHz, `M3_RELEASE`, the tree as above): the build and the fit of `r7c2` (its launcher's lock and report; this tree's own files, no CPU files swapped in):
+
+| | `s15a_s1` | `r7c2_s1` (the same tree before this change) |
+|---|---|---|
+| ALM | 39,257 (94%) | 39,265 |
+| M10K | 324 | 324 |
+| DSP | 87 | |
+| Setup, system clock: slow 100C / slow -40C / fast 100C / fast -40C | -1.912 / -1.744 / +2.320 / +3.496 ns | -1.935 / -1.833 / +2.936 / |
+| Setup, HDMI clock: slow 100C / slow -40C | +0.109 / -0.004 ns | / -0.213 |
+| Hold, system clock: slow 100C / slow -40C / fast 100C / fast -40C | +0.231 / +0.209 / +0.114 / +0.090 ns (every clock positive at every corner) | |
+| SDRAM pins out of I/O cells | 0 | |
+| RBF | `sm3-builds/s15a_s1_01073291.rbf` (01073291e1e973b75a46110329254faa) | 9f01932f |
+
+The change costs nothing measurable in area (-8 ALM, seed noise). The worst paths are the CPU's, as before (the
+I-cache's pending fill into the BTB target, -1.52 ns in the summary run; `op_x` into the FP operands). New among the
+first twenty: `cfg_step` into `r3d_texup`'s mark pointer (-1.34 ns), the run-time `step15` compare now selecting the
+port; the step is static while the game runs, so registering the decode in `m3_system` takes it off if it ever leads.
+Board: not loaded (the ROM and the MRA are on the SD card, md5-checked both ends).
+
+**8. The board, `r7f1` (5c456258: the main tree at 120e335, none of this entry's RTL), 2026-11-07, my recording
+(`ScudRace_M3_Mister.mp4`, 123 s, the FPS counter).** It boots, shows the warning, the BPR splash, the ranking and
+View Change screens, and draws both attract courses in full textured 3D. The counter reads 57-58 in most scenes,
+53 in places, and 29, 27 and 20 in long views, worst in the second attract (the airport). It crashes after about five
+minutes. Against Supermodel's grabs of the same scenes (`sm/long`, every 50 frames to 9,000): the airport's
+green-tinted wide view (the JAL jumbo, board 20 fps) is green in Supermodel too, so the tint is the scene's, not a
+fault; the night sky and the lamp glows match in kind.
+
+**9. Where the slow views' time goes: not the CPU.** Supermodel's interpreter (the census build `supermodel-lv6`,
+`M3CPU`, idle-skip off), Scud Race's wait loops excluded (the same four as VF3's: `2B0C4-2B0CC` the r13+0x8037 poll,
+`2B0A4-2B0AC` the `mfdec` wait, `2B058-2B060` the r13+0x8034 vblank poll, `2584-2588` a count-down), busy
+instructions a frame:
+
+| Frames (Supermodel) | Scene | p50 | p90 | p99 |
+|---|---|---|---|---|
+| 800-2,100 | attract 1, the race | 290,743 | 301,396 | 308,054 |
+| 4,600-6,300 | attract 2, the airport | 346,871 | 366,693 | 380,289 |
+| 6,300-8,000 | ranking, View Change 2 | 342,656 | 364,907 | 376,296 |
+
+VF3's p99 is 1.15 M (R19). At the core's busy CPI of about 2.9 (R116) and 110 MHz (1.91 M clocks a 57.5 Hz frame)
+Scud Race's worst is about 1.1 M clocks, 58% of a frame. So 20-29 fps in the long views is the Real3D (geometry or
+rasteriser), not the CPU. Which of the two needs the frame-busy counters of a test build (overlay row 7, R104) or the
+system bench in those scenes, which are 4,600 frames in (about 30 hours of bench from the nearest checkpoint).
+The NP finding (4) bears on it: `r7f1` draws every Scud Race texture two mip levels finer than Supermodel, so distant
+polygons fetch from the largest levels; the long views are where that costs most texture-cache fills.
+
+**10. The crash after about five minutes: what the bus does in that time.** Supermodel's trace to frame 20,000 (5.8
+minutes, `sm/trace20`, 456.6 M records; Supermodel runs on, 50 draws every 50 frames to the end): after frame 3,000
+the only new region is culling RAM 8C1C0000-8C1DFFFF (from frame 8,488, the third course); no texture-port (90)
+write in all 20,000 frames, no F9, C1 or C2 access; the CROM bank register takes 0xFA, 0xFE, 0xFB, 0xFC, 0xFF and 0xFD
+only (banks 5, 1, 4, 3, 0, 2: all populated); each loop of about 4,000 frames reloads 1.40-1.44 M texture words
+through the FIFO at the BPR splash. So nothing Step 1.5-specific first appears late, and this entry's port change
+cannot be the cause (the game never uses it). Two things do accumulate: the texture ring takes a 1.44 M-word
+load every loop (R106's limit holds it on the bench for the first two), and the timebase: TBL wraps after 2^32 counts
+at 16.5 MHz, 260 s from the game's reset, which with the ROM load is close to "about five minutes". The core's
+timebase is a 64-bit counter (`ppc_core` `tb_q`) and Supermodel passes the wrap without trouble, so the wrap is a
+suspect only until tested: the bench now takes `M3_TB_SET` to set the timebase after a restore, to run the wrap from
+an attract checkpoint. Run from the frame-800 checkpoint (the BPR splash and the second course's texture load) with TBL
+set to 0xFF820000, so it wraps about 29 frames in (and jumps about 4 x 10^9 counts at the poke): the 80 frames' bus
+trace (667,354 records) is identical to the unpoked run's, record for record. The same from the race (the frame-1,000
+checkpoint, TBL 0xFFD00000, wrapping about 11 frames in, 60 frames against a control run): 1,294,180 records and 60
+draws, identical. So the game makes no use of the timebase that reaches the bus in either stretch, and the wrap is
+ruled out as the crash as far as these 140 frames go. What is left: something that takes several course loads (each
+loop reloads 1.44 M texture words; the third course, from Supermodel frame 8,400, is the first new one after the two
+the bench has run), or a board-only cause (timing: the release fits are at -1.7 to -1.9 ns setup). The crash's kind
+(a CPU exception, a hang in a wait loop, a stalled Real3D or DMA) shows on a test build's overlay (the exception rows
+8-11 and the frame-busy row, R104/R105), which the release `r7f1` does not carry.
+
+**11. VF3 and Daytona 2.** VF3 from reset to frame 280 (45 Real3D frames and its first texture-port upload) on the
+changed and the unchanged tree: bus traces (1,553,058 records), cycle counts, SDRAM traffic and composites
+identical. Daytona 2 is not rerun: its port path takes the old expressions (`port3w` 1, `vrom64` 1) and the 64 MiB
+port bench passes; its pictures move by the NP rule (4), as Scud Race's do.
+
+*Wrong turns:*
+- MAME's F9000000 window (2 above).
+- `quartus_map --analyze_file` run inside `s15` rewrote that tree's `Model3.qsf`: the sourced `sys/sys.tcl`,
+  `sys_dual_sdram.tcl` and `files.qip` were written out as explicit assignments (128 lines, no newline at the end).
+  The first fit launch copied it; I stopped it before Quartus started, restored the file and made the launcher check
+  that the copy's `Model3.qsf` is the tree's own. Analysis now goes in a scratch copy.
+- The first launch also appended `M3_RELEASE` to the qsf's last line, which has no newline: the macro would have been
+  lost inside the SDRAM2 pull-up assignment. Caught by reading the copy before Quartus started.
+- I ran the first 100 frames on the unmodified tree's model and carried its checkpoint into the changed model (the
+  two have the same 7,754 members in the same order; the changes add no state). Frame 100's records of the stopped
+  second segment are left in that run's trace (138 records).
+
+*Open:* Step 1.5 luminous polygons (4 above); the analog inputs (channel 0 reads 0 in the core, 0x80 in Supermodel:
+the I/O stub, D-37); the DSB and the drive board (D-46, D-45).
+</content>
+</invoke>
+
+*Board (2026-11-07).* `r7h1` (the main tree's CPU at 120e335 with this entry's three RTL changes, release, 110 MHz;
+setup −2.07 / −1.74 ns, hold least +0.120 ns, 39,711 ALM, 324 M10K) runs Scud Race's attract as `r7f1` did. It
+still freezes at the same point after about three minutes, and again after a reset (R122).
+
+**R120 — r7f1's worst family was the D-cache's `d_rdy` through EX's hold into R118's operand selects, not
+the early word. Keeping the selects off the holds an FP-port op never meets (FSH) is cycle-identical and takes the
+family off the full build's list, but costs 2.2 MHz on the ppc_cpu spike's five-seed means and the full build's
+worst slack moves to LU2's own path (−2.24 against −2.11 ns): not kept. R117's store stall was mostly logical ops;
+the real one, a store right behind its load, is 0.2% of busy cycles, and late store data (SLD) takes it
+(−0.25% / −0.15% work CPI) for 172 ALM and −0.45 / −2.38 MHz with FSH under it. Daytona 2's data wait is half
+line fills from work RAM, with no CPU-side lever over 0.5% of busy cycles.** R117 (load-use 2) and R118 (FP early forward) went to the board together as `r7f1` (110 MHz, release, seed 1), whose
+four worst paths, −1.71 to −2.11 ns, ran from the D-cache's `Selector19` into the single unit's operand muxes
+(`ppc_fpu_sfma` `Mux3` / `Mux4` / `Mux111` / `Mux179`). R117's table put a store waiting only for its data from a
+load ahead of it at 230 k / 453 k / 718 k work cycles (VF3, the load in EX / MEM / WB) and 439 k / 599 k / 1.38 M
+(Daytona 2), more than LU2 took; R118 left Daytona 2's data wait at 13.9% of busy cycles. D-44 applies: the CPU's
+speed comes from cycles at 110 MHz, and the CPU's standalone Fmax (the `ppc_cpu` spike, five seeds, R108 / R111) must
+not drop. The 603e manual is the authority for what a store does with its data. Work in `sm3-builds/st119/`, from
+`base119` (the main tree's `rtl/` with R117 and R118, byte for byte). Desk only: benches, spikes, one full-chip fit;
+not the board. Another change on the fetch side (I-cache, BTB, redirect) was being made at the same time; nothing
+here touches `ppc_icache.sv`, `ppc_btb.sv` or `ppc_fetchq.sv`.
+
+*What I believed:*
+- r7f1's family was an FP load's early word (R117's `d_eword`) meeting R118's early forward in one cycle, so the fix
+  would keep the early forward off operands that arrive by LU2's path, or register them. I read `LU2_FL` as LU2's
+  FP-load path.
+- A store waiting on a load in WB (R117: 718 k / 1.38 M) was the largest store stall, and taking the store's data a
+  cycle or more late on the D-cache side would remove it (R117's table: 230 k / 453 k / 718 k VF3, 439 k / 599 k /
+  1.38 M Daytona 2, the load in EX / MEM / WB).
+
+*What I know now:*
+
+**1. The r7f1 family is `d_rdy` into EX's hold, and the hold into `ex_fs`.** `LU2_FL` is where LU2's early word
+joins the integer operand registers (the last LUT); LU2 takes no FP load's word at all (integer loads only,
+`m_lsp_q`). The fit's retiming report (`r7f1_s1/output_files/Model3.fit.rpt`) lists `ppc_dcache` `d_rdy_q` as
+deleted and `Selector19~1_OTERM4787` as the retimed register made in its place: I read Selector19 as `rdy_c`, d_rdy's
+next-state case select, with the register moved back into it (the report names no source line; `d_rdy_q` is
+the only D-cache register deleted there that leaves the D-cache straight into the core's hold). Of the worst 200 clk_sys paths, 31 start there, 27 of them
+into the single unit (36 of the 200 end in it). The path (r7f1 path 1, 8 levels, 10.60 ns data): that register → the core's
+`(ex_valid && ex_ls && !d_rdy)` → `qh_x` → `f_hold` (EX's hold, the FP operand registers' copy) → `ex_fs`'s next
+state → `ex_fs[0][0]_NEW2402` → `u_sfma` `Mux4~0` → `Mux4~0_NEW_REG4774`. R118's `ex_fs` (the single unit's 4:1
+operand select) is a register whose next value depends on EX's hold (3 → 2 → 1 while held), and the fitter retimed
+it forward through the operand mux it drives (the `ex_fs` → S1 path is itself near the worst, −1.22 to −1.48 ns
+into `r1x_q.sh`), which put the whole hold network, D-cache included, in front of the single unit's S1.
+
+The base spike shows the same family off the worst list: `dq_v` → `ex_fs[2][0]` −0.79 ns (seed 1, 5 levels; new
+probe `DC_FS` in `stage.tcl`).
+
+**2. FSH: `ex_fs` follows only the holds a multiply-add port op can meet.** Of EX's holds, a uop for the FPU's port
+(`ex_fma`) can be held only by MEM's and WB's (`qh_1`-`qh_4`), the FP wait and the serializing wait (an interrupt
+or FEX taken in EX). The others hold loads, stores, multiplies, splits, `sync` and LU2's early-word consumers,
+none of which takes a bypassed FP operand, so their `ex_fs` is 0 and not read. While one of those holds, `ex_fs`
+may take ID's selects; the cycle EX takes its next uop has no hold at all, and `ex_fs` is loaded as before. So the
+machine is the same cycle for cycle, and the D-cache's `d_rdy`, LU2's `lsh` and EX's multiply and split holds leave
+`ex_fs`'s cone. It removes the family from the full build (below), but the spike's five-seed means fall 2.2 MHz (below), so
+D-44 does not hold and FSH is not kept as it stands (`FSH` = 1 in `snaps/fsh` and `snaps/sld` only). Checked in simulation: a uop held outside `s_hold` is never an FPU-port op and has no bypass state,
+and no FPU-port op issues with stale selects (`fs_stale`); R118's select check skips stale cycles.
+
+**3. Far fewer stores wait on a load's data than R117's table said, and with LU2 in they are the load
+in EX.** lu117's profile classes a load-use cycle by where the load is, whether rS is the only register waited on
+(`lp_sd`), and whether the consumer is a load or store (`lp_mem`). R117's "a store waiting only on its data (rS)"
+row summed `lp_sd` alone, so it counted every uop whose rS is its only wait: the logical, shift and rotate ops
+(rS is their first operand), `mtspr`, `mtcrf`. The stores are `lp_sd` with `lp_mem`. On the base (R117 + R118, 48
+frames):
+
+| Load-use cycles, rS the only wait | VF3: all uops | VF3: stores | Daytona 2: all uops (work) | Daytona 2: stores |
+|---|---|---|---|---|
+| the load in EX | 229,744 | **119,490** | 432,956 | **99,006** |
+| the load in MEM | 2,048 | 0 | 69,605 | 4,005 |
+| the load in WB, unanswered | 62,206 | 100 | 85,620 | 931 |
+| stores, share of busy cycles | | 0.23% | | 0.19% |
+
+LU2 takes the MEM case (the store's data is an early-word operand), and moves the WB case behind a miss into EX's
+hold (`lsh`), where it is data wait; a store behind a miss could not go sooner with late data anyway, since answers
+are in order and WB waits for the miss. What late data can take is the load in EX: 119 k cycles in VF3, 99 k in
+Daytona 2.
+
+**4. SLD.** The 603e's store does not wait in dispatch for rS (its data is read at completion and the store queue
+holds it). Built (each a parameter, default on):
+
+| Module | Parameter | What |
+|---|---|---|
+| `ppc_core` | `SLD` (with LU2) | ID: a plain integer store (stw, stb, sth, their x and byte-reversed forms; from the raw word, `id_stp`, cross-checked against the decoder) whose only wait is rS on EX's load (an integer load, one uop, not lha / lwarx: `ex_lsrc`), with no MEM load waited on, leaves ID (`sl_id`). EX: its request goes out with `d_wlate` while the load is the oldest unanswered request: in MEM with WB's request answered this cycle or none (`d_wskip` when WB's answer is this cycle's), or in WB with no answer this cycle; `d_wtok` is the load's byte selects (MEM's `e_jq` / `e_dq`, or WB's `la_jq` / `la_dq`) through the store's rotation (`st_tokf`). Otherwise (a split store, the load answered in MEM, WB's older request unanswered) EX holds (`slh`) until the load's value is final at WB's forward and rS is reloaded from it (`sl_rl`, LU2's reload with WB's result as well) |
+| `ppc_dcache` | `SLD` | a late store keeps its raw word (`r_raw` / `x_raw`) from the next answer after its request (the request's own cycle unless `d_wskip`), is never posted, and its lookup does nothing until it has it (`lk`), as for a blocked set; its lanes are `tok_al(raw, tok)` in front of SB, UQ and DQ |
+| `ppc_cpu` | `SLD` | passed to both; trace outputs `t_dwlate`, `t_dwskip`, `t_dwtok` |
+
+*Measured* (the system bench as R117 runs it: lu117's measurement tree, R112's memory set as `Model3.sv`, the
+R107-era Real3D, mem112's o114 checkpoints through lu117's transplant; 48 frames 1300-1348; work CPI counts all
+three 53C810 waits as waiting, VF3 61DC4-61DD0 and Daytona 2 52A0-52C4 and 2B64-2B7C, R104 / R116 / R117):
+
+| Build | VF3 busy CPI | VF3 work CPI | VF3 busy cycles a vblank | Daytona 2 busy CPI | Daytona 2 work CPI | Daytona 2 busy cycles a vblank |
+|---|---|---|---|---|---|---|
+| base (R117 + R118) | 2.739 | 2.754 | 1,081,783 | 3.118 | 3.253 | 1,138,409 |
+| FSH | 2.739 | 2.754 | 1,081,783 | 3.118 | 3.253 | 1,138,409 |
+| FSH + SLD (as left) | 2.733 (−0.22%) | 2.747 (−0.25%) | 1,079,147 (−0.24%) | 3.113 (−0.16%) | 3.248 (−0.15%) | 1,136,344 (−0.18%) |
+
+- The base repeats fp117's `comb48` runs (VF3 2.739 / 2.754, Daytona 2 3.118 / 3.292 with R116's two waits only).
+- FSH: both games' `--prof2` files are byte-identical to the base's, every per-frame row and every whole-run line;
+  the logs differ only in the checkpoint's name and the wall clock.
+- SLD: stores waiting on a load in EX 119,490 → 0 cycles (VF3) and 99,006 → 1,294 (Daytona 2, work); busy cycles
+  over the 48 frames 51,925,563 → 51,799,038 (VF3, −126,525) and 54,643,633 → 54,544,535 (Daytona 2, −99,098), so
+  the cycles saved are the waits it removes, a little more in VF3. About 95,000 fewer early-word issues in each
+  game: those stores used to leave ID a cycle later on LU2's early word.
+- `--check-lw`: 0 words wrong in every run (211,085 / 91,856 line writes, SLD).
+- Game frames stay at two vblanks (both games); 0.2% of a frame does not move a scene across the 58 / 29 step.
+
+**5. Daytona 2's data wait** (base, 48 frames, 1301-1348; prof2's split by what the CPU's memory port was doing):
+
+| Data wait, share of busy cycles | VF3 | Daytona 2 |
+|---|---|---|
+| all | 21.7% | 13.9% |
+| D line fill, work RAM | 12.54% | 6.80% |
+| D line fill, CROM | 1.32% | 1.03% |
+| cast-out | 4.28% | 0.73% |
+| single read (CROM, I/O) | 0.28% | 0.62% |
+| the port idle (inside the D-cache) | 2.82% | 2.58% |
+| an I fill ahead | 0.27% | 0.40% |
+| the 53C810 holding the bus | 0.23% | 0.17% |
+
+Daytona 2: 4,906 D fills a vblank (first beat mean 19.4 clocks alone, 28.7 contended; last beat 33.4), 1,912
+cast-outs, 662 I/O single reads. A fill from request to first beat: bus 2.4 (p99 48, the 53C810), `s_req` to the
+port 2.3 (15.4 for the 13% that meet a posted cast-out burst, `T_PW`), mailbox 2.1, dispatch to the first READ 4.8
+(row state; 38% of D fills meet a row conflict with a row the CPU's own port opened), READ to data 7, back 2. The
+port-idle share is mostly the clock LU2's reloaded consumers spend in EX as their answer arrives (323 k cycles with
+the cache empty, against 272 k reloads), and X retrying a lookup (another way's hit, a blocked set: 190 k).
+The levers, priced on Daytona 2's 48 frames (busy 54.6 M cycles), none of them large:
+
+| Lever | Cycles it could take | Share of busy | Cost / why not now |
+|---|---|---|---|
+| fewer D fills (4,906 a vblank) | up to 4.28 M | 7.8% | the 603e's 16 KiB, 4-way data cache (D-15); a larger cache is away from the 603e and costs M10K |
+| a fill behind a posted cast-out burst (`T_PW`, 31,549 fills × 15.4) | ~0.49 M | 0.9% | the burst is already in the controller; R112 measured `PW_DLY` 16 and 32 no better than 8 |
+| a row the CPU's own port opened (88,865 D fills) | ~0.3 M (dispatch to READ 4.8 → ~1-2) | ~0.5% | an address map or bank policy change in `m2_sdram`, which every port shares |
+| the D-cache's decision clock (EX's request to `m_req` is R, the lookup, DQ) | ~0.24 M (one clock a fill) | 0.4% | the compare into the miss decision did not close at 120 MHz (D-cache header); at 110 it would need a spike |
+| X's retries (another way's hit, a blocked set) | 0.19 M | 0.35% | the predicted way is already R117's early-word way |
+| non-blocking loads (hits under a miss) | most of the fill wait behind independent work | | the in-order WB stage and in-order answers; a different core |
+
+So the biggest lever that fits D-44 is not in the CPU: it is the SDRAM side's posted burst and row policy, about
+1.4% of Daytona 2's busy cycles together, and both are `m2_sdram` / `m3_sdr_port` changes shared with every other
+port. I did not build one: each needs its own spike and bench sweep, and R112 has already taken the cheap stages.
+
+*Spike:* (`ppc_cpu`, cpi112's template, 120 MHz target, multicorner; Fmax slow 100 °C / −40 °C, MHz; the base's
+seeds 2-5 are the fetch-side work's base spikes, the same RTL and template byte for byte, and its seed 1 repeats
+fp117's `comb_s1` and mine exactly):
+
+| Build | Seed 1 | Seed 2 | Seed 3 | Seed 4 | Seed 5 | Mean | ppc_cpu ALM (mean) | Registers (mean) |
+|---|---|---|---|---|---|---|---|---|
+| base (R117 + R118) | 100.44 / 102.36 | 100.60 / 98.16 | 96.44 / 97.88 | 99.52 / 101.69 | 97.31 / 97.68 | **98.86 / 99.55** | 13,694 | 12,564 |
+| FSH | 101.08 / 100.99 | 92.59 / 95.08 | 94.78 / 93.63 | 96.87 / 98.15 | 98.02 / 99.07 | **96.67 / 97.38** | 13,689 | 12,499 |
+| base with `ex_fs` `preserve` (v4) | 100.44 / 102.36 | | | | | | 13,629 (seed 1) | 12,526 |
+| FSH + SLD | 94.85 / 95.89 | 100.98 / 100.72 | 96.81 / 96.95 | 99.77 / 95.66 | 99.63 / 96.61 | **98.41 / 97.17** | 13,866 | 12,657 |
+
+- FSH is −2.19 / −2.17 MHz on the means, beyond what five seeds resolve (R108: about ±1.5 MHz): D-44 does not
+  hold for it. Its own paths are gone from every seed's worst list (the D-cache into `ex_fs` +0.17 to +0.38 ns on
+  four seeds, −0.28 on seed 2, against the base's −0.79 on seed 1); the seeds lose on LU2's early-word path (the
+  D-cache's set-state MLAB into the operand registers: −2.47 / −2.22 / −1.99 ns worst on seeds 2-4 against the
+  base's −1.61 / −2.04 / −1.72). FSH takes 65 registers out (fewer duplicates) and nothing else; I cannot see a
+  cause in the logic for that family moving, and the full build shows the same move (above).
+- `preserve` on `ex_fs` in the base changes nothing in the spike (seed 1 identical to the last digit): the spike
+  never retimed `ex_fs`. So the spike cannot show r7f1's family at its full depth; only the full build retimes it.
+- SLD on FSH: against the base −0.45 / −2.38 MHz, against FSH +1.74 / −0.21: within what five seeds resolve
+  against FSH, and below the base at −40 °C by more than that, which is FSH's share. +172 ALM against the base
+  (+177 against FSH: the D-cache's raw words, tokens and flags for R and X, the core's token rotation and SLD's
+  hold), +93 registers, 0 M10K, 0 DSP. Seed 1's worst list has a new family, the D-cache's `d_valid_q` into ID's
+  enables (`pend`, `imm4_q`, 32 paths each, −1.85 ns): SLD's hold term takes `d_valid` (`sl_ok`'s "WB's older
+  answer is this cycle's"); the planted faults below show that term is implied by EX's hold.
+- Hold positive at every corner in every run (the least +0.084 ns FSH seed 3, +0.051 ns FSH + SLD seed 3, fast
+  −40 °C).
+
+*Fit:* (`r7g1_s1`: r7f1's tree, the main tree with R117 + R118, with `snaps/fsh`'s `ppc_core.sv` e6202c42; 110 MHz,
+release, seed 1; r7f1's launcher; RBF 31eddc81):
+
+| Build | ALM needed / placed | ppc_cpu ALM needed / placed | registers (map) | M10K | clk_sys setup, slow 100 °C / −40 °C (ns) | TNS (ns) | hold, least (ns) | HDMI setup (ns) |
+|---|---|---|---|---|---|---|---|---|
+| `r7f1` | 39,758 / 41,120 | 13,636.5 / 13,736.0 | 51,130 | 324 | −2.107 / −2.107 | −1,050 / −760 | +0.111 | +0.119 / −0.015 |
+| `r7g1` (FSH) | 40,816 / 40,869 | 13,730.7 / 13,714.1 | 51,131 | 324 | −2.239 / −2.144 | −991 / −702 | +0.092 (fast −40 °C) | −0.053 / −0.148 |
+
+| Worst 200 clk_sys paths, by family | `r7f1` | `r7g1` |
+|---|---|---|
+| from `u_dc` `Selector19~1` (the retimed `d_rdy_q`) | 31 (−1.4 to −2.11) | **0** |
+| into `ppc_fpu_sfma` | 36 | 17 (from `ex_fs` and `fo_res`, −1.94 at worst) |
+| from the D-cache's set-state MLAB (`stm` read address) into the operand registers | 30 (−1.62 at worst) | 73 (−2.24 at worst) |
+| from `fb_q` into frsqrte's operand register (`ppc_fpu_rsqe` `ra_q`) | 0 | 37 (−2.18 at worst) |
+| the 200th path | −1.037 | −1.031 |
+
+The family is off the list: no path from the retimed `d_rdy` reaches the single unit or `ex_fs`, and the fitter
+no longer moves `ex_fs` through the operand muxes with EX's hold behind it. The worst slack did not get better:
+it is now LU2's own early-word path (R117: the set state's MLAB → `st_mru` → `pw` → the way's word → the core's
+byte select → `op_y`, 8 levels) and FBYP's bypass into frsqrte's operand register (R115's `r7c1` had 50 bypass
+paths into the small unit's `ra_q`). Both are the base's families, which this seed placed worse; the TNS is 6% /
+8% better. One seed against one seed cannot separate the change from placement (R115: 0.2 ns between seeds on
+smaller changes). Area: the +1,058 "ALMs needed" is not FSH's logic. Synthesis is the same size: the map's resource
+table has 57,307 → 57,371 combinational ALUTs (+64, of which ppc_core +76 and the double FMA, which FSH does not
+touch, +33) and 51,128 → 51,129 registers. The fit placed fewer ALMs (41,120 → 40,869, −251) and fewer registers
+(51,925 → 51,819, −106: duplicated registers 3,775 → 3,660, retimed 2,434 → 2,432); "needed" is placed − the
+estimate recoverable by dense packing + the unavailable estimate, and the recoverable estimate fell 2,173 → 805.
+Spread by entity, "needed" rose most where FSH changes nothing: `r3d_rast` +480 (placed −93), `r3d_geo` +138,
+the framework's `ascal` +139, `m2_sdram` +68; `ppc_cpu` +94 (placed −22). So it is this placement's packing, at
+98% of the device placed in both. The CPU spikes agree: `ppc_cpu` 13,694 → 13,689 ALM on five-seed means, 12,564 →
+12,499 registers. M10K unchanged (324). Table: `logs/entcmp_r7f1_r7g1.md` (`tools/entcmp.py`). Hold positive at every corner.
+The SDRAM pins are packed (0 unpacked).
+
+*Checks:*
+- CPU benches (`tools/bench.sh`, R104_CHECK on, `-DTB_LU2`): cpi112's 13 runs and fp117's three `--fpchain` runs.
+  Base 16 / 16 PASS. FSH 16 / 16 PASS, every run's cycle count and every architectural line identical to the
+  base's. FSH + SLD (`-DTB_SLD`: the core bench gives a late store the word of the answer due, which must be a
+  load's; the subsystem bench's snoop shadow takes it from the shadow memory as the load was made) 16 / 16 PASS with
+  the same instruction counts (cycles −0.00%), and the five new `--ldst` runs PASS: core 1,000 seeds 3,683 late
+  stores, `--rdy 30` 1,196, `--mis` 1,057, subsystem with snoops 1,381 (the subsystem counts them only with
+  `--snoop`), 767 of the core's with the source answered in the request's cycle.
+- D-cache unit bench (`tools/cbench.sh`, seeds 1-8, 200,000 operations, plus seeds 1-4 with write snoops; I-cache
+  seeds 1-8): base 20 / 20 PASS; with `TB_SLD` (a store right after a load made late half the time it may be, its
+  lanes random tokens within the load's lanes) 20 / 20 PASS, about 16,000 late stores a run (7,300 with the source
+  unanswered, 8,600 with an older answer skipped, 34-57 with the source answered in the request's cycle). The
+  I-cache logs are the base's byte for byte.
+- FPU fast unit bench (EF on, seed 1; the FPU files are byte-identical to the base's): directed 152,317 cases,
+  3,750,000 early-forward ops, 8,469,075 checks, 0 failures.
+- New checks (Verilator): FSH's (a uop held outside `s_hold` is no FPU-port op and has no bypass state; no FPU-port
+  op issues with stale selects); SLD's (the raw-word store kind against the decoder; the store's source is the load
+  it left ID behind, in MEM or in WB; a late store is a plain store with no early word; the D-cache: a late request
+  is a store). None fired in any run, the 48-frame system runs included. The system model with R104_CHECK and FSH,
+  16 frames of each game: no check fired, every per-frame row the base's.
+- Verilator 5.052 `-Wall` lint (`ppc_cpu` top, R104_CHECK): 114 warnings for base, FSH and FSH + SLD, the same
+  list. `quartus_map --analyze_file` (17.0): `ppc_core` (FSH) and `ppc_core`, `ppc_dcache`, `ppc_cpu` (SLD) 0 errors,
+  0 warnings. No new arithmetic idiom (`2'(l) - bo`, a plain size cast); no index past an end (2-bit token bytes
+  into 4-entry arrays).
+- Planted faults (R104_CHECK and LU2's checks off, so the benches' comparisons must catch them):
+  - FSH, 7: 7 caught (`s_hold` without WB's wait, without the FP load slot, without MEM's replay / FP store wait,
+    without MEM's FP-serialised / icbi wait, without EX's FP wait, without the serialising wait, and never held),
+    six by core `--fpchain`, one by core `--fpburst`.
+  - SLD: 20 planted (`faults/sld_list.py`): 12 in `ppc_core` through the CPU benches (`TB_SLD`, the
+    `--ldst` runs first), 8 in `ppc_dcache` through its unit bench (`TB_SLD`, seeds 1-4 and 1-2 with write snoops):
+    - Caught, 13: `d_wskip` never set (an older answer taken as the source's), MEM's selects for a source in WB,
+      stwbrx's and sthbrx's reversal (both only after `--ldst` put an indexed store right behind its load: the
+      first form drew `li r3` between them), the reload from the arriving word only, the source's move to WB
+      missed, a split load's first word taken as its value (only after `--ldst --mis` drew split loads); in the D-cache the skipped answer kept, the source's answer lost on the move to X, a parked store
+      never getting its data, the raw word not taken on the move, X's raw word overwritten after its answer, the
+      lanes reversed.
+    - Not faults, 6, each a term another condition already implies: `sl_ok`'s `!m_got` and its "WB's older
+      answer is this cycle's" (a store in EX behind a source in MEM with WB waiting cannot request: MEM holds, so
+      EX holds), `!mis_x` (a split store's second word requests a cycle after its first, and a load's answer is
+      never sooner than two cycles after its request, so both words see the source's answer), lha excluded at
+      `ex_lsrc` (MEM's `m_lsp_q` excludes it again, and the store is then reloaded); in the D-cache the lookup's
+      data gate and the post's (a late store's source is in R or X when it is taken, so it is never posted, and R
+      is looked up only after X is answered).
+    - Not reached, 1: the waiver with a MEM load waited on as well (no bench draws a store whose rA is one load's
+      and rS the next's; the RTL's own check, "the store took an early word too", stops such a store).
+    - The `--ldst` runs were rerun on the final generator: core 1,000 seeds 5,696 late stores, `--rdy 30` 1,890,
+      `--mis` 1,567, subsystem with snoops 2,066; all PASS.
+
+*Wrong turns:*
+- I read r7f1's family as the early word meeting the early forward and `LU2_FL` as an FP-load path (above). The
+  fit's retiming report and the path's node list settled it: the source is the retimed `d_rdy_q`.
+- My first D-cache took the late store's lanes with lane 0 in the tokens' low bits while the core puts lane 0 in
+  the high bits. The core bench passed (its model of the D-cache used the core's order); the subsystem bench's snoop
+  check caught it on its first `--ldst` run (seed 203: `lhbrx r17` then `sth r17,0x1D56(r1)`, the DMA master read 00
+  where 7E was stored). The D-cache unit bench would have too: its late stores use the core's order.
+- The CPU bench's random programs never put a store of a register right behind the load of it (`dst()` and `src()`
+  are drawn apart), so the first SLD runs made no late store at all (100 core seeds, 30 subsystem seeds: 0). The
+  new `--ldst` mode draws such pairs; the existing seeds draw the same programs as before.
+- I edited `tools/bench.sh` while a bench was reading it; bash read the new tail and started stray runs on the FSH
+  build, which I stopped (their logs deleted; the 16 FSH runs had finished).
+- The transplant's twin list (`xtool/mkextra.py`) asserted that a merged register's twin is in both models; in my
+  FSH and SLD models Verilator merged them the other way, and the transplant stopped. The twin's old value is what
+  the new register mirrors, so the assertion now asks only that the old model has it.
+- The system-bench reruns of my first SLD model were stopped when the lane fault was found; no measurement uses it.
+- The first SLD fault queue ran without the `--ldst` runs, so it made almost no late stores and its first fault
+  ran every run for nothing; I stopped it and reran with the `--ldst` runs first. Its first `--ldst` form drew
+  `li r3` between a load and an indexed store, so the indexed and byte-reversed stores never went late, and it drew
+  no split loads; both were missed faults until the generator was changed and the `--ldst` runs rerun.
+- I took FSH's first spike seed (+0.6 / −1.4 MHz) as a sign it held; seeds 2-5 put it 2.2 MHz down.
+- My own process error: the second Quartus queue waited on a launcher's PID that had already exited, so it ran
+  the three analyses and started SLD's seed-1 spike while my full-chip fit was running, two of my Quartus jobs at
+  once for about two minutes. I stopped the spike and deleted it, and the queue now waits on the first queue's
+  own process. The fit and the analyses are unaffected (an analysis touches no other project).
+
+*Not done:*
+- The board: nothing here is board-verified. FSH's RBF (`r7g1_s1_31eddc81.rbf`) is built but I did not ask for it to
+  be loaded: its worst slack is no better than r7f1's.
+- A timing fix for r7f1's family that also holds D-44. FSH removes the family (no `d_rdy` path into the single unit
+  or `ex_fs` in the full build) but costs 2.2 MHz on the spike's five-seed means, and the full build's worst slack
+  moved to LU2's own early-word path. Not tried: R118's `ex_fs` without its hold progression (the select as a
+  register loaded only as a uop enters EX, with the held copy chosen by `ex_fbh` / `ex_fbl`, so that no hold reaches
+  it at all), and a seed sweep of r7f1 itself to see how often the family leads. A second variant, FSH with `s_hold`
+  not kept as its own net (`spikes/rtl_v2`), and FSH with `ex_fs` preserved (`rtl_v5`) were prepared and not run.
+- SLD at the full chip: its 0.2% does not justify a build on its own. Its default (on or off) is to be decided.
+  The planted faults show two of `sl_ok`'s terms are implied by EX's hold (`!m_got`, and WB's older request answered
+  this cycle): a store in EX with its source in MEM and WB waiting cannot request (MEM holds, so EX holds). Taking
+  them out would take the D-cache's `d_valid` out of SLD's hold term, the family (`d_valid_q` into ID's enables)
+  that led SLD's seed-1 spike; `d_wskip` keeps WB's `wb_out`. Not built.
+- A store whose source is an algebraic halfword load (lha), an update or byte-reversed-and-split store, or `stmw`:
+  left to wait in ID as before.
+- Daytona 2's data wait: measured and priced (above), nothing built. The levers are on the SDRAM side, about 1.4%
+  of Daytona 2's busy cycles together, each a change every port shares.
+- R117's table (store waits) is corrected here, not in R117's own entry.
+
+**R121 — Fetch-side cycles at 110 MHz, by cause, and what moves them: the LR / CTR look-ahead (the 603e's
+BPU resolving bclr / bcctr from the LR / CTR, −0.9% work CPI on each game) and a four-entry instruction micro-TLB
+(Daytona 2 −2.2%) are kept, together −0.9% (VF3) / −3.3% (Daytona 2) work CPI for +390 ALM and no M10K, the
+`ppc_cpu` spike −0.5 / −1.0 MHz on five-seed means; a 32 KiB I-cache would take Daytona 2 to −8.7% (VF3 −1.9%) for
++12 M10K and is left for decision. A next-line prefetch loses on the shared memory port and is not kept.** The starting point is R117 + R118's CPU (`sm3-builds/base119`, board-tested
+as `r7f1`). On it, fetch bubbles were 11.9% (VF3) / 12.4% (Daytona 2) of busy cycles and I-misses 4.1% / 13.0%.
+VF3 needs a 9-18% cut in work a frame for a frame every vblank (R115), and about 9% is done. D-44 applies: cycles
+may be traded, the CPU's standalone Fmax (the `ppc_cpu` spike, five seeds, R108 / R118) must not drop. The 603e
+manual is the authority for anything program-visible. Work in `sm3-builds/fe119/`. Desk only: benches and spikes,
+not the board. The data side (data wait 12.6-13.9%) is being worked on separately and is not touched.
+
+*What I believed:*
+- The fetch bubbles were mostly the redirect after a mispredicted branch (R115's open item), and the earlier redirect
+  was the lever.
+- Daytona 2's I-misses were misses a next-line prefetch would hide (R107's estimate: −1.5 / −4%; 62% / 48% of I fills
+  sequential).
+- A larger BTB was the lever for the taken branches that still cost a bubble.
+
+*What I know now:*
+
+**1. Where the fetch side's cycles go.** A profile bound into `ppc_core` (`prof/fe_prof.sv`, no RTL edit) gives every
+request fetch makes an origin as it goes out (the redirect kind behind it, a BTB target, a sequential word, a line
+crossing, the refetch after a slow translation), and charges every cycle `--prof2` calls a fetch bubble or an I-miss
+(ID empty) to the request ID waits for. Its counts are the bench's own: the base repeats fp117's `comb48` runs on
+every per-frame line. Work cycles leave out all three 53C810 poll loops (VF3 61DC4-61DD0, Daytona 2 52A0-52C4 and
+2B64-2B7C, R116 / R117); 48 frames 1300-1348, whole run:
+
+| Work cycles (VF3 41.66 M, Daytona 2 50.69 M) | VF3 events | fetch bubble | I-miss | Daytona 2 events | fetch bubble | I-miss |
+|---|---|---|---|---|---|---|
+| all | | 5.67% | 5.14% | | 12.15% | 14.06% |
+| a line crossing (sequential, first word of a line) | | 0.40% | 2.37% | | 0.98% | 4.26% |
+| a taken branch the static rule predicts, no BTB prediction (soft redirect) | 428,910 | 1.40% | 1.15% | 578,138 | 1.42% | 2.22% |
+| bc predicted not taken, taken | 215,238 | 1.57% | 0.39% | 328,386 | 2.00% | 1.13% |
+| bc predicted taken, not taken | 116,113 | 0.84% | 0.22% | 73,490 | 0.56% | 0.00% |
+| bclr / bcctr taken, not predicted (no BTB register entry) | 82,359 | 0.61% | 0.33% | 148,463 | 0.84% | 1.18% |
+| a BTB register prediction to the wrong target (MEM refetch, rtm) | 88,757 | 0.65% | 0.07% | 73,418 | 0.56% | 0.28% |
+| the refetch after fetch's slow translation (the 2-entry I micro-TLB missed) | | 0.00% | 0.00% | | 1.51% | 1.47% |
+| an MMU replay's refetch (the data micro-TLB, R115's E) | 4,574 | 0.03% | 0.01% | 405,720 | 2.26% | 1.11% |
+| sc, rfi, isync, mtmsr, exceptions | 4,936 | 0.04% | 0.03% | 161,816 | 0.95% | 0.44% |
+| inside a line (words not yet filled) | | 0.05% | 0.56% | | 0.13% | 1.49% |
+
+Each hard redirect costs the redirect cycle and 3.0 bubble cycles (MRU-way hits, 2-cycle answers). Of VF3's busy
+mispredicted bc, 86% (1.28 M of 1.49 M) are in its poll loop, and are waiting, not work.
+
+- **The earlier mispredict redirect is a smaller lever than I believed**, and the cheap form of it does not exist. A
+  bc resolved in ID instead of EX (the look-ahead's rule over EX and MEM, at the queue head) would catch 21,522 of
+  VF3's 331,351 work bc mispredicts and 42,402 of Daytona 2's 401,876: the CR is almost always set by the instruction
+  right before the branch. The same-cycle redirect from EX saves a cycle on each, about 0.8% of work in either game,
+  and puts EX's decision (through `m_z`, MEM's zero detect) in front of the I-cache's address and the fetch
+  translation, the paths R23 / R104 / R108 took it off. Not built.
+- **Daytona 2's I-misses are capacity.** Shadow I-caches fed with every request the I-cache sees (`prof/patch_fe.py`;
+  the 16 KiB 4-way shadow gives 272,257 misses against 265,227 real fills): 32 KiB 4-way −57.6% (8-way −61.3%), 64 KiB
+  −68.3%, a next-line prefetch on every miss into the 16 KiB cache −30.6%. VF3: −20.1%, −56.1%, −42.6%.
+- **Daytona 2 fetches under page translation, and its 2-entry instruction micro-TLB thrashes**: 265,967 misses in the
+  48 frames, 3.0% of work in bubbles and I-misses after the refetch, plus 0.3% in the slow cycles. Shadows: 4 entries
+  117,316, 8 entries 51,240, 16 entries 28,861. VF3 fetches through BATs only (no page-translated fetch).
+- **bclr / bcctr were the other redirects with a fix the 603e itself has.** "The 603e's branch processing unit decodes
+  and executes branches immediately after they are fetched. The resources of the branch unit include a count register
+  (CTR) rename register for mtspr(CTR), a link register (LR) rename register for mtspr(LR), a link register (LR) rename
+  register for branches specifying an update of the link register" (6.3, p. 6-6), and a bclr waits only when an
+  mtspr(LR) ahead of it has not executed (6.4.1.1, p. 6-15). This core predicted every bclr / bcctr not taken unless
+  the BTB held it, and the BTB holds one target per branch: 88,757 (VF3) returns to the wrong caller were MEM refetches.
+
+**2. What was built** (each a parameter, default as left):
+
+| Module | Parameter | What | Toward the 603e? |
+|---|---|---|---|
+| `ppc_core` | `LRA` (1) | **LR / CTR look-ahead.** Fetch keeps what the LR will be after the words it has pushed (`lw_k`, `lw_lr`): no LR writer pushed since the last hard redirect (the LR is `lr_q` once no older writer is in EX or MEM: it commits as MEM is left); the youngest pushed is a branch with LK = 1 (the LR is its address + 4, the 603e's LR rename for a branch); another (mtlr: unknown, predicted as before). The CTR is `ctr_q` when nothing in the queue, EX or MEM writes it (the look-ahead's `la_ctb`). A bclr / bcctr that branches always (BO = 1z1zz) with its target known, and no other register prediction in flight, is a soft redirect to it, as a b is; its target goes to `rp_tgt`, so EX's existing check (`rt_eq`, MEM refetch on a difference) stands behind it. A BTB register prediction whose target is not the known one fails its fetch check (`bmis_q`) and is refetched to the known target; the soft redirect allocates a register entry | toward: 6.3, 6.4.1.1 |
+| `ppc_core` | `IUN` (4) | the instruction micro-TLB's entries (2, 4 or 8), replaced in turn; with more than 2 the page and WIMG are formed per fetch candidate beside its compare and chosen last | timing only (5.4.3.1: the 603e's ITLB has 64 entries, a hit costs no cycle) |
+| `ppc_icache` (`ppc_cpu`) | `ISB` (0) | **a 32 KiB I-cache**: 4 ways of 8 KiB, 256 sets, the set's top bit EA[19] (`i_eix`, untranslated) — virtually indexed, physically tagged; icbi invalidates the set of both values of EA[19] (two tag writes), the ICFI sweep 256 sets. Not with FETCH2 | timing only (the 603e's is 16 KiB, 3.1); a study-level M10K decision (+12 in the spike) |
+
+**3. Measured** (48 frames 1300-1348, R116's bench, R112's memory set, `--check-lw`; work CPI leaves out the three
+poll loops):
+
+| Build | VF3 busy CPI | work CPI | busy cycles a vblank | Daytona 2 busy CPI | work CPI | busy cycles a vblank |
+|---|---|---|---|---|---|---|
+| base (R117 + R118) | 2.739 | 2.754 | 1,081,783 | 3.118 | 3.253 | 1,138,409 |
+| LRA (first form: conditional bclr too) | 2.719 (−0.7%) | 2.729 (−0.9%) | 1,073,604 | 3.076 (−1.3%) | 3.222 (−0.9%) | 1,119,446 |
+| IUN = 4 | 2.739 (±0) | 2.754 (±0) | 1,081,783 | 3.029 (−2.9%) | 3.183 (−2.2%) | 1,100,850 |
+| IUN = 8 | 2.739 (±0) | 2.754 (±0) | 1,081,783 | 2.983 (−4.3%) | 3.131 (−3.8%) | 1,084,409 |
+| ISB (32 KiB) | 2.715 (−0.9%) | 2.725 (−1.1%) | 1,075,335 | 2.924 (−6.2%) | 3.069 (−5.7%) | 1,056,278 |
+| NLP = 1 (not kept) | 2.740 (+0.0%) | 2.755 (+0.0%) | 1,081,774 | 3.161 (+1.4%) | 3.284 (+1.0%) | 1,156,846 |
+| NLP = 2 (not kept) | | | | 3.117 (−0.0%) | 3.252 (−0.0%) | 1,138,676 |
+| BTB_N = 256 (not kept) | (phase moved, below) | 2.741 (−0.5%) | | 3.094 (−0.8%) | 3.234 (−0.6%) | 1,126,753 |
+
+Together (the as-left defaults, and with ISB = 1 for the decision; the change against the base in brackets). The
+first row is the as-left RTL (LRA in its unconditional-only form):
+
+| Build | VF3 busy CPI | work CPI | busy cycles a vblank | Daytona 2 busy CPI | work CPI | busy cycles a vblank | I fills (VF3 / Daytona 2) |
+|---|---|---|---|---|---|---|---|
+| base | 2.739 | 2.754 | 1,081,783 | 3.118 | 3.253 | 1,138,409 | 63,729 / 265,227 |
+| LRA + IUN = 8 (`al8`, not kept: spike) | 2.719 | 2.729 (−0.9%) | 1,073,619 (−0.8%) | 2.960 | 3.115 (−4.2%) | 1,075,885 (−5.5%) | 62,970 / 231,833 |
+| **as left: LRA + IUN = 4** (`al4`) | **2.719** | **2.729 (−0.9%)** | 1,073,619 (−0.8%) | **3.004** | **3.147 (−3.3%)** | 1,092,802 (−4.0%) | 62,970 / 242,234 |
+| as left + ISB (`al4i`) | 2.698 | 2.703 (−1.9%) | 1,065,512 (−1.5%) | 2.827 | 2.970 (−8.7%) | 1,028,149 (−9.7%) | 50,303 / 120,542 |
+| LRA + IUN = 8 + ISB (`al8i`) | 2.698 | 2.703 (−1.9%) | 1,065,512 (−1.5%) | 2.781 | 2.931 (−9.9%) | 1,020,728 (−10.3%) | 50,303 / 116,245 |
+
+- `--check-lw`: 0 words wrong in every run (90,000-237,000 line writes each).
+- VF3's game frames stay at two vblanks in every build; its poll loop takes what the work saves (its share of busy
+  19.8% → 20.1%).
+
+**4. Spike** (`ppc_cpu`, cpi112's template, 120 MHz target; five seeds; Fmax slow 100 °C / −40 °C):
+
+| Build | Seed 1 | Seed 2 | Seed 3 | Seed 4 | Seed 5 | Mean | `ppc_cpu` ALM (mean) | registers |
+|---|---|---|---|---|---|---|---|---|
+| base (R117 + R118; seed 1 repeats fp117's `comb_s1`) | 100.44 / 102.36 | 100.60 / 98.16 | 96.44 / 97.88 | 99.52 / 101.69 | 97.31 / 97.68 | **98.86 / 99.55** | 13,694 | 12,564 |
+| **as left: LRA + IUN = 4** | 97.42 / 98.40 | 101.78 / 99.59 | 99.16 / 100.87 | 94.98 / 95.14 | 98.57 / 98.97 | **98.38 / 98.59** | **14,084 (+390)** | 12,674 |
+| LRA + IUN = 8 (not kept) | 97.45 / 97.02 | 95.19 / 92.27 | 96.48 / 97.68 | 95.83 / 95.60 | 95.83 / 95.50 | 96.16 / 95.61 | 14,492 (+798) | 12,841 |
+| LRA (first form) + IUN = 8, first form | 95.73 / 96.95 | | | | | | 14,128 | 12,790 |
+| as left + ISB = 1 (`al4i`) | 96.49 / 94.46 | 99.03 / 97.21 | 100.97 / 99.22 | 97.76 / 98.55 | 98.52 / 95.07 | 98.55 / 96.90 | 14,148 (+454; +64 on the as left) | |
+
+- As left the means are −0.48 / −0.96 MHz: inside what five seeds resolve (R108: about ±1.5 MHz); D-44 is held
+  within what five seeds can see, not shown to hold exactly. IUN = 8 is −2.7 / −3.9 MHz, outside it, with every seed
+  below the base's mean at −40 °C: not kept, though it is worth another 1.0% of Daytona 2's work CPI (3.147 → 3.115).
+- The worst paths are the base's families in every seed (the D-cache's set-state MLAB into `op_y`, `op_y` into
+  `m.valid` and `d_rdy_q`, the D-cache's `mp` into the core). The fetch side's own groups (`stage.tcl`, slow 100 °C,
+  seeds 1-5): the I-cache's worst −1.37 / −1.25 / −1.09 / −1.88 / −1.75 ns (base −0.75 / −1.31 / −0.82 / −0.60 /
+  −1.30), into the fetch queue −1.34 / −1.09 / −1.54 / −1.59 / −1.22 (base −1.54 / −1.29 / −1.32 / −1.58 / −1.52), into
+  the redirect registers −1.14 / −0.69 / −0.53 / −1.48 / −0.94 (base −0.85 / −0.95 / −0.85 / −0.61 / −0.67): the
+  I-cache's is the micro-TLB's page into `pa` (four entries ORed after the candidate's choice), 0.3-0.5 ns short of
+  each seed's worst.
+- Area: +390 ALM (13,694 → 14,084, +2.8% of `ppc_cpu`), +110 registers; 0 M10K, 0 DSP. IUN = 8 is +798.
+- ISB = 1 on the as left: +0.17 / −1.69 MHz on the means (−0.31 / −2.65 against the base), the −40 °C mean below
+  what five seeds resolve against the base; +64 ALM (the I-cache 691 → 739), **M10K 39 → 51 (+12)**: the data arrays
+  2048 deep, the tags 256 deep in the same two blocks. The worst paths stay the base's families; the I-cache's own
+  worst −1.49 / −1.74 / −1.25 / −0.78 / −1.36 ns, as without it.
+
+*Checks:*
+- CPU benches (`tools/bench.sh`, R104_CHECK on, TB_LU2): cpi112's 13 runs and fp117's three `--fpchain` runs, 16 of 16
+  PASS on the RTL as left (and on IUN = 8); cycles −0.00 to −0.28% against the base (`core_loops` −0.28%,
+  `sub_loops` −0.07%), instruction counts different only where interrupts are asynchronous (±24). A counter bound in
+  (`cov/fe_cov.sv`): the `--loops` runs make 2,019 / 1,359 bclr predictions from a branch-and-link ahead, 1,089 / 883
+  from `lr_q`, 550 / 715 bcctr from `ctr_q`, and 1,601 / 1,116 BTB register targets replaced by the known one
+  (`core_loops` / `sub_loops`); every run makes 268-1,385 bcctr predictions. The subsystem benches with ISB = 1
+  (`SUBONLY`): the six subsystem runs PASS (IUN 4 and 8), with 114-1,369 icbi second-set writes, 127,529-291,572 fast
+  answers from EA[19] = 1 sets and 2,081-6,729 pre-read answers there in each run.
+- I-cache unit bench (`tb_icache`, 8 seeds, 200,000 fetches): with ISB = 0 every log is the base's line for line;
+  with ISB = 1 and TB_ISB (256 sets in the reference, EA[19] from a per-page alias bit, so some pages are indexed by
+  EA[19] ≠ PA[19], icbi of both sets) 8 of 8 PASS. The pre-read port's bench (`tb_icache_pre`, 4 seeds): ISB = 0 the
+  base's logs, ISB = 1 4 of 4 ok, 41-43% of pre-reads answered in one cycle as in the base. D-cache: unchanged.
+- FPU fast unit (EF = 1, the tree's bench, seed 1): directed 152,317 cases, 3,750,000 early-forward ops, 8,469,075
+  checks, 0 failures; the FPU files are base119's byte for byte.
+- New checks (R104_CHECK): a register target the look-ahead knew is the register EX reads (the EX check behind it
+  stays the architectural guard); every branch with LK = 1 is an LR writer to the predecode; the micro-TLB's
+  existing check covers all IUN entries. In the I-cache (PPC_CACHE_SIM): a sequential request keeps EA[19].
+- Planted faults (one textual change each; `faults/`):
+  - LRA, R104_CHECK off (the comparison against the reference must catch it): the soft redirect's target one word
+    off with `rp_tgt` right — caught (core and subsystem). Every other look-ahead fault makes a target that EX's
+    existing check refetches, so it is a cycle cost, not a wrong result; with the new check on, L2-L7 and L10-L12
+    are caught by it: L2-L4, L6, L7, L10, L12 (lw_lr without the + 4, mtlr not making the LR unknown, `lw_k` not
+    reset by a hard redirect, the CTR known with a writer in flight, `rp_tgt` not loaded, `rp_v` not set, the state
+    never updated). Not reached by any bench: an older LR writer still in MEM (L5) or in EX or MEM (L11) when a
+    bclr arrives with `lw_k` 0 (it needs a branch-and-link held in MEM past a hard redirect's refill; EX's check
+    would refetch). Not faults (cycles only, the existing checks recover): the BTB's target not compared with the
+    known one (L8), the queue's predicted bit left 0 (L9: EX redirects to the right target).
+  - IUN, R104_CHECK off: the page written to the wrong entry, the invalidation by set over two entries only —
+    caught. The valid bit set on entry 0 instead of the one written — not caught by the comparison (entry 0 then
+    holds a translation from before the last invalidation, which the benches never fetch again under a changed
+    mapping); R104_CHECK's micro-TLB check does not catch it either (the stale entry still matches the TLB in every
+    bench: none changes an instruction page's TLB entry and fetches it again). MSR[PR] left out of the compare: not reached (no bench fetches
+    one page in both modes under different protection).
+  - ISB, the unit benches (PPC_CACHE_SIM's checks off): 8 of 11 caught (icbi's second set, kl's EA[19] out of
+    `p_line`, the data index's EA[19], `nx_e` at a pre-read hit, the deferred touch's set, the fill's set, `pa_e`,
+    the pre-read's index); 3 not faults: the lookahead's set without EA[19] (it then never matches: crossings are
+    slower), the fill-forward test without it and `fs_q`'s availability without it (both only more conservative).
+- Verilator 5.052 `-Wall` lint with R104_CHECK: `ppc_core` top 21 warnings as the base; `ppc_cpu` top (ISB 0 and 1)
+  17 as the base (the empty `t_alloc` pins of the base aside, no new warning). `quartus_map --analyze_file` (17.0) on `ppc_core`, `ppc_icache`, `ppc_cpu` as left: 0 errors, 0 warnings. The
+  new size casts (`IW'({e, s})`, `DW'(...)`, `IUW'(iu_nx + 1'b1)`, `8'(NS - 1)`) constant-folded in Quartus 17
+  (`cfold/`): every output as intended. No index past an array's end (`iu_ix` is `$clog2(IUN)` bits).
+- The transplant: `XP_LRA` derives the look-ahead's state from the queue's words (VF3's c1300 queue holds a `bl`:
+  `lw_k` 1, `lw_lr` 63FC4); `XP_IUN` carries the two entries (Daytona 2 has pages 00001 and 00016 valid); `XP_ISB`
+  places each of the 512 valid I-cache lines at its PA[19] (the I-cache idle at both checkpoints but for a set-state
+  write).
+
+*Wrong turns:*
+- **A next-line prefetch into the I-cache loses on the shared port.** Built (`NLP`, the lookahead's tag read finding
+  kl + 1 absent starts a fill of it into the set's victim, untouched, served as a demand fill's words are): VF3 busy
+  CPI +0.0%, Daytona 2 +1.4% (3.118 → 3.161). Daytona 2's I fills rose 265,227 → 341,308; I-misses on line crossings
+  fell 0.33 M cycles, and every other I-miss and the data wait rose (data wait 13.9 → 15.3% of busy): a demand miss,
+  I or D, waits behind a prefetch on the one port. A form that prefetches only in a stream of misses (`NLP` = 2) almost
+  never fired (266,110 fills, ±0.0%): after a demand fill fetch is pending on every word until the fill ends, so the
+  lookahead finds no cycle before the crossing. The shadow's −30% assumed a free port. Taken out of the RTL; its unit
+  bench mirror showed allocation-order failures I did not chase once the system bench had ruled it out.
+- **BTB 256 entries** (no M10K: the entry's width, not its depth, sets the blocks): Daytona 2 busy / work CPI −0.8% /
+  −0.6%. VF3's run moved into a different frame phase (busy instructions a vblank 395 k → 531 k, the poll loop and the
+  209C0-20A00 blocks 2.1-2.5 times as often, frames still two vblanks), so its CPI cannot be compared; its work CPI
+  read −0.5%. Left at 64: not shown to be worth new spikes.
+- My first LRA also resolved conditional bclr / bcctr (the rule's direction, `pw_rstk`, from the look-ahead) and marked
+  them `lar`: the seed-1 spike put the I-cache's word through the look-ahead into the queue entry and `redir_q` on its
+  worst list (−2.11 / −1.60 ns, 95.73 / 96.95 MHz with IUN = 8). As left only BO = 1z1zz is resolved.
+- IUN = 8's first form chose the micro-TLB hit by `f_sel` and then OR-ed eight pages into `pa`: `f_pc` → the I-cache's
+  `pa` −1.74 ns on that spike (base −0.75). As left each candidate's page is formed beside its compare and chosen last.
+
+*Merged:* not yet (2026-11-07). `ppc_core.sv`'s hunks are in the fetch section and two checks; the store-data
+path (being changed in `sm3-builds/st119/`) is not touched.
+
+*Not done:*
+- The board: nothing here is board-verified.
+- ISB = 1 as a default: +12 M10K (39 → 51 in the spike; the full build 324 → about 336 of 553), +64 ALM, the spike's
+  −40 °C mean −1.7 MHz against the as left; Daytona 2 −5.7% work CPI alone, −8.7% with the as left (VF3 −1.9%). A study-level decision (M10K is as binding as ALM); left at 0 here, and decided in D-47.
+- The same-cycle mispredict redirect (about 0.8% of either game's work, EX's decision in front of the I-cache's
+  address) and the resolution of a bc in ID (1-6% of the bc mispredicts in work). Not built.
+- Taken branches without a BTB prediction (VF3 1.40% + 1.15%, Daytona 2 1.42% + 2.22% of work): 59% of VF3's
+  (280,337 of 476,964 in work) and 45% of Daytona 2's are the first or second request after a redirect, which design C's key
+  (B − 4) can never predict; a bigger BTB reaches only the rest (BTB_N = 256, above).
+- IUN = 8 (another −1.0% on Daytona 2) at −2.7 / −3.9 MHz; a micro-TLB of 8 with its compare split over two cycles.
+- The data micro-TLB's replays (Daytona 2 3.4% of work in the refetch's bubbles and I-misses): the data side's work.
+- The line-crossing I-misses that remain (VF3 2.4%, Daytona 2 4.3% of work): a prefetch would need a second memory
+  path or one that can be pre-empted.
+- Conditional bclr / bcctr in the look-ahead (the first form's timing cost; the gain was the same on VF3).
+
+*Board (2026-11-07).* `r7i1` (`r7h1` plus LRA, IUN = 4 and ISB = 1, D-47; setup −2.10 / −1.88 ns, hold least
++0.060 ns, 41,001 ALM, 336 M10K) runs correctly. In Daytona 2 one attract scene now holds 58 fps from start to finish;
+the others stay mostly at 29, with a few seconds at 58. VF3 looks about the same: 29 mostly, 58 in some scenes. That
+is in line with the bench's −1.9% for VF3.
+
+**R122 — Scud Race's freeze is the CPU's alignment exception, not the Real3D: at frame 10,730 the game loads a word
+from CROM at FF292FFE, misaligned and crossing a 4 KB page under page translation, and the core traps it as D-39
+decided. The real 603e cannot be trapping it. Sega Bass Fishing's crash after its warning screen fits the same cause.**
+
+*Board.* Scud Race freezes in attract at the same point every time, on `r7f1` and `r7h1`, and again after a reset.
+- The screenshot is the "RANKING / MEDIUM / TIME ATTACK" table over the white #32 car, the ranking after the third
+  course, with the FPS counter at 0. The whole screen stops; INSERT COIN stops blinking too.
+- Against Supermodel's grabs (every 50 frames to 20,000, then every frame around it), the frozen picture is frame
+  10,730 (17.6 dB PSNR, the next best 16.9).
+
+*The trace, and what it did not show.* I first expected the Real3D or bad data:
+- Supermodel's bus trace holds nothing new in frames 10,550-10,760. No region, register value, texture load, polygon
+  count, node count or VROM model there is new or larger than earlier in the run.
+- The core's geometry, rasteriser and host blocks reproduce Supermodel on every frame from 10,690 to 10,770, given
+  Supermodel's memory.
+- The one first-time event at 10,730 is the first read of RAM line 0x1E5DC0, a table entry written at the third
+  course's load (frame 8,483) that points at culling nodes loaded at 8,486. That made it the lead suspect, with a
+  walker that cannot end a sibling cycle (`r3d_walker`, shown only with a planted input) as the way it could hang.
+- It was a coincidence of timing. The details are in `sm3-builds/crash15/STATUS.md`.
+
+*The debug build at the freeze.* The overlay build with rows 3-7 dropped (`r7h1p`) answered it:
+- Row 0: the PC loops in FFF00030-FFF00048, the boot ROM's fatal handler.
+- Rows 8-11: the last exception is vector 0x600 (alignment), SRR0 0x0002DF34, entered through FFF00600. The
+  202,580 exceptions counted before it are the game's DTLB misses (0x1100 / 0x1200), the 603e's software table walk.
+- Row 1: frames drawn stops at 8,668, with geometry error bits 0. The Real3D is not involved.
+
+*The instruction and its address.* 0x2DF34 is `lwzx r16,r16,r5`, a table load (index from a halfword, times 4, plus a
+base read from r13-0x50F8).
+- A Supermodel build that logs every misaligned access (`sm3-builds/misal`) shows that load at EA FF292FFE, in CROM,
+  in frames 10,729-10,738: 4 bytes, misaligned by 2, crossing from page FF292000 into FF293000.
+- It is the only page-crossing misaligned access in the run. It comes back once per attract loop, every 15,477
+  frames, at the same point, to beyond frame 100,000.
+- Scud Race runs with data translation on, and that CROM range is page-translated.
+
+*What it means for D-39.* D-39 split a page-crossing misaligned integer access inside a BAT block, and trapped it
+when page-translated or when it left the block. The manual's §4.5.6.1.1 is ambiguous there. D-39's own argument was
+that the boot ROM treats every alignment exception as fatal, so a chip that traps means no game does this. Scud Race
+does it in attract, which runs for hours on real cabinets. So the 603e splits it, and D-39's trap is wrong for this
+case. The CPU change (a page-crossing split with each half translated on its own page) is being built separately.
+It will amend D-39 with its own entry when it is proven on the board.
+
+*Sega Bass Fishing.* The same Supermodel log on `bassdx` (Step 1.0, 3,000 frames) shows 300 page-crossing misaligned
+word loads from CROM:
+- PCs 0x7AB24-0x7AB40 and 0x2B27C;
+- EAs such as FF145FFD, FF24AFFF and FF265FFE, misaligned by 1, 2 and 3 bytes;
+- the first at frame 797, just after the blue warning screen, which is where the board crashes.
+
+That is the same pattern, so the CPU fix should cover it too. Bass Fishing is not proven on the board yet.
+
+Before that log, I found these for Bass Fishing (`sm3-builds/bass`):
+- The core's idle inputs are not the cause. Supermodel runs 20,000 frames with port C = FF, G = 7F and the ADC at 0.
+- The Real3D host blocks pass bassdx's trace to frame 1,500.
+- From frame 797 Bass Fishing uses the Step 1.0 one-word texture port every frame, by 53C810 DMA (2,145 writes in
+  3,000 frames, each a 128×128 texture with its mip levels). It is the first game to lean on that path, and it was
+  the lead suspect until the alignment log. It remains the next place to look if the CPU fix does not cure Bass
+  Fishing.
+
+*Debug builds.* The full overlay no longer fits:
+- `r7h1d`: 4,201 LABs needed of 4,191.
+- With the frame-busy counter off (`r7h1d2`): seed 1 fitted at 41,521 ALM but had hold −0.036 ns at slow −40 °C, on
+  a register-to-register path in `ppc_fpu_rsqe`. Seed 2 was worse: setup −4.81 ns and hold negative at three
+  corners.
+- With overlay rows 3-7 tied to zero (`r7h1p`): 41,488 ALM, setup −2.52 / −2.27 ns, hold positive everywhere (least
+  +0.104 ns). That is the build that found this.
+
+At 99% the fitter stops placing well. A debug build now has to drop rows to fit.
+
+*Wrong turns:*
+- I followed the bus trace and the Real3D for a day's work before the overlay showed a CPU exception.
+- The first failed debug fit left an RBF from an older compile in its folder, copied by the launcher as if it were
+  the new one. I deleted it before it went anywhere. The launchers now clear `output_files` after copying the tree,
+  and copy an RBF only when the flow log says the compilation succeeded.
+- My first misaligned-access run did not stop at frame 11,000 (`M3TG_EXIT` only acts with the tile dump on). It ran
+  past frame 100,000 before I stopped it, which turned out useful.
+
+**R123 — The 3D tearing in VF3 was the scan-out taking the layer buffer one clock before `r3d_cmd` moved it: every
+frame was shown one frame late, from a buffer `r3d_cmd` had already freed and could draw the next frame into. Taking
+the buffer through line 384 fixes both. On the board the tearing is gone, and every game's 3D is one frame sooner.**
+
+*The fault.*
+- `r3d_cmd` moves `show_buf` to the newly finished frame on its `vbl`, which is `ln_start` with `ln == 384`. That
+  comes a clock after `vcnt` reaches 384.
+- `m3_compose` took `buf_q <= show_buf` on the first clock of `vcnt == 384` (`vq != 384`), so it always took the
+  value from before the move.
+- So the scan-out showed the previous frame's buffer for the whole next frame, while `r3d_cmd` counted that buffer
+  as free (`used` holds only `show_buf`, the pending buffer and the frames in flight). A frame ending in that
+  display period could pick it with `free_i` and be drawn into it.
+- The screen shows the top from one frame and the bottom from the next, split where the drawing has reached. That
+  is the picture from the board: two copies of a fighter's head across a clean line, with the background unbroken
+  because the camera was still.
+
+My R118 note was wrong: I had reasoned that the swap at line 384 meant a half-drawn frame could not be shown.
+
+*Reproduced on the bench.* A check in the system bench (`M3_TEAR`, `sm3-builds/tear`) flags any visible line read
+from a buffer `r3d_cmd` still has in flight, and any frame where the scan-out's buffer is not `r3d_cmd`'s after the
+swap. On Scud Race's first race (frames 1,000-1,040, 60 fps, from the `s15` checkpoint):
+
+| | Frames with a visible line from a buffer being drawn | Clocks | Frames with scan-out ≠ `show_buf` |
+|---|---|---|---|
+| before | 40 of 40 | 37.8 M of 63.0 M visible (60%) | 40 |
+| after (`buf_q` taken through line 384) | 0 | 0 | 0 |
+
+Every composite in the window differs between the two, as it should: the fixed model shows each frame one vblank
+earlier.
+
+A tear shows only where the drawing gets ahead of the beam, which is why it was occasional and mostly in VF3, whose
+frames swing between 29 and 58. The fault itself was there in every game, at any frame rate, as one frame of added
+3D latency. Lag-free is a requirement, so that frame matters as much as the tearing.
+
+*The change.* `rtl/video/m3_compose.sv`: `else if (vcnt == 10'd384) buf_q <= show_buf;`. `r3d_cmd` moves `show_buf`
+only at the line-384 start and the first fetch of the next frame is at line 385, so taking it through the line is
+safe.
+
+*Board (`r7j1`, 2026-11-07: `r7i1` plus this).*
+- The fit: setup −2.72 / −2.77 ns at slow 100 °C / −40 °C, hold least +0.100 ns, 41,161 ALM, 336 M10K. The setup
+  is worse than `r7i1`'s for a one-line change, which is this seed's placement.
+- I built it before the bench had shown the tear, to save the time, and ran the bench alongside.
+- VF3's tearing is gone. Scud Race and Daytona 2 run at the same frame rates as before.
+
+**R124 — Integer accesses that cross a 4 KiB page are split under page translation too, with the second
+word translated on its own page: D-39's alignment trap was a misreading, and it froze Scud Race in attract and Bass
+Fishing straight after its warning screen.** Work in `sm3-builds/xpage/` (tree: `h3src`, the `r7j1` RTL). Only
+`rtl/cpu/ppc_core.sv` changes. The fit `xp1_s1` failed hold at three corners (−0.042 / −0.065 / −0.003 ns, all in `r3d_rast_tcache`, which this change does not touch). Seed 2, `xp1_s2`, is the board build.
+
+*What I believed (D-39, R85, R86):* a misaligned integer access that crosses a page is split in hardware inside a
+DBAT block, and takes the alignment exception (0x600) under page translation (MSR[DR] = 1, no BAT hit) or when the
+crossing leaves the block. My reasoning was that the boot ROM treats every alignment exception as fatal, so no game
+relies on the trap: "if the chip traps, games never do this". The CPU bench agreed, because I had written its model
+(`sim/cpu/ppc_iss.h`) from the same reading, so it could not find the misreading.
+
+*What I know now:*
+
+- **Scud Race (`scuddxo`, Step 1.5, 603ev) on the board** freezes in attract at the same point every time, about 3
+  minutes in. At the freeze the overlay shows the CPU looping in the boot ROM's fatal handler (PC FFF00030-FFF00048).
+  The last exception was 0x600 with SRR0 0x0002DF34, entered at FFF00600. The word at 0x2DF34 is `lwzx r16,r16,r5`
+  (7E10282E).
+- **Supermodel, built to log misaligned accesses** (`sm3-builds/misal/sm`, run `misal/run/misal.log`), shows that
+  `lwzx` load the word at FF292FFE: four bytes across the page into FF293000, in CROM. It does this once a frame for
+  frames 10,729-10,738 (the freeze point) and again for 26,206-26,215. Those 20 are the only page-crossing misaligned
+  accesses in the run. Scud Race uses page translation all the time: about 200,000 DTLB-miss exceptions
+  (0x1100 / 0x1200) by the freeze.
+- **Bass Fishing Deluxe (`bassdx`, Step 1.0, 603e)** stops on the board straight after its warning screen (R96's
+  freeze: last vector 0x600). In the same Supermodel build (`misal/runb/misal.log`), from frame 797 it makes 300
+  page-crossing word loads from CROM in 3,000 frames. They come from PCs 0x7AB24-0x7AB40 (239) and 0x2B27C (61), at
+  every offset a word can cross from: 68 at xxxFFD, 160 at xxxFFE, 72 at xxxFFF (for example FF145FFD, FF24AFFF,
+  FF248FFF, FF249FFF, FF265FFE). All are 4-byte reads.
+- **Both crossings are page-translated, not BAT ones.** Both games load the same DBATs and SDR1 from their own code
+  (Scud Race at 0x16CC-0x1848, Bass Fishing at 0x8A82C-0x8A97C). In the system bench (`s15/runs/h1` at frame 35,
+  `bass/runs/a` at frame 50; no later BAT write to frame 100) the last writes are:
+
+  | DBAT | Upper / lower | Block |
+  |---|---|---|
+  | 0 | 0000000F / 00000019 | 0-512 KiB |
+  | 1 | 0010001F / 0010001A | 1 MiB at 0x00100000 |
+  | 2 | FF8000FF / FF800019 | 8 MiB at FF800000 |
+  | 3 | F00003FF / F000003A | 32 MiB at F0000000 |
+
+  SDR1 is FF800000: the hashed page table sits in ROM. FF000000-FF7FFFFF, where every crossing above lies, has no
+  DBAT, so with DR = 1 it goes through the page table. The board's trap says the same thing on its own: a BAT block
+  is at least 128 KiB and aligned, so FF292FFE and FF293000 always share one, and under D-39 a crossing inside a
+  block never trapped. This is exactly the case 4.5.6.1.1 talks about, not the "leaves the block" case.
+- **So the chip splits.** Two shipped games make this access in attract, which runs for hours on real cabinets, and
+  Bass Fishing makes it every time it starts. The boot ROM's 0x600 handler is fatal. If the 603e (Bass Fishing) or
+  the 603ev (Scud Race) trapped here, every cabinet would freeze where mine does.
+
+*What the manual says* (MPC603e User's Manual rev 1, 1997; rev 3, 2002; the PEM rev 2), read again against this:
+
+- **§2.2.3, implementation notes:** "The 603e provides hardware support for some misaligned memory accesses". It
+  names only FP accesses that are not word-aligned as unsupported ("the 603e will invoke an alignment exception").
+  "Any memory access that crosses an alignment boundary must be broken into multiple discrete accesses."
+- **§4.5.6, the alignment exception's list** ("will initiate an alignment exception when it detects any of the
+  following"): FP not word-aligned; lmw, stmw, lwarx, stwcx. not word-aligned; little-endian misaligned;
+  multiple / string with LE; dcbz to a W or I page. No integer page crossing. §4.5.6.2's second list is the same.
+- **§4.5.6.1:** misaligned operations "may either cause an alignment exception or they may cause the processor to
+  break the memory access into multiple, smaller accesses". Table 4-14 gives the page-address translation access
+  (DR = 1, T = 0) as the type for which "the appropriate range check is performed before the instruction begins".
+- **§4.5.6.1.1:** "Half-word operands **can** cause an alignment exception if the EA ends in 0xFFF. Word operands
+  **can** cause an alignment exception if the EA ends in 0xFFD-FFF. Double-word operands **cause** an alignment
+  exception if the EA ends in 0xFF9-FFF." It closes: "there is no special handling for accesses that fall into BAT
+  regions". Rev 3's errata (appendix C) only drop the 4.5.6.1.1 heading into 4.5.6.1, with the wording unchanged.
+- **§4.5.3, DSI:** "The 603e supports the crossing of page boundaries. However, if the second page has a translation
+  error or protection violation associated with it, the 603e will take the DSI exception in the middle of the
+  instruction. In this case, the data address register (DAR) always points to a byte address in the first word of
+  the offending page." Table 4-11's DAR row says the same for pages ("a byte in the first word accessed in the page
+  that caused the DSI exception, for a byte, half word, or word memory access") and for BAT areas.
+- **PEM 3.2.2:** "A single-register instruction that accesses a misaligned operand may be restarted if the access
+  crosses a page, BAT, or segment boundary". Table 3-3 rates a 4-byte integer access at under 4-byte alignment that
+  crosses a page as "Poor" (slow), not as a trap; the same row for FP is the trap.
+- **PEM 6.1.4:** an integer load is never partly executed (rD and an update's rA are not altered); a store "that
+  causes an alignment or DSI exception" may have updated "some bytes just before the boundary".
+- **TLB miss (603e 5.5.2.1.1):** DMISS holds "the effective page address of the access which caused the TLB miss
+  exception". The manual says nothing more about a miss on the second page.
+
+So the manual does not contradict itself once each part is read for what it covers. 4.5.6's lists are the
+exceptions the chip takes. 4.5.6.1.1 says where an exception *can* come from in page-translated memory and where the
+range check is made. Its firm "cause" is for double words only (FP doubles: lfd / stfd). 4.5.3 says what the chip
+does with an integer crossing: it supports it, and it takes a second page's fault in the middle of the instruction.
+D-39 read "can" as "does". The board shows "does not", on both CPU versions Model 3 uses.
+
+*The change* (`ppc_core.sv`, required behaviour, no parameter):
+
+- **The split's second word is translated on its own page.** The +4 into EX's address adder, the DBAT compare and
+  the micro-TLB compare is now carried by `ex_s0ok` (the first word was made), not `ex_sp1`. The micro-TLB's own
+  low adder `ea_lo` takes it too. Before, it had no +4, because with DR = 1 a crossing was the trap. So the second
+  word hits its own page's micro-TLB entry or DBAT. If its first word replayed, a second cycle without `ex_s0ok` is
+  the first word's EA, replays again, and MEM translates the first page (as before).
+- **A second word that misses the micro-TLB replays with its own page.** `m_xpg` (EA[0-19] of `ea_x`) and `m_x4`
+  are registers of their own beside `m`, loaded as it is, so `mem_t` keeps its layout and the system bench's
+  checkpoints still transplant. MEM's slow translation, the micro-TLB fill, DMISS, DCMP's API and the DSI's DAR take
+  that page. For a second word, DMISS and DAR are the second page's first byte, (EA & ~3) + 4. 4.5.3 asks for
+  "a byte address in the first word of the offending page"; I took its first byte, which is also the address the
+  second access is made at. The replay then takes the second page's DTLB miss (0x1100 / 0x1200, C = 0 on a store
+  included) or DSI (protection, T = 1, a refusing BAT). SRR0 is the instruction, which the handler's rfi runs again
+  from its start (4.5.3 "in the middle of the instruction", PEM 3.2.2 restart). A store's first-page bytes are then
+  in memory (PEM 6.1.4). A load writes nothing, and an update form's rA is untouched: the first word is a uop with no
+  effect but its access. A replay that refills the micro-TLB refetches the instruction, so its first word is made a
+  second time (same bytes).
+- **The alignment exception stays** for exactly 4.5.6's list: lmw / stmw / lwarx / stwcx. not word-aligned (DAR
+  EA + 4 for lmw / stmw), FP not word-aligned, dcbz to a W or I page. FP doubles crossing a page with DR = 1 outside a
+  DBAT block also stay (4.5.6.1.1's "cause"; D-39's BAT exception for them is unchanged). The integer page-crossing
+  term of `algn` is gone. `db_c12s`, the block-end adder only that term needed with a +4, is gone: the FP double's
+  block-end test uses `ea_lo`.
+- **Unchanged:** DR = 0 (the split's carry is the same register there), every access that does not cross a page,
+  and lmw / stmw crossing a page between words (each word is its own uop, as before).
+- **Bench port:** `ev_xrf`, one flop, pulses when a page crossing's second word replays after its first word was
+  made and the replay refetches, so the core bench drops the first word's earlier access from the stream it
+  compares. It is left unconnected in `ppc_cpu` (Verilator: one new PINMISSING warning) and costs nothing there.
+
+*How it was established:*
+
+- **Reproduced on the bench before the fix.** The old core, with the new bench (`--xpage`) and the model as the
+  manual reads now, fails at Scud Race's own word: seed 10072, `lwzx r16,r16,r5` (7E10282E) at EA 0x60367FFE, page
+  offset FFE as FF292FFE, DR = 1. The old core takes 0x600 with SRR0 that instruction (the board's overlay), where
+  the model splits. Seed 10175 is the same at 0x60344FFE. Of 300 `--xpage` seeds run one at a time, the old core
+  fails 281 (`logs/repro_scan.txt`); 35 of them are a 0x600 where the model takes the second page's DSI. The new core
+  passes all 300.
+- **The model (`ppc_iss.h`)** now splits a page-crossing halfword or word with DR = 1. It translates EA, makes the
+  first page's bytes, then translates (EA & ~3) + 4 for the second word, which can take its own DTLB miss or DSI. The
+  bench's handlers are the manual's (5.5.2.2.2): their DSI path copies DMISS into DAR, and the DSI handler reads DAR
+  into r9, which is compared at every instruction. So DMISS and DAR are checked against the model.
+- **New bench runs, `--xpage`** (translated programs). Each crossing goes to one of: a seg 6 data page (both mapped
+  where the layout has both); a page with no entry (the second word's DTLB miss, then the handler's DSI); a page into
+  DBAT0's block; the block into a page (mapped half the time); inside the block (D-39's split); or across a 4 MiB
+  line (the second page's API differs in DCMP). Half the time the second page is first taken out of the TLB
+  (`tlbie`) and the first page's word touched. A third of the time the access is made twice, both pages in the
+  micro-TLB. Every D and X form is covered: plain, update and byte-reversed, loads and stores, words at FFD / FFE /
+  FFF and halfwords at FFF, and `lwzx rD,rD,rB` with Scud Race's registers.
+
+*Results (desk only):*
+
+| Check | Result |
+|---|---|
+| New `--xpage` runs, 6 (core `--mode 1` 400 seeds, `--mode 2 --mis` 300, `--rdy 30` 300; subsystem `--mode 1` 200, `--mode 2 --snoop 50` 100, `--mode 1 --mis` 100) | 1,400 of 1,400 seeds PASS, 8.81 M instructions compared. Crossings with DR = 1 done: 26,507 (both pages page-translated 16,522; one word in a DBAT block, the other not: 5,428). The second page's DTLB miss taken 20,912 times, its DSI 3,010. First words made again after a replay: 9,135. Crossings met by page offset: words at FFD 11,779, FFE 23,260, FFF 11,609; halfwords at FFF 23,300 |
+| fe119's 16 runs, old core + old bench against new core + new bench | 16 / 16 PASS. 12 are identical in instructions, cycles and every count line. The 4 that make page crossings differ as they should: `core_mis` 993,474 → 1,008,537 instructions and 4,753 → 4,324 alignment exceptions; `core_misint` 661,519 → 674,140; `sub_mis` 348,617 → 354,613; `core_alias` 1,091,384 → 1,092,081 (its misaligned update forms) |
+| The same subsystem runs with ISB = 1 (the release's 32 KiB I-cache) | 10 / 10 PASS. sub200, sub_loops, sub_snoop, sub_fpb and sub_chain identical in instructions and cycles to fe119's `al4i` runs (this RTL's base with ISB = 1). sub_mis differs by its page crossings (translated 137,227 → 141,191 instructions). The three subsystem `--xpage` runs pass |
+| D-cache and I-cache unit benches (seeds 1-8, 200,000 operations; I-cache also with ISB = 1) | 32 / 32 PASS, 0 errors (`ppc_dcache.sv` and `ppc_icache.sv` are unchanged) |
+| 48-frame system bench (fe119's: mem112's o114 checkpoints transplanted, frames 1300-1348, ISB = 1) against fe119's `al4i` (this RTL's base) | VF3 and Daytona 2 identical: every log line but the checkpoint path, and the `--prof2` profiles byte for byte. VF3 2,341,460,810 cycles, Daytona 2 2,343,199,210; busy CPI 2.698 / 2.827, work CPI 2.703 / 2.970; `--check-lw` clean. Neither game crosses a page with DR = 1 |
+| Verilator lint (`-Wall`, `ppc_core` and `ppc_cpu`, R104_CHECK on and off) | 0 errors. Against the base: one warning fewer (`db_c12s` gone) and one new PINMISSING (`ev_xrf` unconnected in `ppc_cpu`) |
+| `quartus_map --analyze_file` (17.0), `ppc_core.sv` | 0 errors, 0 warnings, in a scratch project and in the tree's `Model3` project (its `.qsf` saved and put back, md5 83f20823 before and after) |
+| Planted faults (R104_CHECK off; core `--xpage` 150, core `--xpage --mis` 100, subsystem `--xpage` 60) | 10 of 10 caught (X5 only after the 4 MiB-line case went in) |
+
+New arithmetic: none. The +4 carry into `ea_lo` is the form `db_c12s` had (and `ea_x` has), so I did not constant-fold
+anything new. No array index changes.
+
+Planted faults (`faults/xpg.txt`):
+
+| Fault | What it does | Caught by |
+|---|---|---|
+| X1 | `ea_x`'s +4 by `ex_sp1` again | all three runs |
+| X2 | no +4 into the micro-TLB compare (the second word takes the first page's entry) | all three; the ORed-translation check |
+| X3 | MEM translates the first word's page for the second word's replay | all three; livelock (no end in 500,000 cycles) |
+| X4 | DAR / DMISS keep EA's low 12 bits for the second page | all three |
+| X5 | DCMP's API from the first page | all three, once a crossing crossed a 4 MiB line; missed before |
+| X6 | `ev_xrf` never set | core runs (stream check); the subsystem has no stream compare |
+| X7 | the integer page-crossing alignment trap back (the old core) | all three |
+| X8 | `m_x4` from `ex_sp1` (a replayed first word's DAR becomes the page's first byte) | all three |
+| X9 | MEM's slow translation from `m.result` (EA's page) | all three; livelock |
+| X10 | the DSI's DAR from `m.result` | all three |
+
+*Price* (`ppc_cpu` spike, cpi112's template, 120 MHz target, five seeds; Fmax slow 100 °C / −40 °C):
+
+| Build | Seed 1 | Seed 2 | Seed 3 | Seed 4 | Seed 5 | Mean | `ppc_cpu` ALM (mean) | Registers |
+|---|---|---|---|---|---|---|---|---|
+| fe119 as left (this RTL's base) | 97.42 / 98.40 | 101.78 / 99.59 | 99.16 / 100.87 | 94.98 / 95.14 | 98.57 / 98.97 | 98.38 / 98.59 | 14,084 | 12,674 |
+| **page crossings split** | 98.39 / 101.40 | 101.03 / 102.29 | 95.96 / 97.48 | 99.81 / 99.04 | 99.40 / 97.32 | **98.92 / 99.51** | **14,142 (+58)** | 12,688 |
+
+- +0.54 / +0.92 MHz on the means: inside what five seeds resolve (about ±1.5 MHz). The slowest seed is 95.96 MHz
+  (the base's 94.98). M10K 39 in both, DSP unchanged. `ppc_core` 12,238 → 12,303 ALM.
+- The worst paths stay the base's families: the D-cache's set-state MLAB into `op_y` / `op_s`, `d_valid_q` into
+  `op_y`, the fetch queue into `ex_ls`, `m.valid`. The new carry source shows up in two seeds: `ex_s0ok` into
+  `m.valid` −1.320 ns (seed 5, worst −1.727) and into `m.fsm` −1.212 ns (seed 2, worst −1.565). That is 0.35-0.4 ns
+  inside each seed's worst. `ex_sp1` drove the same adder before.
+
+*Release fit `xp1_s1`* (110 MHz, `M3_RELEASE`, seed 1, r7j1's launcher with this `ppc_core.sv`):
+
+| Corner | Setup (CPU clock) | Hold (CPU clock) | HDMI setup |
+|---|---|---|---|
+| slow 100 °C | −2.314 ns (TNS −1,247) | **−0.042 ns** (TNS −0.294) | −0.011 |
+| slow −40 °C | −2.195 ns (TNS −884) | **−0.065 ns** (TNS −0.455) | −0.172 |
+| fast 100 °C | +2.828 | +0.023 | +2.315 |
+| fast −40 °C | +3.784 | **−0.003 ns** (TNS −0.021) | +3.247 |
+
+- Area 41,274 ALM (98%), 336 of 553 M10K, 87 DSP. `r7j1_s1` (the base, seed 1): 41,161 ALM, setup −2.721 / −2.767,
+  hold +0.115 / +0.137 / +0.133 / +0.100.
+- RBF `sm3-builds/xp1_s1_2fb9f1f3.rbf`, md5 2fb9f1f31e8dd4568a860742c56922ec.
+- **Hold fails at three corners**, all on seven endpoints of one register: the Real3D texture cache's
+  `r3d_rast_tcache` `g_gate.st_n[1]~DUPLICATE` into its `fs` MLAB's write port. That is a placement outcome in a block
+  this change does not touch, but by my rule this build does not go on the board. It needs another seed or a hold
+  fix for that path.
+
+*Wrong turns:*
+
+- D-39's argument was a deduction from absence: VF3 and Daytona 2 never make the access, so I took "no game does
+  this" as the safe side. It was the unsafe side: the trap is fatal, the split is not.
+- R96 recorded Bass Fishing's freeze after a 0x600 and wrote "That may be D-39's crossing trap reached by a pattern
+  VF3 never makes ... Not yet looked at." It was. It went unchecked for a week, and Scud Race found it again.
+- The R86 bench's 404 page crossings in 200 `--mis` seeds were checked against a model I wrote from the same
+  reading. A model and RTL from one reading cannot find a misreading; only the game could.
+- My first version put the new page in `mem_t`. That would have shifted the struct the system bench's transplant
+  copies by name and type. I moved it into registers of its own, and stopped the spikes and the bench already
+  running on the first version and ran them again.
+- My first subsystem run with interrupts (`sub_xpgi`, `--mode 2 --xpage --mis --snoop 50`) failed one seed,
+  740, on the bench's cycle cap (500,000), not a mismatch. Without the snoop it passes at 479,520 cycles. `--mis`'s
+  short interrupt period (869 external interrupts in that seed) on the subsystem's wait-80 port, with the second-page
+  handler runs on top, is over the cap. I split the run: `--mode 2 --xpage --snoop 50`, and `--mode 1 --xpage
+  --mis`.
+- Planted fault X5 (DCMP's API from the first page) was missed at first: no crossing in the bench crossed a 4 MiB
+  line. I added one (0x607FF000 / 0x60800000, mapped under both VSIDs); see the fault table for the rerun.
+- The 603e text is in `sm3-builds/refs/MPC603EUM_rev1_1997.txt` (and rev 3 in `MPC603e-manual_hackaday.txt`), not
+  `docs/603e.txt`.
+
+D-39 is amended: *an integer halfword or word that crosses a 4 KiB page is split in hardware in every mode, its
+second word translated on its own page (DBAT, micro-TLB, TLB), a fault there taken from the instruction with DAR /
+DMISS the second page's first byte; the alignment exception is taken only for 603e 4.5.6's list, and for an FP double
+crossing a page with DR = 1 outside a DBAT block (4.5.6.1.1).*
+
+*Board (2026-11-07, `xp1_s2`: `r7j1` plus this change; 110 MHz, release, setup −2.56 / −2.84 ns at slow 100 / −40 °C,
+HDMI −0.13 ns, hold least +0.109 ns, 41,227 ALM, 336 M10K, RBF 8851ce80):*
+- **Scud Race** no longer freezes at the third course's ranking.
+- **Sega Bass Fishing Deluxe** now boots past the warning screen into its attract, at 30-60 fps. Its open graphics
+  faults: the water's shadows look wrong, and some objects under the water are not tinted blue. It may be depth, or
+  a per-polygon attribute some objects use. Not looked at yet.
+- **VF3** is as before.
+- **Daytona 2** is as before, perhaps with a few more one-second peaks at 60. That is too little to call by eye.
+
+**R125 — Area since `r7c2`: the "ALMs needed" figure rose by about 1,900, but the logic grew by about 1,200 ALUTs. The
+rest is the fitter's dense-packing estimate shrinking as the chip fills. The chip is now about 98% placed in every
+build, with about 700 ALMs left to recover.**
+
+| Build | ALMs needed | Placed | Recoverable by packing | ALUTs (logic) | Registers |
+|---|---|---|---|---|---|
+| `r7c2` | 39,265 | 40,762 | 2,309 | 57,641 | 51,758 |
+| `r7f1` (R117, R118) | 39,758 | 41,120 | 2,173 | 58,270 | 51,925 |
+| `r7h1` (R119) | 39,711 | 41,109 | 2,217 | 58,245 | 51,895 |
+| `r7i1` (R121, D-47) | 41,001 | 41,137 | 850 | 58,802 | 51,801 |
+| `r7j1` (R123) | 41,161 | 41,193 | 797 | 58,922 | 51,876 |
+| `xp1_s2` (R124) | 41,227 | 41,132 | 685 | 58,931 | 52,035 |
+| `du1_s1` (data micro-TLB LRU) | 41,168 | 41,108 | 714 | 58,857 | 51,994 |
+
+- **The real growth** is in the ALUT column:
+  - R117 and R118 (+629 ALUTs);
+  - R121's fetch side and the 32 KB I-cache (+557, in line with the spike's +390 ALM and +64 ALM);
+  - R123 (+120).
+
+  The page-crossing split and the LRU change net out at about zero.
+- **Placed ALMs** have sat at 41,100-41,200 since `r7f1`. The fitter spreads the design over the whole chip while it
+  can.
+- **The jump in "needed" at `r7i1`** is the recoverable estimate falling from 2,217 to 850, the same effect R120 found
+  in `r7g1`.
+- **What it means:** the free room is about 700 ALMs, not the 2,000-2,600 the "needed" figure suggested before
+  `r7i1`. Sound (about 4,500 ALM) and I/O (about 1,000, R105, R110) do not fit without an area pass. D-45's fallback
+  and the area plan's order (the CPU area pass after the board proves it) are now the next decisions on area, ahead
+  of any further speed change that costs logic.
+
+**R126 — The data micro-TLB's size and replacement on Daytona 2 at 110 MHz: 8 entries take its
+replays from 410,674 to 218,185 and its work CPI 2.8%, but cost the `ppc_cpu` spike about 3-5 MHz; LRU replacement
+on the 4 entries costs nothing in EX, takes Daytona 2's work CPI down 1.4%, and is kept (`DRP` = 1).** Work in `sm3-builds/dutlb/`, on xpage's tree (r7j1 plus
+the page-crossing split). The release build is `du1`, tested on the board.
+
+*What I believed:*
+- That the data micro-TLB had 2 entries, like the instruction one before R121. It has had 4 since R63 (`du_*[3:0]`).
+- That the replays were mostly capacity misses a bigger micro-TLB would remove. They are, but replacement matters
+  as much as size at 4 entries.
+- I had forgotten that R115 had already built and priced an 8-entry form (change E, `cpi112/patches/utlb8.py`,
+  −2.4 MHz then, left out). This entry repeats it on today's CPU and adds LRU.
+
+*What I know now:*
+
+1. **Where Daytona 2's replays come from** (48 frames 1300-1348, a profile bound into `ppc_core`,
+   `s48/prof/du_prof.sv`, no RTL edit; the base run is fe119/xpage's byte for byte apart from the new lines):
+
+   | Busy, 48 frames | Daytona 2 | VF3 |
+   |---|---|---|
+   | page-translated accesses leaving EX | 5,330,440 | 627,717 |
+   | replays that filled the micro-TLB | 410,674 | 4,585 |
+   | replays that took a DTLB miss (load / store) | 53,937 / 3,356 | 133 / 50 |
+   | a page hit refused (store, no write permission) | 0 | 0 |
+   | selective invalidations (the handler's `tlbld`) | 57,293 | 183 |
+
+   Every DTLB miss costs two replays: the one that faults and the one after the handler's `rfi`, because `tlbld`
+   empties the set's entries (UTS).
+
+2. **Shadow micro-TLBs on the same stream** (misses, busy, Daytona 2; FIFO is the RTL's pointer):
+
+   | Entries | FIFO | FIFO, empty first | LRU |
+   |---|---|---|---|
+   | 2 | 779,351 | 759,300 | 730,508 |
+   | 4 | 492,926 | 458,938 | **389,103** |
+   | 6 | 349,351 | 312,277 | 278,287 |
+   | 8 | 298,214 | 259,814 | 231,480 |
+   | 16 | 220,453 | 186,224 | 174,234 |
+   | 64 | 168,645 | 138,576 | 138,576 |
+
+   VF3 is negligible at 4 entries or more (4,784 misses FIFO). LRU on 4 entries removes 21% of the misses, half what
+   8 FIFO does, without touching EX's compare.
+
+3. **Measured** (48 frames, `--check-lw` 0 wrong in every run; work CPI leaves out the three poll loops):
+
+   | Build | VF3 busy / work CPI | Daytona 2 busy / work CPI | Daytona 2 fills |
+   |---|---|---|---|
+   | base (DUN 4, in turn) | 2.698 / 2.703 | 2.827 / 2.970 | 410,674 |
+   | DUN 8, in turn | 2.698 / 2.702 | 2.737 / 2.887 (−3.2% / −2.8%) | 218,185 |
+   | DUN 4, LRU (kept) | 2.699 / 2.703 | 2.774 / 2.927 (−1.9% / −1.4%) | 328,701 |
+   | DUN 8, LRU | 2.697 / 2.702 | 2.718 / 2.868 (−3.9% / −3.4%) | |
+   | DUN 2, in turn | 2.706 / 2.713 | 2.922 / 3.077 (+3.4% / +3.6%) | |
+   | DUN 6, LRU | run stopped after 5 frames | | |
+
+   From the 8-entry run a replay costs about 7 cycles of work (0.083 CPI over about 16.5 M work instructions for
+   192,489 fewer replays).
+
+4. **Price** (`ppc_cpu` spike, five seeds, slow 100 °C / −40 °C; xpage's base 98.92 / 99.51 MHz, 14,142 ALM):
+
+   | Build | s1 | s2 | s3 | s4 | s5 | `ppc_cpu` ALM |
+   |---|---|---|---|---|---|---|
+   | DUN 4, in turn (= base) | 98.39 / 101.40 | | | | | 14,118.9 (seed 1 identical to xpage's) |
+   | DUN 4, LRU | 99.60 / 100.06 | 99.82 / 100.02 | 97.62 / 98.15 | 96.96 / 96.60 | 98.67 / 100.27 | 14,082-14,183; mean 98.53 / 99.02 |
+   | DUN 6, LRU | 97.39 / 96.71 | 99.85 / 100.15 | 92.49 / 90.36 | 100.08 / 100.00 | 98.34 / 98.40 | mean 97.63 / 97.12 |
+   | DUN 8, in turn | 95.90 / 94.65 | 92.85 / 93.74 | 99.12 / 98.47 | 95.79 / 97.23 | 99.41 / 96.98 | 14,256-14,295 (+140); mean 96.61 / 96.21 |
+
+   DUN 8's worst is `op_y` → the D-cache's `d_valid_q` through the hit and `xl_rp` (−2.09 ns, seed 1). It does not
+   hold D-44, as R115 found.
+
+*The change* (`ppc_core.sv`, timing only, the 603e has a 64-entry DTLB and no micro-TLB, 5.4.3.1):
+- `DUN` (2, 4, 6, 8) sizes the arrays, the compare, the page AND-OR (groups of three; above 4 the low five bits by
+  the DBAT hit, R115's form) and the invalidation; `DUN` = 4 is the old netlist (spike seed 1 identical in Fmax
+  and ALM, CPU bench identical in instructions and cycles on all 22 runs).
+- `DRP` = 1: least recently used, an empty entry first. The order is a DUN x DUN bit matrix updated in MEM from the
+  hit vector registered as MEM takes the uop (`du_hq`) and from the fill; nothing of it is in front of EX's request.
+  A Verilator check keeps it an order.
+
+*Wrong turns:* the premise of 2 entries; starting the size sweep before rereading R115 E.
+
+*Not done:* the 6-entry LRU CPI run (stopped after 5 frames; its spike averages 97.63 / 97.12 MHz, below D-44's margin anyway). The CPU bench passes every size: 2, 4, 4 LRU, 8 and 8 LRU. Not built: a refill at `tlbld` (about
+57,000 of the replays, roughly 0.8% of Daytona 2's work at 7 cycles each), not built.
+
+*Checks on the kept form:*
+- the CPU bench passes 22 of 22;
+- 10 of 10 planted faults are caught, including the LRU order check and the micro-TLB's laid-out page check;
+- lint is clean;
+- `quartus_map --analyze_file` gives 0 errors.
+
+*Board (2026-11-07, `du1_s1`: the main tree at R124 plus `DRP` = 1; 110 MHz, release):*
+- the fit: setup −1.76 / −1.72 ns at slow 100 / −40 °C, HDMI −0.05 ns, hold least +0.103 ns, 41,168 ALM, 336 M10K,
+  RBF 9385d044;
+- it works, with no regression;
+- 1.4% is too small to see by eye.
+
+**R127 — The geometry's VROM reads overlapped and in bursts: VROM in DDR3 in pair order, up to four of the model
+stream's requests in flight. Scud Race's geometry −14% a frame (its wait on VROM words −95%), Daytona 2's −24%
+(a drawn frame's geometry from 123-128% of a 110 MHz frame to 95-98%); at the board's worst DDR3 latency Scud Race's first race goes from 30
+to 60 fps on the bench. On the way: every Daytona 2 texture-port upload read half its words from the wrong VROM
+block.** R119 left the geometry as Scud Race's longest stage (74% of a 100 MHz frame, 89% at worst) with 43% of its
+time a VROM request waiting, one request at a time; R100 found the same on Daytona 2. D-44 applies (110 MHz; a cycle
+may be traded, a block's standalone Fmax may not drop), and so does §8.4 (area first): any ALM or M10K is priced
+below. Work in `sm3-builds/vrom/`: `tree` (the main tree at r7j1's RTL, with this change), `s15tr` / `d107tr` (the
+measurement trees: R119's `s15` and mem112's `tree107o` with R123's scan-out fix, bench additions only; `s15lr`,
+`s15hr`, `d107lr` the same with this change), `dev`, `ub` (unit bench), `an`, `runs`.
+
+*What I believed* (R100, R119):
+- The lever was "requests overlapped in `m3_xmem`, or a VROM cache": models are read again every frame.
+- The time went on each model's first words.
+
+*What I know now:*
+
+**1. Where the wait is.** The bench's `--prof-vrom` now also splits the decoder's cycles waiting on the model stream:
+on a model's first word, on any later word, and on the stream draining before a start (frames 1,001-1,059 from the
+idle point in frame 1,000; 100 MHz; the DDR3 model at 12-40 clocks):
+
+| per frame | Scud Race (first race) | Daytona 2 (attract, 1,301-1,347) |
+|---|---|---|
+| geometry busy | 1,124,339 (64.7%) | 1,246,936 (71.7%, every other frame the whole frame) |
+| VROM models started | about 300 | about 540 |
+| decoder waiting on a model's first word | 13,651 | 26,311 |
+| decoder waiting on a later word | 260,554 (23% of the geometry) | 503,520 (40%) |
+| decoder waiting for the stream to drain | 95 | 827 |
+
+Models are long (170-190 words), so the wait is not each model's start: it is the stream itself.
+`r3d_mstream` already asks up to four 8-word bursts ahead into a 32-word FIFO; `m3_xmem` took one at a time (the
+next only once the last one's words were out), and split each into four or five single-beat reads, because the
+MRA's layout puts a request's pairs in four different VROM blocks (16 or 8 MiB apart). **Wrong turn:** I had the
+starts as the cost and a next-model prefetch as a candidate; the main machine only learns the next model after the
+last chunk of this one, so that prefetch would need the walker run ahead, and it would have bought at most the
+first-word column (1-2%).
+
+**2. A VROM cache does not fit.** Every request of 99 Scud Race frames and 47 Daytona 2 frames (`--vtrace`) through
+an LRU model of 32-byte lines (`an/vcache.py`):
+
+| | Scud Race | Daytona 2 |
+|---|---|---|
+| VROM a frame, unique lines | 193 KiB | 365 KiB |
+| of them read the frame before | 98% | (draws every other frame) |
+| requests all-hit, 32 KiB 4-way | 6.1% | 11.5% |
+| 128 KiB | 19-28% | 12% |
+| 256 KiB | 53-71% | 12-15% |
+| 512 KiB | 75-92% | 29-37% |
+
+The reuse is across frames, over a working set of 0.2-0.4 MiB; within a frame a line is read about once (the
+"lines hit" near 50% at every size is only the next request starting in the line the last one ended in). A cache
+that helps would be a third to two-thirds of all M10K (691 KiB), with 553 / 553 the ceiling. Not built.
+
+**3. The change.**
+- `m3_xmem` `PIPE` (1): up to `GQ` (4) geometry requests taken before the first one's words are out. Their beats are
+  issued in request order as the port takes them, return in order into a 32-beat ring (one MLAB deep, as the old
+  8-beat buffer already was), and each request's words leave in order as its beats arrive. A texture read waits
+  until the geometry has no beat in flight and holds back the geometry's next one meanwhile, so every beat's owner
+  follows from the order. The request being given is kept in registers beside the queue (its first beat's place,
+  first word's half, length, zero flag), so a word's ring address does not go through the queue's select. `PIPE` 0
+  is the old one-at-a-time form.
+- `m3_system` `VROM_LIN` (1), with `m3_xmem` `XLIN`: VROM in the extra memory in pair order (word {g, b, h} at beat
+  {g, b}), so a request's pairs are one DDR3 burst of 4-5 beats on the pipelined port (its `p_blen`, 1 before). The
+  loader maps the MRA layout's byte address to it as it writes (b at bits 25:24 for a 64 MiB VROM, 24:23 for 32
+  MiB; index 4 comes before index 1 in Daytona 2's MRA, so `vrom64` is known), and `m3_xmem` maps `r3d_texup`'s
+  SDRAM-layout addresses the same way. The burst also matters to `m3_ddr3p`'s cap of 8 reads in flight (R101):
+  four overlapped requests of single beats would hold 16-20 of them; as bursts they hold four.
+- `r3d_mstream`, `r3d_geo`: unchanged. (A deeper stream, eight bursts and a 64-word FIFO with `GQ` 8, was built
+  and measured, 4 below: 0.3% more for two more MLABs and a 64-beat ring. Not kept.)
+
+**4. Measured** (the same idle-point checkpoints carried into each model, R116's transplant by name; checked by
+carrying the checkpoint into a model of the old logic under new member names, `PIPE` 0, which repeats the original
+model's 20 frames exactly: every profile line, the bus trace, the composites):
+
+Scud Race, 100 MHz, frames 1,001-1,099 (R123's scan-out fix in for the images, frames 1,001-1,059):
+
+| | geometry mean / worst (share of a frame) | later-word wait | VROM port busy | rasteriser mean | draws |
+|---|---|---|---|---|---|
+| before | 1,075,880 / 1,151,807 (61.9 / 66.3%) | 232,148 | 340,641 | 889,481 | 98 / 98 |
+| overlapped, single beats (`XLIN` 0) | 950,478 / 1,015,120 (54.7 / 58.4%) | 46,951 | 113,354 | 888,369 | 98 |
+| **overlapped, bursts (as built)** | **935,423 / 990,876 (53.8 / 57.0%)** | **11,450** | 89,187 | 888,497 | 98 |
+| eight in flight, 64-word FIFO | 932,289 / 990,159 (53.6 / 57.0%) | 2,431 | 83,471 | 888,351 | 98 |
+
+Daytona 2, frames 1,301-1,347 (the game draws every other vblank; the geometry of one drawn frame spans two):
+
+| | geometry a drawn frame | worst frame | later-word wait | rasteriser a drawn frame | draws in 47 vblanks |
+|---|---|---|---|---|---|
+| 100 MHz before | 2.38-2.50 M | 100% | 503,520 | 1.81-1.91 M | 23 |
+| 100 MHz as built | 1.82-1.89 M | 97.5% | 36,078 | 1.80-1.89 M | 23 |
+| 110 MHz before (`CLK_HZ` 110 M, 1,912,240 clocks a frame) | 2.36-2.45 M (123-128% of a frame) | 100% | 480,448 | 1.79-1.90 M | 23 |
+| 110 MHz as built | 1.81-1.87 M (95-98%) | 86.5% | 29,940 | 1.80-1.88 M | 23 |
+
+At the board's worst DDR3 latency (`--ddr-lat 40 136` for every DDR3 client, R82's tail), 100 MHz, 11 vblanks from
+the same points:
+
+| | Scud Race geometry a drawn frame | draws | Daytona 2 geometry a drawn frame | draws |
+|---|---|---|---|---|
+| before | 1.82-1.84 M (over a 1,738,400-clock frame) | 5 (30 fps) | 4.3-4.8 M | 2 (about 10 fps) |
+| as built | 1.22-1.28 M | 10 (60 fps) | 2.38-2.42 M | 5 (about 27 fps) |
+
+- *Frames drawn.* At the bench's default latency Scud Race's first race already draws every vblank, before and
+  after. At the tail latency the old path takes it to 30 fps and the new one keeps 60: the bench's form of the board's
+  20-29 fps views, which are this scene with more models. Daytona 2 stays at 30 on the bench at 100 and 110 MHz: its
+  geometry now fits a 110 MHz frame (95-98% per drawn frame, 86.5% in the worst vblank), but its rasteriser takes
+  1.80-1.90 M clocks a drawn frame, 94-99% of a 110 MHz frame (D-44's 94% / 104%), and the game paces itself to the
+  pair of vblanks. So for Daytona 2 the geometry is no longer the limit and the rasteriser is next; the board decides
+  whether it now reaches 60 anywhere.
+- *Images.* With R123's scan-out fix in both measurement models, every composite is identical: Scud Race 29 of 29
+  (frames 1,002-1,058), Daytona 2 23 of 23. Every Real3D write stream is identical (Scud Race: 8E 215,380 words, polygon
+  RAM 1,054,168, command port 60, VRAM 3,953; Daytona 2 the same, its last frame's polygon RAM stream cut by the
+  stop): the CPU's work interleaves differently with I/O only. **Wrong turn:** the first comparisons, on models
+  without R123, differed in every Scud Race frame (36% of pixels, in bands): R123's tear, whose split line follows the
+  rasteriser's timing, not this change.
+- *Scan-out.* `n_late` (m3_compose's late lines, all time, carried in the checkpoint) is 2 before and 2 after on both
+  games, at 12-40 clocks and at 40-136: no new late line. At 40-136 the rasteriser's busy time rises with the change
+  (Scud Race 0.68 M → 1.38 M a vblank, Daytona 2 0.76 M → 1.51 M) because it now draws twice as many frames, and the
+  scan-out still gets every line.
+- *Requests.* The bench's VROM request count (`pv_req`) assumes one request at a time and undercounts when they
+  overlap (3,627 against 6,486); words a frame are the same. The VROM port's busy count is kept for comparison only.
+
+**5. Daytona 2's texture port read the wrong VROM half (found by the unit bench).** `m3_xmem` took a texture read's
+beat as `24'(t_addr - SDR_VROM) >> 2`: the cast cuts the 25-bit SDRAM word offset to 24 bits before the shift, so
+with a 64 MiB VROM bit 24, block bit b[1], was dropped and blocks 2 and 3 read blocks 0 and 1. Every upload walks the
+words in order, b cycling every two words, so every Daytona 2 port texture since R100 has had words 4-7 of every 8
+from the wrong block. R100's `tb_m3_xmem` tested texture reads in VF3's 32 MiB layout only. The game uploads through
+the port throughout the attract (Supermodel `smnv`: 77 uploads between frames 960 and 2,782, four addresses in turn,
+0x4E7FC0 among them), not in the bench stretch measured above, so the board is where it shows: a texture refreshed
+during the race with eight-texel stripes. Fixed here (`t_off[25:2]`, and pair order with `XLIN`); a planted fault
+of the old form fails the 64 MiB seeds. Board: to look for.
+
+**6. Checks.**
+- Unit bench `sim/system/tb_m3_xmem2.cpp` (`make -f sim/system/system.mk test_xmem`): the model stream's pattern (runs
+  of 8-word bursts, up to four, any start, the VF3 zero half), texture reads at random over the whole 64 or 32 MiB, a
+  port taking requests at random and returning beats in order after 1-136 clocks; PIPE and XLIN each 0 and 1, 9 runs
+  of 300,000 clocks, 0 wrong; R100's bench on `XLIN` 0, PIPE 0 and 1, 0 wrong. Eleven planted faults
+  (`vrom/ub/faults.py`): all caught on the seeds that reach them (the zero-half fault on 32 MiB seeds only, the
+  texture-address faults on 64 MiB only), by wrong words, the RTL's ring and head-register checks (Verilator only) or a stall.
+- Verilator lint (`lint_sys`): the same 8 warnings as r7j1's tree. `quartus_map --analyze_file` (17.0, in a scratch
+  project) on `m3_xmem` and `m3_system`: 0 errors. The new idioms constant-folded in Quartus 17 (beats from the first
+  word's half and the length, the ring's distance, the beats-in-flight update, the pair-order texture and loader
+  addresses: 12 outputs) as computed by hand.
+- The loader's pair order on the system bench from reset (the bench's `--xlin` maps every place it puts or checks VROM
+  in the DDR3 model): Scud Race's index-0 route, the 64 KiB window at 0x4000000, 8,192 of 8,192 beats where pair order
+  puts them; Daytona 2's index 1, three 64 KiB windows (start, middle, end), 0 beats wrong, no VROM overwritten by the
+  CROM window. The same runs with the bench expecting the MRA layout fail (3 of 8,192 beats found; 18,432 wrong), so
+  the check sees the order. The checkpoints' DDR3 was put in pair order at the transplant.
+
+**7. Area and the fit.** Release, 110 MHz, seed 1, r7j1's tree (`sm3-builds/h3src`) with this change. `vr1_s1` has the
+first pipelined form (the queue's select in the giver's path), `vr2_s1` the form as left; both RTL otherwise equal.
+
+| | `r7j1_s1` (before) | `vr1_s1` | `vr2_s1` (as left) |
+|---|---|---|---|
+| `m3_xmem`, `quartus_map` ALUTs / registers / block memory bits | 104 / 165 / 0 | 164 / 315 / 0 | 177 / 323 / 0 |
+| `m3_xmem`, fit ALMs needed (of them MLAB) | 121.4 (40) | 186.5 (40) | 189.5 (40) |
+| whole design, `quartus_map` ALUTs / registers | 57,872 / 51,261 | 58,069 / 51,413 | 57,992 / 51,422 |
+| ALM (fit summary) | 41,161 (98%) | 41,177 (98%) | 41,291 (99%) |
+| M10K | 336 | 336 | 336 |
+| setup, system clock: slow 100C / slow -40C / fast 100C / fast -40C | -2.721 / -2.767 / +2.694 / +3.599 ns | -2.204 / -2.051 / +2.617 / +3.697 | -2.730 / -2.493 / +2.038 / +2.953 |
+| setup, HDMI clock: slow 100C / slow -40C | +0.144 / +0.109 | +0.192 / -0.102 | -0.468 / -0.719 |
+| hold, least, every clock: slow 100C / slow -40C / fast 100C / fast -40C | +0.115 / +0.137 / +0.133 / +0.097 | +0.211 / +0.136 / +0.134 / +0.115 | +0.229 / +0.201 / +0.134 / +0.108 |
+| SDRAM pins out of I/O cells | 0 | 0 | 0 |
+| RBF | 6c89cad1 | `vr1_s1_d5ed4fd5.rbf` | `sm3-builds/vr2_s1_e4099c84.rbf` (e4099c84e3dca052bb227b44f36b48cd) |
+
+- The change costs +73 ALUTs and +158 registers in `m3_xmem` (+68 ALMs needed in the fit), no M10K: the ring is one
+  32-deep MLAB, as the old 8-beat buffer was. The design-wide ALUT and ALM moves beyond that (+120 ALUTs, +130 ALM
+  against r7j1) are in blocks this change does not touch (the CPU, `audio_out`, `ascal` move by tens of ALUTs either
+  way between the two fits): placement and seed. Under R125's budget (about 700 ALM left to recover) this is about
+  70 of it.
+- No `m3_xmem` path is among the 200 worst on the system clock in either fit. `vr2_s1`'s worst are the CPU's
+  (`ppc_dcache` `wk_req`, -2.730), as r7j1's.
+- `vr2_s1`'s HDMI clock misses at the slow corners (-0.468 / -0.719 ns): the framework's scaler (`ascal`
+  `o_v_poly_t` into `o_v_poly_pix`), placement at 99% full, as R100 saw at 99% (and `s15a`, -0.004). No path of this
+  change is on that clock. A board-test build only by my rule (hold positive at every corner, which it is); not a
+  release.
+- Board: `vr2_s1` not loaded; the board build is `vr3_s1` below.
+
+*Board (2026-11-07, `vr3_s1`: the main tree at R126 plus this change; 110 MHz, release, seed 1):*
+- the fit: setup −2.33 / −2.18 ns at slow 100 / −40 °C, HDMI −0.05 / −0.16 ns, hold least +0.109 ns, 41,226 ALM,
+  336 M10K, 87 DSP, RBF 0fa26a16;
+- Scud Race: the long-view scene mostly holds 58 fps, dropping to 30 for about a second;
+- Sega Bass Fishing: mostly 58 fps, better than `du1`'s 30-60;
+- VF3: no regression;
+- Daytona 2: frame rate about the same, as the bench predicted (the rasteriser limits it now); I could not see a
+  difference in its textures by eye, so the port fix is shown by the bench, not yet on the screen.
+
+*Wrong turns:*
+- Next-model prefetch as the main lever (1 above).
+- The R123-less composites (4 above).
+- My first transplant into the burst model copied Verilator's temporaries by name (`__VdfgRegularize`, numbered
+  differently in the two models); I stopped it and reconverted with `--no-tmp`. The validation run (the old logic
+  under new names) repeats the original either way.
+- The first `xmem` issued a request's first beat a clock after taking it; the issuer now takes a request straight
+  from the port when idle (R100's one-at-a-time bench 8,516,319 → 8,476,020 clocks, the old module's own count
+  being 8,516,319).
+- The first pipelined form read the head request's fields through the queue's 4:1 select straight into the ring's
+  address and `g_rdata`: standalone (`m3_xmem` alone, virtual pins, 8.333 ns, slow 100 °C / −40 °C) it made
+  149.6 / 143.7 and 168.1 / 160.9 MHz (seeds 1, 2) against the old module's 190.4 / 182.0, 165.3 / 156.1, 176.7 /
+  169.1 (seeds 1-3, mean 177.5 / 169.1): about 18 MHz down, which D-44 does not allow. `vr1_s1` was fitted from it.
+  With the head in registers it makes 174.7 / 171.6, 193.1 / 189.1, 182.4 / 174.8 (mean 183.4 / 178.5), the unit
+  bench's cycle counts unchanged to the clock, and the system bench's 20 frames identical to the first form's.
+
+*Open:* which Daytona 2 texture the port fix changes on screen; whether
+Daytona 2 now reaches 60 anywhere is the rasteriser's question (D-44); a whole from-reset run on the new layout (only
+the loader's windows were run from reset); a release fit that closes the HDMI clock.
+
+**R128 — Area census of `du1_s1` and every candidate priced: the CPU grew 1,476 ALM (+2,200 ALUTs) since R110 and is
+the whole of the growth; outside the CPU nothing cycle-free is left above about 50 ALM. The room for sound has to come
+from my decisions: the iterative double FMA (−1,350 to −1,750 ALM for 0.2-1.2% of a 110 MHz vblank with a converter),
+a Step 1.x RBF of its own (−724 ALM by map), and a smaller sound and I/O plan than R105/R110's (Model 1's 68000
+register file and its DSB, about −1,500 against the plan).** Work in `sm3-builds/area127/`. D-44 applies (110 MHz;
+a cycle may be traded only inside each frame's budget, no block's standalone Fmax may drop); D-45 (sound in the FPGA
+if it fits). Desk only: map runs, one release fit (`ar1_s1`), the 48-frame system bench; not the board.
+
+*What I believed:*
+- That the growth since R110's census (`r5f1_s2`, 38,938 ALM) was spread over the design.
+- That `MISTER_DUAL_SDRAM` (R97's addendum) was the next framework option to measure.
+- That per-instance area settings on the framework's own blocks (not on clk_sys) might give a few hundred ALM at no
+  cost, since the global mode cost the rasteriser 10 MHz (R97) only because it was global.
+- That the double FMA's price was R113's: 0.3% / 1.6% of busy CPI with a converter, measured on an older CPU.
+- That sound needed about 4,500 ALM, I/O about 1,000 and the DSB about 2,000 (R105, R110).
+
+*What I know now:*
+
+**1. The census** (`cells.tcl` on `du1_s1`'s netlist, `area107/tools/grp.py`; per-entity ALMs needed and fitter ALUTs
+from `area127/tools/ent2.py`; table in `area127/logs/census_du1.md`):
+
+| Block | ALM `r5f1_s2` | ALM `du1_s1` | ΔALM | ALUT `r5f1_s2` | ALUT `du1_s1` | ΔALUT |
+|---|---|---|---|---|---|---|
+| **`ppc_cpu`** | 12,676 | 14,153 | +1,476 | 18,143 | 20,343 | +2,200 |
+| `ppc_core` own logic | 4,739 | 5,823 | +1,084 | 6,862 | 8,462 | +1,600 |
+| double FMA | 2,730 | 2,691 | −40 | 4,157 | 4,197 | +40 |
+| single FMA | 943 | 1,165 | +222 | 1,550 | 2,010 | +460 |
+| divider, frsqrte, misc, FPSCR, FP ld/st | 872 | 869 | −3 | 1,331 | 1,407 | +76 |
+| fetch queue, decode, pre-decode, ALU, mul/div, BTB | 1,118 | 1,123 | +5 | 1,799 | 1,771 | −28 |
+| register files (MLAB) | 273 | 273 | 0 | 97 | 88 | −9 |
+| D-cache | 1,134 | 1,204 | +70 | 1,413 | 1,368 | −45 |
+| I-cache | 605 | 730 | +124 | 913 | 990 | +77 |
+| **`r3d_geo`** | 7,523 | 7,529 | +6 | 10,028 | 10,040 | +12 |
+| **`r3d_rast`** | 7,541 | 7,712 | +171 | 11,491 | 11,179 | −312 |
+| **rest of `m3_system`** | 5,218 | 5,337 | +119 | 7,630 | 7,761 | +131 |
+| **framework** (`sys_top` less `m3_system`) | 5,979 | 6,437 | +458 | 9,525 | 9,534 | +9 |
+| **whole build** | 38,937 | 41,168 | +2,231 | 56,817 | 58,857 | +2,040 |
+
+- The CPU is the growth: `ppc_core`'s own logic +1,600 ALUTs (R115's FP bypass and write-back, R117's load-use 2,
+  R121's instruction micro-TLB, `fc_iu` 49 → 231 LUTs, R124's page-crossing split, `db_lt` / `db_ml` / `db_lo` about
+  210 LUTs, `wb_result` 50 → 154), the single FMA +460 (R118's early forward, the operand selects), the 32 KB I-cache
+  +77 (D-47). The Real3D lost 300 ALUTs (R110's store and table 1); the SDRAM port −170 (R110/R111); `m3_bus` and
+  `m2_sdram` +94 (R112, R114).
+- The framework's +458 ALM is packing: its ALUTs moved by 9 (`ascal` +330 ALM on −3 ALUTs). At 98% the fitter packs
+  every block less densely, as R105 and R125 found.
+- No group above 6% of `ppc_core` still (R105). The largest single names: `comb` 820, `fc_iu` 231, the fetch queue's
+  heads 213 / 205, `ex_mfv` 209, `fc_hit` 184; in the FMA its align shifter 322 and output select 240.
+- Worst setup slack per block at 110 MHz (slow 100 °C, `area127/sta/blk.tcl`): fetch queue −1.61 ns, single FMA
+  −1.61, D-cache −1.34, texture cache −1.28, I-cache −1.03, `r3d_mem` −1.00; double FMA −0.66; only the SDRAM port,
+  `m3_jtag` and `m3_io` positive. Anything that adds a level anywhere in the CPU fails D-44 on sight.
+
+**2. The double FMA on today's CPU.** A profile bound into `ppc_core` (`area127/s48/prof/dbl_prof.sv`, no RTL change;
+the bench's frame rows came out identical to `dutlb`'s `d4l` runs, so it is the `du1` CPU) counted, over 48 vblanks
+(frames 1301-1348):
+
+| A vblank | VF3 | Daytona 2 | Scud Race (Supermodel census, 6,000 frames) |
+|---|---|---|---|
+| double-unit ops | 4,534 | 5,914 | 4,568 |
+| … fctiw / fctiwz | 3,716 | 1,297 | 2,926 |
+| … frsp | 282 | 1,407 | 531 |
+| … double arithmetic | 536 | 3,209 | 1,111 |
+| busy cycles | 1,065,577 | 1,021,082 | not on the bench |
+
+An iterative unit at R100's 8 cycles an op blocks the port 7 cycles more an op. Taken as no overlap at all (an upper
+bound):
+
+| | VF3 | Daytona 2 | Scud Race |
+|---|---|---|---|
+| everything iterated | 31.7 k cycles, 3.0% of busy, 1.7% of a 110 MHz vblank | 41.4 k, 4.1%, 2.2% | 32.0 k, 1.7% of a vblank |
+| conversions in a small pipelined converter, arithmetic iterated | 3.8 k, 0.35%, 0.2% | 22.5 k, 2.2%, 1.2% | 7.8 k, 0.4% |
+| the same at 4 / 12 cycles an op | 0.2% / 0.6% of busy | 1.3% / 3.8% | |
+
+In plain terms, with the converter: VF3 and Scud Race lose what a 109.6 MHz CPU would against 110; Daytona 2 what a
+107.6 MHz one would. A game held at 30 fps by its pacing does not change; what is lost is the frames whose busy time is
+within that margin of a vblank, Daytona 2's 58-fps scene first. The ALM: −1,600 to −2,000 without the converter,
+−1,350 to −1,750 with it (R110, R113; estimates, the unit is not designed). The 603e's double multiply is 2-1-1 (table
+6-5), so a half-rate or slower double unit is the silicon's own shape, not a hidden symptom.
+
+**3. Measured by `quartus_map`** (the full design, release, against `du1_s1`'s own map: the base re-run gave
+40,342 / 57,886 / 51,298 exactly, so identical RTL maps identically here):
+
+| Change | ALMs needed (map) | ALUT | Registers | M10K | Cycles |
+|---|---|---|---|---|---|
+| A Step 1.x RBF: `STEP2` = 0, `SEC5881` = 0, no `M3_STEP2_*` | −724 | −952 | −598 | −1 (8 Kbit) | 0; Daytona 2 needs the other RBF |
+| `FPS` = 0 (the frame counter) | −168 | −256 | −78 | 0 | 0; the OSD option goes |
+| `ISB` = 0 (16 KB I-cache) | −100 | −13 | −12 | −12 (138 Kbit) | Daytona 2's I-fills about double (D-47) |
+| `MISTER_DUAL_SDRAM` | 0 | 0 | 0 | 0 | it is already on (D-26, `sys_dual_sdram.tcl`) |
+| AREA, mux restructure and resource sharing per instance on the framework's blocks (not ascal) | +8 | +5 | 0 | 0 | 0 |
+| the same on `m3_jtag`, `m3_io`, `m3_loader`, `m3_sec` | 0 | 0 | 0 | 0 | 0 |
+
+The Step 1.x split takes `m3_bus`'s Step 2 map (−451 ALUTs), the 315-5881 (−279), `r3d_texup`'s three-word port
+(−198), the Real3D DMA mode in `m3_scripts` (−168). In two of the maps `audio_out`'s filter taps came out +99 ALUTs
+with no change near them; I read it as Quartus choosing differently for the taps, and the totals include it.
+
+**4. Built: one change, cycle-free.** `m3_jtag`'s device array (32 × 97, read registered, `rq <= dev[rk]`) from MLAB to
+M10K: the read is at `rk` while the write is at `wk = rk − 1`, or at `rk = nlast + 1` past the chain, so the two never
+meet, and an M10K's registered address gives the same word in the same cycle as the MLAB's output register. No logic
+changes, so there is no fault to plant; `test_jtag` passes against the Supermodel trace (25,511 writes, 12,755 TDO reads,
+0 mismatches) and `test_jtag_fault` fails as it should; `quartus_map --analyze_file` 0 errors, 0 warnings. Fitted in
+`ar1_s1`: `m3_jtag` 190 → 139 ALM, +3 M10K, its worst slack +0.47 → +0.40 ns (slow 100 °C), so −51 ALM at about 17 ALM an M10K.
+
+**5. The sound and I/O plans, re-read against Model 1 and Model 2:**
+
+| Part | R105/R110 plan | What exists | Now |
+|---|---|---|---|
+| 68000 | fx68k, 1,859 (Model 2; 2,142 standalone, R59) | Model 1's fx68k with its register file in MLAB, a live-value table and the last writes bypassed: −526 (Model 1 `16e6d88`, map, cycle-identical on its sound bench) | about 1,330-1,620 |
+| both SCSPs | one engine, 2,053-2,148, 39 M10K, 3 DSP (R59) | as R59; it misses 100 MHz (87-90), so at 110 it needs its own clock (80 MHz) | 2,053-2,148 |
+| glue | 357+ | | 357+ |
+| **sound** | **about 4,270-4,500** | | **about 3,740-4,125** |
+| I/O | about 1,000 | the 315-5649 and 93C46 (`m3_io`, 150), the 53C810 (338), JTAG (190) and RTC are built | inputs, analog channels and the gun board: about 150-400 (est.) |
+| Scud Race's DSB (Z80 + MPEG) | about 2,000 | Model 1's DSB: a microcoded Z80 for the program's opcodes (339) and the MPEG Layer II player (570), 999 ALM fitted, +14 M10K, +3 DSP (Model 1 `8b1ddbc`) | about 1,000, if Scud Race's Z80 program fits the same opcodes (to be censused) |
+
+Further sound sharing (R59): a narrower SCSP ALU taking two passes would take the engine toward 1,140 (−900) but the
+engine is already at 64% of its clocks at 100 MHz and 81% at 80; a cut-down microcoded 68000 for the driver's opcodes
+(by Model 1's Z80, perhaps 600-900, est.) risks the 0x408 polling's timing (R59, Model 2 R885). Neither is mine to
+take without the measurements.
+
+*The budget, as it now stands* (free 742 ALM in `du1_s1`):
+- a Step 1.x RBF with sound and I/O: 3,890-4,525 needed, 742 + 724 = 1,466 there, 2,400-3,050 short; with the
+  iterative FMA (−1,350 to −1,750) 650-1,700 short; Scud Race's DSB adds about 1,000;
+- the Step 2.x RBF (Daytona 2): the split does not help it, and its DSB2 is a second 68000 and the MPEG player.
+So D-45's ARM fallback is not yet avoided by anything cycle-free; it is avoided by my decisions on the FMA, the split and
+the 68000 / SCSP sharing, in that order of price.
+
+*Ranked candidates* (ALM saved, best estimate; cycles at 110 MHz; the §8.4 technique):
+
+| # | Candidate | ALM | M10K | Cycles a frame (VF3 / Daytona 2 / Scud Race) | Fmax risk (D-44) | §8.4 technique | Whose call |
+|---|---|---|---|---|---|---|---|
+| 1 | Sound on the HPS (D-45 fallback) | −3,740 to −4,125 (not built) | −45 | none in the FPGA; latency rule | none | — | mine, last |
+| 2 | Iterative double FMA, no converter | −1,600 to −2,000 (est.) | 0 | 31.7 k / 41.4 k / 32.0 k (1.7 / 2.2 / 1.7% of a vblank) | new unit, unknown; today's FMA −0.66 ns | doubles iterated through one multiplier; one shifter and normaliser | mine |
+| 3 | Iterative double FMA + pipelined converter (fctiw, fctiwz, frsp) | −1,350 to −1,750 (est.) | 0 | 3.8 k / 22.5 k / 7.8 k (0.2 / 1.2 / 0.4%) | as 2; the converter is a 64-bit shift and a rounder | as 2 | mine |
+| 4 | Step 1.x and Step 2.x RBFs | −724 on the Step 1.x RBF (map) | −1 | 0 | none (logic only goes) | per-board logic behind parameters (Model 2 R948) | mine |
+| 5 | Model 1's fx68k register file | −526 against Model 2's fx68k (Model 1 map) | 0 | 0 | Model 1 closed with it | register file in MLAB, live-value table | in the sound plan |
+| 6 | Model 1's DSB for Scud Race | about −1,000 against the plan | +14 | 0 | Model 1 closed | cut-down microcoded CPU | in the DSB plan; Z80 census first |
+| 7 | I/O re-estimate | about −600 to −850 against the plan | 0 | 0 | — | — | in the plan |
+| 8 | SCSP ALU two passes | about −900 (R59, est.) | 0 | none on the CPU; the engine's margin 81% → over budget at 80 MHz | the engine already misses 100 | time-sharing | mine, measure first |
+| 9 | Cut-down 68000 | about −700 to −1,000 (est.) | ? | timing of the 0x408 poll | unknown | cut-down microcode | mine, risky |
+| 10 | FMA shifters as DSP multiplies (R98) | −300 to −500 (est.) | 0, +6-8 DSP | 0 | high: the geometry's analogue lost 8 MHz; moot if 2 or 3 | arithmetic in DSP | not with 2/3 |
+| 11 | Single FMA sharing the double unit's normaliser and rounder | −200 to −400 (est.) | 0 | blocking: the same order as 2 | medium | shared FP pool | mine |
+| 12 | FP divider on the FMA's multiplier (Newton–Raphson) | −150 to −250 (est.) | 0 | 346 / 1,041 divides a vblank at a few cycles more | medium; conflicts with 2/3 | the reciprocal on the pool | mine |
+| 13 | `FPS` = 0 | −168 (map) | 0 | 0 | none | — | mine (a feature) |
+| 14 | Integer and FP dividers shared | about −120 to −180 (est.) | 0 | only a `divw` meeting an `fdivs` in flight: not counted | low-medium | time-sharing | mine |
+| 15 | `ISB` = 0 | −100 (map; D-47: about 64) | −12 | Daytona 2 work CPI up, part of D-47's 8.7% | none | — | mine (D-47 names it first for M10K) |
+| 16 | Delay lines into MLAB (`r3d_vpu` `c_d` 512 and `wq` 250 flip-flops, `r3d_face`'s, `ppc_fpu_rsqe` `rd_q` 221) | 0 to −150 (est.) | 0 | 0 | low with a registered output | small storage out of flip-flops | not built (below) |
+| 17 | D-cache `fbuf` in MLAB | about −60 | 0 | 0 | high: `d_rdata`, −1.34 ns | MLAB | no (R105) |
+| 18 | Fetch queue ring in MLAB | about −50 | 0 | 0 | high: R63's path, −1.61 ns | MLAB | no (R100) |
+| 19 | `m3_jtag` device array in M10K | −51 (fit) | +3 | 0 | none (+0.47 ns, boot only) | MLAB and M10K traded | **built (ar1)** |
+| 20 | Real3D cycle trades (lanes, dividers, interpolants) | −60 to −1,800 | | Daytona 2 is over a frame in the geometry and 94% in the rasteriser at 110 (D-44) | | | closed |
+| 21 | `FP_DSP` | −316 | +10 DSP | 0 | geometry 111.7 → 103.5 MHz | arithmetic in DSP | no (R99) |
+| 22 | Framework and small-block area settings (qsf) | +8 / 0 (map) | 0 | 0 | | | measured: nothing |
+| 23 | `MISTER_DUAL_SDRAM` | 0 | 0 | 0 | | | already on |
+
+Rows 1-4, 8-15 need my decision; 5-7 are how the sound, I/O and DSB get built; 19 is in `ar1`.
+
+*The fit* (`area127/ar1_go.sh`, from `dutlb/du1_go.sh`: release, 110 MHz, seed 1; the main tree with `m3_jtag.sv`
+a5bad84c, the other pins as `du1`):
+
+| Fit | ALMs needed | Placed | Recoverable | ALUTs | Registers | M10K | DSP | Setup slow 100 / −40 °C | Hold, least | HDMI setup | RBF |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `du1_s1` | 41,168 | 41,108 | 714 | 58,857 | 51,994 | 336 | 87 | −1.758 / −1.716 | +0.103 | −0.051 / +0.119 | 9385d044 |
+| `ar1_s1` | 41,167 | 41,092 | 724 | 58,692 | 52,082 | 339 | 87 | −2.595 / −2.438 | +0.102 | −0.604 / −0.852 | 888b4fc4 |
+
+`ar1`'s whole-build total moved by −1 ALM and −165 ALUTs for `m3_jtag`'s −51: on identical RTL `ppc_cpu` came out +93
+(+80 in `ppc_core`, −97 ALUTs), the ±260 R110 saw between fits at 98%. Its slack is worse than `du1_s1`'s by about 0.8 ns
+at the slow corners and HDMI by 0.55-0.97 ns, all on paths the change does not touch: the five worst start in the
+geometry (`cv_lo` → `xb_data`, `pst.P_Q0` → `pq_wa_d` / `xw_data`), then the D-cache's tag MLAB into the core's operand
+registers, as `du1`'s family. One seed cannot separate this from placement; neither build closes 110 MHz, and hold is
+positive at every corner in both (least +0.102 ns, fast −40 °C). Every SDRAM pin packed.
+Also: `quartus_map` is exactly repeatable on identical RTL here (the base re-run gave `du1_s1`'s 40,342 / 57,886 / 51,298),
+but a one-attribute change moved untouched blocks by 10-30 ALUTs in the map, so map deltas under about 50 are not a
+measurement, as Model 1 found.
+
+*Wrong turns:*
+- `MISTER_DUAL_SDRAM`: R97's addendum named it the next framework option, and I queued a map for it before seeing
+  that `Model3.qsf` already sources `sys_dual_sdram.tcl` (D-26). The map came out identical, which was the check.
+- Per-instance area settings: I expected a few hundred ALM on the blocks off clk_sys. The map moved +8 and 0. Model 1
+  found the same for ascal (`a26df41`).
+- The bench copy first failed in its checkpoint transplant: I had copied the main tree's `rtl/cpu`, whose `ppc_cpu`
+  has `ISB` = 0 by default, and `fe119`'s bench `m3_system` does not pass `ISB`, so the I-cache's second-set state was
+  missing. `dutlb`'s variants carry `ISB` = 1 in `ppc_cpu`; mine does now.
+- My first symlinks into `dutlb`'s reference models were one directory short.
+- The Supermodel census build would not start without its `Assets` folder (the crosshair bitmaps); it then wrote its
+  census and crashed on exit (code 139), after the files were complete.
+- I counted the delay lines as a likely Model 1-style win ("registers count at 98%", Model 1 `0ac55df`) before working
+  out that a 4- to 11-deep line uses a 32-deep MLAB at an eighth or a third of its depth: 512 flip-flops of `c_d`
+  become 7 MLABs (70 ALM) for 4-deep storage. R98's shift-register inference (−61 ALM for +22 M10K) points the same way.
+  Not built; a fit at this fill would settle it.
+
+*Not done:*
+- A design of the iterative double unit, so its ALM stays an estimate; a bench copy that holds the FP port K cycles
+  after each double op would price the overlap that my no-overlap figures leave out.
+- The frames-fit measure (R107) for the FMA options on the Supermodel frames; the Z80 opcode census of Scud Race's DSB;
+  a 68000 opcode census of the sound driver; FM use across every game (R59's −28).
+- A Step 2.x-only map (what Step 1.0-only logic a Daytona 2 RBF could drop).
+
+**R129 — CPU area pass. The CPU's largest room is the double unit's front, about −700 to −800 ALM (est.) for
+under 0.1% of a 110 MHz vblank in both games, measured with the conversions kept on the pipelined path. A merged FPU
+is not it: one multiply-add unit for both precisions costs VF3 27% of its work CPI. Built and kept, both cycle-identical
+on every bench: an FP double crossing a page from a DBAT block is split instead of trapping, as 4.5.6.1.1 has it
+(−87 ALUTs), and the four TLB ways in M10K (−140 ALMs of MLAB for +8 M10K). Built, off or rejected: FAST = 0 (no
+single unit), last-page fetch translation (−230 ALUTs for 2.3% of a Daytona 2 vblank). The speed features are priced:
+FBYP 1,019 ALUTs for 2.4% of a VF3 vblank, FEF 497 for 1.0%, IUN 4 405 for 1.4% (Daytona 2), LU2 216 for 0.8%, LRA
+174, FHD 43.** Work in `sm3-builds/ar_cpu/`. D-44 applies (110 MHz; a cycle may
+be traded only inside each frame's budget; no block's standalone Fmax may drop). Desk only: `quartus_map` on the full
+design, `ppc_cpu` spikes, the CPU bench and the 48-frame system bench; not the board, no full fit.
+
+*What I believed:*
+- R128's census: nothing cycle-free is left in the CPU above about 50 ALM, and an iterative double FMA is worth
+  −1,350 to −1,750 ALM with a converter, for 0.2% (VF3) to 1.2% (Daytona 2) of a vblank, no overlap counted.
+- That one FPU the 603e's way (singles 1-1-1, the double multiply 2-1-1, 603e table 6-5) could take most of the single
+  unit's 1,179 ALM: the double unit already gives singles bit for bit (`ppc_fpu_fast` rule 1).
+- That R124 kept the FP double's "leaving the block" trap because the manual asks for it.
+- That FBYP was R115's −241 ALM for 1.2% of VF3's busy CPI, and FHD about 73 ALM.
+
+*What I know now:*
+
+**1. Every option by `quartus_map` on the full design** (release, the main tree, which is `vr3_s1`'s RTL; the base
+maps to 40,442 ALMs needed, 58,098 ALUTs, `ppc_cpu` 20,109 ALUTs; each variant from the same frozen base CPU). The
+measurement is `ppc_cpu`'s own ALUT delta: on identical CPU RTL the rest of the design moves 20-180 ALUTs from map to
+map (`audio_out`'s filter taps again), so whole-design deltas under about 50 are not a measurement (R128):
+
+| Variant | `ppc_cpu` ALUTs | Whole design ALUTs | ALMs needed | Registers | DSP | M10K |
+|---|---|---|---|---|---|---|
+| `FBYP` = 0 (takes FEF with it) | −1,019 | −1,196 | −505 | −304 | 0 | 0 |
+| `FEF` = 0 | −497 | −626 | −323 | −88 | 0 | 0 |
+| `LU2` = 0 | −216 | −338 | −220 | −19 | 0 | 0 |
+| `LRA` = 0 | −174 | −222 | −75 | −36 | 0 | 0 |
+| `IUN` = 2 | −405 | −596 | −322 | −89 | 0 | 0 |
+| `FHD` = 0 | −43 | 0 | −28 | −1 | 0 | 0 |
+| `FBYP` = `FHD` = `LU2` = 0, `IUN` = 2 | −1,661 | −1,817 | −918 | −408 | 0 | 0 |
+| `FAST` = 0: one multiply-add unit (built) | −2,222 | −2,259 | −1,408 | −924 | −1 | 0 |
+| the double unit's front removed (`dfront0`, price only) | −2,264 | −2,367 | −1,481 | −1,502 | −4 | 0 |
+| FP crossing split (built, kept) | −87 | −211 | −38 | −2 | 0 | 0 |
+| `LPG` = 2 on top of it (built, rejected) | −230 | −201 | −177 | +45 | 0 | 0 |
+| `LPG` = 1 (fall-through only) on top of it | −60 | +37 | −49 | +45 | 0 | 0 |
+
+R115's −241 ALM for FBYP was before FEF, which needs it (R118): FBYP = 0 is now both. FHD costs nothing.
+
+**2. One FMA for everything is too slow.** `FAST` = 0 (`ppc_core` and `ppc_cpu` parameter; `ppc_fpu_fast` `SF`, the
+single unit's valid tied low so synthesis removes it, its instance kept so the checkpoints' names still match) is a
+working one-FMA CPU: 19 of 19 CPU bench runs PASS. On the 48-frame bench (frames 1301-1348, the base reproducing
+`du1`'s rows exactly: VF3 busy / work CPI 2.699 / 2.703, Daytona 2 2.774 / 2.927):
+
+| | VF3 work CPI | work cycles a vblank | % of a 110 MHz vblank | Daytona 2 work CPI | work cycles | % of a vblank |
+|---|---|---|---|---|---|---|
+| base | 2.703 | 851,742 | | 2.927 | 955,480 | |
+| `FAST` = 0 | 3.425 (+26.7%) | 1,079,003 (+227,260) | +11.9% | 3.224 (+10.1%) | 1,043,846 (+88,366) | +4.6% |
+
+(a 110 MHz vblank is 110 MHz / 57.52 Hz = 1,912,378 cycles.) A dependent single op waits out the double unit's
+12 cycles instead of 5. The single unit is the 603e's fast path and stays; the 603e's single pipeline is not
+something this fabric gives at 110 MHz, where the double datapath needs 12 stages and the single one 6.
+
+**3. The iterative double unit, measured from both sides.**
+- *Area.* Removing the double unit's front (`dfront0`: S1a to S4b's adders; the back end kept, because the divider
+  rounds through it: R4, both counts, the normalise shift, the rounder, the flags, the output register) is −2,264
+  ALUTs in `ppc_cpu`, −1,481 ALMs needed, −4 DSP. Of `ppc_fpu_fma`'s 4,167 ALUTs the front is 2,231 and the back end
+  1,936. By the cell census (R128's `du1_s1` names) the front is about 900 ALUTs of S1 (classification, special
+  results, the exponent sums and alignment amount, three 53-bit normalise shifts of denormal operands, 350, and their
+  counts, 106) and about 1,330 of S2-S4 (the 178-bit alignment shifter, 518; T1 and T2 at 82 + 81 bits, about 650;
+  the 162-bit select, 163). R128's −1,350 to −1,750 counted the whole unit; the back end cannot go.
+- *An iterative front I would build* (not built): the operand normalise one shift of 16 a cycle (denormals only); the
+  product kept on the four DSPs and their sum; the addend placed into the 162-bit window 54 bits a cycle by one
+  funnel shift; T1 and T2 on 55-bit adders with a carry, three chunks, the sum assembled into R4's injection register
+  as the divider's quotient is (`inj_s` widened to 162 bits); the sticky from the alignment amount as now. About
+  550-700 ALUTs against the front's 2,231, so about −1,050 to −1,250 ALUTs, about −700 to −800 ALMs needed at the
+  map's 0.65 ALM an ALUT (est.), for K = 4-6 cycles an op. fctiw, fctiwz and frsp use the addend path alone (no
+  product, the shift fixed or under 64), so they take one pass and need no converter.
+- *Cycles.* The 48-frame bench with the multiply-add port held K − 1 cycles after each double-unit op (bench-only
+  hooks in a copy of `ppc_core`: `+XBK`, `+XBM`; the result still at the unit's 12 cycles, so this prices the unit's
+  occupancy, not a longer latency):
+
+| Model | VF3 work CPI | work cycles a vblank | Daytona 2 work CPI | work cycles a vblank |
+|---|---|---|---|---|
+| K = 4, separate, conversions one pass | 2.703 (+0.00%) | +0 | 2.929 (+0.08%) | +231 (+0.01% of a vblank) |
+| K = 4, shared (single ops held too) | 2.703 (+0.00%) | +0 | 2.929 (+0.08%) | +231 (+0.01%) |
+| K = 8, separate, conversions one pass | 2.704 (+0.01%) | +71 (+0.00%) | 2.935 (+0.27%) | +1,564 (+0.08%) |
+| K = 16, separate, conversions one pass | | | 2.968 (+1.42%) | +13,832 (+0.72%) |
+
+  VF3 issues 532 double-arithmetic ops a vblank, Daytona 2 about 3,200 (R128's profile, the same frames), and almost
+  none of them has another multiply-add op behind it within a few cycles: the overlap R128's no-overlap bound left
+  out is nearly all of it. With the conversions on the pipelined path, an iterative front costs both games under
+  0.1% of a vblank at K = 4-8.
+
+**4. Built and kept: an FP double crossing a page from a DBAT block is two words, wherever its second word lands.**
+603e UM rev 1, 4.5.6.1.1: "A page-address translation access occurs when MSR[DR] is set, SR[T] is cleared and there
+is not a match in the BAT." The FF9-FFF rule for doubles is that section's, and it closes: "when the 603e is in page
+address translation mode, there is no special handling for accesses that fall into BAT regions". Table 4-14 names the
+page-address translation access as the one whose range is checked before the instruction begins. So a double whose EA
+hits a DBAT is not the access 4.5.6.1.1 traps, whether or not its second word leaves the block. R124 kept D-39's trap
+for the double leaving its block; nothing in the manual backs it. No game can depend on it (the boot ROM's 0x600
+handler is fatal), and none of the 48 frames of either game makes the access (both runs are identical to the base,
+the profiles byte for byte).
+- RTL (`ppc_core.sv`): `algn`'s FP term takes `!db_any` for `!db_stay`; the block-end compare (`db_lt`, 64 laid-out
+  LUTs, `db_lv`, `db_leave`, `db_stay`) and its check are gone. The double's step 1 is already its own uop at EA + 4,
+  translated and faulting on its own. Map −87 ALUTs in `ppc_cpu`; spikes in §6.
+- Model (`ppc_iss.h`): `pg_cross` traps only with no DBAT hit for EA, and counts the three cases. Bench
+  (`tb_ppc_core.cpp`): a quarter of the `--xpage` crossings are FP doubles at the page's last word (lfd, lfdu, stfd,
+  stfdu, lfdx, lfdux, stfdx, stfdux) into the same kinds of page.
+- Reproduced first: the old core under the new bench fails `core_xpm` at its first seed (11001): `lfdu f23,0x100(r6)`
+  (CEE60100) at EA 7008FFFC takes 0x600 where the model splits. The new core passes 19 of 19 runs; the 16 without
+  `--xpage` have the base's instruction counts exactly. The three `--xpage` runs met 10,322 doubles trapped (no DBAT
+  hit), 860 split inside a block and 1,056 split leaving it. A planted fault (the FP crossing never trapping, R104_CHECK
+  off) fails all three `--xpage` runs.
+
+**5. Built and rejected: fetch translation by the last page (`LPG`).** R121's instruction micro-TLB compares each of
+fetch's five candidate addresses against the four IBATs and the four entries (`fc_hit` 184, `fc_iu` 231 LUTs). With
+`LPG` = 2 the sequential `f_pc` and the fall-through `redir_b` are compared only against the page of the last fetch
+that went out translated (or of the slow path's fill), emptied by any micro-TLB or BAT invalidation; another page
+takes the slow translation, which then also fills from an allowed IBAT hit (`sf_bt`, `iu_bt`). It passes 19 of 19
+runs (and again with a new check that an IBAT-filled entry is the IBAT's translation); a planted fault (the last page
+kept across `tlbie` / `mtsr`) fails all three `--xpage` runs. The spike likes it (seed 1: 100.2 / 103.3 MHz against
+the base's 98.6 / 99.5, −192 ALM). But the slow translation is ten cycles, and Daytona 2 fetches page-translated
+code that changes page sequentially about 1,900 times a vblank: work CPI +4.8% on Daytona 2 (+2.3% of a vblank),
++2.1% on VF3 (+0.9%), for −230 ALUTs. `LPG` = 1 (the fall-through only) saves 60 ALUTs, which is noise. Neither is in
+the tree; the RTL is kept in `ar_cpu/cpu_lpg` for the record.
+
+**5a. Built and kept: the four TLB ways in M10K (§8.4's last line).** They were four MLAB arrays (32 × 63, read
+asynchronously; 14 MLABs in `du1_s1`'s census). Both slow translations already read them in one cycle from a set held
+in a register: fetch's from `f_rsp_pc`, MEM's from `m_xpg`. So each way is now an M10K whose read address is the
+next value of that register (`f_issue ? fetch_pc : f_rsp_pc`, `mem_hold ? m_xpg : ea_x`), read every cycle; the
+block's output is what the MLAB gave, except on the edge of a TLB write, where an M10K gives the old word. The
+lookup in the cycle after a `tlbld` / `tlbli` / `tlbie` therefore waits a cycle and reads again (`itw_q` holds
+`f_slow`, `dtw_q` holds back `sl_done`). The RTL models the M10K's read (a registered read, old data on a write's
+edge), and a check compares the reads with the arrays every cycle but those. `quartus_map` against the
+FP-crossing tree: `ppc_cpu` +1 ALUT, −18 registers, 7,808 bits moved from MLAB to block RAM (the map's ALMs-needed
+estimate does not see MLABs; it moved −132 and −23 on two forms of the same change). In the spikes (§6) the memory
+ALMs fall 660 → 520 (−140) and M10K 51 → 59 (+8), the change's whole cost: 17.5 ALMs an M10K, as R128's `m3_jtag`
+(17). Benches: 19 of 19 PASS, each identical to the FP-crossing tree's in instructions and cycles. A planted fault (no retry) passes all three `--xpage` runs: the benches never
+look a TLB up on the edge of its write (`tlbie` is followed by `sync`, `tlbld` / `tlbli` by `rfi`), and I expect no
+game to; the retry is there for code that does, not shown to be needed. 48-frame bench: both games identical to the base, the profiles byte for byte; the read check never fired.
+
+**6. Spikes** (`ppc_cpu`, fe119's template, 120 MHz target; Fmax slow 100 °C / −40 °C, MHz; ALM of `sub_spike_top`):
+
+| Build, seed | Fmax 100 °C / −40 °C | ALMs needed | memory ALMs | M10K |
+|---|---|---|---|---|
+| base s1 | 98.61 / 99.45 | 14,226 | 660 | 51 |
+| base s2 | 98.01 / 98.18 | 14,237 | 660 | 51 |
+| base s3 | 95.99 / 97.44 | 14,143 | 660 | 51 |
+| base s4 | 95.04 / 97.01 | 14,189 | 660 | 51 |
+| **base, mean of 4** | **96.91 / 98.02** | **14,199** | 660 | 51 |
+| FP crossing s1 | 97.31 / 97.78 | 14,113 | 660 | 51 |
+| FP crossing s2 | 99.36 / 98.14 | 14,120 | 660 | 51 |
+| FP crossing s3 | 102.23 / 100.53 | 14,153 | 660 | 51 |
+| FP crossing s4 | 98.59 / 99.36 | 14,290 | 660 | 51 |
+| **FP crossing, mean of 4** | **99.37 / 98.95** | **14,169** | 660 | 51 |
+| + TLB in M10K s1 | 101.80 / 99.83 | 14,101 | 520 | 59 |
+| + TLB in M10K s2 | 99.84 / 97.96 | 14,115 | 520 | 59 |
+| + TLB in M10K s3 | 96.53 / 93.72 | 14,116 | 520 | 59 |
+| **+ TLB in M10K, mean of 3** | **99.39 / 97.17** | **14,111** | 520 | 59 |
+| LPG = 2 s1 (rejected) | 100.20 / 103.34 | 14,034 | 660 | 51 |
+
+Every worst path in every run is the D-cache or the fetch queue's (R120's family): the D-cache's tag RAM or
+`d_rdy` / `d_valid` into EX's operands, `m.valid` into the queue's heads. The FP crossing only removes logic; its mean
+is above the base's at both corners. The TLB change's −40 °C mean is 0.85 MHz under the base's, from one seed at
+93.72, and no path through the TLB blocks is among the 90 worst of any of its seeds (the nearest, `f_rsp_pc` into
+`sf_q`, is the segment and IBAT compare, −0.79 / −1.33 ns), so I read it as the spread: five seeds would settle it.
+On the ALMs-needed column the spike is the less exact measure (±50 between seeds of one RTL); −30 (FP crossing) and
+−88 (both) on the means.
+
+**7. The speed features in cycles** (48-frame bench, work CPI and work cycles a vblank against the base):
+
+| Feature off | `ppc_cpu` ALUTs | VF3 work CPI | % of a vblank | Daytona 2 work CPI | % of a vblank | ALUTs per % of a vblank (worse game) |
+|---|---|---|---|---|---|---|
+| FBYP (and FEF) | −1,019 | +5.29% | +2.36% | +2.61% | +1.31% | 432 |
+| FEF | −497 | +2.30% | +1.02% | +1.29% | +0.60% | 487 |
+| LU2 | −216 | +1.01% | +0.45% | +1.56% | +0.76% | 284 |
+| LRA | −174 | R121: about +0.9% work CPI each game (not re-measured) | | | | |
+| IUN 4 → 2 | −405 | +0.00% | +0.00% | +2.73% | +1.35% | 300 |
+| FHD | −43 | R115: VF3 busy CPI +0.2%, Daytona 2 +0.6% (not re-measured) | | | | |
+
+**8. Not built, estimated:**
+- *Divider sharing.* `ppc_muldiv`'s divide is a radix-2 restoring loop with four 32-bit negations and a 33-bit trial
+  subtract (about 250 ALUTs); the FP divider's subtractor and quotient register could run its loop, but the
+  negations stay and its operands need a select in front of the 56-bit subtractor: about −50 to −80 ALUTs (est.).
+  `ppc_fpu_rsqe` is a pipelined table estimate whose latency decides the worst frame (R30), not a divider.
+- *Shifters and selects in DSPs.* A product with 2^k places a 27-bit field, so the FMA's 178-bit alignment frame needs
+  six or seven 27 × 27 blocks and an OR of their outputs (about 160 LUTs) to replace about 520, each registered in and
+  out, a stage on a unit already at its limit (R98). About −150 to −250 ALUTs for 8 DSP (est.); the iterative front
+  takes the same shifter away for nothing.
+- *SPRs in MLAB.* The flip-flop SPRs mfspr reads (SRR0/1, DSISR, DAR, DMISS, DCMP, IMISS, ICMP, HASH1/2) are written
+  several in one cycle by an exception; a copy in `spr_mem` needs a write sequencer whose 9:1 data select costs most
+  of what the 17-way read select would lose: about −50 ALUTs (est.).
+
+*Ranked* (ALMs needed from the map, or est.; cycles the worse game's % of a 110 MHz vblank):
+
+| # | Change | Built? | `ppc_cpu` ALUTs (map) | ALMs needed | M10K / DSP | Worse game, % of a 110 MHz vblank | ALM per % | Fmax (§6) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Iterative double front, K = 4-8, conversions one pass | no (designed) | −1,050 to −1,250 (est.) | −700 to −800 (est.) | 0 / 0 | 0.01-0.08% (Daytona 2, model) | about 10,000 | unknown: a new unit |
+| 2 | TLB ways in M10K | yes, kept | +1 | −140 memory ALMs (spike) | +8 / 0 | 0 (identical) | free | 100 °C +2.5, −40 °C −0.9 MHz on the means, inside the seeds' spread; no TLB path in the worst 90 |
+| 3 | FP double crossing a page from a DBAT block split | yes, kept | −87 | −38 (map), −30 (4-seed spike mean) | 0 / 0 | 0 (identical) | free | no drop |
+| 4 | FEF = 0 | parameter | −497 | −323 | 0 / 0 | 1.02% (VF3) | 317 | not run |
+| 5 | LU2 = 0 | parameter | −216 | −220 | 0 / 0 | 0.76% (Daytona 2) | 289 | not run |
+| 6 | IUN = 2 | parameter | −405 | −322 | 0 / 0 | 1.35% (Daytona 2) | 239 | not run |
+| 7 | FBYP = 0 (FEF goes with it) | parameter | −1,019 | −505 | 0 / 0 | 2.36% (VF3) | 214 | not run |
+| 8 | FAST = 0, one multiply-add unit | yes, a parameter, off | −2,222 | −1,408 | 0 / −1 | 11.9% (VF3) | 118 | not run |
+| 9 | FHD = 0 | parameter | −43 | −28 | 0 / 0 | about 0.3% (R115) | about 90 | |
+| 10 | LRA = 0 | parameter | −174 | −75 | 0 / 0 | about 0.4% (R121) | about 190 | |
+| 11 | LPG = 2, last-page fetch translation | yes, rejected | −230 | −177 | 0 / 0 | 2.33% (Daytona 2) | 76 | +1.6 / +3.9 MHz (seed 1) |
+| 12 | Divider sharing (integer on the FP divider) | no | −50 to −80 (est.) | −30 to −50 (est.) | 0 / 0 | about 0 | | |
+| 13 | SPR copies in `spr_mem` | no | about −50 (est.) | about −30 (est.) | 0 / 0 | 0 | | |
+| 14 | Alignment shifter in DSPs | no | −150 to −250 (est.) | −100 to −160 (est.) | 0 / +8 | a stage | | high (R98) |
+
+Against the budget (R125, R128: about 700 ALMs free; sound 3,740-4,125 and I/O 150-400 to fit, 3,890-4,525): rows
+1-3 take the free room to about 1,640 for no cycle; R128's Step 1.x RBF (−724) to about 2,360; rows 4-6 (−865; on Daytona 2
+0.60 + 0.76 + 1.35 = 2.7% of a vblank if they add, on VF3 1.5%) to about 3,230. That is still 660-1,300 short of sound
+and I/O in the FPGA, so R128's sound-side items (Model 1's 68000 register file, the SCSP plan) stay in the sum. The
+iterative front is the one large item here that costs no frame.
+
+*Wrong turns:*
+- My first queue scripts waited on `$!` from `setsid`, which is the parent of the forked job, so three of my Quartus
+  jobs ran at once for a few minutes; two maps (`lu20`, `iun2`) took a half-written `ppc_core.sv` from the tree. Every
+  variant now starts from a frozen base CPU, and those two were re-run (`lu20c`, `iun2c`).
+- `LPG`'s first form failed the bench twice: the slow translation filled the micro-TLB with the TLB's RPN for a page
+  inside an IBAT block (until then a BAT hit never went slow: "instruction micro-TLB 0 (page 40020) is not the TLB's
+  translation"), and the refetch after a slow fill, which is `f_pc`'s, compared only the last page and went slow for
+  ever ("no retire for 2000 cycles").
+- I built `LPG` expecting the sequential candidate to change page rarely. A fetch profile in the FP-crossing run
+  (`s48/prof/iu_prof.sv`) already counted 4,300 such changes a Daytona 2 vblank, which I discounted because it reset
+  its page after every slow fetch; the 48-frame run of `LPG` itself gave the cost, and it was the profile's order.
+- The bench-only hooks first read their plusargs in `initial`, which the checkpoint restore overwrote with zero; they
+  read them on the first clock edge now.
+- The transplant tool asserted on a register twin that Verilator merged away in the `LPG` model; it now takes the old
+  model's value, which is all it used.
+- I edited `bench.sh` in place while runs of it were waiting in `wait`; I put it back byte for byte before they read
+  on, and the variant is a copy (`bench_xp.sh`).
+
+*Not done:* the iterative front itself (designed and priced above; I would build it next, with the FPU unit bench
+and its MPFR reference deciding); a fifth seed for the base and the FP crossing and two more for the TLB change; a
+directed test that looks a TLB up on its write's edge, so the retry is exercised; the frames-fit measure (R107) for
+the options with cycles; a full fit.
+
+*Other checks:* `quartus_map --analyze_file` (17.0) on `ppc_core.sv` (both forms), `ppc_cpu.sv` and
+`ppc_fpu_fast.sv`: 0 errors, 0 warnings. Verilator lint (`-Wall`, R104_CHECK) identical to the base's warnings with
+`FAST` = 1; with `FAST` = 0 nine more UNUSEDSIGNAL, the single unit's early-forward inputs. The FPU unit bench
+(`test_fpu_fast`, seeds 1 and 2) on the tree: 152,317 directed cases and 4,719,074 checked, 0 failures. No new
+arithmetic idiom (no adder, no cast); no array index can pass an array's end (the TLB reads are 5-bit sets of
+32-entry arrays).
+
+*Merged (2026-11-08):* rows 2 and 3 (the TLB ways in M10K, the FP crossing split), both cycle-identical. Under D-48
+the iterative double front (row 1, under 0.1% of a vblank but not zero) and every speed-feature switch (rows 4-10)
+are not taken. Board: `c1_s1` and `c3_s1` (R131, R133), no change seen on any game.
+
+**R130 — The geometry's operators measured clock by clock. The pool is latency-bound, not lane-bound: its
+lanes take an operation on 26-48% of the geometry's busy clocks, its adders do a real add on 16-29%, the reciprocal
+works on 1.5-3.1% and the facing unit on 11-28%. Two things are found:**
+- **Cycle-free.** The adders' align shift as a DSP multiply (`FP_DSP_AL`) gives −372 ALUTs and −330 ALM (whole-design
+  map) for +5 DSP. The geometry's standalone Fmax drops 5 MHz (127.9 → 122.9).
+- **Sharing the facing unit's adder with lane 3** (`FACE_POOL` 2) gives another −411 ALUTs and −198 ALM in the whole
+  design, for +1.06% of Daytona 2's geometry on the system bench. That takes its worst drawn frame from 99.1% to
+  100.2% of a 110 MHz frame.
+
+**Taking the facing unit's whole multiply-add (`FACE_POOL` 1) costs 3.0% and is out.** Neither found item is cycle-free and Fmax-neutral both: each is
+a D-44 decision for me.
+
+R128 said that outside the CPU, nothing cycle-free was left above about 50 ALM. I did not accept that without
+measuring where the geometry's operators sit idle, so this entry measures it and prices the sharing that follows.
+Rules: D-44 (110 MHz; a cycle may be spent only inside a frame's budget; no block's standalone Fmax may drop), and
+§8.4's method (`quartus_map` ALUTs, standalone map and fit, old-against-new miters, real-code benches). Work in
+`sm3-builds/ar_geo/`:
+- `tree`: the main tree with the change;
+- `snap/`: the RTL each map and fit read;
+- `prof/`, `miter/`, `maps/`, `fits/`, `runs/`, `logs/`, `tools/`.
+
+Desk only; I did not load the board.
+
+*What I believed:*
+- R128: nothing cycle-free above about 50 ALM outside the CPU.
+- That `r3d_geo`'s own 2,603 ALM (`vr3_s1`) held one or two structures worth restructuring.
+- That the four lanes were the cost. R98's "45% of cycles issued" reads like a pool half idle. R99 had already shown
+  two lanes fail Daytona 2, so I expected the room to be in the units beside the pool: the facing unit, the
+  reciprocal and the walker.
+- That swapping the adder's operands before the PIPE_A2 cut would remove a 27-bit select. The census credits
+  `small_aligned` with 26 LUTs an adder.
+- That the pool's write-back, three 128-LUT names a lane in the census (`rr`, `wd_r`, `wd`), could lose a select.
+- That a DSP for the align shift alone would keep the geometry's Fmax, since R98 put FP_DSP's loss on the normalise
+  multiply.
+
+*What I know now:*
+
+**1. Utilisation.** The method: a profile bound into `r3d_geo` (`prof/geo_prof.sv`; no RTL change) counts the
+clocks on which each operator takes an operation. It prints cumulative counts at each start of the geometry, so one
+row is one drawn frame's walk. Benches:
+- the geometry bench (`SETUP_OUT`, `test_real3d_setup_out`'s arguments, 400 frames a game, today's RTL);
+- R127's system bench, its checkpoints carried by name into a model with the profile (R127's `xtool`, `--no-tmp`;
+  100 MHz, as R127's own runs):
+  - Scud Race: from `l4r` at frame 1000 for 40 frames, on `vrom/s15lr`, which is today's Real3D;
+  - Daytona 2: from `dlr` at frame 1300 for 48 vblanks (24 drawn frames), on `vrom/d107lr`. That geometry is R107's,
+    with the same micro-code and pool (the diff is `NORM_B` only).
+
+The transplanted runs repeat R127's exactly: Scud Race's 40 `--prof-vrom` rows and 19 composites are identical to
+`l4r`'s; Daytona 2's 48 rows and 23 composites are identical to `dlr`'s. With the profile bound in, the geometry
+bench's report is R110's line for line (VF3 p99 1,337,886, Daytona 2 p99 2,043,806).
+
+Shares of the geometry's busy clocks, mean over the frames:
+
+| | VF3 (geo bench) | Bass Fishing (geo) | Daytona 2 (geo) | Scud Race (system) | Daytona 2 (system) |
+|---|---|---|---|---|---|
+| busy clocks a frame (mean) | 928,209 | 423,898 | 1,011,046 | 963,439 | 1,866,505 a drawn frame |
+| engine running a kernel | 80.7% | 81.8% | 80.5% | 61.3% | 74.6% |
+| of it, words issued | 44.0% | 48.4% | 43.0% | 26.6% | 39.8% |
+| of it, wait words (latency holds) | 36.7% | 33.4% | 37.5% | 34.7% | 34.8% |
+| each lane's multiplier | 43.2% | 47.6% | 42.3% | 26.2% | 39.2% |
+| words on all four lanes | 98.0% | 98.1% | 98.3% | 98.3% | 98.4% |
+| MAC words that are a pure product (c = −0) | 38.4% | 39.9% | 39.5% | 38.3% | 39.4% |
+| each lane's adder, a real add | 26.6% | 28.6% | 25.6% | 16.2% | 23.8% |
+| reciprocal (values accepted) | 2.68% | 3.11% | 2.56% | 1.48% | 2.26% |
+| lane 3 free (no MAC word on it, no DIV word) | 56.2% | 51.7% | 57.1% | 73.5% | 60.3% |
+| facing unit running / issuing | 31.3 / 21.4% | 41.4 / 27.7% | 25.8 / 15.8% | 22.9 / 11.2% | 28.1 / 14.7% |
+| facing unit's operations in a clock lane 3 is taken | 62.2% | 62.4% | 67.6% | 57.5% | 64.4% |
+| walker busy / memory requests / events | 100 / 0.19 / 0.50% | 99.9 / 0.12 / 0.38% | 99.9 / 0.37 / 0.60% | 99.9 / 0.55 / 0.73% | 100 / 0.35 / 0.58% |
+
+What this says:
+- **The pool is latency-bound.** A third of the geometry's time is wait words, holds for the MAC's 13-clock result.
+  Almost every word uses all four lanes. Two lanes would at least double the issued words, which even perfectly
+  packed into the waits is +5.5-7% of the geometry. R99's no-reschedule bound is +44% on Daytona 2. R99 stands.
+- **Inside a lane the adder idles more than the multiplier.** 39% of MAC words are pure products, so the adder does
+  real work on 16-29% of clocks against the multiplier's 26-48%. This is what makes sharing an adder cheaper than
+  sharing a lane.
+- **The reciprocal works 1.5-3.1% of the time,** but its bursts of four, one a clock, are part of the static schedule
+  (lane k written at +15+k). An iterative unit changes the micro-code.
+- **The facing unit's work comes when the pool is busy:** 57-68% of its operations fall on a clock when lane 3 is
+  taken. So sharing costs more than the averages suggest.
+- **The walker is busy the whole frame but waits on main:** memory on 0.1-0.6% of clocks, events on 0.4-0.7%. Its
+  569 ALM are control (state, node buffer, about eight address adders).
+
+**2. What `r3d_geo`'s own logic is** (`du1_s1`'s netlist, `area107/tools/grp.py`). It is 4,275 LUTs and 2,926
+flip-flops over about 1,450 signal names, and no name is above 136 LUTs (`mst`, main's state decode). By kind:
+- `Selector` (the case-statement next-state selects of the machines' registers): 1,256 over 758 names;
+- `Add`: 348 over 70 adders;
+- `LessThan`: 314 over 26 compares (the outcodes; the culling radius `rlt` x 4);
+- `Mux`: 262;
+- `Equal`: 165;
+- the rest is the registers' own logic.
+
+It is the glue of six machines in one module (main, decoder, polygon, emitter, set-up port, kernel grant), not a
+block to restructure. The next step there is the one R98 named for `ppc_core`: split it into sub-modules so a fit can
+say where the area is.
+
+**3. Built and measured.** Every item is bit-exact on the benches in 6.
+- *Map:* `r3d_geo` standalone (`SETUP_OUT`, `LOD_WORD`), `quartus_map`.
+- *Fit:* standalone, seed 1, 9.091 ns, virtual pins.
+- *Cycles:* the geometry bench's total over 400 frames (VF3 / Bass Fishing / Daytona 2), then the system bench
+  (Scud Race / Daytona 2).
+
+| # | Technique | map ALUT | map ALM est. | fit ALM | DSP | Fmax 100 °C / −40 °C | Cycles | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| — | base (`vr3_s1`'s Real3D) | 9,833 | 7,578 | 7,667 | 11 | 127.9 / 125.1 | — | |
+| a | adder operands swapped before the PIPE_A2 cut (no `p_b`, no select after the shifter) | adder alone 522 → 522 | adder 397 → 393 (fit) | | 0 | adder alone 118.6 / 115.8 → 131.3 / 128.6 | identical | in; 0 ALM, Fmax margin |
+| b | facing unit made shareable (chain registers in an MLAB, issue on grant, LOD's B before Q, d in A word 6), `FACE_POOL` 0 | a+b 9,790 (−43) | 7,507 (−71) | | 0 | | identical, report line for line | in (the tree's default) |
+| c | b + align shift in DSP, all five adders (`FP_DSP_AL`), `FACE_POOL` 0 | 9,500 (−333) | 7,331 (−247) | 7,417 / 7,518 (two fits) | +5 (16) | 122.9 / 122.1 | identical, report line for line | mine to take: no cycle, −5.0 / −3.0 MHz |
+| d | b + facing unit's adder on lane 3, lane 3's pure products past its adder (`FACE_POOL` 2) | 9,403 (−430) | 7,267 (−311) | | 0 | (with e: 111.2 / 111.3) | +3.0 / +5.7 / +1.4%; +0.82 / +1.06% | mine to take: Daytona 2's worst drawn frame 99.1 → 100.2% of 110 MHz |
+| e | d + align shift in the four pool adders | 9,168 (−665) | 7,144 (−434) | 7,278 | +4 (15) | 111.2 / 111.3 | as d | no: −16.7 MHz |
+| f | facing unit's whole multiply-add on lane 3 (`FACE_POOL` 1) | 9,272 (−561) | 7,121 (−457) | | −1 (10) | | +6.3 / +9.3 / +3.6%; +1.76 / +3.04% | no: Daytona 2 to 102.0% of a 110 MHz frame |
+| g | d with each chain's first step past the lane (`FACE_POOL` 3) | 9,430 (+27 on d) | 7,292 | | 0 | | +2.7 / +5.2 / +1.3% (geo bench only) | no: 0.1-0.5 points for 27 ALUTs |
+| h | one select step in the write-back (`WB_SEL`) | +123 on e, +129 on b | | | 0 | | identical | no: larger |
+| i | Step 1.0-only / Step 1.5+-only geometry (`step15` tied 0 / 1) | −21 / −13 | | | 0 | | 0 | no: not worth an RBF |
+
+Whole design, `quartus_map`, release, against the main tree (58,098 ALUTs, 40,442 ALM est., 87 DSP; `maps/base`):
+
+| Set | ALUT | ALM est. | registers | DSP | M10K bits | Cycles |
+|---|---|---|---|---|---|---|
+| c (the cycle-free set: a + b + align shift, `FACE_POOL` 0) | 57,726 (−372) | 40,112 (−330) | −30 | 92 (+5) | 0 | identical |
+| e (d + align shift, `FACE_POOL` 2) | 57,315 (−783) | 39,914 (−528) | −163 | 91 (+4) | 0 | as d |
+
+In `r3d_geo`, c is −317 ALUTs and e is −716; outside it, the two maps move by at most ±45 ALUTs (`ppc_cpu`).
+
+Ranked by ALM saved per % of frame time (Daytona 2's system bench, the tightest):
+1. c: −330 ALM est. at 0%, but +5 DSP and −5 MHz standalone;
+2. d on top of c: about −200 ALM est. for +1.06% (about 190 ALM a per cent);
+3. f: about −450 for +3.0% (150 a per cent; over the frame).
+
+For scale, R128's iterative double FMA is about 1,350-1,750 ALM for 0.2-1.2% of a vblank: three to ten times
+better a per cent.
+
+**4. Priced, not built** (estimates marked est.):
+
+| Candidate | ALM | Cycles | Why not now |
+|---|---|---|---|
+| two pool lanes, micro-code rescheduled into the waits | −1,500 to −1,800 (R99) | at least +5.5% on Daytona 2 (perfect packing); up to +44% (R99) | Daytona 2 is at 95-100% of a 110 MHz frame |
+| the facing unit's V from the vertex store (T&L's own view vertex): 12 of its 26 operations gone | about −40 to −80 more on d (est.) | about half of d's cost (est.) | the facing test moves after T&L in the polygon machine: a restructure |
+| iterative reciprocal on 3 DSP | −100 to −150 (est.), −3 DSP | every divide kernel longer | the DIV latency per lane changes in `gen_ucode.py` |
+| reciprocal seed table in an M10K | −20 to −30 (est.) | 0 | +1 M10K at about 25 ALM a block |
+| walker's address adders through one | about −25 (est.) | 0-1 a node | small |
+| culling radius compares `rlt` x 4 in turn | about −30 (est.) | about 3 a culled node, under 1% | small |
+| the normalise shift in DSP too (`FP_DSP`, R98) | about −20 an adder more (est.) | 0 | R98: geometry 111.7 → 103.5 MHz |
+
+**5. Why the DSP align costs Fmax.**
+- In c the worst paths are `sA_sticky` into stage B's subtract (7.9-8.0 ns) and the facing adder's
+  exponent-to-`p_pow` (8.2 ns). Neither is near the base's worst (`P_X2` to `xw_data`, 1.275 ns slack): the adders'
+  stages now straddle the DSP columns.
+- The 27-way compare form of `p_pow` (`snap/c2z`, `var/al2`; no subtract after the saturation select) did not
+  change the result: 122.9 / 122.1 MHz against 122.9 / 121.7 with the old decode.
+- In e the four pool adders' `mul result → p_pow` path is the worst (8.57 ns, 111.2 MHz).
+- The standalone adder with the DSP align made 129.4 / 123.4 MHz, so the loss is placement inside the geometry, as
+  R98 found for FP_DSP.
+
+**6. Proof.**
+- Geometry bench (`SETUP_OUT`; 400 frames each of VF3, Bass Fishing and Daytona 2, Step 2.1 nodes). Every build
+  matches the model on 400 of 400 frames on every triangle field:
+  - base, a+b+c with the old and the new `p_pow`, d, e, f, g, and the tree's defaults;
+  - the tree's defaults and c have a report identical to the base's line for line, cycle counts included;
+  - e's cycles are identical to d's;
+  - no subnormal at any unit, and `r3d_vpu`'s Verilator check for h (a MAC and a divide result never in one lane in
+    one clock) never fired.
+- System bench, against the transplanted base:
+  - Scud Race: 19 of 19 composites identical in f and d;
+  - Daytona 2: 23 of 23 composites identical in f and d;
+  - every frame's draw count is identical.
+- Facing unit alone (`tb_r3d_face`; LOD 0, LOD with KZ2 1.0, LOD with MAME's KZ2; seeds 1-5, Step 1.5 on 4 and 5;
+  300,000 polygons each): 0 wrong in all 30 runs on the final tree, with the lane free on every clock or on 40% at
+  random (`FACE_GRANT`).
+  - Free on every clock, without LOD, the cycles equal the old unit's (28.7 a polygon).
+  - With LOD the extra hold (d into A) changes the bench's random input order, so its polygons differ from the old
+    run's; it is 32.1 a polygon either way.
+  - At 40%: 64-71 a polygon.
+- Adder miter (`miter/`): old against new every clock, operands biased to equal and near exponents, cancellation,
+  zeros, specials, subnormals and shifts of 22-29; 10 M clocks x 3 seeds each:
+  - a in PIPE_A2 1, PIPE_A2 1 with SUBNORM, PIPE_A2 1 with DSP_SHIFT, and PIPE_A2 0;
+  - a with DSP_AL, both `p_pow` forms; the new form with DSP_SHIFT too;
+  - 0 differ everywhere.
+  - Planted faults: no swap, 121,764 of 1 M differ; equal exponents always shifting b, 121,766; `p_pow` one place
+    off, 307,404.
+- Planted faults on the geometry bench (VF3, 20 frames), each 0 of 20 frames matching:
+  - the facing unit issuing without its grant;
+  - h's divide data taken from the sum;
+  - the DSP align's sticky a bit short.
+- Verilator lint (`lint_real3d_geo`'s flags) clean on FACE_POOL 0-3, with and without SETUP_OUT, LOD_WORD and
+  FP_DSP_AL; `r3d_face` SHARED 0 and 1, with and without LOD.
+- Quartus 17: `--analyze_file` 0 errors on the changed files, and every standalone map elaborates them in every mode
+  (`maps/gm_t*` is the final tree).
+- No new arithmetic idiom: the `p_pow` compares are against integer constants in a generate loop (genvar declared
+  apart), with no cast.
+
+*Wrong turns:*
+- **The swap (a).** It removes the select after the shifter, but the ALUTs come out equal (522, 522); only 25
+  registers go. It gave 12.7 MHz of standalone margin, which the DSP align then spent.
+- **h.** Two 3:1 selects a lane came out 123-129 ALUTs larger than Quartus's shared sum-or-divide select. The
+  census's three 128-LUT names were not three removable selects. Reading LUT names as structures misled me; the map
+  is the test.
+- **The DSP align's Fmax.** I expected the align-only form to keep the geometry's Fmax; it loses 5 MHz there (and 17
+  with d). The compare-form power did not recover it.
+- **g's first build** let a first step issue without advancing the sequencer, so it re-issued every clock until its
+  grant came. The results were right and the cycles were d's exactly, every frame, and I nearly recorded that as
+  "the stalls that pace the unit are in the later rounds". A probe counting issues showed it. Fixed, g is
+  0.1-0.5 points better than d.
+- **Quartus 17 rejects an assignment pattern whose field and signal share a name.** `'{v: issue, cz: cz, ...}` gives
+  "cz is not a constant" (Error 10734). `--analyze_file` passed it; only elaboration, at the first standalone map,
+  failed. The signal is now `op_cz`. For the Quartus 17 findings list.
+- **R127's transplant tool** stops on an old model without the one-at-a-time `m3_xmem`'s state; my copy
+  (`ar_geo/xtool/conv.cpp`) drops that check, since both models are pipelined. My first map summaries read
+  `output_files/` in projects that write their reports beside the `.qsf`; the maps were fine.
+- **The facing bench's drain loop** held the last random grant, so at 40% it could end with B words left over; it
+  now draws the grant there too. At 10% the bench's own clock cap ends the run, still with 0 wrong.
+- **Races the stall opened, found by reading the schedule before any bench.** With slots that wait for the lane,
+  LOD's B (the polygon two back) could read its Q after the next same-parity polygon wrote it, and `dreg` after the
+  next d landed. B now runs before Q in round 3, and d lives in A word 6. With the lane free on every clock this
+  changes no cycle without LOD.
+
+*Changed files* (`sm3-builds/ar_geo/tree`, against the main tree's working copy):
+- `rtl/real3d/r3d_face.sv`, `r3d_vpu.sv`, `r3d_geo.sv`, `r3d_fp_add.sv`, `sim/real3d/tb_r3d_face.cpp`.
+
+New parameters (the tree's defaults are cycle-identical and use no DSP):
+- `r3d_geo`: FACE_POOL (0; 1, 2 and 3 as in 3) and FP_DSP_AL (0);
+- `r3d_vpu`: FACE_L3, FP_DSP_AL, WB_SEL (0);
+- `r3d_face`: SHARED, FP_DSP_AL;
+- `r3d_fp_add`: DSP_AL.
+
+For a build, c is FP_DSP_AL = 1, and d is FACE_POOL = 2 on top.
+
+*Open:* the system bench at 110 MHz (R127's `CLK_HZ` model) for d. A second and third seed for c's Fmax. Whether
+Daytona 2 at 100.2% of a frame in its worst drawn frame costs a frame on the board, or only on the bench's DDR3
+latencies.
+
+*Not merged (2026-11-08):* rank 1 drops the geometry's standalone Fmax (127.9 / 125.1 to 122.9 / 122.1 MHz), and
+D-48 takes nothing that could make a game slower; the sharing options cost Daytona 2 cycles. The work stays in
+`sm3-builds/ar_geo/` as the record.
+
+**R131 — The rasteriser is bound by its front's latency, not by its pixels: the per-pixel units have a pixel in
+25-48% of a replay's cycles, and every (triangle, band) pair waited for the one before it to leave the front. With the pair's
+tag carried through the front (the next pair divides while this one walks) Daytona 2's replay is 10.1% shorter on the mean and
+its p99 frame goes from 94.3% to 83.6% of a 110 MHz frame. That pays for the edge walker's product on the walk's own adders
+(−389 ALUTs, −123 ALM in the rasteriser's fit) at 0.8 points of it. With the filter's banks and fractions taken from the
+address stages, the SDRAM VROM reader that cannot run, and one copy of the MPC106 registers, the whole design maps 791 ALUTs
+and 469 ALMs-needed below `vr3_s1` (57,307 ALUTs), for +3 M10K and no DSP. R128's "outside the CPU nothing cycle-free is left
+above about 50 ALM" was wrong twice: the filter's duplicate was about 290 ALUTs and cycle-free, and the rasteriser's cycles
+were not where D-44 put them.** Work in `sm3-builds/ar_rast/`: `tree` (the main tree at `vr3_s1`'s RTL with these changes),
+`base` (the RTL before), `prof.sv` / `prof2.sv` / `mkprof.sh` (bench counters), `logs`, `map` (full-design `quartus_map`,
+release), `fits` (standalone map and fit at 9.091 ns), `sysb` (the system bench A/B), `rejected/l1`, `ep1`, `flt_f1`, `flt_f2`
+(planted faults). D-44 applies (110 MHz; a cycle traded only inside each frame's budget; no block's standalone Fmax may
+drop) and §8.4's method (map ALUTs on the full design, standalone map and fit, bit-exact benches, planted faults). Desk only:
+benches, maps and standalone fits; no full fit, not the board.
+
+*What I believed* (R110, R128, D-44):
+- The rasteriser was pixel-bound in Daytona 2 ("the Real3D has no cycles left to trade there"), so the per-pair set-up units
+  were the only time-sharing candidates, and R110 had priced them out: each cycle a pair costs about 10,000 cycles a VF3
+  frame, so one divider lane (+38 to +54 a pair) or a one-bit edge product (+8 to +13 a pair) did not fit.
+- Outside the CPU nothing cycle-free was left above about 50 ALM (R128 §1; its row 20, "Real3D cycle trades", closed).
+- R110 §3's overlapped front was a speed change of about 150-250 ALM, carrying about 140 bits of per-pair state down the
+  divider and the edge's stage 0.
+
+*What I know now:*
+
+**1. Where the rasteriser's cycles go.** Bench counters on every handshake (`prof.sv`: wires only, summed per frame by the
+bench; replay and stall lines identical to the base binary's on every frame), the whole-rasteriser bench, MIP 1, port profile
+p0, 400 frames a game (Daytona 2 from the geometry model's `r62` lists, VF3 and Bass Fishing with the geometry's LOD). Share
+of the replay's cycles, mean over the frames / in the p99 frame (`logs/util_base.txt`):
+
+| Unit | Daytona 2 | VF3 | Bass Fishing |
+|---|---|---|---|
+| a pair into the front | 1.1 / 1.3 | 1.3 / 1.1 | 1.2 / 1.5 |
+| slope divider busy | 27.8 / 31.5 | 30.5 / 24.4 | 30.9 / 37.9 |
+| … each of its three lanes | 22-25 / 25-28 | 25-27 / 21-22 | 25-27 / 30-34 |
+| edge product (the first rows' multiplies) | 10.2 / 11.6 | 12.1 / 11.2 | 11.2 / 13.3 |
+| edge walking (rows out, mostly held) | 37.7 / 33.2 | 33.2 / 40.5 | 33.4 / 27.2 |
+| a span held, the Z walk busy | 50.1 / 44.2 | 43.1 / 50.9 | 42.8 / 35.3 |
+| Z walk: a pair out | 25.3 / 20.4 | 30.1 / 33.7 | 28.3 / 25.9 |
+| Z band refusing a pair (a pair is two pixel cycles) | 33.1 / 32.4 | 22.4 / 25.2 | 20.6 / 15.6 |
+| **a pixel into the interpolants** (and so the reciprocal, the filter, the colour stage) | **34.7 / 24.9** | **40.9 / 47.8** | **34.8 / 26.8** |
+| texture cache refusing a pixel | 18.8 / 21.5 | 6.6 / 6.2 | 6.3 / 5.6 |
+| no pixel, the divider busy | 23.0 / 27.0 | 22.0 / 16.2 | 25.0 / 32.0 |
+| no pixel, the rest of the front busy | 39.8 / 45.7 | 34.3 / 34.0 | 35.6 / 38.9 |
+| the front empty | 2.0 / 1.6 | 2.2 / 1.7 | 4.2 / 1.3 |
+
+A Daytona 2 frame: 11,217 pairs, 35,882 spans, 251,071 Z pairs and 344,582 pixels in 994,189 cycles (88.6 a pair). Its p99
+frame has 23,503 pairs in 1,797,969 cycles. The lanes run 62.9 lane-cycles a pair (21.5 / 19.7 / 21.7), which is 24.7 cycles
+with all three side by side; the product takes 9.0 a pair. The pixel path takes a pixel a clock, but in the p99 frame it has
+one in only a quarter of the cycles: in 72.7% of them there is no pixel and the front is working. The frame is long because
+`t_go` waited for the front to empty (R110 §1). D-44's "no cycles left" was true of the frame, not of the pixel units: they
+idle for half the replay or more, and the per-pair chain is the critical path.
+
+**2. The front overlapped (`FOV` = 1), built.** The span path took the pair's Z plane, Z kind and tag from registers loaded at
+`t_go`. That is why a pair could not enter the divider until the last pair's spans were taken. Now:
+- the pair's 8-bit tag rides with it: `r3d_rast_div` (`o_tag`, at go), `r3d_rast_edge` (`z_tag` at stage 0, `w_tag` at
+  `m_load`, `p1_tag`, `s_tag`) and out of `r3d_rast_front` beside each span;
+- table Z (`tabz`, 256 × 131 bits in M10K: the Z kind and the 1/w plane) is written at `t_go` at `tag_n`, beside tables 1 and 2.
+  It is read registered at `s_tag_n`, the tag the span register will hold after the edge, so its word is the span's whenever
+  the Z walk takes the span. `zc`/`zdx`/`zdy`/`ze`/`cur_zk`/`cur_tag` are now that word and `s_tag`, so 131 flip-flops go;
+- `t_go = t_full && f_tready && ((FOV && !t_gen) || (!f_busy && !f_svalid))`. A pass's first record (a new Z generation)
+  still waits for the front to empty, so `gen_carry` lands on the first span taken after it, as before.
+
+With `FOV` = 0 the bench's FRAME and STALL lines are identical to the base binary's on all 1,200 frames, cycles included, so
+the table and the tag change nothing by themselves. With `FOV` = 1 (a 110 MHz frame is 1,912,240 cycles):
+
+| Replay: mean / p99 / max | Daytona 2 | VF3 | Bass Fishing |
+|---|---|---|---|
+| base | 1,007,720 / 1,802,708 / 1,985,946 (52.7 / 94.3 / 103.9%) | 914,532 / 1,426,511 / 1,567,513 (47.8 / 74.6 / 82.0%) | 469,061 / 1,100,798 / 1,131,547 (24.5 / 57.6 / 59.2%) |
+| `FOV` | 905,912 / 1,598,962 / 1,748,149 (47.4 / 83.6 / 91.4%) | 767,943 / 1,257,154 / 1,340,090 (40.2 / 65.7 / 70.1%) | 401,704 / 925,415 / 1,037,419 (21.0 / 48.4 / 54.3%) |
+| `FOV` + `PB` = 1, as built | 912,377 / 1,613,310 / 1,760,864 (47.7 / 84.4 / 92.1%) | 780,241 / 1,262,844 / 1,366,344 (40.8 / 66.0 / 71.5%) | 405,941 / 935,444 / 1,046,300 (21.2 / 48.9 / 54.7%) |
+
+- `FOV` makes the mean frame 10.1% / 16.0% / 14.4% shorter.
+- R110's upper bound, a hack that mislabelled spans, was 12.5% on Daytona 2's p99; the real figure there is 11.3%.
+- Daytona 2's worst frame now fits a 110 MHz frame with 8.6% to spare.
+
+Cost: +4 M10K (table Z), +40 flip-flops of tag in the front and −131 of Z plane in `r3d_rast`. In the full map `r3d_rast`'s own
+logic is +38 ALUTs, inside the ±60 the untouched blocks move by. It is not 150-250 ALM: the state went into a table by tag,
+not down the pipeline.
+
+**3. The system bench agrees.** `sysb`: vrom's `d107lr` measurement tree (its CPU and bus, 100 MHz, 1,738,400 clocks a frame)
+in two variants, A with the base rasteriser and B with this one and `m3_bus`. Both run Daytona 2 from the idle checkpoint at
+frame 1300 for 47 vblanks. The checkpoint was carried from vrom's `dlr` model by name. The rasteriser was idle at it, and
+`sysb/xtool/extra.h` fills the state the old tree's rasteriser lacked from what was copied: the cache's need MLAB from its
+entries, and `rd_n1`, `bq_rp1`, `sw_nz` and the Z band's `sb_nz` as the registered shadows of their copied sources. Without
+that, both A and B hung at the first replay.
+
+| | A (base) | B (R131) |
+|---|---|---|
+| composites (every other frame, 1302-1346) | 22 | 22, identical to A's |
+| draws in 47 vblanks / late lines | 23 / 2 | 23 / 2 |
+| rasteriser busy, all 47 vblanks | 42,625,310 | 38,879,230 (−8.8%) |
+| rasteriser a drawn frame (a pair of vblanks) | 1.789-1.882 M (103-108% of a 100 MHz frame) | 1.629-1.720 M (94-99%) |
+
+The game still draws every other vblank, as its pacing has it (R127). At 110 MHz B's 1.63-1.72 M is 85-90% of a frame,
+where the board decides whether a 60-fps scene appears. B is the tree before item 5's re-timing, which is cycle-identical
+on the rasteriser bench (all 1,200 frames).
+
+**4. The edge's product on the walk's adders (`PB` = 1), built: the trade the overlap pays for.** The edge loaded each of
+its three edges' first-row x as x1 + offset × slope, two offset bits a cycle, in three 56-bit three-input adders of their
+own, then walked with three more two-input adds. With `PB` = 1 each edge register has one adder,
+`a + (m_busy ? (bit ? slope : 0) : step)`, and the product takes one offset bit a cycle:
+
+| `r3d_rast_edge` | full map ALUT | ALM standalone / in the rasteriser's fit | Registers | Fmax standalone, slow 100 °C / −40 °C |
+|---|---|---|---|---|
+| base | 1,094 | 924 / 725 | 1,017 | 129.2 / 131.8 MHz |
+| `PB` = 1 (with the tag) | 705 | 809 / 602 | 1,049 | 143.8 / 147.2 MHz |
+
+The ALM fall is smaller than the ALUTs' because the block is now register-bound (1,049 flip-flops in 809 ALM). Cycles
+against `FOV` alone:
+
+| | Daytona 2 | VF3 | Bass Fishing |
+|---|---|---|---|
+| mean frame | +6,465 (+0.34% of a 110 MHz frame) | +12,298 (+0.64%) | +4,237 (+0.22%) |
+| p99 frame | +0.8 points | +0.3 points | +0.5 points |
+
+R110 priced this at +8 to +13 cycles a pair, 10% of a VF3 frame, on the serial front. On the overlapped front most products
+are short (a triangle's own first row is a few offset bits), and part of each hides behind the next pair's divide. Without
+`FOV` it would not fit; with it, it is about 390 ALUTs for under 1% of a frame.
+
+**5. The filter's address stages taken from the address instance (`TSPLIT`), built, cycle-free.** `r3d_rast` runs
+`r3d_rast_texel` twice: `u_tf` does stages 1-2, the corners' addresses for the cache, and `u_tb` does stages 3-7, the filter.
+`u_tb` got u, v and the texture's words through ring A and recomputed stages 1-2 to find its four corners' banks and the
+fractions. So the masks, the level shifts, the mirrors and two 12-bit adds were built twice.
+
+Now `r3d_rast_texel`'s `PART` = 1 gives out stage 2's banks (8 bits), fractions (16) and format (3). Ring A carries those
+27 bits: it is written at F2 as the pixel enters the cache, and read at the filter's stage-1 pixel (`o_tagr`). Its registered
+output lands while the pixel is in stage 2, and `PART` = 2 registers it into stage 3 as before.
+
+My first version read the ring at stage 2 and used its output as stage 3 directly. Its fit lost 7.5 / 10.5 MHz on the ring's
+output into the decode (`dt4`: −0.300 ns at 110 MHz). This is item 7 below.
+
+Ring A goes from 69 bits (2 M10K) to 27 (1 M10K). The FRAME and STALL lines are identical to the base's on all 1,200 frames. In
+the full map `u_tb` goes 939 → 618 ALUTs and `u_tf` 487 → 519, so −289 ALUTs net, −85 registers and −1 M10K. In the
+rasteriser's fit `u_tb` is 557 → 344 ALM and `u_tf` 251 → 285. `PART` = 0 is the whole texel: its unit bench is unchanged
+and passes (`test_real3d_rast100_texel`: 48.7 M texels from the frames and 3 M random, 0 wrong).
+
+**6. Two system items, cycle-free.** `map/sys` is `vr3_s1` with only `m3_bus.sv` and `m3_system.sv` changed.
+- `m3_bus`: `rd_int`'s X_PCID arm read `c106[pci_reg]` again instead of `cq`, so Quartus built the MPC106 register file twice:
+  two 64 × 32 MLAB copies, fitted at 49.8 and 41.5 ALM in `vr3_s1`. It now reads once, and the map's second `altdpram` is gone.
+  In ALUTs this shows as nothing (`m3_bus` +21: the read select remains, only the second MLAB goes). The saving is in
+  memory ALMs, which only a fit counts.
+- `m3_system`: with `VROM_LOC == XMEM`, as built, the SDRAM VROM reader's request is a constant 0. Its state machine and SDRAM
+  port 3 were still fitted (33 ALM, 52 ALUTs, 90 flip-flops in `vr3_s1`). It is now generated only when VROM can be in the
+  SDRAM: `r3d_vrom_rd` −53 ALUTs and −77 registers, `m2_sdram` −26 ALUTs and −31 registers (port 3's state).
+- Together they are −162 ALUTs, −110 registers and −102 ALMs-needed in the full map. The −16 of that in `r3d_rast`, which
+  is unchanged, is the map's noise.
+
+**7. The rasteriser standalone** (`fits/rast_*`; MIP 1, every port a virtual pin, 9.091 ns):
+
+| `r3d_rast` | ALM seed 1 / 2 / 3 (mean) | M10K | DSP | Fmax slow 100 °C, seeds 1 / 2 / 3 (mean) | Fmax slow −40 °C, seeds 1 / 2 / 3 (mean) |
+|---|---|---|---|---|---|
+| base | 8,156 / 8,163 / 8,133 (8,151) | 114 | 45 | 113.99 / 113.19 / 116.24 (114.47) | 114.59 / 114.26 / 116.51 (115.12) |
+| R131 | 7,884 / 7,886 / 7,843 (7,871) | 117 | 45 | 117.27 / 115.66 / 115.58 (116.17) | 111.96 / 116.60 / 114.43 (114.33) |
+
+The fit is −280 ALM on the mean and +3 M10K. Fmax is +1.7 MHz at 100 °C and −0.8 MHz at −40 °C on the means. The −40 °C
+figure is inside the seeds' own spread (2.3 MHz in the base, 4.6 MHz here), so three seeds do not resolve a drop. Seed 1's
+111.96 is the low one, and no changed structure is among seed 1's 15 worst paths at 100 °C (table 2 into the address stages,
+the Z band, the store: all as before).
+
+In the fit: the edge goes 725 → 602 ALM, the filter (`u_tb`) 557 → 344, the address stages (`u_tf`) 251 → 285, and the
+divider and the rest are unchanged.
+
+**8. Rejected, measured: one divider lane for the three slopes.** With the overlap the divider's latency hides behind the
+walk, so I built `LANES` = 1 (`rejected/l1`):
+- one lane takes the three divides in turn;
+- the operands are formed one edge a cycle ahead from the held vertices (one subtract, one negate, one set of tests);
+- each quotient is signed into its slope register as it finishes;
+- a slope the band does not use is not divided (s12 only on rows above y2, s23 only from y2 on, none when the band has no row
+  of the triangle).
+
+It is bit-exact on every bench, but against `FOV` with three lanes:
+
+| | One lane | Against |
+|---|---|---|
+| Daytona 2 mean frame | +12.6% | `FOV` with three lanes |
+| Daytona 2 mean frame | +2.4% | the base |
+| Daytona 2 p99 / max | 95.5% / 104.6% of a 110 MHz frame | |
+| VF3 mean frame | +21.6% | `FOV` with three lanes |
+| front, standalone | 1,393 → 1,327 ALM (−66: the divider −208, the band flags and operand selects +145) | the base |
+| front, standalone Fmax | 123.99 / 120.44 → 115.37 / 113.10 MHz (the lane's done into the next operand select) | the base |
+
+It fails D-44 on Fmax and on Daytona 2's frame, and is not kept.
+
+*Per technique* (full-design `quartus_map`, release, against `vr3_s1`'s map; the base re-run gave it exactly: 40,442
+ALMs-needed, 58,098 ALUTs, 51,458 registers. Cycles are the mean frame's change as a share of a 110 MHz frame. Benches below):
+
+| # | Technique (§8.4) | Full map ALUT | Rasteriser fit ALM | Fmax | DSP | M10K | Daytona 2 / VF3 / Bass, % of a frame | Bench |
+|---|---|---|---|---|---|---|---|---|
+| 1 | Front overlapped, per-pair state in a table by tag (path sharing: tables 1 and 2 are already by tag) | +38, −147 regs | about +30 (the rest of the fit's change) | the whole: §7 | 0 | +4 | −5.3 / −7.7 / −3.5 | PASS |
+| 2 | Edge product on the walk's adders (operator sharing, paid for by 1) | −389 | −123 (edge 924 → 809 alone) | edge +14.6 / +15.4 MHz alone | 0 | 0 | +0.34 / +0.64 / +0.22 against 1 | PASS |
+| 3 | Filter's stage 3 from the address stages (duplicated arithmetic built once) | −289, −85 regs | −179 | the whole: §7 | 0 | −1 | 0 | PASS, identical |
+| 4 | One MPC106 register-file read (duplicated storage) | +21 (noise), one 64 × 32 MLAB fewer | about −40 to −50 (est.: the second copy's fitted ALM) | — | 0 | 0 | 0 | `test_bus` PASS |
+| 5 | Dead SDRAM VROM path behind its compile-time condition (per-board logic behind parameters) | −79, −108 regs | about −45 (est.: 33 + port 3) | — | 0 | 0 | 0 | by construction (request constant 0) |
+| | **All (`map/fin3`)** | **−791, −308 regs; −469 ALMs-needed** | **−280 (mean of three seeds)** | | **0** | **+3** | **−5.0 / −7.0 / −3.3** | |
+| r | One divider lane (with 1) | — | front −66 alone | front −8.6 / −7.3 MHz alone | 0 | +4 | +1.3 / +1.0 / 0.0 against the base | PASS, rejected |
+
+Ranked by ALM saved for frame time spent: 3, 4 and 5 are free. 2 costs about 390 ALUTs (about 120 ALM) for 0.2-0.6% of a frame.
+1 spends 4 M10K and gives 3.5-7.7% of a frame back; that is what makes 2 possible, and it leaves Daytona 2 8% of headroom.
+
+*Proof:*
+- **Whole-rasteriser bench**, MIP 1, 400 frames each of Daytona 2, VF3 and Bass Fishing, on the final tree:
+  - on p0 and on the hostile p1 (acknowledge waits up to 400 cycles, BUSY 60%, latency 20-200, beat gaps): 0 pixels wrong
+    and 0 port violations on all 2,400 frames;
+  - with `FOV` = 0, and with `TSPLIT` alone: every FRAME and STALL line identical to the base's.
+- **Unit benches** on the final tree, all PASS:
+  - `test_real3d_rast100_front` with `PB` = 1, 0 wrong: the divider on 3.6 M + 1.8 M triangles and 2 M random; the edge on
+    400 + 400 frames at bands 16 and 0 and 200,000 synthetic pairs; the front on 400 + 400 frames and the synthetic set;
+  - `test_real3d_rast100_texel`, 0 wrong;
+  - `test_bus`.
+- **Planted faults**:
+  - The generation rule loosened (a gen pair waits only for a pending span, not for the walk): 2,216 wrong pixels in 4 VF3
+    frames. Daytona 2's 4 frames have no pass change mid-band and stay right.
+  - Ring A's fu and fv swapped: 239,141 wrong pixels in 2 Daytona 2 frames, before and after the re-timing.
+  - The obvious fault for table Z, reading at `s_tag` instead of `s_tag_n`, is not a fault. The new tag reaches the span
+    register at least two advances before the pair's first span, because the product takes a cycle or more, so that read is
+    right too; `s_tag_n` keeps it right without depending on that argument.
+- **System bench**: §3.
+- **Lint and analysis**: Verilator `-Wall` is clean on every changed block, and `make lint_sys` shows only its existing
+  warnings in blocks I did not touch. `quartus_map --analyze_file` gives 0 errors on the five changed rasteriser files and
+  both system files (`an/`).
+- **Quartus 17 rules**: no new arithmetic idiom (selects, an add and a table). No index past an array's end: ring A's old
+  fields sit in a generate branch, so `RAW-43` is never elaborated at `RAW` = 27.
+
+*Wrong turns:*
+- My first one-lane divider looked free: on two Daytona 2 frames it was 1-2% faster than the base. On 400 frames it was 2.4%
+  slower, and the fit then showed −66 ALM and −8 MHz. Two frames are not a measurement.
+- I read D-44's "no cycles left" as a statement about the pixel path. The counters show it was the front's latency, which the
+  overlap turns into headroom.
+- The first set of full maps was a debug build. `Model3.qsf` in the copied tree has the release macro commented out, and my
+  script's check matched the comment. The four maps were thrown away and re-run.
+- `fov` and `tsp` (each technique alone) were copied after I had added `PB` to the tree, so both carry `PB` = 1. The
+  per-technique rows above are therefore taken from the entity figures, not from those two maps' totals.
+- The audio filter's taps moved −99 ALUTs between two of my maps with no change near them (R128 saw +99). Totals of maps that
+  differ by under about 100 ALUTs say nothing; the entity rows do.
+- The filter's first version read ring A at stage 2 and fed its output to stage 3 directly: −7.5 / −10.5 MHz (§5).
+- The system bench first hung in both A and B. The old tree's rasteriser lacked registered shadows (`bq_rp1`, `rd_n1`) that
+  the transplant left at zero.
+- A suggestion that `m3_bus`'s `h_wdata`/`h_we` serve only reads under R3P was wrong: B_R3D also takes the 9C writes.
+
+*Not done* (priced by estimate from widths or a map, not built):
+
+| Candidate | Est. | Cost / risk |
+|---|---|---|
+| `m2_sdram`'s `p_dout`: one shared register for the four live ports (every consumer samples only at its `p_ack` / `p_lo`) | −40 to −90 ALM (192 flip-flops) | R557's timing stage then fans out to four blocks; it is Model 2's controller, so it goes behind a parameter |
+| DDR3 write-data select without the P ports' constant-zero arms, or as an OR of owner-gated writers | −30 to −60 ALUT, up to about −120 | drives `DDRAM_DIN` directly; both forms remove levels |
+| The MPC106 registers cut to the few the boot ROM reads back (MCCR1, PICR1), with their reset values | −60 to −90 ALM on top of row 4 | needs the device-0 read set from the bus trace first |
+| `tg_shadow` at 32 entries, if no game reads tile registers above F118007F | −30 to −36 ALM | needs a trace |
+| VROM addresses passed through as pair indices under `VROM_LOC == XMEM` (permuted in `r3d_texup`, unpermuted in `m3_xmem`) | −40 to −50 ALUT | low |
+| `m3_bus`'s `wd` loaded in B_DEC from the registered master select | −30 to −60 ALUT | masters must hold wdata until `m_ack` (they do) |
+| Two divider lanes with the overlap | about −80 ALM | cycles between `FOV` and `LANES` = 1; the lane's Fmax path as in row r |
+| The interpolants' leading one and normalise taken from the Z walk's | about −75 to −115 ALM | the Z walk has no \|o2\| for o2 ≤ 0, which the Z test (>=) lets through, so it needs two more negates there |
+
+The overlap reopens the trades R110 closed. Daytona 2 now has 8% of a frame to give, and each cycle a pair costs about 11,000
+cycles a frame (12,000 on VF3).
+
+*Merged (2026-11-08), with one change:* `PB` = 2. D-48 takes no change that costs a game cycles, and technique 2 gives
+back 0.2-0.6% of a frame of what 1 gains; `PB` = 1 stays in the RTL as an option. The whole-rasteriser bench on the
+merged tree (`PB` = 2): 0 wrong pixels on 1,200 frames (400 each of Daytona 2, VF3, Bass Fishing), mean replay against
+`PB` = 1: Daytona 2 905,912 / 912,377 cycles (−0.7%), VF3 767,943 / 780,241 (−1.6%), Bass Fishing 401,704 / 405,941
+(−1.0%). Board (`c1_s1`: main plus this, R129's two kept changes and R132's): 40,996 ALM, 347 M10K, 87 DSP; setup
+−2.47 / −2.38 ns, HDMI −0.45 / −0.17 ns, hold least +0.084 ns. Pictures clean on all four games, Bass Fishing a solid
+58 fps, Scud Race, VF3 and Daytona 2 at the same frame rates as before: the shorter replay shows only in a frame
+bound by the Real3D, and these scenes are not.
+
+**R132 — The Lost World (`lostwsga`, Step 1.5): VF3's ROM layout with the CROM banks selected through
+their mirror (8-15), the 53C810 at C1 by its BAR, and the first game seen to use the Step 1.5 texture port, which
+the core already uploads as Supermodel does, texel for texel. The game's one RTL change is the 315-5649's serial
+status, which decides whether it looks for a serial gun board; the fit also needed R104's kept-LUT hold fix on three
+more geometry MLABs. On the bench the game reaches its intro, but the first 3D is not drawn: the CPU streams the
+intro's cloud bitmaps at a fifth of Supermodel's rate, the game drops to 30 Hz, and its two draw signals then never
+meet in one frame.** D-46, after Scud Race (the R-entry of `s15`). Work in
+`sm3-builds/lw15/`, the tree `h2src` (`r7i1`: the current CPU, s15's Step 1.5 changes, the 32 KB I-cache). Oracles:
+Supermodel (the bus-trace build `dt2/supermodel`, `supermodel-sb` for finished frames and Real3D memory) from a fresh
+NVRAM; MAME 0.289's `model3.cpp` read, and MAME run headless only to dump RAM for disassembly.
+
+*What I believed* (§2, §4's map, §12, s15's entry):
+- Lost World is a Step 1.5 board like Scud Race; §4's map row says "Lost World expects C1000000" for the 53C810
+  (MAME's `init_lostwsga` maps it there).
+- The texture port's three-word form was benched (s15) but no game had been seen to write it on Step 1.5.
+- The core needed only an MRA: the index-4 configuration with step 0x15 and VF3's banks 0-7 in slots 0-7.
+- The guns would be MAME's: a serial light-gun board on the 315-5649's serial FIFO (10-bit X and Y, an off-screen
+  bit).
+
+*What I know now:*
+
+**1. The ROM.** MAME's `ROM_START(lostwsga)` and Supermodel's `Games.xml` agree: fixed CROM 2 MiB (`epr-19936a`..
+`19939a`, .17-.20); banked CROM 64 MiB, all four CROMs populated (sixteen 4 MiB ROMs, .1-.16, VF3's offsets);
+VROM 32 MiB (sixteen 2 MiB ROMs, .26-.41, the part numbers in IC order, VF3's offsets); 68000 program 512 KiB and
+samples 8 MiB (not loaded, D-8). No DSB, no drive board. The zip's 40th file, `epr-18022.ic2` (64 KiB), is the
+billboard's Z80 (MAME `segabill.cpp`, cosmetic) and is not loaded. 98 MiB without sound, the same SDRAM image as VF3.
+MAME patches the program (`rom[0x7374f0/4] = 0x38840004`, "an actual bug in the original code"); Supermodel does
+not, and neither do I (below, 2).
+
+**2. The bus** (Supermodel's trace, frames 1-4,000, 27.86 M records; `sm/trace/map.txt`, `tools/tmap.py`). Against
+Scud Race's trace (`s15/sm/trace`, 3,000 frames):
+
+| | Scud Race | Lost World |
+|---|---|---|
+| 53C810 | BAR1 = C0000000 | BAR1 = **C1000000** (the boot ROM's PCI write at frame 1, again at 90); registers 0C, 14, 2C, 38, 39 at C1 |
+| C0000000 | the 53C810 | **probed once** at frame 90 (writes DEB00BED, reads it back: FFFFFFFF), and a byte written at C0010180: the comm board's probe; nothing answers |
+| CROM banks (F0100008) | FA-FF (banks 0-5) | **F0-F7 only: banks 8-15**, all eight used |
+| texture port (90) | never | **630 words by the 53C810, frames 3,736-3,945: 210 uploads** (address, header, a third word) |
+| texture FIFO (94) | 2.49 M words | 0.86 M words, frames 97-912 |
+| polygon RAM (98) | 39.9 M words, all by the 53C810 | 9.32 M words **by the CPU**, 504 by the 53C810 |
+| I/O, system, RTC | byte accesses | **word accesses** (lwz/stw), the register in bits 31:24 |
+| serial (F0040024-37) | never | one probe at frame 421 (below, 5) |
+| RTC | three reads at frame 61 | written at 421 (1997-07-12), all 13 registers read at 1,159 and 3,955 |
+| ADC (F004003C) | 8 channels a frame | 8 channels a frame: Supermodel gives 80 7F 80 7F 00 00 00 00 |
+| stray writes | none | 287,604 word writes at 00F76DE0, 01EEDBC0, ... 1EEDBC00 (below) |
+
+Nothing at C2, F9 or the security board (F018); no MPC106; the MPC105 set-up, the Real3D ID 0x16C311DB, the JTAG
+(F010000C writes, F0100010 reads) as Scud Race's; the Real3D status block read nine words at a time with
+Supermodel's values. PCI device 11 is written twice at frame 90 (command 3, register 50 = 1): nothing is there in
+either emulator or the core.
+- *The 53C810 at C1* needs nothing: the core takes the window from BAR1 (`m3_scripts` `win_base`), and C0000000
+  then decodes to nothing and reads FFFFFFFF, as Supermodel's.
+- *Banks 8-15* are the upper half of the bank register's 4 bits. Both emulators mirror the 64 MiB there (MAME
+  `ROM_COPY` into the upper 64 MiB of its region, Supermodel's banked CROM copied twice when it is 64 MiB or less).
+  The Step 1.x default in `m3_loader` has 8-15 empty (read as zero), so the game would have run zeros: the MRA's
+  index-4 configuration now maps banks 8-15 to slots 0-7 (`m3_mra.py` `crom_mirror`); no RTL change.
+- *Word accesses to the 315-5649*: the core returns the byte in bits 31:24 and zeros below, Supermodel FFFFFF
+  below. I disassembled every word read (MAME's RAM at frame 1,300, `llvm-mc`): port A/B (0x1178AC-0x1178E0), C, D,
+  G (0x1180D0-0x118114), the ADC (0x11816C) and the EEPROM's DO (0x11A440, 0x11A65C) all use bits 31:24 only
+  (`srwi 24`, `andis`, `rlwinm` on the top byte). So the low bytes are invisible to the program; no change.
+- *The stray writes* come from a copy-with-byte-swap routine at RAM 0x1174E0 (copied from FFF374E0): its pointer
+  step is `add r4,r4,r4` (FFF374F4), which doubles the destination each word, so each call stores 6 words at
+  doubling addresses above RAM. MAME patches it to `addi r4,r4,4`. In Supermodel and the core the addresses decode
+  to nothing. Whether the real MPC105 mirrors RAM there is not known; not chased.
+- *UART status* (F0080004, read 96 times as a word): Supermodel FFFFFFFF, the core 83000000; the game only writes
+  MIDI bytes, so the TxRDY bit (set in both) is what it reads.
+
+**3. The texture port: the first game to use it on Step 1.5, and the core uploads it as Supermodel does.** All 210
+uploads come from VROM with bit 23 of the address set (VROM word 0xC00000-0xCE2DF2, the upper 32 MiB of the 64 MiB
+space, where Supermodel keeps its mirror of a 32 MiB set), in pairs: type 1 (level 0) then type 2 (the mip levels)
+at the same place, all on page 1. The third word (0x0002000C or 0x0000AAAC) is discarded, as Supermodel does. This
+is the case s15's `vrom64` change and its `--v32` bench were for. On the game's own data (`tools/tb_lw_port.cpp`:
+the 210 uploads replayed through `r3d_texup`'s three-word port on the packed MRA image's VROM, and the same textures
+through the FIFO path): 929,351 texel words, 599,356 sheet beats, 0 differ; and the port's sheets against
+Supermodel's texture RAM at frame 3,946 (`supermodel-sb` dump): 1,873,136 texels written, **0 differ** (1,829,862 of
+them changed by these uploads in Supermodel, so the test sees them). The planted fault (16 MiB blocks on a 32 MiB
+set) fails 210 of 210 uploads. Supermodel's own oddity on the way: its loader copies a 32 MiB VROM to the lower half
+as `32*100000` bytes (3.2 MB, decimal) and only the upper mirror whole; Lost World reads only the upper half.
+
+**4. The serial gun probe and the one RTL change.** At frame 421 the program (RAM 0xDE74) writes FF to F0040028,
+command 1 to F0040024 and polls F0040034 for (status & 0x0C) == 0x0C, at most 120 times (0xDDEC). If the bits come,
+it goes on with a gun-board conversation (commands 0x08, 0x81, 0x83, 0x7D, 0x7E, 0x88 ...) and stores 0 in RAM
+0x1A3474; if not, it stores 1. That flag's address is formed at 29 places in the program (two of them the stores). In Supermodel the status reads 0 (its value when no
+serial gun is attached), the flag is 1, and the game reads its guns from the ADC every frame. MAME returns 0x0C
+always (the 315-5649's "serial hack") and emulates a serial light-gun board for this set: its RAM at frame 1,300 has
+the flag 0. The core returned MAME's 0x0C (`m3_io`, from my Model 2 core), so the game would talk to a gun board
+that is not there, read the core's 00 and FF from the FIFO registers, and keep the serial mode.
+No other dumped set touches F0040024-37 (Supermodel traces of VF3, Bass Fishing, Daytona 2, Scud Race). The core
+builds no serial device, so the status of an empty port is the honest value: `m3_io` now has `SER_ST`, default
+0x00, MAME's 0x0C one parameter away. Bench: see 6.
+
+**5. The guns** (for planning; nothing built). The program has both paths and picks one at boot (4):
+- *Analog* (Supermodel `analog_gun1/2`, the path with no serial board): the ADC, 8 bits a channel, read every frame
+  (channel select written 0 at F004003C, then 8 reads): channel 0 P1 X, 1 P1 Y, 2 P2 X, 3 P2 Y. Supermodel inverts Y
+  for Lost World only (255 - y; its comment says it does not know why) and centres at 0x80. Triggers on port C (P1,
+  F0040008) and port D (P2, F004000C), bit 0, active low; bit 1 is Supermodel's second "trigger".
+- *Serial* (MAME): the 315-5649's serial FIFOs, a register select (command 0x00 with the register in FIFO 2) and a
+  read (0x87): registers 0-7 the two guns' Y and X, 10 bits in two bytes each, register 8 the off-screen bits; the
+  trigger on port C / D bit 0 as above. MAME centres at 0x200.
+- A Sinden gun on MiSTer is a joystick with absolute axes, so either path can carry it: the analog path needs only
+  the ADC channels and the trigger bits fed from the joystick (8 bits, the game's own gun calibration in test mode),
+  the serial path a small responder for the select/read protocol (10 bits). Supermodel's analog path is the one the
+  core now selects (4).
+
+**6. The bench** (`tb_m3_system`, R112's options and `ISB` as `Model3.sv` builds, `--tb-fast-pc 0`, the packed MRA
+image and its index-4 configuration; `tools/chain.sh`, 100-frame segments with checkpoints):
+- *Boot*: the boot ROM's MPC105 set-up, PCI (BAR1 = C1), system registers and bank writes are Supermodel's, record for
+  record, PCs aside. The boot ROM's RAM test (FFF00690-FFF006AC, stores and compares 0x80000 words a pattern with the caches off)
+  takes the bench 84 frames where Supermodel takes 3: every access goes to SDRAM uncached, where Supermodel counts
+  one cycle an instruction. So the bench runs about 81 frames behind Supermodel from frame 85 on.
+- *The 93C46*: the same 101 commands as Supermodel's (35 reads, 64 writes, EWEN, EWDS; every word FFFF read, then
+  written), decoded from both traces (`tools/ee.py`); the core's 2 ms write time makes it 9 frames (bench 195-203)
+  where Supermodel takes one, so the offset becomes 124-125 frames from there.
+- *Warning screen*: pixel-identical to Supermodel's grabs once the (-2, -2) grab offset is out (bench 425, 450, 475,
+  525 against Supermodel 300, 310, 336, 386: 100.00% of pixels equal); it ends at bench frame 458, Supermodel's 334.
+- *The serial probe, reproduced* (the same checkpoint at frame 100, run to 600 on the unchanged model (`r1`, 0x0C)
+  and on the changed one (`r2`, SER_ST 0)): Supermodel at frame 421 and `r2` at 548 make the same 122 accesses
+  (FF to 28, command 1 to 24, 120 status reads of 00) and go on to the copyright screen; `r1` answers the probe
+  and from frame 548 runs the gun-board conversation, 17,875 serial accesses in 53 frames, its screen reading
+  **PROGRAM DOWNLOAD 36%** (it downloads a program into the gun board, which the core does not have), with no
+  Real3D traffic at all in 560-600 where Supermodel and `r2` load textures and draw. So with MAME's value the
+  core would sit on that screen on the board. After the probe `r2`'s RTC, MIDI and backup-RAM writes are
+  Supermodel's.
+- *The copyright screen*: the tile layers equal Supermodel's (bench 575 against Supermodel 422-436, 100% equal),
+  but from Supermodel frame 450 to about 800 its picture is white behind the text and the bench's black. The
+  Real3D data agree (one 496 x 384 viewport, no triangles, in both Supermodel's dump at 560 and the bench's at 703,
+  `tools/vps.py`; the RTL-form model `sb_ref` draws nothing from either, and the bench's layer paints nothing).
+  The white is Supermodel's block-culling flash (`CNew3D::RenderFrame` clears to white while Mercury's mode bit 2
+  is set): with `-no-white-flash` its frame 500 is not white (mean 0.25 against 0.99). The core hides the 3D layer
+  there (`r3d_cmd` `hide`). R47 lists Supermodel's white block-culling flashes as not modelled; which the hardware does is a
+  question for footage of a real cabinet booting, not for the bench.
+- *The SEGA logo and the black INSERT COIN frames* (bench 1,175-1,530 against Supermodel 958-1,250): 100.00% of pixels
+  equal on every composite (25-frame steps, then 5). The bench is 213 frames behind by then: it loads the same
+  863,247 texture-FIFO words as Supermodel (Supermodel frames 97-912, the bench 224-1,125), at R106's pace.
+- *The first 3D frames: the intro ("SOMETHING HAS SURVIVED") is not drawn.* Supermodel draws the 3D word SOMETHING
+  and rain over animated lightning clouds from frame 1,264. The clouds are the tile layers (`tg_tool` of
+  Supermodel's own surfaces at 1,400), the word and the rain are 3D. The bench (composites every 5 frames, 1,505-1,700)
+  shows the clouds, textured, lit and fading as Supermodel's (95-97% of pixels equal at the best-matching frames,
+  1,600-1,670), but never the word or the rain. The Real3D data are right: Supermodel's dump at 1,396 rendered through
+  the RTL-form model (`sb_ref`, rebuilt with a Step 1.5 switch, `obj/sbref`) gives SOMETHING and the rain, 588
+  triangles in 3 viewports. The core simply stops drawing: `r3d_cmd`'s draw count is 689 at frame 1,500 and still 689 at 1,520, with no drop counted, and the geometry, the rasteriser and the upload are idle in every frame
+  1,500-1,700 (`--prof-vrom`, all zero).
+- *Why: the CPU falls to half rate, and the draw rule then never fires.* From Supermodel frame 1,161 the program
+  streams the cloud bitmaps into tile pattern RAM, one word a call (`stwbrx` in a three-instruction function at RAM
+  0x2E618, from a decompressor): Supermodel writes 142,784 words in 8 frames (17,800 a frame) and is done; the bench
+  writes 31,231 in 10 frames (3,100 a frame, 5.7 times fewer) and is still streaming at 1,700. Meanwhile the game
+  runs at 30 Hz, and its command-port write (88, by the 53C810) and its tile-generator draw write (F118000C) land in
+  alternate frames: in 1,400-1,699 the bench has 132 frames with an 88 write, 131 with F118000C, **none with both** (the last frame with both is 1,375)
+  (900-1,350: every frame both). The core starts a draw only when both came since the last ping-pong flip
+  (Supermodel's DrawFrame rule), and clears both at every flip, so it draws nothing and shows the last image.
+  Supermodel has the same rule but only for the block-culling latch: it renders the Real3D memory every emulated
+  frame regardless ("No command starts the drawing"), so a slow game still gets its 3D there. In Supermodel the
+  same upload frames (1,161-1,168) also lack the 88 write every other frame; it only lasts 8 frames.
+- So two things stand between the core and Lost World's attract on the bench: the CPU's throughput on this
+  decompress-to-VRAM loop (the CPU is saturated: 0 cycles in the main loop's vblank wait, 0x118284-0x1182A0, in each of frames 1,500-1,511
+  by `M3_IDLE`; how much is the call per word and how much the uncached tile-RAM write is not yet measured apart), and what the
+  Real3D does when the two signals miss each other. The second is a hardware question with no source (Supermodel's
+  own comment: "todo figure out what exactly happens if a frame hasn't been triggered for rendering"). Neither is
+  changed here.
+
+**7. The fit.** `lw15a_s1` (110 MHz, `M3_RELEASE`, seed 1, r7i1's launcher; the tree as h2src plus `SER_ST`):
+hold **-0.010 / -0.039 ns** at slow 100C / slow -40C, all on `r3d_geo`'s `fb_wp` into the LOD-word MLAB's write
+address (`u_fb`); seed 2 (`lw15a_s2`): **-0.034 / -0.064 ns** on `tq_wp` into the triangle queue's MLAB (`u_tq`). Not a
+board candidate either. `r7i1_s1` (the same RTL but for one constant) had passed by placement only: these are the
+paths R104 fix 21 (`u_lvl`) and R109 (`u_vsa`-`u_vsc`) cured with the write address through a kept LUT. I did the same
+for `u_fb`, `u_tq` and `u_fv` (`fv_wp`, +0.072 ns at fast -40C in `lw15a_s1`): logic identical, so the bench from the
+frame-700 checkpoint gives the same 56,197 bus records, record for record, over 19 frames (701-719); lint as before, `quartus_map
+--analyze_file` 0 errors, 0 warnings. `lw15b_s1` (seed 1):
+
+| | `lw15b_s1` | `r7i1_s1` (h2src) |
+|---|---|---|
+| ALM | 41,132 (98%) | 41,001 |
+| M10K / DSP | 336 / 87 | 336 / 87 |
+| Setup, system: slow 100C / slow -40C / fast 100C / fast -40C | -2.682 / -2.505 / +2.115 / +3.384 ns | -2.097 / -1.880 / +1.888 / +3.320 |
+| Setup, HDMI: slow 100C / slow -40C | -0.547 / -0.785 ns | -0.346 / -0.255 |
+| Hold, system: the four corners | **+0.168 / +0.126 / +0.121 / +0.075 ns** | +0.122 / +0.084 / +0.102 / +0.060 |
+| Hold, HDMI | +0.251 / +0.231 / +0.134 / +0.119 ns | |
+| SDRAM pins out of I/O cells | 0 | |
+| RBF | `sm3-builds/lw15b_s1_e3c5bdb3.rbf` (e3c5bdb3c63b18b76b39bcf4da591dbc) | 86e789dc |
+
+The worst setup paths are the CPU's I-cache data into the fetch and the rasteriser's band request (-2.68 ns), none
+near either change; the 0.6 ns against `r7i1_s1` is placement (`lw15a_s1`, one constant from r7i1, was -2.095). Not
+loaded: r7i1 is behind main, so I rebuilt the three changes on main (`lw2_s1`, the VROM overlap merged, R127).
+
+*Board (`lw2_s1`, 2026-11-08):* 41,348 ALM, 336 M10K, 87 DSP; setup −2.62 / −2.27 ns, HDMI −0.45 / −0.69 ns, hold least
++0.096 ns. PROGRAM DOWNLOAD is gone: the game boots to attract and the 2D layers draw and move. No 3D at all from the
+intro on and the FPS counter reads 0 the whole time, as the bench showed. R133 has the cause.
+
+*Wrong turns:*
+- I launched the first fit with nothing but the constant changed and took r7i1's positive hold as the tree's;
+  two seeds (`lw15a_s1`, `_s2`) missed hold at the slow corners on two different geometry MLABs before I applied
+  the fix the study already had for the class.
+- I read the bench as hung in the warning screen at frame 500: the per-frame bus records (59 a frame) were the
+  same as in the stretch before, and I took a 5-frame bin count for the whole range. I spent a retirement
+  histogram (`M3_PCS`, added to the bench) and a disassembly of the main loop (it waits on the vblank byte at
+  0x6ED) before counting by frame: the stretch had ended at bench frame 458, Supermodel's 334 plus the offset.
+  Supermodel's own warning is the same 209 frames of nothing on the bus.
+- I took §4's "Lost World expects C1000000" (MAME's static mapping) as a second 53C810 window to build; the game
+  writes C1 into BAR1 and the core decodes the window from the BAR.
+- MAME's headless debugger (`-debug -debugger none -debugscript`) never ran its script; it sat for 10 minutes and
+  ignored the SIGTERM of `timeout`. A Lua `-autoboot_script` reading the program space did the RAM dump in seconds.
+- I first read MAME's patch offset (0x7374f0) as the PowerPC address; with its uint32 indexing of a 64-bit
+  big-endian region on a little-endian host it lands on FFF374F4, the `add r4,r4,r4`.
+
+*Open:* the analog inputs for the guns (5); Step 1.5 luminous polygons (s15); the RTC on Step 1.x still reads the
+constant (the game reads the date twice in 4,000 frames and writes 1997-07-12 at frame 421, which neither Supermodel
+nor the core keeps).
+
+**R133 — The Lost World's missing 3D is its instruction cache, left off by a DIP switch: the game reads the
+CPU board's DIP bank at start-up and enables the I-cache only when DIP 1 is OFF. The core gives the bank Supermodel's
+7F (DIP 1 ON), so the game ran every instruction as a single-beat SDRAM read, 17 clocks each, at 20.6 clocks an
+instruction; a game frame took two video frames, and its two draw signals then never met in one frame. With the bank
+at FF (all OFF, MAME's default) the start-up takes the I-cache path, the game frame takes 16% of a video frame, both
+signals come every frame and the Real3D draws every frame. The tile-RAM store path is not the cause: 5.3-5.7 bus
+clocks a word.** Follows R132 (§6: the bench never draws from the intro on). Work in
+`sm3-builds/lw3/`, the tree `h5src` (main plus Lost World's three changes). Oracles: the 603e manual for the cache
+and bus behaviour, Supermodel's bus trace (`lw15/sm/trace`) for what the game writes each frame, MAME 0.289's
+`model3.cpp` for the DIP bank's default. Desk only.
+
+*What I believed* (R132 §6):
+- The game streams the intro's cloud bitmaps into tile pattern RAM one word a call (`stwbrx` in a short function at
+  RAM 0x2E618): Supermodel 17,800 words a frame and done in 8 frames, the bench 3,100 a frame and still streaming 300
+  frames later. 1.9 M clocks a frame over 3,100 words is about 600 clocks a word, far beyond a short call and a
+  decompressor step, so something in the path was pathological: most likely the uncached store to tile RAM, through
+  `m3_bus`, the SDRAM port and the tile generator's share of the SDRAM.
+- The CPU was saturated: 0 clocks in the main loop's vblank wait (0x118284-0x1182A0) in frames 1,500-1,511.
+
+*What I know now:*
+
+**1. Where the clocks go (bench, frames 1,500-1,527 from lw15's checkpoint, lw15's model; `runs/a`, `runs/m1`).**
+Retirements by PC, and a retirement watch on the store loop:
+
+| | per video frame | per word |
+|---|---|---|
+| tile-RAM words (CPU writes to F10xxxxx) | 2,432 (3,196 and 1,668 in alternate frames) | |
+| instructions retired outside the wait loop | 60,018 | 24.7 |
+| busy clocks (outside the wait loop) | 1,236,887 | 509 |
+| busy CPI | 20.6 | |
+| instructions in the store path (caller loop 0x2CE64-0x2CED0 and the function 0x2E618-0x2E63C) | | 23.7 |
+| clocks between two stores, inside the loop | | 440 (275 and 605 alternating: 14 and 33 instructions) |
+| bus clocks a tile-RAM store holds the bus (`m3_bus` not idle, the CPU's, F10xxxxx) | | 5.3 |
+
+Every instruction in the loop retires 17 clocks after the one before it, `mr` and `addic` included (the watch,
+`runs/m1/w1.log`). That is an instruction fetch from SDRAM per instruction: the I-cache is off. The bench log of the
+boot has it: HID0 is written 00000C00, 00000000, 00000400, 00000000 and last **00004000** (DCE only) at pc 0x49C,
+frame 117, and never again. VF3, Bass Fishing, Daytona 2 and Scud Race all end their start-up with HID0 = 0000C001
+(their bench logs).
+
+So the 600 clocks a word were 23.7 instructions at about 18.7 clocks each, and the store itself was 5.3 clocks of bus
+time. The CPU was not saturated either: in alternate frames it spent 1.01 M clocks in a second wait loop,
+0x118374-0x11837C (it waits for a vblank counter at RAM 0x1C10D0 to change). One game frame took 2.47 M busy clocks,
+1.4 video frames, so the game ran at 30 Hz with the 88 write in one frame and F118000C in the next.
+
+**2. Why the I-cache is off: the DIP bank.** The program's start-up (RAM 0x0) calls, in order:
+- 0x12C: `lbz r3,0x18(F0040000)`, the 315-5649's port G, the CPU board's DIP bank; each nibble is bit-reversed and
+  inverted through a table at 0x178, and r28 = rev(low nibble) << 4 | rev(high nibble), stored at 0x6F6. So r28 bit 0
+  is DIP 1 ON (port G bit 7 = 0), bit 1 DIP 2 ON (bit 6 = 0).
+- 0x404: MSR |= EE FP ME RI; `if (!(r28 & 1))` call 0x438: ICFI set and cleared, HID0[ICE] set, MSR[IR] set;
+  `if (!(r28 & 2))` call 0x47C: DCFI set and cleared, HID0[DCE] set, MSR[DR] set.
+
+The core returns Supermodel's 7F for port G (`m3_io` `DSW`; sim/system/notes.md listed it as "7F, to match the
+oracle trace; open"). 7F is DIP 1 ON: r28 = 01, the I-cache path is skipped and only the D-cache is enabled.
+Supermodel's own comment says the 7F is there for a side effect on Ocean Hunter; it returns 01 for Bass Fishing. MAME
+has the bank at FF, all eight OFF, its only note "vs215o: enables debug stats if ON" on DIP 1. Supermodel models no
+caches, so the game's choice costs it nothing there; on the core it costs a single-beat SDRAM read per instruction.
+The game reads the bank again every frame (Supermodel's trace: 3,871 word reads, 7FFFFFFF, frames 78-4,000) through
+the same table into a RAM variable; what it does with it there I have not traced.
+
+**3. What the hardware does.** The 603e manual (§3.1.3.2): "When the instruction cache is in the disabled state, the
+cache tag state bits are ignored, and all accesses are propagated to the bus as single-beat transactions." So a
+board with DIP 1 ON would also fetch every instruction from DRAM through the MPC105, one single-beat read at a time.
+The core's 17 clocks at 110 MHz (155 ns) for that read is probably slower than the MPC105's page-hit single-beat read
+on the 66 MHz bus (the 603e's timebase at 16.5 MHz is bus/4), but I have no MPC105 timing in hand to say by how
+much, and on either it is many times the cached cost. A factory board has the DIP bank all OFF (MAME's default; I have
+no Sega document for the CPU board's bank), and no operator setting would want the game at 30 Hz, so DIP 1 reads as a
+developer switch; on vs215o MAME has it turning on debug statistics. **On the board, Lost World runs with its
+I-cache on.** The cost of a word with the I-cache on, from the manual's rules rather than a measurement: 23.7
+instructions of unoptimised code (stack stores and reloads, a call and return a word) at the 603e's one instruction a
+clock with its load latency, about 25-40 clocks, and a cache-inhibited single-beat store that the 603e posts and
+that holds the 60x bus for a few bus clocks; 4,480 words a frame (below) then take 7-11% of a frame at 100 MHz.
+The core with the I-cache on: 39 clocks a word at 110 MHz, 10% of a frame for the 4,480; inside that range.
+
+**4. The tile-RAM store path is not slower than the hardware.** A CPU store to F10xxxxx holds `m3_bus` for 5.3 clocks
+(I-cache off) and 5.6 clocks (on) on average, 48-51 ns at 110 MHz: B_IDLE, B_DEC, then the SDRAM port's acknowledge
+of a posted write. A cache-inhibited single-beat write on the 66 MHz 60x bus takes at least an address and a data
+tenure (§8, the fastest single-beat write), 2-3 bus clocks, 30-45 ns, before the MPC105 and the tile generator add
+anything. Nothing to change there.
+
+**5. The fix: the DIP bank per game, Lost World's FF, on the OSD.** The bank is a per-cabinet setting, so it goes in
+the MRA, as MiSTer's arcade cores carry DIP switches: a `<switches>` block, which Main shows as the core menu's DIP
+Switches page and sends as download index 254 after the last `<rom>`, and again on every change (Main_MiSTer
+`mra_loader.cpp` `arcade_sw_send`; "Reset & apply" saves the setting per game in `config/dips/` and pulses `status[0]`).
+- `m3_loader`: byte 0 of index 254 is the DIP bank (`cfg_dsw`). Its default, at reset, as each configuration download
+  starts and for an image download with no configuration before it, is 7F, so an MRA without `<switches>` runs as
+  before and never keeps the last game's bank. A switches download does not hold the game in reset: the game reads
+  port G live, as it would a real switch.
+- `Model3.sv`: `DIP;` in the configuration string places the page.
+- `m3_io`: the `DSW` parameter becomes the input `dsw`; `m3_system` wires `cfg_dsw` to it.
+- `m3_mra.py`: every MRA gets the eight switches, SW1 to SW8 (bit 7 to bit 0, MAME's DIP locations, 0 = ON; SW1
+  labelled "debug", MAME's note for vs215o), `ids="On,Off"`. The default is the set's `'dsw'`, else 7F: Lost World
+  FF, the other four 7F as before. Apart from the block, all five regenerate byte-identical.
+- `sim/system/notes.md`: the DIP row. `tb_m3_system`: `--sw FILE` sends index 254 last, as Main does; `m3_mra.py pack`
+  writes the default as `IMG.i254.bin`.
+
+My first form of this (the game configuration's byte 20) worked on the bench but gave no way to change the bank on the
+board; I replaced it before any board test, so only the switches form was built for the board.
+
+Area: an 8-bit register in the loader; `m3_io`'s constant becomes a mux input: a few ALM by count (no map run: a fit was in the queue), no M10K, no
+cycle anywhere; the other games' behaviour is unchanged by construction (their port G still reads 7F).
+
+**6. Bench evidence.**
+- *The fixed tree from reset* (`obj/lwf`: `lw3/tree`, the system bench with Model3.sv's options but the clock,
+  `--xlin`; frames 0-130, `runs/f1`): the loader reports DIP bank FF; at frame 117 the start-up's `lbz` at 0x14C reads
+  FF, r28 = 0, and HID0 goes 00000800, 00000000, 00008000 (the I-cache path), then 00008400, 00008000, **0000C000**.
+  The same binary with the old 20-byte configuration (`runs/f0`, the planted fault, and what every other MRA sends):
+  DIP bank 7F, `lbz` 7F, r28 = 1, the I-cache call skipped, HID0 **00004000**, as lw15's model.
+- *Lost World's intro with the I-cache on* (`runs/b`): lw15's model and its frame-1,500 checkpoint, with HID0[ICE]
+  set after the restore (`M3_HID0_OR=8000`, what the start-up's 0x438 call does; MSR[IR] left off, which changes no
+  address or cacheability here: IBAT0 maps 0-2 MiB 1:1, WIM 001, and all the code is below 2 MiB; the I-cache's tags
+  are those of the reset sweep, since it was never on). Frames 1,500-1,599 against the unchanged run (`runs/a`):
+
+| | I-cache off (`runs/a`) | I-cache on (`runs/b`) | Supermodel, frames 1,169-1,300 |
+|---|---|---|---|
+| tile-RAM words a frame | 3,196 / 1,668 alternating | 4,480 every frame | 4,480 every frame |
+| frames with an 88 write / F118000C / both (of 100) | 50 / 50 / **0** | 100 / 100 / **100** (and 100 of 100 in 1,600-1,699) | every frame |
+| draws (`n_draw`) | 689 throughout | 689 → 789 → 889 at 1,700: one a frame | |
+| busy clocks a frame | 1,236,081, 71% (a game frame takes 2.47 M) | 301,578, 17.3% (1,600-1,699: 354,155, 20.4%) | |
+| busy CPI | 20.6 | 2.51 (2.71) | |
+| clocks between stores in the store loop | 440 | 39 (median 49, p10 18, p90 61) | |
+| bus clocks a tile-RAM store holds `m3_bus` | 5.33 | 5.94 | |
+| CPU in the wait loop 0x118374-0x11837C | 28.9% | 82.7% | |
+
+The composites (every 5 frames, `cmp/b`, `cmp/c`, against Supermodel's dense grabs with `lw15/tools/grabcmp2.py`): up to
+1,565 both runs are byte-identical (black but the text; the intro's timeline runs by vblank, not by game frame). From
+1,570 the I-cache-on run shows the word SOMETHING and the rain over the clouds, as Supermodel's frames 1,300-1,416
+do: 93-98% of pixels within 16 of the best-matching grab, the word's shading and the lightning's flashes following
+Supermodel's frame for frame where the match is closest (1,615-1,635: 97-98% within 16, 31.8-36.3 dB). lw15's
+I-cache-off run (`lw15/runs/r3`, `cmp/r3`) shows the same clouds with no word and no rain at every frame to 1,700
+(1,690 against Supermodel 1,372: the clouds equal, the word absent). The fade timing does not line up frame for frame
+(the best match jumps by tens of Supermodel frames between neighbouring bench frames); I have not chased it.
+
+lw15's "still streaming 300 frames later" was this steady 4,480 words a game frame, which Supermodel writes every frame
+from 1,169 on (the cloud animation): the upload burst itself (Supermodel 1,159-1,168, 17,600-22,900 words a frame,
+the 88 and F118000C alternating there too) ended at bench frame 1,425.
+
+**7. The draw rule.** With the I-cache on, the 88 write and the F118000C write land in the same frame every frame
+from 1,500 to 1,599, and `r3d_cmd` draws every frame. So the rule ("both since the last flip") is not what stopped Lost
+World, and nothing here says what the Real3D does when they miss each other. Supermodel's trace shows the game itself
+alternating them in its upload burst (1,161-1,168), where it overruns its frame even at one clock an instruction; on
+the core those eight frames would show the previous image. The intro's first 3D is at Supermodel 1,264, a hundred
+frames later. The rule stays as it is, unsourced.
+
+*Checks:*
+
+| Check | Result |
+|---|---|
+| `quartus_map --analyze_file` (17.0): `m3_loader.sv`, `m3_io.sv`, `m3_system.sv` | 0 errors, 0 warnings each |
+| `lint_sys` | the same 9 warnings as h5src |
+| `test_io` (VF3's Supermodel trace) | PASS, 0 mismatches; planted fault (the bench's `dsw` = FF): 1,017 mismatches, all VF3's port G reads |
+| `test_bus`, `test_xmem` (12 runs) | PASS |
+| the loader's DIP bank (`sim/system/tb_loader_sw.cpp`, `test_loader_sw`, 13 checks in Main's order: configuration, image, switches FF; an OSD change; the next game's configuration; VF3's order with no configuration; NVRAM after) | PASS; planted faults: switches on index 255, 4 failed; byte 1 for byte 0, 5 failed; no set-back at a configuration's start, 1 failed |
+| the system bench from reset with `--sw` (FF, sent last; `c3src`, frames 0-130) | loader DIP bank FF; HID0 to 0000C000 at frame 117; 224,089,610 cycles to frame 130, the same as the byte-20 run |
+| the five MRAs regenerated | the `<switches>` block added; otherwise byte-identical |
+
+*Wrong turns:*
+- lw15 measured the CPU "saturated" with 0 clocks in the vblank wait at 0x118284-0x1182A0; the game was waiting in
+  another loop, 0x118374-0x11837C, for 1.0 M clocks every other frame. It was not saturated, it was slow.
+- lw15 read the bench's 3,100 words a frame "still streaming" as an upload that never finished; it was the steady
+  per-frame cloud animation, which Supermodel also writes every frame.
+- I went in expecting the tile-RAM store path (`m3_bus`, the SDRAM port's arbitration with the tile generator) and
+  read the first retirement watch that way: the load after `stwbrx` retired 46-63 clocks after it. The per-frame bus
+  counter shows the store holding the bus for 5.3 clocks; the 17 clocks on every other instruction were the story.
+- I first read the core's I-cache flash invalidate (`hid_icfi && hid_ice` in `ppc_icache`) as a reason the I-cache
+  might not come up; it ignores ICFI while ICE is off, which the 603e manual does not say (§3.1.3.1), but the reset
+  sweep leaves the tags invalid and the game sets ICFI before ICE, so it changes nothing here. Noted below, not
+  changed.
+
+*Open:*
+- The other games' DIP bank: they read port G too (VF3 1,017 times in `test_io`'s trace) and enable both caches
+  regardless. Whether they should see FF (the factory setting) rather than Supermodel's 7F is a separate decision:
+  their MRAs set nothing and stay at 7F.
+- `ppc_icache` ignores ICFI while HID0[ICE] is 0; the manual makes no such condition. Harmless after a hard reset.
+- The core's uncached single-beat read (17 clocks a fetch with the I-cache off) against the MPC105's: needs the
+  MPC105 manual's DRAM timing. It matters for code that runs with the caches off, such as the boot ROM's RAM test
+  (84 bench frames where Supermodel takes 3).
+- The fixed tree has not been run from reset past the start-up on the bench (about 12 hours to the intro); the
+  intro's bench evidence is lw15's model with HID0 set at 1,500. The board (below) has since shown it.
+- A green box round some foliage cards in attract (board, `c3_s1`): the cut-out texels drawn opaque green. Under
+  investigation.
+
+*Board (`c3_s1`, 2026-11-08: main plus R129's two kept CPU changes, R131's rasteriser set with `PB` = 2, R132's
+three changes and this):* 40,826 ALM (97%), 347 M10K, 87 DSP; setup −1.85 / −1.61 ns, HDMI −0.14 / −0.28 ns, hold
+least +0.059 ns (slow −40 °C).
+- Lost World: the intro draws its 3D and attract holds 58 fps (57-58 on the counter). The DIP Switches page shows
+  SW1-SW8, all Off.
+- SW1 set On from the OSD, Reset & apply: the 3D is gone again. The switch reaches the game both ways.
+- VF3's page shows SW1 On (7F) and the game runs as before.
+
+**R134 — Lost World's green boxes are L8 foliage under contour: MAME's decode gives every format 5 and 6 texel alpha
+0xFF, and Supermodel makes 0xFF transparent. With Supermodel's key in the texel decode the cards cut out as in
+Supermodel's frames. Daytona 2 and Bass Fishing are unchanged to the cycle, and VF3 changes in 11 of 400 frames by under
+200 pixels. It costs 17 ALUTs.** Work in `sm3-builds/lwtx/`. Desk only: benches, lint, `--analyze_file` and a
+standalone map of the texel module; no fit, not the board.
+
+*Board (`c3_s1`, 2026-11-08):* Lost World's attract runs at 57-58 fps with its 3D. In the Dilophosaurus pack scene a
+foliage card at the top left is drawn as a solid mid-green rectangle (about RGB 50, 140, 40) behind its leaves. The
+bushes at the top right and in the centre of the same frame are cut out correctly: not every tree, only some.
+
+*What I believed:*
+- The rasteriser's texel decode is MAME's `get_texture`, all eight formats (`r3d_rast_texel`, m3-notes §2). D-19 and
+  D-25 follow Supermodel where it corrects MAME's renderer, but the decode had stayed MAME's.
+- R100 listed two format differences from Supermodel as left unchanged: format 2's nibble order, and formats 5 and 6,
+  where Supermodel makes 0xFF transparent. Daytona 2 has 8 and 3 meshes that use them, alpha-tested 2D. m3-notes §8
+  measured the whole DECODE switch at within 0.2 dB on VF3 and 0.4 dB on Bass Fishing. So I took the L8 key as not
+  worth building.
+- My first suspect for a box was the other half of Supermodel's DECODE: formats 1-4 lose their alpha nibble under
+  contour (`GetTexFormat`, +7). Lost World does not use those under contour in any frame I sampled.
+
+*What I know now:*
+
+**1. The frame.** Supermodel (`supermodel-sb`, fresh NVRAM) grabs every 25 frames from 4,000 to 10,000
+(`sm/grab/sb`): the first attract demo is the jungle and the shed (4,000-5,450), the second the stegosaurus
+(6,750-8,050), then the Dilophosaurus pack (8,075-8,325). The photo is the pack at Supermodel frames 8,225-8,250.
+
+**2. The polygon.** I took Supermodel's Real3D memory at frames 8,100-8,275 (`sm/pack/sb`). Each dump went through the
+geometry model (Step 1.5) and `render_d25`, with a census of the textured polygons by format and header bits
+(`tools/lw_tex.cpp`). The card is:
+- h6 0x848086E0: bit 31 contour, format 5 (L8 in the low byte), texture alpha bits 0, the opaque list;
+- colour 3F7F33, texture page 1 (512, 0), 256 x 256;
+- 38,758 of its 65,536 texels are 0xFF;
+- at 8,225, 42 triangles and 19,226 pixels over (0, 0)-(218, 153) of 496 x 384. That is the photo's x 65-565 of 1,350
+  at its scale.
+
+**3. What each does with it.**
+- Supermodel's `ExtractColour` types 5 and 6 give alpha 0 when the byte is 0xFF and 1 otherwise. With contour
+  (`alphaTest`) the shader discards alpha < 32/255, so the 0xFF texels are cut out.
+- MAME's decode gives every L8 texel alpha 0xFF, so the contour test (alpha < 0xF8 discards) never fires.
+- The core follows MAME, so the 0xFF texels draw as white times the polygon colour: the green box.
+- Only alpha differs; the colour is the same in both.
+
+**4. It is more than one card.** Format 5 under contour is in 7 of 10 frames I sampled from 4,025-6,950, and format 6
+in 3. In the shed scene (4,900) the MAME form draws a second green box over the tree line by the gate, which the key
+cuts out (`cmp/m4900.png`). That is consistent with "only some trees".
+
+**5. Reproduced on the bench.** The whole-rasteriser RTL bench (`r3d_rast`, `tb_r3d_rast`, MIP 1) took the geometry
+model's lists of these dumps (`lw/tris`, `lw/dumps`).
+- With the old decode it draws the card as the green rectangle at 8,225 and 8,250 (`cmp/f8225.png`, `f8250.png`: Supermodel,
+  RTL before, RTL after).
+- The old decode is the new tree built with `-GL8K=0`. Its FRAME and STALL lines equal `c3src`'s RTL on all 7 frames.
+- With the key, the card is cut out and the jungle behind it shows. Supermodel's sky in that corner is the tile layer,
+  which this bench does not draw.
+
+**6. The change.**
+- `r3d_rast_texel` `dec()`: in formats 5 and 6 a byte of 0xFF decodes with alpha 0x00, all other bytes 0xFF, behind
+  `L8K` (default 1; `r3d_rast` passes it through). Colour, the filter and the kinds are unchanged.
+- Only the contour and texture-alpha kinds read texel alpha. For them an 0xFF texel is now discarded, and its
+  neighbours blend at the filtered alpha, as format 0's bit-15 key already did.
+- The model: `texram::decode` with `l8_key` (default on), used by `texel()` and `fetch_texel_lv`. `r3d_rast_ref`
+  turns it off where it compares with MAME's renders. `tb_r3d_rast` takes `--l8key` and writes each frame's
+  layers with `--out`.
+
+**7. Effect, whole-rasteriser bench, MIP 1, port profile p0** (`tools/rr.sh`, 400 frames a game; `logs/rb_*` the
+unchanged RTL, `logs/rt_*` the fixed):
+
+| Game | Wrong pixels | FRAME / STALL lines against the unchanged RTL |
+|---|---|---|
+| Daytona 2 | 0 | identical, 400 frames |
+| Bass Fishing | 0 | identical, 400 frames |
+| VF3 | 0 | 35 of 400 frames differ. Run alone, 24 of them are identical: the bench replays 25 frames back to back with random port delays, so one changed frame shifts the rest of its chunk. 11 are real: shaded pixels −75 to +187, replay −335 to +54 cycles, texture lines −101 in three. p50 781,141, p99 1,257,154 and max 1,340,090 cycles are unchanged. |
+| Lost World, 8,100-8,275 | 0 | the card's pixels drawn fall 19,226 → 10,883 (8,225) and 14,739 → 8,794 (8,250). Replay +0.2% to +1.6% a frame (8,225: 1,431,294 → 1,444,044), because what the card hid now passes Z and is textured. |
+
+VF3's changes are fmt 5/6 texels under contour or texture alpha: 22 and 176 such texels in the frames I sampled
+(`tools/texdis.cpp`). Daytona 2 and Bass Fishing use formats 5 and 6 only with colour modulation, which does not read
+alpha. I could not check VF3's frame 8,460 against Supermodel: its 3D-only grab there is a blank white frame.
+
+**8. Checks.**
+- The texel unit bench (MIP 1, 3,000,000 random texels over random texture RAM, all formats): 0 wrong. On 40 VF3
+  frames: 0 of 10,235,291 wrong.
+- Planted faults, all caught by the random set:
+
+  | Fault | Texels wrong of 3,000,000 |
+  |---|---|
+  | format 5 keyed on the high byte | 10,968 |
+  | no key on format 6 | 5,630 |
+  | `L8K` = 0 against the keyed model | 11,185 |
+  | 0xFE keyed too | 5,591 |
+
+- The unfixed RTL against the fixed model on Lost World: 78,927 pixels wrong in 7 of 7 frames.
+- Verilator `-Wall` lint gives the same warning sets as `c3src`: the rasteriser 22, the texel 0, the whole system 408.
+- `quartus_map --analyze_file` (17.0.0 Build 595, in a scratch copy) on `r3d_rast_texel.sv` and `r3d_rast.sv`:
+  0 errors, 0 warnings each.
+
+**9. Area.** A standalone `quartus_map` of the filter instance (`PART` 2, `MIP` 1, `TW` 7) gives:
+
+| `L8K` | ALUTs | ALMs needed | Registers | DSP | M10K |
+|---|---|---|---|---|---|
+| 0 | 621 | 634 | 703 | 12 | 0 |
+| 1 | 638 | 647 | 703 | 12 | 0 |
+
+That is +17 ALUTs, +13 ALMs needed. The viewer's `m3v_raster` picks up the default too.
+
+**10. Not built: the rest of Supermodel's DECODE.**
+- Formats 1-4 under contour, Supermodel types 8-11: the alpha nibble is ignored and luminance 15 is transparent.
+- Format 7 with no alpha test, and format 2's nibble order.
+- Supermodel's alpha test at 32/255 with colour dilated from opaque neighbours, where MAME's form tests ≥ 248/255
+  and blends by alpha.
+
+On texels the formats 1-4 rule is far from small. In the frames I sampled:
+- Daytona 2 has 48-59 contour textures in each of formats 1-4, and about 37% of their texels are transparent under one
+  rule only, in both directions. It is 72,099 SM-only / 72,422 MAME-only of 196,608 texels in format 1, and similar
+  in 2-4.
+- VF3's three format 3 contour textures have 1,025,246 texels MAME's rule discards and Supermodel's draws.
+
+So one of the two rules draws large wrong areas in Daytona 2 and VF3, and the board has not shown which. It needs its
+own comparison with Supermodel's grabs and a look on the board before it goes in. The L8 key does not depend on it.
+
+*Wrong turns:*
+- Before the photo I looked for the tree in the first attract demo. The pack scene comes 3,000 frames later. The shed's
+  tree line at 4,900 has the same fault, but it is not the scene in the photo.
+- I expected the formats 1-4 contour rule. It turned out to be the L8 key, the simpler of Supermodel's two decode rules.
+- R100 priced the L8 difference on Daytona 2 alone, and m3-notes' DECODE ablation on VF3 and Bass Fishing. None of
+  them has an L8 card under contour on a large polygon; Lost World does. A difference measured as small on the games I
+  had was not small on the next one.
+- Supermodel's grabs are not the same from run to run: frames 4,775 and 5,425 differed between two fresh-NVRAM runs,
+  while 4,025 and 6,950 matched. So I compared each dump only with the grab from its own run.
+- I first read VF3's 35 differing frames as the change itself. 24 of them are the bench's port timing shifting
+  after one changed frame in the chunk (see 7).
+
+*How established:*
+- `sm/run_grab.sh`: Supermodel grabs and dumps.
+- `tools/lw_tex.cpp`: geometry, `render_d25`, census, `.tri` and `.bin.gz` writer.
+- `tools/tricen.py`: the format and contour census of the bench lists.
+- `tools/texdis.cpp`: per-texel Supermodel/MAME disagreement.
+- `tools/texel.sh`: the unit bench and planted faults.
+- `tools/rr.sh`: the three-game bench.
+- `cmp/`: the images.
+- `logs/`: the runs, lint, `--analyze_file` and the standalone map (`qmap/k0`, `k1`).
+
+*Board (`c4_s1`, 2026-11-08: main plus this):* 40,952 ALM, 347 M10K, 87 DSP; setup −2.20 / −2.10 ns, HDMI −0.10 /
+−0.33 ns, hold least +0.104 ns. Lost World's foliage cards cut out and attract holds 58.
+
+*Open: leaves drawn with too little fog.* In the T-rex close-up (Supermodel frames about 7,975-8,050) the board shows
+dark-green leaf fragments and a bluish-green band in an area Supermodel and the RTL bench both draw flat olive. The
+olive is right: a canopy of format-0 contour cards (h6 84808460) fogged all the way to the fog colour; with fog off in
+the model the canopy appears, and its lower edge is the photo's boundary. Ruled out on the bench: the texture rules
+(the old and new rules draw the area alike), missing texture data (with the canopy's texels zeroed or random the
+render is the same, as fog hides any texel), and the store (1,901 triangles at frame 8,000, a fifth of a region). So
+the board fogs some pixels much less than the bench: the per-pixel fog path under real DDR3 timing, or different fog
+words reaching the rasteriser. The bench under the hostile port profile does not show it; a board readout of the fog
+terms or a system-bench run to this frame would. The trunk on the right is also brighter on the board and the bench
+than in Supermodel, a fog-model difference of its own.
+
+**R135 — Daytona 2's car glass is a translucent textured polygon, and MAME's texture-alpha kind ignores the
+polygon's translucency: it blends by the texel's alpha, which is 0xFF, or 0 where a format 0 texel has bit 15 set.
+So the glass drew opaque with holes in it. Following Supermodel for texture decode, contour and texture alpha (my
+decision of 2026-11-08) fixes it, and with it Bass Fishing's water (+1.0 dB over 400 frames) and VF3's translucent
+sea and shadows. Everything is behind `SMTX` (default 1). With `SMTX` = 0 the rasteriser is cycle-identical to
+`c4src` on all 1,200 bench frames. With 1, the bench is 0 pixels wrong against the updated model, and the replay
+changes only where pixels are now drawn or discarded. In a standalone map of the rasteriser it costs +70 ALMs
+needed, +1 DSP and no M10K.** Work in `sm3-builds/tx2/` (`tree` = `c4src` plus this). Desk only: benches, lint,
+`--analyze_file` and standalone maps. No fit, and not the board.
+
+*Board (`c3_s1`, 2026-11-08):* in Daytona 2's attract, with the purple PHANTOM #41 car from behind and above, the
+windscreen and side glass are an opaque pale green sheet with dark streaks. In Supermodel the same scene shows the
+roll cage and seat through tinted glass.
+
+*What I believed:*
+- R100 and R134 left two parts of Supermodel's decode unbuilt: formats 1-4 under contour (types 8-11, luminance 15
+  transparent), and format 2's nibble order. R134 measured that about 37% of the texels in Daytona 2's contour
+  textures are transparent under one rule only. So I expected the windows to be a contour texture with the wrong
+  decode.
+- The texture-alpha kind (`K_TEX_ALPHA`) was MAME's `draw_scanline_tex_alpha`. I took it to be right wherever the
+  texel's alpha was right.
+
+*What I know now:*
+
+**1. The window.** I took Supermodel's Real3D memory at Daytona 2 attract frames 700-1480, every 20th
+(`dt2/smdump`), plus a short new run at every frame from 1194 to 1206 (`sm/dt2`, `tools/sm_dt2.sh`). Frame 1200 is
+the photo's scene. I listed the polygons that draw in the windscreen box (`tools/tx_cen.cpp --box`):
+- the glass is h6 0x04428420: format 0, textured, no contour, no texture-alpha bits, polygon translucency 16
+  (h6 bit 23 clear), colour FFFFFF, page 1 (640, 0), 128 x 128, about 3,500 pixels;
+- it lands in the alpha list because it is translucent. MAME's alpha kind then blends by the texel's alpha alone,
+  with no polygon translucency and no colour;
+- format 0's alpha is 0xFF, or 0 where bit 15 is set. So the glass texture draws opaque, and is cut out wherever
+  bit 15 is set. That is the photo's see-through/opaque pattern;
+- Supermodel (`R3DShaderCommon.h` 266-268) forces the texel's alpha to 1 when the polygon has neither texture alpha
+  nor contour. It then multiplies by the polygon's alpha (`New3D.cpp` 1568, `PolyHeader::Transparency`), so the
+  glass is half transparent everywhere.
+
+The RTL bench reproduces the board's glass from these dumps (`cmp/dt2_w001200.png`, `cmp/dt2b_rtl_w1201.png`:
+Supermodel, RTL before, RTL after). The fault was in the alpha list's rule for a translucent textured polygon, not
+in the decode.
+
+**2. Census.** Textured triangles by kind, 40 frames a game, with the pixels they last write
+(`tools/tx_lc.cpp`, `logs/lc_*.txt`):
+
+| Kind | Daytona 2 | VF3 | Bass Fishing |
+|---|---|---|---|
+| format 0, translucent, no texture alpha (the glass case) | 2,668 tris, 51,838 px | 7,276 tris, 1,615,164 px | 1,447 tris, 656,281 px |
+| format 7, texture alpha and translucent | 2,993 tris, 71,193 px | 2 tris, 2,372 px | 49,973 tris, 23,047 px |
+| formats 1-4, texture alpha and translucent | 574 tris, 28,266 px | 5 tris, 995 px | — |
+| formats 1-4 under contour | 2,749 tris, 9,757 px (all with texture inversion) | 21 tris, 29,373 px | — |
+| format 0 under contour | 10,625 tris, 234,648 px | 8,059 tris, 44,656 px | 562 tris, 4,551 px |
+
+So the translucency rule decides large areas in every game: VF3's sea and shadows, and Bass Fishing's water
+surface. MAME's rule draws all of them opaque.
+
+**3. Each case, Supermodel against the core before** (Supermodel `036af1c`, `Src/Graphics/New3D`):
+
+| Case | Supermodel | `c4src` (MAME's) | Now (`SMTX` = 1) |
+|---|---|---|---|
+| Format 0 A1RGB5 | `ExtractColour` type 0 (`R3DShaderCommon.h` 17-23): RGB / 31, alpha = !bit 15 | the same, RGB as x << 3 \| x >> 2 | unchanged (within 1 of 255 x / 31) |
+| Format 1 | type 1 (24-28): luminance 3:0, alpha 7:4 | the same | unchanged |
+| Format 2 | type 2 (29-33): alpha 3:0, luminance 7:4 | read as format 1 | Supermodel's |
+| Formats 3, 4 | types 3, 4 (34-43) | the same | unchanged |
+| Formats 5, 6 (L8) | types 5, 6 (44-53): 0xFF transparent | R134's key | unchanged |
+| Format 7 | type 7 (54-60) | the same | unchanged |
+| Formats 1-4 under contour | `GetTexFormat` (`New3D.cpp` 1380-1396) to types 8-11 (61-80): alpha nibble ignored, luminance 15 transparent | the alpha nibble, test >= 0xF8 | Supermodel's |
+| Format 7 under contour | `SetMeshValues` 1422-1424: no alpha test; alpha 1 unless texture alpha (266-268) | test >= 0xF8 on the alpha nibble | no test |
+| The contour test | `GetTextureValue` 247-251: filtered alpha < 32/255 discarded; the colour pass writes opaque (`WriteOutputs` 357) | < 0xF8 discarded, else blended by alpha; Z written | A < 32 discarded, else written without a blend; Z written |
+| Contour filtering | `texBiLinear` 179-191: a corner below an edge neighbour's alpha takes its colour, in that order | none | the same, as a bank select per corner |
+| Texture alpha (h6 2:0, bit 0 on Step 1.0) | 253-264 and `Triangles.h` 160-166: a = A x the polygon's alpha; a < 1/32 discarded; a = 1 drawn in the colour pass with Z, the rest in the translucency layers | A = 0 discarded, blended by A; no polygon translucency, no colour, no Z | a = A x P / 255; a < 8 discarded; blended by a, written without a blend at 255; no Z (D-29); colour when colormod |
+| Translucent textured, no texture alpha | 266-268: A = 1, so a = the polygon's alpha | blended by A (0xFF or 0): opaque with holes | a = P |
+| Contour on an alpha-list polygon | the alpha test applies in every pass | ignored | A < 32 discarded |
+| Texture inversion (h6 30:24 = 2) | 243-245, `New3D.cpp` 1431: RGB = 1 - RGB after the filter | not built | 255 - RGB on every textured kind |
+
+P is the core's translucency factor, t << 3 | t >> 2 (255 when opaque), the one the untextured kind already uses.
+Supermodel's is t x 255 / 32; they differ by up to 8 at t = 31. I kept one factor for both kinds (see 9).
+
+**4. Supermodel's renderer artefacts, and what I did with each.**
+- *Dilation* (`texBiLinear` under `alphaTest`; `New3D.cpp` 1439 calls it "pixel dilate"). This is a GPU fix for
+  cutting out a bilinear 1-bit texture: without it the transparent texels' colours bleed into the edges. Those are
+  white for luminance 15 and L8 0xFF, and whatever format 0 holds. *Built.* With the 32/255 threshold the edges
+  are drawn, so their colour has to come from somewhere. Against Supermodel's grabs, on the pixels where it
+  matters (the new rule with and without it, `tools/dil.py`):
+
+  | Set | Pixels it changes | Mean L1 to Supermodel, with / without | Closer with / without |
+  |---|---|---|---|
+  | Lost World, 7 frames | 60,665 | 87.9 / 115.6 | 85.1% / 14.5% |
+  | Daytona 2, 13 frames | 210 | 130.5 / 139.2 | 89.5% / 10.0% |
+  | VF3, 29 frames | 9,495 | 328.5 / 340.0 | 59.4% / 39.2% |
+  | Bass Fishing, 12 frames | 810 | 180.9 / 192.3 | 56.9% / 42.3% |
+
+  What the hardware does at a contour edge is not known. MAME's 0xF8 test discards almost every edge pixel.
+- *Two passes for texture alpha* (`DiscardAlpha`, `New3D.cpp` 545 / 551), and the two translucency layers.
+  These are Supermodel's order-independent approximation. D-29 keeps the plain blend, so *not built*: a texel at
+  a = 255 is written without a blend, but writes no Z. Writing Z there would put the alpha list on the Z band's
+  contour-verdict path, which costs cycles (D-48).
+- *Wrap smoothing off under the alpha test* (`New3D.cpp` 1439). This belongs to Supermodel's sampling (the
+  half-texel offset and clamp modes), which the core does not follow (R47 `SAMPLE`). *Not built.*
+- *Floats.* 32/255 became A < 32, and 1/32 became a < 8 (8/255 = 0.0314 against 0.03125). A x P became
+  (m + (m >> 8) + 128) >> 8, which is exact whenever either factor is 255.
+
+**5. Built** (`tree`, against `c4src`):
+- `r3d_rast_texel` `SMTX`:
+  - format 2 swapped;
+  - under contour (not format 7) the dilation: each corner's colour is read from the bank the select names, and its
+    own alpha is kept;
+  - formats 1-4 under contour always dilate, so their luminance key comes from the select logic, not the decode.
+  - With `PART` = 2 the selects are formed in stage 2 from registers only. `r3d_rast` reads ring A a stage earlier
+    (`o_tagr` is the tag going into stage 1), and a copy of the word line's flags (`wdf`, 8 x 20 MLAB: bit 15 and
+    the nibbles all ones) is read a cycle early. Stage 3's data path keeps its depth: a bank select from
+    registers, the decode, the differences.
+- `r3d_rast_colour` `SMTX`: the contour and alpha-list rules above, with the alpha mode {inversion, alpha test,
+  texture alpha, colormod}. The 8 x 8 product is registered at stage 2, and a and the verdicts are formed at
+  stage 3, so the latency is unchanged.
+- `r3d_rast`: table 2 carries the contour bit and the alpha mode (67 → 72 bits), ring A the contour bit (27 → 28),
+  ring B the alpha mode (70 → 74). All three keep their M10K counts.
+- The record: word 0 bit 15 was MAME's page bit again (word 0 bit 5 already has it), and is now texture alpha
+  alone. The alpha flag (bit 2) cannot tell texture alpha from translucency, and Bass Fishing's and Daytona 2's
+  format 7 smoke needs both. Word 3 bit 7 is texture inversion. `r3d_geo` stores the page apart (emission MLAB
+  95 → 97 bits). `r3d_rast_store` keeps word 3 bit 7 at bit 14.
+- The model: `texram::sm_tex` (default on), `texram::decode(fmt, p, ctr)`, `sm_dilate`, `frag`'s rules, `d25_am`,
+  `TP_TALPHA` (param bit 0), and `set_talpha(frame, step)` for lists made before this, which carry the page there.
+  `r3d_geo.cpp` emits texture alpha in param bit 0. `r3d_rast_ref` turns `sm_tex` off where it compares with
+  MAME's renders.
+- The M2.5 viewer's instances take `SMTX` = 0, since its tables carry none of these bits.
+
+**6. Proof.**
+- Texel unit bench (`PART` = 0, MIP 1), 0 wrong in all of:
+  - 3,000,000 random texels, with contour random;
+  - 2,000,000 with keyed words dense (`--rkey 3`);
+  - 40 VF3 frames (10.2 M texels), 40 Daytona 2 (13.4 M), 7 Lost World (3.5 M), 41 Daytona 2 attract (12.5 M).
+
+  Planted faults (texels wrong of 3 M / 2 M):
+
+  | Fault | Wrong |
+  |---|---|
+  | corner 0 prefers 1 over 2 | 54,673 / 91,222 |
+  | corner 3's order | 53,931 / 90,209 |
+  | no dilation | 317,744 / 540,896 |
+  | format 2 not swapped | 371,607 / 246,232 |
+  | a dilated corner takes the neighbour's alpha | 323,369 / 552,719 |
+  | format 3's key on nibble 15:12 | 70,548 / 60,855 |
+  | format 1's key on nibble 7:4 | 69,983 / 60,809 |
+  | L8 key on half the byte | 37,728 / 34,284 |
+  | no bit-15 key | 172,154 / 119,885 |
+  | format 7 dilated | 187,767 / 123,556 |
+
+  `-GSMTX=0` against the old model passes; against the new one it fails (1,095,385 / 843,633). My first form had
+  the luminance key in the decode as well, and a fault there (luminance 14) changed nothing: under contour formats
+  1-4 always dilate, so the key was dead and I took it out.
+- Colour unit bench, 0 wrong on 3,000,000 random pixels (alpha mode and alphas about 8, 32 and 255 included), 40
+  Daytona 2 frames (13.6 M) and 40 VF3 frames (11.5 M). Planted faults (wrong in random / Daytona 2 / VF3):
+
+  | Fault | Wrong |
+  |---|---|
+  | test at 31 | 2,312 / 173 / 200 |
+  | discard below 7 | 3,804 / 2,412 / 201 |
+  | always blend | 9,288 / 145 / 69,397 |
+  | P ignored | 424,563 / 375,785 / 2,547,134 |
+  | colormod ignored | 119,973 / 86,158 / 2,509,144 |
+  | no rounding | 292,541 / 463,877 / 2,607,822 |
+  | contour alpha ignored on the alpha list | 90,148 / 0 / 0 |
+  | inversion ignored | 528,912 / 13,756 / 0 |
+
+  `-GSMTX=0` with the old model passes.
+- Whole rasteriser (`tools/rr.sh`, MIP 1, p0), 400 frames each of Daytona 2, VF3 and Bass Fishing, with each
+  game's step (21, 10, 10): 0 pixels wrong and 0 port violations on all 1,200. The hostile p1 profile on 100 frames
+  each: 0 and 0. Lost World 8,100-8,275 (7 frames), Daytona 2 attract 700-1480 (41) and 1194-1206 (13): 0 wrong.
+  - `-GSMTX=0` against the old model: every FRAME and STALL line identical to `c4src`'s on all 1,200 frames, cycles
+    included.
+  - Planted in the rasteriser:
+
+    | Fault | Daytona 2 attract (41 frames) | Lost World (7) |
+    |---|---|---|
+    | the store drops the inversion bit | 1,982 px in 24 frames | 0 (it has none) |
+    | ring A read a stage late | 3,723,292 px | 1,179,041 px |
+    | the flags read a cycle late | 5,089 px | 73,887 px |
+    | ring A's contour bit 0 | 3,310 px | 60,665 px |
+
+- Geometry (`tb_r3d_geo`, Supermodel's rows, culling, the LOD word): every triangle field matches the model on
+  all 400 frames of Daytona 2 (2,868,892 triangles), VF3 (2,313,148) and Bass Fishing (1,389,845). The old RTL
+  against the new model fails 39 of 40 Daytona 2 frames and 40 of 40 VF3 frames.
+- Lint (Verilator 5.052 `-Wall`): texel, colour and geometry 0 warnings, as before. The rasteriser has 23 against
+  22: one more empty pin of the same kind (`o2_ctr`). The system has the same 9.
+- `quartus_map --analyze_file` (17.0.0 Build 595, scratch copy) on `r3d_rast_texel`, `r3d_rast_colour`,
+  `r3d_rast`, `r3d_rast_store`, `r3d_geo` and `m3v_raster`: 0 errors, 0 warnings each.
+- Quartus 17 rules: no signed casts, a plain product and adds. No index past an array's end: two-bit bank indices
+  into four, and flags at 5k for k < 4.
+
+**7. Cycles** (D-48: nothing beyond pixels now drawn or not drawn). Replay against `c4src`, 400 frames, p0:
+
+| Game | Mean | p99 | Max | Per frame |
+|---|---|---|---|---|
+| Daytona 2 | 905,912 → 905,804 | 1,587,758 → 1,586,894 | 1,748,149 → 1,748,481 | −3,797 to +1,928 |
+| VF3 | 767,940 → 768,803 (+0.11%) | 1,256,059 → 1,255,436 | 1,340,090 → 1,340,015 | −2,783 to +40,660 |
+| Bass Fishing | 401,704 → 401,678 | 925,170 → 924,897 | 1,037,419 → 1,037,489 | −882 to +363 |
+| Lost World, 7 frames | 9,616,405 → 9,611,934 in all | | | |
+
+- With `SMTX` = 0 the structure costs nothing (all lines identical), so every change is a pixel verdict.
+- Contour pixels written without a blend no longer wait in the band, which makes frames shorter.
+- What makes them longer is contour pixels now drawn. Each one's Z write takes the Z band's port behind its
+  verdict.
+- VF3's largest increases:
+  - 4080 and 4110 (+40.6 k, 2.1% of a 110 MHz frame, at 55%) are a scene change that Supermodel's grab shows
+    white; a format 2 contour polygon there now draws 62 k more pixels;
+  - 2040 / 2070 and 9450 / 9480 (+27 k to +31 k, 1.4-1.6%, at 41-47%) are VF3's large format 0 contour polygon
+    (h6 0xFFEF640C). It draws 8.5-11 k more pixels under the 32/255 test. That is about 2.5 cycles a newly drawn
+    contour pixel.
+- In Daytona 2 the max frame is 332 cycles longer (0.02% of a frame). The bench's random port delays move every
+  later frame of a 25-frame chunk once one frame changes (R134), so single-frame deltas this small are within
+  that.
+
+**8. Pictures against Supermodel's grabs** (`tools/tx_cmp.cpp`). These are render_d25 with the old and new rules,
+which the bench shows bit-exact to the RTL. Only the pixels that change between the two are compared:
+
+| Set | Pixels changed | Mean L1 to Supermodel, old → new | Closer new / old | Frame PSNR old → new | Luminance correlation old → new |
+|---|---|---|---|---|---|
+| Bass Fishing, 400 frames (3D-only grabs) | 9.6% | 180.2 → 97.9 | 71.8% / 26.7% | 16.14 → 17.14 dB | 0.324 → 0.493 |
+| VF3, 400 frames (3D-only grabs) | 23.6% | 213.8 → 191.5 | 68.1% / 31.3% | 8.70 → 8.74 dB | 0.307 → 0.345 |
+| Lost World 8,100-8,275 (finished frames) | 44.6% | 79.5 → 75.3 | 81.1% / 16.3% | 11.80 → 11.87 dB | 0.539 → 0.560 |
+| Daytona 2 1194-1206 (finished frames) | 3.9% | 172.1 → 191.1 | 31.1% / 68.5% | 9.875 → 9.865 dB | 0.251 → 0.232 |
+
+The Daytona 2 row is the glass. By region, over the windscreen's changed pixels (`tools/glass.py`):
+- the red interior shows in 8.1% of them before, 14.0% after, and 16.4% in Supermodel;
+- the green tint covers 69.4% before, 61.5% after, and 44.4% in Supermodel;
+- mean R + G + B is 282 before, 259 after, and 398 in Supermodel.
+
+So the pattern is now Supermodel's, but its glass is 116-139 R + G + B brighter than either render. The glass's
+header has specular on (h0 bit 7, coefficient 38 / 63). Supermodel adds specular to RGB and raises a translucent
+fragment's alpha with it (`Triangles.h` 237-242), and the core has no specular (R47). That is my reading of the
+gap, not measured. VF3's worse frames are its floor and sand, which R47 already puts down to lighting: with the
+translucency right, the too-dark floor under it shows.
+
+**9. Area** (standalone `quartus_map`, 17.0, every port a virtual pin):
+
+| Block | ALMs needed | ALUTs | Registers | DSP | Memory |
+|---|---|---|---|---|---|
+| `r3d_rast`, MIP 1, `SMTX` 0 → 1 | 8,783 → 8,853 (+70) | 11,471 → 11,554 (+83) | 12,928 → 13,037 (+109) | 45 → 46 | +1,920 bits in the same 39 M10K RAMs, +1 MLAB (8 x 20) |
+| of which the filter (`PART` 2) | 659 → 700 (+41) | 638 → 684 | 705 → 758 | 12 | — |
+| of which the colour stage | 322 → 351 (+29) | 209 → 248 | 453 → 484 | 13 → 14 | — |
+| `r3d_geo` emission MLAB | 95 → 97 bits, 5 MLABs either way | | | | |
+
+*Wrong turns:*
+- I went in expecting the formats 1-4 contour rule, as R134 had priced it. The window is format 0 with no contour
+  and no texture alpha: a translucent textured polygon. MAME's alpha kind ignores the polygon's translucency, and
+  so did the core.
+- My first dilation sat in stage 3: per-bank flags, the corner's transparency and the select, all in front of the
+  decode and the differences, which R87 and R104 had already shortened. I moved it to stage 2, from registers, with
+  ring A read a stage early and a copy of the word line's flags.
+- I put the contour luminance key in the decode as well as in the selects. It was dead, and the planted fault
+  showed it.
+- I first left texture inversion out as colour, not decode. Every Daytona 2 contour A4L4 polygon has it (car
+  decals, in 21 of 40 race frames), so the contour rule without it draws them dark. R100's "a few alpha-tested 2D
+  ones" are these 3D decals.
+- Two VF3 frames (4080, 4110) weigh against the new rules in the per-pixel numbers. They are a scene change that
+  Supermodel shows white, so both renders are wrong there.
+- Daytona 2's per-pixel numbers got worse. It is the glass's brightness, not its pattern, so I measured the glass
+  by region.
+
+*Not done:*
+- The board.
+- A fit or full map. The stage-2 select path (four LUT levels from registers) and the colour stage's product are
+  new paths. No fit has timed them.
+- The system bench.
+- Texture-alpha texels at 255 writing Z, as Supermodel's colour pass does (D-29; it would cost Z-band cycles).
+- Specular (Daytona 2's glass brightness).
+- Supermodel's always-modulate (R47 `COLOUR`) and its translucency scale t x 255 / 32. The alpha list now follows
+  colormod as the other textured kinds do; MAME's never modulated it.
+- Step 1.0's texture-alpha gate stays bit 0 (R106 open).
+
+*How established:*
+- `tools/sm_dt2.sh`: a Supermodel run with dumps and grabs.
+- `tools/tx_cen.cpp`: geometry, census, box, lists.
+- `tools/tx_lc.cpp`: census over a list directory.
+- `tools/tx_tri.cpp`: per-polygon changes.
+- `tools/tx_inv.cpp`: inverted polygons on screen.
+- `tools/tx_cmp.cpp`, `tools/glass.py`, `tools/dil.py`: the pictures and the dilation experiment.
+- `tools/texel.sh`, `tools/colour.sh`: the unit benches and their faults.
+- `tools/rbuild.sh`, `tools/rr.sh`, `tools/rsum.py`: the whole rasteriser.
+- `tools/gbuild.sh`: the geometry.
+- `tools/lint.sh`, `tools/an.sh`: lint and `--analyze_file`.
+- `tools/qmap.sh`, `tools/qmapm.sh`: the standalone maps.
+- `cmp/`: the images. `logs/`: everything.
+
+*Merged (2026-11-08), as D-49:* texture decode, contour and texture alpha follow Supermodel's renderer rather than
+MAME's, where nothing from the hardware says otherwise. Board (`c6_s1`: `c5_s1` plus this; 40,970 ALM, 347 M10K, 88 DSP;
+setup −2.33 / −1.94 ns, HDMI met, hold least +0.066 ns): Daytona 2's glass is tinted and the interior shows through.
+The merged tree passed every check again after the store's changes (R136): 0 wrong pixels on all sets, replay lines
+identical.
+
+**R136 — Daytona 2's "shadow over the car" is the polygon store throwing records away, not depth: a list
+region held 131,072 beats (LB 17, 1 MiB), the opaque list of pass 0 needs up to 158,644 in Daytona 2's attract,
+and the newest records, which are the player's car, were dropped. Its shadow and underbody showed where the body
+should be. LB 18 (2 MiB a list) holds Daytona 2 but not Scud Race, whose opaque list needs up to 283,335 beats. The store now
+gives each pass one 8 MiB region its two lists share and 8,190 runs a bin, three times the heaviest of 5,143 frames of
+five games, and counts any overflow on the overlay.** Work in `sm3-builds/sh1/`, the
+tree `sh1/tree` (`c4src` plus this). Oracles: Supermodel (`supermodel-rast`, Daytona 2 from `daytona2.nv.bak`) for
+the picture and for how it orders and depth-tests the shadow; the model (`render_d25`) for the bench.
+
+*Board.* Daytona 2 attract, the purple #41 car close to the camera: a dark area lies over the lower left of the car's
+body. Supermodel draws the shadow under the car.
+
+*What I believed* (R87, R106, `m3-notes.md` "DDR3, per bank"):
+- The shadow was a depth fault: Z precision for close polygons, the near plane, a translucent pass without a depth
+  test, an ignored layered or high-priority bit, or a Z bias Supermodel applies and the core does not.
+- The store could not overflow. R87's census gave at most 7,247 records in any list against about 11,900 a region,
+  "none occurred". That census was VF3 and Bass Fishing on MAME's lists.
+- The whole-rasteriser bench's Daytona 2 set (`r3d/tris_daytona2_r62`, MAME's lists) stood for what the board draws.
+
+*What the shadow is, and how each renderer draws it.*
+- The car shadow is page 1 (576, 0), 64 x 256, format 7 (R106), header[6] 0x047F8781 (7,124 triangles in 400
+  frames; 0x04678781 and 0x04638781 for a few). Bit 23 clear: translucent, transparency 31 of 32. Bits 2:0 = 1:
+  texture alpha. Bit 17 set: translucency layer 2. Bit 16: luminous. Bit 4 (high priority) and bit 3 (layered) are
+  clear. It is pass 0, the alpha list, in the same viewport as the car.
+- Supermodel (`New3D.cpp` RenderFrame, `Model.h` Mesh::Render): per priority, the opaque meshes with depth write
+  (GEQUAL), the depth stored, then the translucent meshes into layer 1 or 2 by bit 17, depth-tested GREATER against
+  the opaque depth. Depth is near / w (`gl_FragDepth = projMat[3][2] * gl_FragCoord.w`). The only bias is
+  1 + 1/512 on layered polygons, and the shadow is not layered.
+- The core: the alpha list after the opaque list, in reverse buffer order, Z on 1/w tested against the opaque Z, no Z
+  write. For a shadow under an opaque body both renderers hide it. That part is renderer choice in Supermodel (its
+  two layers) and MAME's order in the core, and they agree on this case. Nothing here is documented for the Pro-1000.
+
+*Depth was ruled out first, with numbers.*
+- Every alpha pixel that met an opaque pixel, the core's verdict against the exact one (1/w of both triangles in
+  double, screen-space barycentric): 29,164,611 tests in 400 attract frames, 6 shadow pixels the wrong way; 5,032,073
+  tests in 46 close-car frames (3,380-3,470, every second frame), 2.
+- The geometry model with the camera moved (18 views of frame 3,440: closer, higher, pitched, rolled): no shadow
+  pixel in front of the car.
+- Model and RTL both draw the shadow under the car on every frame of that run. So the bench could not show the
+  board's picture with the lists it had.
+
+*What is now known.*
+- The bench never sent the board's record stream. It sends what `render_d25` draws, and `render_d25` leaves out every
+  triangle with no pixel row (`rtl_tri::setup` fails). The geometry sends those too (FACE_DROP drops only what faces
+  away) and the store bins and keeps them. Counted from the geometry model with the core's settings (Supermodel's rows,
+  records flagged as facing away left out, in the order sent), Daytona 2's opaque list of pass 0 needs, in store
+  beats (textured 11, untextured 8):
+
+  | Record stream, 400 attract frames | list 0 max, beats (records) | frames over 131,072 |
+  |---|---|---|
+  | MAME's lists (`tris_daytona2_r62`, the bench's set) | 121,280 | 0 |
+  | the geometry's stream (Supermodel's rows, FACE_DROP), r62 dumps | 157,074 (14,466), f006270 | 39 |
+  | the same, a fresh Supermodel run | 158,644 (14,603), f012390 | 38 |
+  | VF3, Bass Fishing, the geometry's stream | 84,274 / 83,959 (other lists) | 0 |
+
+  The difference is the triangles with no row: on frame 6,420 the stream's records with rows are 120,066 beats, the
+  same as MAME's rows drawn, and those without add 15,425 (1,405 records); on 6,270, 40,307 (3,721). Over 400 frames
+  they are 20.7% of Daytona 2's beats (1,464 records a frame), 7.3% of VF3's and 26.0% of Bass Fishing's.
+- A record that does not fit its list's region is dropped (`wfit`, `ovf[1]`). The newest go first, and Daytona 2
+  draws the player's car last. On the geometry's stream 29 of the 39 frames lose more than 100 pixels. In 22 chase
+  views the car loses parts of its painted body (100 to 15,296 pixels), so its dark underbody, interior and shadow
+  show in their place; 7 in-car views lose most of the cockpit (91,001-169,863 pixels).
+- Reproduced on the RTL bench. Its record set from Supermodel's rows is not the board's stream either: it has no
+  no-row triangles, but `render_d25` draws both copies of a double-sided polygon (it culls only single-sided ones),
+  where the geometry sends the one facing the camera. That set needs up to 175,096 beats and overflows in 39 of the
+  400 r62 frames, 30 of them the same as the stream's. On it four frames (6,420 and 5,610 of a fresh run, 3,412 and 3,416 of the
+  close #41 car) lose 4,262 / 3,974 / 921 / 1,286 records and 17,059 / 16,770 / 445 / 550 pixels, and the RTL
+  picture is the model's with the store's limit applied, 0 pixels different on all four. Against Supermodel the mean
+  difference in the pixels the fix changes falls from 110 / 116 / 21 / 22 to 40 / 43 / 5 / 5 (of 255; the rest is
+  texture filtering and Supermodel's quad-renderer holes).
+- The board's stream itself through the model with the store's limit (`sh1/tools/shadow --away --cap 131072`) gives
+  the 29 frames above: the player's car loses its painted body and its dark underbody, interior and shadow show.
+- The board's own frame is not reproduced: Supermodel's Daytona 2 attract does not repeat the board's camera, and no
+  frame I made shows that view. The mechanism and the picture class are reproduced; the exact frame is not.
+- Hardware: the Pro-1000 sheet gives 750 K polygons/s per geometry unit, and nothing on overload. Supermodel draws
+  every polygon; MAME's buffers stop at 50,000 opaque and 15,000 alpha triangles. The store's region is my
+  implementation's limit, not a behaviour, so the fix has no switch: LB is a capacity parameter.
+
+*The first change, `c5_s1`* (`sh1/tree`: `rtl/real3d/r3d_rast.sv`, `r3d_rast_store.sv`, comments in `m3_system.sv`):
+- LB 17 → 18, the default in both modules. A list region is 2 MiB (262,144 beats, about 23,800 textured records), a
+  bank 32 MiB, both banks 64 MiB from `store_base`: 0x400000-0xBFFFFF in the core, which was free up to the texture
+  sheets at 0xC00000. A run-list entry holds an 18-bit start beat, so 18 is the most LB can be.
+- The bench (`tb_r3d_rast.cpp`): the store's memory doubled, and a frame whose binning sets `st_ovf` fails, with its
+  name and the records not stored. Before this nothing looked at `st_ovf`.
+- New bench sets: Daytona 2, VF3 and Bass Fishing as the geometry model sends them with Supermodel's rows
+  (`sh1/rr.sh`: dt2sm, vf3sm, basssm).
+
+*Measured for the first change (LB 18).*
+- Whole-rasteriser bench, MIP 1, 400 frames a set, against the model (unchanged):
+
+  | Set | before (LB 17) | after (LB 18) | FRAME / STALL lines |
+  |---|---|---|---|
+  | Daytona 2, MAME's lists | 0 wrong | 0 wrong | 400 of 400 identical |
+  | VF3 | 0 | 0 | 400 identical |
+  | Bass Fishing | 0 | 0 | 400 identical |
+  | Daytona 2, Supermodel's rows | 1,134,963 pixels wrong in 37 frames | 0, no overflow | see below |
+  | VF3, Supermodel's rows | 0 | 0 | 400 identical |
+  | Bass Fishing, Supermodel's rows | 0 | 0 | 400 identical |
+
+- Cycles (D-48). In the Daytona 2 Supermodel-rows run, 181 frames' lines differ, because a 25-frame chunk shares one
+  random port model and the frame before an overflowing one replays beside its binning. Each of the 181 run alone:
+  142 identical, and the 39 that overflowed replay 0.3% to 31.7% longer (64.87 M → 71.10 M cycles, +9.6%; the worst
+  2,175,217, f005610). All of it is records that were dropped and are now drawn. Those frames were faster only because
+  the car was missing.
+- Planted fault: LB 17 in the new bench fails Daytona 2's Supermodel-rows set (exit 1): 39 frames flagged, 56,449
+  records not stored, 1,134,963 pixels wrong. The standard sets cannot catch it, which is how it got through.
+- Quartus 17.0: `--analyze_file` on the three changed RTL files, 0 errors. Analysis and elaboration of `r3d_rast`
+  (MIP 1) at LB 18: 0 errors, the same 29 warnings as LB 17.
+- Verilator lint: `r3d_rast` (MIP 0 and 1) the same 22 warnings, word for word, as before; the store 0; the
+  Makefile's flags 0.
+- Area, the store synthesised alone (Quartus 17.0 map, not fitted): 1,006 → 1,012 ALMs needed (+6), registers 914 →
+  928, block memory bits 47,872 → 48,672 in the same M10K blocks (the bin table 768 x 39 is still three at 256 x 40;
+  the run buffers 16 x 25 one each). DSP 0.
+- DDR3: the store's footprint doubles (32 → 64 MiB), and list regions sit 2 MiB apart instead of 1. Bytes moved are
+  the same for a frame that did not overflow. Row and bank behaviour on the board is not measured.
+
+*Second part: how big the store has to be* (after `c5_s1`, the LB 18 fit: on the board car polygons still disappear in
+Daytona 2, and Scud Race does the same).
+
+*Census on the geometry's stream* (`sh1/tools/census.sh`: the geometry model with the core's settings on every dump, then
+`storesim`, the store's binning: records not facing away, bands from the first and last sorted y, runs of consecutive
+records up to 64 beats). New Supermodel dumps (`supermodel-rast`), every 10th frame: Scud Race 300-15,800 (1,551 frames,
+the whole attract loop with the long views, the race views and the in-car view), Lost World 300-12,000 (1,171), Daytona 2
+1,800-14,000 (1,221, from `daytona2.nv.bak`); plus VF3 and Bass Fishing's census sets. Lost World's VROM image is made
+from the ROM zip by `sh1/tools/mkvrom.py` (VF3's layout; checked byte for byte against `r3d/vrom_vf3.bin` on VF3).
+
+| Game, frames | one list, max beats | one pass (both lists) | records a frame | records in a bin | runs in a bin | frames over 2^17 / 2^18 a list |
+|---|---|---|---|---|---|---|
+| Scud Race, 1,551 | 283,335 (f006270) | 311,849 | 28,555 | 12,472 | 2,570 | 182 / 12 |
+| Daytona 2, 1,221 | 159,282 (f012390) | 170,231 | 15,728 | 8,140 | 1,810 | 117 / 0 |
+| Daytona 2 r62, 400 | 157,074 | 168,286 | 15,743 | 6,264 | 1,476 | 39 / 0 |
+| VF3, 400 | 84,274 | 108,941 (frame) | 10,684 | 14,003 | 946 | 0 / 0 |
+| Bass Fishing, 400 | 83,959 | 128,283 (frame) | 12,387 | 5,542 | 1,116 | 0 / 0 |
+| Lost World, 1,171 | 65,574 | 75,309 | 6,946 | 1,596 | 457 | 0 / 0 |
+
+So `c5_s1` (LB 18) still drops records in Scud Race: frames 6,070-6,300 of its attract, 12 of 1,551 sampled, up to 21,263
+beats (about 1,930 records) over.
+
+*What bounds it.* I looked for a bound and there is none to size against:
+- The core's geometry has no per-frame limit. The walker stops only at its return stack and chain lengths, and a model
+  can be instanced by any number of nodes, so the culling RAM's size bounds nothing. MAME's 50,000 opaque and 15,000
+  alpha triangle buffers are MAME's, and the RTL does not have them.
+- Records per polygon: a 3- or 4-vertex polygon, clipped by up to 7 planes, is at most 9 triangles; FACE_DROP sends one
+  copy of a double-sided polygon (two only when its facing dot is exactly 0). Runs per bin are at most the bin's
+  records, and at least its records x 11 / 64.
+- The Pro-1000 sheet: "Throughput averages 750,000 polygons per second per R3D/PRO-1000 unit", "basic system performance
+  is specified as 30 Hz, but 60 Hz update is also available" (textfiles.com r3dspec.txt). That gives 25,000 polygons an
+  update at 30 Hz, but it is an average, and Scud Race's attract walks up to 31,228 polygons a frame (Daytona 2 15,059,
+  Lost World 11,064), so it is not a bound on what a game sends.
+- So no finite store can be shown never to overflow. I sized it at three times the heaviest frame measured and made an
+  overflow visible.
+
+*The store as built* (`sh1/tree2`; `r3d_rast_store`, `r3d_rast`, `m3_system`):
+- PAIR: a pass's opaque and alpha lists share one region, the opaque list up from its base and the alpha list down from
+  its top, so either can use what the other leaves. LB 19: 2^20 beats (8 MiB) a pass, the last beat unused (1,048,575;
+  95,325 textured records), 3.4 times Scud Race's 311,849. Records take 64 MiB for the two banks
+  (0x400000-0xBFFFFF in the core, where LB 18 kept 32 MiB of records and 32 MiB for its run lists).
+- BB 12: 8,190 runs a bin (was 4,096), 3.2 times Scud Race's 2,570. The run lists move out of the records' space to
+  `RUNO` (a parameter; the core puts them at word 0x1800000, 32 MiB, in DDR3's top 64 MiB above the extra memory, which
+  ends at 0x17FFFFF with VROM_LIN; the cores' region is byte 0x30000000-0x3FFFFFFF).
+- The bin table stays 40 bits in its four M10K: the closed-run count is one bit narrower (8,190 runs, so the replay's
+  count of items still fits) and the open run's valid bit is its beats being nonzero. The list pointers stay 20 bits
+  (one MLAB each, a second copy for the other list of the pass): an alpha list keeps its start modulo 2^20, 0 meaning
+  the top, and a record fits when next + beats < start, so a region's last beat is never used.
+- A run-list entry holds a 25-bit start beat; the run buffers are 27 bits wide.
+- If a record or a pair still does not fit, it is dropped as before: the newest. That is what MAME does at its buffer
+  limit (the rest of the model) and what Supermodel's author guesses the hardware does in overload ("Real h/w probably
+  bails out after X polys", Supermodel a8297d4). The hardware's overload behaviour is not documented. The least visible
+  choice would drop the farthest or smallest polygons, which needs a sort the Pro-1000 is not known to make; I did not
+  build it. What is new is that it is never silent: `n_ovff` counts the frames whose binning overflowed (16 bits,
+  saturating, cleared only by reset), shown on overlay row 2, third word, low half (`{n_unmapped, store overflows}`),
+  and the whole-rasteriser bench fails a frame whose binning sets `st_ovf` and checks the RTL's count against its own.
+
+*Measured for the store as built* (`sh1/tree2`, bench `sh1/rr2.sh`, MIP 1):
+
+| Set (frames) | LB 18 (`c5_s1`) | as built | FRAME / STALL lines against LB 18 |
+|---|---|---|---|
+| Daytona 2, VF3, Bass Fishing, MAME's lists (400 each) | 0 wrong | 0 wrong | identical, 1,200 of 1,200 |
+| the same three, Supermodel's rows (400 each) | 0 | 0 | identical, 1,200 of 1,200 |
+| Scud Race (378: its 182 sampled frames over 2^17 a list, the rest evenly) | 0 | 0 | identical, 378 |
+| Lost World (391) | 0 | 0 | identical, 391 |
+| Daytona 2, second run (393: its 117 over 2^17, the rest evenly) | 0 | 0 | identical, 393 |
+
+- No overflow on any of the 3,562 frames, and the RTL's `n_ovff` equals the bench's count in every run.
+- Cycles (D-48): every FRAME and STALL line is identical to LB 18's. Only addresses moved; the records, runs and bursts
+  are the same.
+- The bench's sets cannot show Scud Race's overflow at LB 18: their record set is `render_d25`'s (Open, below), whose
+  Scud Race list peaks at 211,230 beats. The board's stream, with its no-row triangles, peaks at 283,335; that the board
+  drops there is the census's evidence, not the bench's.
+- Pair sharing works across the middle of the region: LB 17 with PAIR (262,143 beats a pass) passes Daytona 2's and
+  Scud Race's Supermodel-row sets with 0 wrong, with opaque lists up to 211,230 beats, past the 131,072 a list held
+  before.
+- Planted faults: LB 17 without PAIR, BB 11 fails 39 / 21 / 101 frames of Daytona 2 (Supermodel's rows) / Scud Race /
+  Daytona 2's second run (56,453 / 77,414 / 149,455 records not stored), each flagged and counted by the RTL; BB 8 (512
+  runs a bin) fails 213 Scud Race frames on run lists alone.
+- Quartus 17.0: `--analyze_file` on `r3d_rast_store`, `r3d_rast`, `m3_system`, 0 errors and 0 warnings; analysis and
+  elaboration of `r3d_rast` (MIP 1), 0 errors and the same warnings as LB 18.
+- Verilator lint: `r3d_rast` (MIP 0 and 1) the same 22 warnings; the store 0, also with LB 17, PAIR 0, BB 11.
+- Area, the store synthesised alone (Quartus 17.0 map, not fitted): 1,012 → 1,088 ALMs needed (+76), registers 928 →
+  986, MLAB bits 152 → 320 (the second pointer copy), M10K the same blocks (the bin table 768 x 40, four). The same code
+  at LB 18, no PAIR, BB 11 is 1,054: +42 is the counter, the run lists' offset and the new entry coding; LB 19 adds 24,
+  PAIR and BB 12 the rest.
+- DDR3: records 64 MiB (0x400000-0xBFFFFF) and run lists 32 MiB (0x1800000-0x1BFFFFF). `tb_m3_system`'s DDR3 model
+  now covers the whole 256 MiB window. The top 64 MiB is free only while the extra memory stays 64 MiB (VROM_LIN).
+
+*Open.*
+- The bench's record stream is not the board's (first part). Two consequences not looked at: (1) the board's
+  rasteriser walks 1,464 more records a frame in Daytona 2 (472 VF3, 878 Bass Fishing) than any bench cycle count
+  includes, each at least a (triangle, band) pair through the front; (2) where a double-sided polygon faces away,
+  `render_d25` draws the copy and then the polygon, so its picture can differ from the board's, which draws only the
+  copy. The bench needs a mode that sends exactly the geometry's records and a model that draws the same; then a Scud
+  Race set would show LB 18's overflow on the bench too.
+- Nothing bounds a frame's records. A frame over 1,048,575 beats in one pass, or 8,190 runs in one bin, still drops the
+  newest records; the overlay now shows it. Gameplay (not attract) is not in the census.
+- Bass Fishing's water shadows are not this: its lists use at most 84,000 beats.
+
+*Board:* `c5_s1` (LB 18) is being fitted; on the census it still drops records in Scud Race's frames 6,070-6,300. The
+store as built needs its own fit; it costs no cycles in frames that fit.
+
+*Wrong turns:*
+- I spent the first part on depth: Z precision, the near plane (Supermodel's 1e-3 is the model's), translucent
+  ordering, the layered and high-priority bits. All clean.
+- My first Supermodel run had no Daytona 2 NVRAM and grabbed white frames (the link setting); `daytona2.nv.bak` fixed it.
+- Supermodel's 3D-only grabs with quad rendering leave white holes near the camera, and in frames 3,428-3,432 one
+  covers the car's lower left. I first read that as Supermodel not drawing the car there. It is its quad shader
+  discarding fragments of polygons that cross the near plane, not the data.
+- My first store count used the model's drawn set: it counts both double-sided copies and misses the no-row
+  triangles, so it was wrong in both directions (175,096 against the stream's 157,074 at the top; 145,868 against
+  149,776 on frame 3,180). The count that stands is the geometry's stream. With it the five close-car frames
+  3,412-3,420 of my dense run overflow by 57-369 records that draw nothing visible; the visible losses are in other
+  frames.
+- My first analysis tool wrote its triangle-index map over the triangle list it had read (the same name).
+- For the second part I first took the Pro-1000 sheet's 750,000 polygons a second at 30 Hz as the bound and sized the
+  store to it (25,000 polygons, 550,000 beats in one pass). Scud Race walks 31,228 polygons in one frame of its attract,
+  so the sheet's average is not a bound; I sized against the measurements instead.
+- My first build of the new table entry was 42 bits (five M10K, one more) and its pointers 21 bits (two MLABs each).
+  The narrower closed-run count, the open run's valid bit taken from its beats, and the alpha start modulo 2^20 brought
+  it back to 40 bits, four M10K, and one MLAB each.
+- I rebuilt the bench binary while a bench run was still using it, so that run mixed two builds; I stopped it and ran
+  everything again.
+
+*Board.* `c5_s1` (LB 18; 40,908 ALM, 347 M10K, 87 DSP; setup −1.82 / −1.72 ns, hold least +0.066 ns): Daytona 2's car
+keeps its panels and Scud Race is better. `c7_s1` (the shared regions, run lists above VROM and the counter, on top
+of R135; 41,091 ALM, 347 M10K, 88 DSP; setup −2.59 / −2.55 ns, HDMI met, hold least +0.084 ns): Daytona 2 and
+Scud Race both right. Merged 2026-11-08.
+
+**R137 (follows R135) — The car shadow over the bumper is not texture alpha. In Supermodel's
+close-car frames the bumper and the rest of the car's lower body are opaque-list polygons, and they hide the shadow
+by Z as they do in Supermodel. Supermodel's opaque pass for texture alpha (texels at full alpha drawn among the
+opaque polygons, with Z) would not move a single bumper pixel. It does change the order of overlapping texture-alpha
+structures (Daytona 2's dome roof and grandstand fences, VF3, Bass Fishing and Lost World foliage), and there it is
+closer to Supermodel on about 68-70% of the pixels it changes. Not built.** Work in `sm3-builds/tx3/` (`tree` =
+`c7src`). Desk only, model and analysis.
+
+*Board (`c5_s1`, 2026-11-08):* Daytona 2 attract, close car: the car no longer loses panels (R136), but its shadow
+shows through the bumper.
+
+*What I believed:* the bumper was a texture-alpha (or contour) polygon on the alpha list. In the core those write no
+Z (D-29, R135 §4), so the shadow (header 0x047F8781: format 7, texture alpha, translucency 31, layer 2, alpha list)
+would draw over it. Supermodel draws texture-alpha texels at full alpha in its opaque pass with a Z write.
+
+*What I know now:*
+- **What the shadow lands on.** `tools/tx_bump.cpp` follows every shaded pixel in `render_d25`'s draw order (the
+  core's order: the opaque list, then the alpha list in reverse buffer order). It counts the shadow pixels written
+  after a full-alpha alpha-list texel of another polygon that is nearer than the shadow. Those are the pixels
+  Supermodel's opaque pass would hide.
+
+  | Frames (Supermodel dumps, the geometry model's lists) | Shadow pixels written | Over an alpha-list texel | Over a full-alpha one nearer than the shadow |
+  |---|---|---|---|
+  | 1194-1206 (the photo's scene), 13 | 11,934-12,756 a frame | 21-44 | 0 |
+  | 700-1480 every 20th, 41 | up to 81,545 | up to 6,012 | 0 in 37 frames; 1, 4, 1 and 140 in 1340-1400 |
+  | 3412, 3416 (sh1's close #41 car) | 58,664 / 60,953 | 333 / 102 | 0 / 0 |
+
+  Even counting blended texels at alpha 248 or more as full (the board runs the old rules), only 1340-1400 have any.
+- **The bumper is opaque.** In 3412's box over the car's lower body (190-365, 195-230), every car polygon is `tex`
+  or `tex_colormod`: 77 polygons, all on the opaque list. The four alpha-list polygons there are the shadow itself
+  (53 pixels, at the ground line under the car) and two small format 7 decals. Where the shadow is drawn over its
+  own model's polygons it is 3-107 pixels a frame, none of them on the bumper (`cmp/bump_3412.png`). So both
+  renderers hide the shadow behind the bumper by Z, as R136 measured (6 shadow pixels the wrong way in 29 M tests).
+- **What Supermodel's opaque pass for texture alpha would change.** A model experiment (`exp/`, `TAOP`):
+  - before the alpha list, its non-translucent texture-alpha polygons' full-alpha texels are drawn in buffer order
+    with Z, and later skipped in the alpha list.
+  - Against Supermodel's grabs, on the pixels it changes:
+
+  | Set | Frames changed | Pixels | Mean L1 to Supermodel, with / without | Closer with / without |
+  |---|---|---|---|---|
+  | Daytona 2 1194-1206 | 13 | 15,420 | 129.7 / 151.2 | 69.9% / 29.6% |
+  | Daytona 2 700-1480 | 22 of 41 | 131,931 | 96.7 / 112.6 | 67.9% / 31.6% |
+  | Daytona 2 3412, 3416, 5610, 6420 | 4 | 29,936 | 93.5 / 104.7 | 63.8% / 35.8% |
+  | Lost World 8100-8275 | 7 | 12,920 | 72.1 / 115.6 | 68.2% / 31.2% |
+  | VF3, every 10th of 400 | 19 of 40 | 17,314 | 243.4 / 326.4 | 68.6% / 30.9% |
+  | Bass Fishing, every 10th of 400 | 12 of 40 | 82,929 | 74.0 / 103.4 | 69.7% / 29.6% |
+
+  The pixels are overlapping texture-alpha structures whose order the Z now settles: Daytona 2's dome roof and
+  fences (`cmp/taop_rep_f003412.png`), foliage and billboards. None is on a car.
+- **What building it would take.**
+  - Supermodel's form draws a polygon in two places: its full-alpha texels with the opaque list, and the rest in the
+    alpha list. In the core that means the geometry or the store sending those records into both lists. That is
+    more binning and replay, and the opaque pass would also need the alpha decision before Z.
+  - The cheaper form keeps the polygon in the alpha list and writes Z at full alpha. That puts the alpha list on the
+    Z band's contour-verdict path (zk = 2), which holds pairs behind pending writes (R135 §7: about 2.5 cycles a
+    contour pixel newly drawn). It also does not reproduce Supermodel's order, since the earlier alpha polygons are
+    already drawn.
+  - Neither is built or priced in RTL. The picture value above is the model's.
+
+*Wrong turns:*
+- The bumper hypothesis came from my own "not built" item: texture alpha writes no Z. The census of what the shadow
+  is drawn over says the car's lower body is all opaque-list. The shadow comes through only where that body is
+  missing, which was R136's store loss.
+
+*Not done:* the board's new photo. The coordinator's message has no path, so the frame and view are not known, and
+no Supermodel frame I have shows the shadow over the bumper in the core's picture. If c7's store does not clear it
+on the board, the next thing to look at is the board's stream against these lists: the no-row triangles and the
+double-sided copies R136 found the bench does not send.
+
+*How established:* `tools/tx_bump.cpp` (shadow census, own-model and box checks), `exp/` and `obj/tx_cmp_taop`
+(the TAOP experiment through `../tx2/tools/tx_cmp.cpp`), `../tx2/tools/dil.py` (with / without on the pixels that
+change), `../tx2/obj/tx_cen` (polygons in a box). Images in `cmp/`.
+
+---
+
+**R137, second part — The front-view "shadow over the bumper" (`c6_s1`, photo 22) is the car's shadow on the road beside its
+front-left fender. Supermodel draws it there too, and so do the RTL bench under c6src's and c7src's rules. It is not
+over the bumper and not a fault. Supermodel's opaque pass for texture alpha (`TAOP`) is now built behind a
+parameter. It brings the picture closer to Supermodel where it matters (Bass Fishing −32% error on the pixels it
+changes, Lost World −38%, Daytona 2 −14%; VF3 mixed). But it costs a lot: +0.6% to +6.1% of a 110 MHz frame on the
+mean, up to +35% on single frames, and Scud Race's worst frame goes from 91.4% to 107.7%. The area is almost
+nothing (+16 ALM in standalone maps, no M10K, no DSP). Not merged; the price is for my decision.**
+Work in `sm3-builds/tx3/` (`tree` = `c7src` plus this).
+
+*A. The photo.*
+- I matched photo 22 against Supermodel Daytona 2 attract frames. The car front-on, close, flag top right:
+  `dt2/smdump` 1140 (that run's timing), and a new short run with dumps and grabs at 1118-1180 (`sm/dt2`,
+  `runs/fr`). The closest is new-run 1130 (`cmp/front_find.png`, `front_find2.png`).
+- RTL bench, c6src and c7src, 23 frames: 0 wrong, 0 overflows, the same picture.
+- At the car's front-left corner (photo x 520-640, y 800-960), the board, Supermodel and both RTL renders all show
+  the same dark-grey wedge on the road left of the fender (`cmp/front_1130_zoom.png`).
+- On those frames the shadow is drawn over 0 nearer full-alpha alpha-list texels, and over 4-49 pixels of its own
+  model's polygons, none on the bumper (`tools/tx_bump.cpp`).
+- So the board draws the scene as Supermodel and the bench do. There is no missing or out-of-order body polygon,
+  and no front-view Z fault. Nothing to fix in the RTL for this photo.
+
+*B. TAOP, built.*
+- *The forms, by the model* (`exp/`, against Supermodel's grabs, mean L1 on the pixels any form changes):
+
+  | Set | None | F1, Supermodel's (an opaque-list copy, its full-alpha texels with Z) | F2 (Z at full alpha inside the alpha list) |
+  |---|---|---|---|
+  | Daytona 2 700-1480 | 112.6 | 96.7 | 108.8 |
+  | Daytona 2 3412-6420 | 104.7 | 93.5 | 104.7 |
+  | Lost World 8100-8275 | 115.6 | 72.1 | 73.4 |
+  | VF3, every 10th | 326.4 | 243.4 | 240.2 |
+  | Bass Fishing, every 10th | 103.4 | 74.0 | 117.6 |
+
+  F2 is worse than none on Bass Fishing and does almost nothing on Daytona 2, because the alpha list's order
+  decides before the Z can. So I built only F1, the closer of the two. The cheaper form is not the useful one.
+- *Built:*
+  - `r3d_geo` `TAOP` (with `SETUP_OUT`): the set-up emitter sends an opaque texture-alpha triangle (textured, texture
+    alpha, transparency 32) twice. The first copy has word 0 bit 2 = 0, so the store bins it on the opaque list. It
+    is re-sent from the same set-up lane, so there is no new storage.
+  - `r3d_rast` / `r3d_rast_colour` `TAOP` (with `SMTX`): a textured opaque-list record with texture alpha is kind 7.
+    It draws only texels at alpha 255, without a blend, with Z, colour-modulated per colormod. Its Z write waits
+    for the colour's verdict on the contour's path (Z kind 2, ring C's flag). On the alpha list the same polygon
+    then discards a = 255.
+  - `m3_system` `TAOP` (default 1 in this tree) sets both blocks together; module defaults are 0.
+  - The model: `K_TEX_ALPHA_OP`, `texram::taop`, `frag`, `add_taop`, `r3d_geo::taop`.
+  - Benches: `--taop` in `tb_r3d_rast`, `tb_r3d_rast_colour`, `tb_r3d_geo`.
+- *Cycles* (sh1's nine sets, MIP 1, p0; % of a 110 MHz frame of 1,912,240 cycles). The MAME-list sets are compared
+  against `--taop 0`, the geometry's alpha flag alone: Daytona 2 +0.03% on the mean, VF3 and Bass Fishing
+  identical. The others are compared against `TAOP` off.
+
+  | Set | Mean replay | p99 | Max | Most grown frames |
+  |---|---|---|---|---|
+  | Daytona 2 (MAME lists) | 906,385 → 962,267 (+2.92%) | 83.0 → 90.3% | 91.4 → 99.6% (f010800) | f012780 +21.0%, f010530 +19.8% |
+  | VF3 | 768,803 → 779,729 (+0.57%) | 65.7 → 69.2% | 70.1 → 71.9% | f011100 +7.7% |
+  | Bass Fishing | 401,678 → 472,354 (+3.70%) | 48.4 → 64.9% | 54.3 → 65.1% | f004020 +21.9% |
+  | Daytona 2 (Supermodel's rows) | 1,099,639 → 1,186,310 (+4.53%) | 109.9 → 120.3% | 185.8 → 187.7% | f012780 +30.9% |
+  | VF3 (rows) | 884,935 → 905,036 (+1.05%) | 137.5 → 137.6% | 156.6 → 158.4% | f011100 +11.3% |
+  | Bass Fishing (rows) | 533,658 → 611,271 (+4.06%) | 70.6 → 88.4% | 78.3 → 88.7% | f004020 +32.4% |
+  | Scud Race | 905,002 → 948,019 (+2.25%) | 88.9 → 97.2% | 91.4 → 107.7% (f008990) | f008780 +26.7% |
+  | Lost World | 368,811 → 382,016 (+0.69%) | 71.6 → 79.5% | 80.6 → 85.7% | f008070 +12.0% |
+  | Daytona 2, second run | 1,270,371 → 1,386,337 (+6.06%) | 113.1 → 122.7% | 185.8 → 187.7% | f003570 +35.1% |
+
+  - Where it goes: on Daytona 2 f012780 (rows) the pixels into shading rise 642,978 → 997,246 and the Z band's
+    held cycles 381,728 → 763,470.
+  - Every texel of an opaque texture-alpha polygon is now Z-tested twice, once on the opaque list and once on the
+    alpha list. The opaque-list pass sits on the contour's verdict path, where pairs behind pending writes wait.
+    Daytona 2's dome structures, Bass Fishing's billboards and Scud Race's scenery are large polygons of that kind.
+  - The geometry is not slower: cycles per frame p50 / p99 / max are within ±0.05% (Daytona 2 1,009,600 /
+    2,045,498 / 2,121,348 → 1,009,540 / 2,046,147 / 2,121,580). The copies are re-sent from the set-up lane the
+    original uses.
+- *Area* (standalone `quartus_map`, 17.0):
+
+  | Block | ALMs needed | ALUTs | Registers | DSP | M10K / memory bits |
+  |---|---|---|---|---|---|
+  | `r3d_rast`, MIP 1, `TAOP` 0 → 1 | 8,939 → 8,939 | 11,719 → 11,730 | 13,109 → 13,111 | 46 | same (881,696 bits) |
+  | `r3d_geo`, `SETUP_OUT`, `LOD_WORD`, `TAOP` 0 → 1 | 7,591 → 7,598 | 9,855 → 9,864 | 9,389 → 9,391 | 11 | same (216,960 bits) |
+
+- *Picture*, render_d25 (bit-exact to the RTL on the bench), the tree's rules without and with `TAOP`, against
+  Supermodel's grabs on the pixels it changes (`tools/tx_cmpt.cpp`, `logs/cmpt_*.txt`):
+
+  | Set | Pixels changed | Mean L1, without → with | Closer with / without |
+  |---|---|---|---|
+  | Daytona 2 700-1480 (40 frames) | 1.73% | 112.6 → 96.7 | 67.9% / 31.6% |
+  | Daytona 2 front view 1118-1180 (23) | 2.96% | 134.3 → 130.2 | 53.5% / 46.1% |
+  | Daytona 2 3412-6420 (4) | 3.93% | 104.7 → 93.5 | 63.8% / 35.8% |
+  | Lost World 8100-8275 (7) | 0.97% | 115.6 → 72.1 | 68.2% / 31.2% |
+  | VF3 (400) | 0.28% | 348.8 → 346.2 | 43.8% / 55.6% |
+  | Bass Fishing (400) | 0.98% | 123.2 → 84.2 | 71.6% / 27.8% |
+
+- *Proof:*
+  - `TAOP` = 0: every FRAME and STALL line identical to sh1's `c7` logs on all nine sets (3,562 frames).
+  - `TAOP` = 1: 0 pixels wrong, 0 port violations, 0 overflows on all nine.
+  - The geometry with `TAOP`, `SETUP_OUT` and `LOD_WORD` (set-up records checked word by word against the model):
+    every field on 400 frames each of Daytona 2 (2,985,361 triangles), VF3 (2,330,387) and Bass Fishing
+    (1,414,863).
+  - The colour unit bench with `-GTAOP=1` (kind 7 in the random set): 0 wrong on 3 M random pixels and 80 frames.
+  - Planted faults:
+
+    | Fault | Result |
+    |---|---|
+    | the copy's Z kind 1 (written at test time) | 6,351 px wrong in Daytona 2 1194-1206; 68,452 in Lost World |
+    | ring C's flag left out for kind 7 | the bench hangs (verdicts never released; killed at 900 s) |
+    | the alpha list's a = 255 discard left out | 15,400 px wrong in Daytona 2 1194-1206; 2,183 in Lost World |
+    | the copy draws every texel (no alpha-255 test) | 107,642 px wrong in Daytona 2 1194-1206; 125,916 in Lost World |
+    | geometry: the copy on translucent polygons too | 18 of 20 frames mismatch |
+    | `TAOP` RTL against a model without copies, and the reverse | 5 of 5 frames mismatch |
+
+  - Lint (Verilator 5.052 `-Wall`): rasteriser 23 warnings both ways, the same set as c6 / c7; colour and
+    geometry 0; system 9.
+  - `--analyze_file` (17.0, scratch copy) on `r3d_rast.sv`, `r3d_rast_colour.sv`, `r3d_geo.sv`, `m3_system.sv`:
+    0 errors, 0 warnings.
+
+*Decided (2026-11-08):* `TAOP` is not taken. It makes frames slower (Scud Race's worst attract frame from 91% to 108%
+of a frame, so a dropped frame where it now holds 58), which D-48 rules out. A cheaper form (skip the second test where
+a texel block is entirely see-through, for example) would need its own design. The RTL stays in `sm3-builds/tx3`.
+
+*Correction to the second part.* I know the real cabinet: there the shadow lies on the floor under the car and does
+not poke out past the front-left fender. Supermodel draws the same wedge as the core, so Supermodel is wrong here too,
+and "Supermodel draws it there too" is no evidence. The wedge is a fault, still open; the mechanism the hardware uses
+is being looked for (`sm3-builds/shd`).

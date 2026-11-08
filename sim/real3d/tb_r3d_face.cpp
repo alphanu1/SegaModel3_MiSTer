@@ -37,6 +37,7 @@ struct poly { int32_t v[3], n[3]; uint32_t np; int mb; bool step15; };
 static std::deque<uint32_t> g_sums;   // debug: V0..2 N0..2 d per polygon, in write-back order
 static float g_c = 0;                 // LOD: the viewport's C
 static uint32_t g_b = 0;              // LOD: the last polygon's B
+static bool g_step15 = false;         // FACE_STEP15=1: 13.11 positions and u10.14 NP (a run's step is fixed)
 static void model(float const T[4][3], poly const &p, bool &gt, bool &lt) {
   fp_unit f; f.ftz = true;
   float const sc = p.step15 ? float(1.0 / 2048.0) : float(1.0 / 128.0);
@@ -50,7 +51,7 @@ static void model(float const T[4][3], poly const &p, bool &gt, bool &lt) {
   }
   float d = f.mul(V[0], N[0]); d = f.add(f.mul(V[1], N[1]), d); d = f.add(f.mul(V[2], N[2]), d);
   gt = d > 0.0f; lt = d < 0.0f;
-  g_b = fbits(f.mul(d, f.mul(float(p.np) * float(1.0 / 4096.0), g_c)));
+  g_b = fbits(f.mul(d, f.mul(float(p.np) * float(p.step15 ? 1.0 / 16384.0 : 1.0 / 4096.0), g_c)));   // u10.14 from Step 1.5
   for (int j = 0; j < 3; j++) g_sums.push_back(fbits(N[j]));
   for (int j = 0; j < 3; j++) g_sums.push_back(fbits(V[j]));
   g_sums.push_back(fbits(d));
@@ -58,6 +59,7 @@ static void model(float const T[4][3], poly const &p, bool &gt, bool &lt) {
 
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
+  g_step15 = std::getenv("FACE_STEP15") && std::atoi(std::getenv("FACE_STEP15"));
   long const npoly = argc > 1 ? std::atol(argv[1]) : 200000;
   std::mt19937 rng(argc > 2 ? unsigned(std::atoi(argv[2])) : 1u);
   auto rf = [&](int lo, int hi) {   // a random float with exponent in [lo, hi], a zero sometimes
@@ -68,7 +70,7 @@ int main(int argc, char **argv) {
   auto ri = [&](int bits) { int32_t m = int32_t(rng() % (1u << bits)); return (rng() & 1) ? -m : m; };
   Vr3d_face *t = new Vr3d_face;
   auto tick = [&]() { t->clk = 0; t->eval(); t->clk = 1; t->eval(); };
-  t->rst = 1; t->t_we = 0; t->t_clr = 0; t->t_set = 0; t->in_we = 0; t->in_commit = 0; t->step15 = 0;
+  t->rst = 1; t->t_we = 0; t->t_clr = 0; t->t_set = 0; t->in_we = 0; t->in_commit = 0; t->step15 = g_step15;
   tick(); tick(); t->rst = 0;
   float T[2][4][3] = {};
   std::deque<std::pair<bool, bool>> expect;
@@ -137,7 +139,7 @@ int main(int argc, char **argv) {
     // polygon words (none while draining for a new C)
     if (istate == 0 && sent < npoly && left > 0 && tstate == 0 && !drain) {
       if (t->in_ready && rng() % 3 == 0) {
-        cur.step15 = false;
+        cur.step15 = g_step15;
         int sc = int(rng() % 23);
         for (int k = 0; k < 3; k++) { cur.v[k] = ri(1 + sc); cur.n[k] = ri(23); }
         if (rng() % 8 == 0) cur.n[rng() % 3] = 0;
