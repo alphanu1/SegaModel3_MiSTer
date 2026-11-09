@@ -9,7 +9,7 @@
 module m3_bus_tb
   import ppc_cache_pkg::*;
 #(parameter bit L16 = 1'b0, parameter bit BXOR = 1'b0, parameter bit LW1 = 1'b0, parameter bit PAIR = 1'b0, parameter bit RA = 1'b0, parameter bit PW = 1'b0, parameter bit RA_CONF = 1'b0,
-  parameter bit FWD = 1'b0, parameter bit FREQ = 1'b0, parameter bit FDSP = 1'b0, parameter bit HITRD = 1'b0, parameter bit FAST = 1'b0, parameter int PW_DLY = 0, parameter bit R3P = 1'b0)   // m3_sdr_port / m2_sdram (study R107)
+  parameter bit FWD = 1'b0, parameter bit FREQ = 1'b0, parameter bit FDSP = 1'b0, parameter bit HITRD = 1'b0, parameter bit FAST = 1'b0, parameter int PW_DLY = 0, parameter bit R3P = 1'b0, parameter bit TGT = 1'b0)   // m3_sdr_port / m2_sdram (study R107)
 (
   input  logic        clk,
   input  logic        rst_n,
@@ -92,7 +92,7 @@ module m3_bus_tb
   logic [1:0]  wb_be;
   logic [63:0] p_dout;
 
-  m3_bus #(.AW(26), .MIDI_GAP(500), .FAST(FAST), .R3P(R3P)) u_bus (
+  m3_bus #(.AW(26), .MIDI_GAP(500), .FAST(FAST), .R3P(R3P), .TGT(TGT)) u_bus (
     .clk, .rst,
     .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
     .sn_req, .sn_addr, .sn_inv, .sn_ack,

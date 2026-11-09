@@ -161,7 +161,9 @@ module m3_system
   parameter bit          INP_DRIVE   = 1'b1,
   parameter bit          INP_GUN     = 1'b1,
   parameter bit          INP_FISH    = 1'b1,
-  parameter bit          INP_LEAN    = 1'b0        // the driving block without "Steering", "Steering smoothing", "Analog control"
+  parameter bit          INP_LEAN    = 1'b0,       // the driving block without "Steering", "Steering smoothing", "Analog control"
+  //   TG_TIMING    m3_bus: the tile generator's bus timing, tile RAM and palette writes at the board's rate (R152)
+  parameter bit          TG_TIMING   = 1'b1
 ) (
   input  logic        clk,
   input  logic        mem_rst_n,
@@ -523,7 +525,7 @@ module m3_system
 `endif
 
   m3_bus #(.AW(AW), .SDR_CROM(SDR_CROM), .SDR_FIXED(SDR_FIXED), .SDR_BACKUP(SDR_BACKUP), .SDR_RAM(SDR_RAM),
-           .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P)
+           .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P), .TGT(TG_TIMING), .TG_MHZ(CLK_MHZ)
 `ifdef M3_STEP2_BUS
            , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ)
 `endif

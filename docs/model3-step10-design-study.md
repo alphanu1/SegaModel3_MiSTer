@@ -13289,6 +13289,9 @@ at map. It adds waits on purpose, toward the hardware: about 133 tile writes a f
 the symptom was reproduced in Supermodel with its timing off, and the fix proven against Supermodel's timing model. The
 board build is the confirmation.
 
+*Board (2026-11-09, `tgt1_s3`, RBF 0c7d551a: `area` 60b7bdb with the controls and this fix, 120 MHz, setup −2.98 /
+−2.59 ns).* Scud Race's race HUD is right: the speedometer, the CONDITION panel and the digits.
+
 **R153 — The geometry's clip pool and vertex store in M10K (on 60b7bdb, 120 MHz): −380 ALM of MLAB for +19
 M10K, cycle-identical. Net in the geometry −226 to −337 ALM fitted, after the logic the next-address reads need
 (+168 ALUTs). Its worst path improves, −1.254 against −1.883 / −2.329. Each memory is read a clock early at the address its next state will hold. Each had a write

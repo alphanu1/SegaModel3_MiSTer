@@ -106,7 +106,9 @@ module m3_bus
   parameter logic [26:0] SDR_FIX8   = 27'h730_0000,   // a Step 2 set's 8 MiB fixed CROM
   parameter int          RTC_HZ     = 100_000_000,    // clocks a second, for the RTC
   parameter bit          FAST       = 1'b0,           // the CPU's work-RAM reads to the SDRAM port from B_IDLE, past B_DEC (R112)
-  parameter bit          R3P        = 1'b0            // writes to the Real3D's host port posted in an eight-word buffer (R112)
+  parameter bit          R3P        = 1'b0,           // writes to the Real3D's host port posted in an eight-word buffer (R112)
+  parameter bit          TGT        = 1'b0,           // the tile generator's bus timing (R152)
+  parameter int          TG_MHZ     = 100             // the clock, for TGT's 32 MHz VRAM clock
 ) (
   input  logic          clk,
   input  logic          rst,
@@ -599,6 +601,69 @@ module m3_bus
       if (r3_go)   r3_rp <= r3_rp + 4'd1;
     end
 
+  // ---- TGT (R152): the tile generator's bus timing ----
+  // Supermodel 0d1dd3d (gm_matthew's measurements on Scud Race Plus), with its units: one VRAM clock (1/32 us)
+  // is TG_V sixteenths of a clock.
+  // - an access to tile RAM or the palette (F1000000-F111FFFF) keeps the chip busy 5 VRAM clocks (2.5 pixels):
+  //   the next one is not taken before that;
+  // - in the first 32 tile pairs (32 VRAM clocks each, 512 pixels) of a shown line the chip fetches tiles, and
+  //   a tile RAM access is taken only at the start of the last 4 VRAM clocks of a pair, and only if it is
+  //   there by then (one arriving later waits for the next pair), and keeps the chip for those 4; the palette
+  //   is not fetched from;
+  // - an access lands 12.6 VRAM clocks after it is taken, and a read over the bus (anything but work RAM and
+  //   F1000000-F11FFFFF) waits until every access taken has landed; so does a read of tile RAM or the palette
+  //   (Supermodel starts that read as a write and returns it when it has landed; here it starts then).
+  // tg_free and tg_done are the busy and landing times less the current clock's, in sixteenths, plus 16
+  // (0: long past), so an access that waited starts at the busy time's fraction, as Supermodel's (rounding
+  // each to whole clocks drifted 4.5% slow over back-to-back writes). Unsigned, no signed casts.
+  // Without it the CPU wrote tile RAM and the palette several times faster than the board: Scud Race's loader
+  // filled its 128-entry palette queue (drained in the vertical blank) past its count's wrap and the race's
+  // palette upload was lost (the HUD drawn with the selection screens' colours). The CPU's accesses only.
+  localparam int TG_V     = (TG_MHZ + 1) / 2;            // a VRAM clock in sixteenths of a clock (Supermodel's m_busClock)
+  localparam int TG_PAIR  = 2 * TG_V;                    // a tile pair, in clocks (32 VRAM clocks)
+  localparam int TG_SLOT  = (28 * TG_V) / 16;            // the clock the PowerPC's slot starts in, from the pair's
+  localparam int TG_SFRAC = (28 * TG_V) % 16;            // and the slot's start in it
+  localparam int TG_ISSUE = 5 * TG_V;                    // busy after an access
+  localparam int TG_SBUSY = 4 * TG_V;                    // busy after an access in a slot
+  localparam int TG_LAND  = (63 * TG_V + 2) / 5;         // landed
+  logic [7:0]  tg_pp;             // clocks into the tile pair (the line's start is clock 0)
+  logic [5:0]  tg_pn;             // tile pairs into the line, held at 32
+  logic        tg_act;            // a shown line
+  logic [9:0]  tg_free;           // busy time - now + 16, sixteenths; 0 when long past
+  logic [10:0] tg_done;           // landing time - now + 16
+  logic        tg_w;              // the access in B_DEC waited last clock
+  wire         tg_fetch = ln_start ? (ln < 10'd384) : (tg_act && !tg_pn[5]);   // the line starts in this clock
+  wire         tg_slot  = !ln_start && (tg_pp == 8'(TG_SLOT));
+  wire         tg_tile  = (tgt == X_SDR) && dswap;                                   // F1000000-F10FFFFF
+  wire         tg_ram   = tg_tile || (tgt == X_PAL);                                 // and F1100000-F111FFFF
+  wire         tg_rd    = !cur_w && (addr[31:23] != 9'd0) && !(a_hi == 8'hF1 && addr[23:21] == 3'd0);
+  wire         tg_inslot = tg_tile && tg_fetch;
+  wire         tg_hold  = TGT && !who && (tg_ram ? ((tg_inslot ? !(tg_slot && tg_free <= 10'(16 + TG_SFRAC)) : (tg_free > 10'd16)) ||
+                                                    (!cur_w && tg_done > 11'd16))
+                                                 : (tg_rd && tg_done > 11'd16));
+  // where the access starts, + 16: the slot's start, the busy time if it waited for it, or this clock
+  wire [10:0]  tg_s    = tg_inslot ? 11'(16 + TG_SFRAC) : (tg_w && tg_free != 10'd0) ? {1'b0, tg_free} : 11'd16;
+  wire [10:0]  tg_land = tg_s + 11'(TG_LAND);
+  always_ff @(posedge clk) begin
+    if (rst || !TGT) begin
+      tg_pp <= '0; tg_pn <= 6'd32; tg_act <= 1'b0; tg_free <= '0; tg_done <= '0; tg_w <= 1'b0;
+    end else begin
+      if (ln_start) begin
+        tg_pp <= 8'd1; tg_pn <= '0; tg_act <= (ln < 10'd384);
+      end else if (tg_pp == 8'(TG_PAIR - 1)) begin
+        tg_pp <= '0; if (!tg_pn[5]) tg_pn <= tg_pn + 6'd1;
+      end else tg_pp <= tg_pp + 8'd1;
+      tg_w <= (bs == B_DEC) && tg_hold;
+      if (bs == B_DEC && !who && tg_ram && !tg_hold) begin
+        tg_free <= 10'(tg_s + 11'(tg_inslot ? TG_SBUSY - 16 : TG_ISSUE - 16));
+        tg_done <= tg_land - 11'd16;     // starts only move on, so this landing is the latest (Supermodel's max)
+      end else begin
+        tg_free <= (tg_free > 10'd16) ? tg_free - 10'd16 : 10'd0;
+        tg_done <= (tg_done > 11'd16) ? tg_done - 11'd16 : 11'd0;
+      end
+    end
+  end
+
   // ---- the state machine ----
   always_ff @(posedge clk) begin
     m_ack <= '0; m_wnext <= '0; m_rvalid <= '0; r3_push <= 1'b0;
@@ -639,7 +704,9 @@ module m3_bus
         end
 
         B_DEC: begin
-          if (tgt == X_SDR) begin
+          if (tg_hold) begin
+            // TGT: the tile generator is busy, fetching, or has accesses still to land
+          end else if (tgt == X_SDR) begin
             s_req <= 1'b1; s_cmd <= cmd; s_sa <= dsa; s_swap <= dswap; s_zero <= dzero; s_be <= be; s_wdata <= wd;
             bs <= B_SDR;
           end else if (R3P && !(tgt == X_R3DH && cur_w) && (!r3_empty || r3_push)) begin
