@@ -342,7 +342,13 @@ module r3d_geo
     logic ok, bz, lt, eq;
     ok = !fisnan(a) && !fisnan(w);
     bz = a[30:0] == 31'd0 && w[30:0] == 31'd0;
-    lt = a[30:0] < w[30:0];
+    // |a| < |w| as a subtract's borrow, a carry chain (the compare was a four-level LUT tree in front of the
+    // outcodes and P_C's accept: 110 MHz merged fits, aw -> acc / P_Q0 / src_n -1.79 ns)
+    begin
+      logic [31:0] df;
+      df = {1'b0, a[30:0]} - {1'b0, w[30:0]};
+      lt = df[31];
+    end
     eq = a[30:0] == w[30:0];
     opair[1] = ok && (bz || (w[31] ? (a[31] && !lt) : (a[31] || lt || eq)));     // a <= w
     opair[0] = ok && (bz || (w[31] ? (!a[31] && !lt) : (!a[31] || lt || eq)));   // -a <= w
@@ -365,6 +371,25 @@ module r3d_geo
   // one ext-port register set; only the owner drives it
   logic        vk_start;
   logic [9:0]  vk_entry /* verilator public_flat_rd */;
+  // the kernel's entry, one register a machine, each written only in its own states, and the engine's
+  // owner choosing among them (study: pst -> the shared register's priority of three machines' states was
+  // five levels, the worst path of a full fit at 110 MHz). The engine reads entry only at start, and only
+  // its owner starts it.
+  logic [9:0]  m_entry, p_entry, s_entry;
+  assign vk_entry = own_p ? p_entry : own_s ? s_entry : m_entry;
+`ifdef VERILATOR
+  // each machine changes its entry only while it owns the engine, so the one shared register they replace held
+  // the owner's value at every start
+  logic [9:0] m_eq, p_eq, s_eq;
+  /* verilator lint_off PROCASSINIT */
+  logic       e_ok = 1'b0, om_q, op_q, os_q;
+  /* verilator lint_on PROCASSINIT */
+  always_ff @(posedge clk) begin
+    m_eq <= m_entry; p_eq <= p_entry; s_eq <= s_entry; e_ok <= !rst; om_q <= own_m; op_q <= own_p; os_q <= own_s;
+    if (e_ok && ((m_entry != m_eq && !om_q) || (p_entry != p_eq && !op_q) || (s_entry != s_eq && !os_q)))
+      $fatal(1, "r3d_geo: a kernel entry written by a machine not owning the engine");
+  end
+`endif
   logic [4:0]  vk_spa, vk_spd;
   logic [1:0]  vk_cls;           // 0 plain, 1 T&L, 2 projection, 3 set-up (SETUP_OUT)
   logic [3:0]  xw_we;
@@ -681,6 +706,16 @@ module r3d_geo
     P_Q0, P_Q1, P_PJ0, P_PJ1, P_PJ2, P_PJ3, P_GAP, P_SU0, P_SU1, P_SU2
   } pst_t;
   pst_t pst /* verilator public_flat_rd */;
+  // the clip pool's read address in each state
+  function automatic logic [4:0] cb_ra_of(input pst_t st, input logic [4:0] el, input logic [4:0] ep,
+                                          input logic [4:0] eq, input logic [4:0] ec);
+    case (st)
+      P_CL0: cb_ra_of = el;
+      P_X1, P_X2: cb_ra_of = ep;
+      P_Q0, P_Q1: cb_ra_of = eq;
+      default: cb_ra_of = ec;
+    endcase
+  endfunction
   pst_t pj_ret;
 
   typedef enum logic [2:0] {E_IDLE, E_P0, E_P1, E_P2, E_OUT, E_VR} est_t;
@@ -712,6 +747,7 @@ module r3d_geo
   logic [15:0] cu_r;
   logic        m_drain;
   logic [31:0] vq_r;             // a viewport word, registered before its conversion
+  logic [13:0] vsel;             // M_VPW: the one-hot of cnt
   logic        amb_ld;           // M_VPW: the ambient byte into the decoder's k255 (tc_k)
   logic [7:0]  amb_b;            // the ambient byte, registered beside amb_ld (vq_r[15:8] then)
   logic [15:0] cv_in;            // the one int16 converter: viewport words (M_VPW), u and v (P_B, P_C)
@@ -735,6 +771,8 @@ module r3d_geo
 
   // polygon-machine state the main machine waits on
   logic        p_quiet, e_quiet;
+  logic        p_quiet_q, ebz_q;     // (registered idle tests, below)
+  logic [2:0]  cq_cnt_n;
   logic        d_quiet;
 
   // decoder handshake
@@ -853,6 +891,11 @@ module r3d_geo
   // write, not a 263-bit copy
   logic        cba_we, cbb_we;
   logic [4:0]  cb_wa, cb_ra;
+  // the clip pool's read address: which entry register the polygon machine's state reads at, one-hot {Q0 / Q1,
+  // X1 / X2, CL0}, a register made from the state's next value (case by case, below). The state's decode and the
+  // four-way select were in front of the pool's 263 loads (merged fits at 110 MHz: P_CL0 / P_Q1 -> cba_q ->
+  // xw_data -1.77 ns); now one select of registers is.
+  logic [2:0]  cb_cl;
   // {list, index} -> entry, in an MLAB (it was 160 flip-flops and a 32-way select): one write and one read
   // a cycle, each at the address the polygon machine's state names, the read unregistered as before
   logic        cl_we;
@@ -1091,7 +1134,7 @@ module r3d_geo
   // ===========================================================================
   always_ff @(posedge clk) begin
     if (rst) begin
-      mst <= M_IDLE; pst <= P_IDLE;
+      mst <= M_IDLE; pst <= P_IDLE; p_quiet_q <= 1'b1;
       err <= '0;
       w_start <= 1'b0; vk_start <= 1'b0; cr_in <= 1'b0; sq_in <= 1'b0; g_req <= 1'b0;
       xw_we <= '0; xb_we <= 1'b0; vw_we <= 1'b0;
@@ -1108,6 +1151,12 @@ module r3d_geo
       w_start <= 1'b0; vk_start <= 1'b0; cr_in <= 1'b0; sq_in <= 1'b0; cu_v <= 1'b0; f_init <= 1'b0;
       f_tclr <= 1'b0; f_tset <= 1'b0; f_cwe <= 1'b0;
       xw_we <= '0; xb_we <= 1'b0; vw_we <= 1'b0; lv_we <= 1'b0;
+      // the engine port's words are read only with their write enables (r3d_vpu: ext_wdata with ext_we, ext_bdata
+      // with ext_bwe), so they need not hold: a default each cycle instead of the hold. The hold's enable, every
+      // writing state of both machines ORed, fanned out to 128 data bits (110 MHz merged fits: pst.P_X1 -> that OR
+      // -> xw_data -1.84 ns). The defaults are the commonest words (P_X1 / P_X3's, M_VPW's).
+      for (int l = 0; l < 4; l++) xw_data[l] <= cba_q[32 * l +: 32];
+      xb_data <= vq_r;
       cq_push <= 1'b0; cq_pop <= 1'b0; dq_pop <= 1'b0; eb_push <= 1'b0;
       pq_we <= '0; pm_we <= 1'b0; cba_we <= 1'b0; cbb_we <= 1'b0;
       pq_wea <= '0; pq_web <= '0; s_dv <= 1'b0; s_pop <= 1'b0; so_set <= 1'b0; tq_we <= 1'b0;
@@ -1227,34 +1276,46 @@ module r3d_geo
         // the projection constants change: wait until every queued polygon of
         // the last viewport is out
         M_VPD: if (p_quiet && e_quiet && !out_valid && d_quiet) begin
-          m_drain <= 1'b0; m_req <= 1'b1; cnt <= '0; mret <= M_VPW; mst <= M_OWN;
+          m_drain <= 1'b0; m_req <= 1'b1; cnt <= '0; vsel <= 14'd1; mret <= M_VPW; mst <= M_OWN;
         end
         // broadcast scalars (bank 0): the word is read at cnt, written at cnt + 1
         M_VPW: begin
           vq_r <= vw_q;
-          if (cnt != 5'd0) begin
+          vsel <= {vsel[12:0], 1'b0};
+`ifdef VERILATOR
+          if (vsel != 14'(1) << cnt) $fatal(1, "geo: M_VPW's one-hot");
+`endif
+          if (!vsel[0]) begin
             xb_we <= 1'b1; xb_bank <= 2'd0;
             case (cnt)
-              5'd1: begin xb_addr <= 5'(R_BC_L0); xb_data <= vq_r; end                      // node[5]
-              5'd2: begin xb_addr <= 5'(R_BC_L1); xb_data <= vq_r; end                      // node[6]
-              // node[4]: Supermodel's light z is -node[4] in MAME's view space
-              5'd3: begin xb_addr <= 5'(R_BC_L2); xb_data <= SM_LIGHT ? negf(vq_r) : vq_r; end
-              5'd4: begin xb_addr <= 5'(R_BC_IP); xb_data <= SM_LIGHT ? dclamp(vq_r) : vq_r; end   // node[7]
-              // the ambient byte: MAME's / 256 here; Supermodel's * (1 / 255) in
-              // two steps, written at the end
-              // cnt 5..9 through the one int16 converter (cv_q); the ambient's
-              // * (1 / 255) through the decoder's k255 (tc_k, idle here)
-              5'd5: begin xb_addr <= 5'(R_BC_AMB); xb_data <= cv_q; end
-              5'd6: begin xb_addr <= 5'(R_BC_VW); xb_data <= cv_q; end
-              5'd7: begin xb_addr <= 5'(R_BC_VX); xb_data <= cv_q; end
-              5'd8: begin xb_addr <= 5'(R_BC_VH); xb_data <= cv_q; end
-              5'd9: begin xb_addr <= 5'(R_BC_VY); xb_data <= cv_q; end
-              // the depth map: Supermodel z/w * 0.5 + 0.5 (times 1, plus -0), MAME's * 99999 + 1
-              5'd10: begin xb_addr <= 5'(R_BC_ZS); xb_data <= FRUSTUM_SM ? F_ONE : 32'h47c3_4f80; end
-              5'd11: begin xb_addr <= 5'(R_BC_ZO); xb_data <= FRUSTUM_SM ? 32'h8000_0000 : F_ONE; end
-              5'd12: begin xb_addr <= 5'(R_BC_L2N); xb_data <= SM_LIGHT ? vq_r : negf(vq_r); end   // -L2
-              default: begin xb_we <= SM_LIGHT; xb_addr <= 5'(R_BC_AMB); xb_data <= tc_kq; end
+              5'd1: xb_addr <= 5'(R_BC_L0);                      // node[5]
+              5'd2: xb_addr <= 5'(R_BC_L1);                      // node[6]
+              5'd3: xb_addr <= 5'(R_BC_L2);
+              5'd4: xb_addr <= 5'(R_BC_IP);                      // node[7]
+              5'd5: xb_addr <= 5'(R_BC_AMB);
+              5'd6: xb_addr <= 5'(R_BC_VW);
+              5'd7: xb_addr <= 5'(R_BC_VX);
+              5'd8: xb_addr <= 5'(R_BC_VH);
+              5'd9: xb_addr <= 5'(R_BC_VY);
+              5'd10: xb_addr <= 5'(R_BC_ZS);
+              5'd11: xb_addr <= 5'(R_BC_ZO);
+              5'd12: xb_addr <= 5'(R_BC_L2N);                    // -L2
+              default: begin xb_we <= SM_LIGHT; xb_addr <= 5'(R_BC_AMB); end
             endcase
+            // the word, from the one-hot of cnt (vsel): the count's decode was in front of xb_data's select (110 MHz merged fits: vq_r -> xb_data
+            // in all four, cnt -> xb_data -1.32 ns). node[4]: Supermodel's light z is -node[4] in MAME's view
+            // space; the ambient byte: MAME's / 256 here, Supermodel's * (1 / 255) in two steps, written at
+            // the end; cnt 5..9 through the one int16 converter (cv_q), the ambient's * (1 / 255) through the
+            // decoder's k255 (tc_k, idle here); the depth map: Supermodel z/w * 0.5 + 0.5 (times 1, plus -0),
+            // MAME's * 99999 + 1
+            xb_data <= ({32{vsel[1] | vsel[2]}} & vq_r)
+                     | ({32{vsel[3]}} & (SM_LIGHT ? negf(vq_r) : vq_r))
+                     | ({32{vsel[4]}} & (SM_LIGHT ? dclamp(vq_r) : vq_r))
+                     | ({32{|vsel[9:5]}} & cv_q)
+                     | ({32{vsel[10]}} & (FRUSTUM_SM ? F_ONE : 32'h47c3_4f80))
+                     | ({32{vsel[11]}} & (FRUSTUM_SM ? 32'h8000_0000 : F_ONE))
+                     | ({32{vsel[12]}} & (SM_LIGHT ? vq_r : negf(vq_r)))
+                     | ({32{vsel[13]}} & tc_kq);
           end
           cnt <= cnt + 5'd1;
           if (cnt == 5'd13) begin cnt <= '0; mst <= M_VPC; end
@@ -1312,7 +1373,7 @@ module r3d_geo
           for (int l = 0; l < 4; l++) xw_data[l] <= lane[0] ? negf(vw_q) : vw_q;
           lane <= lane + 2'd1;
           if (lane == 2'd3) begin
-            if (cnt[1]) begin cnt <= '0; vk_entry <= K_MUL; kret <= M_AL1; mst <= M_K; end
+            if (cnt[1]) begin cnt <= '0; m_entry <= K_MUL; kret <= M_AL1; mst <= M_K; end
             else cnt[1] <= 1'b1;
           end
         end
@@ -1327,7 +1388,7 @@ module r3d_geo
             for (int l = 0; l < 4; l++) xw_data[l] <= vw_q;
             lane <= lane + 2'd1;
             if (lane == 2'd3) begin
-              if (cnt[3]) begin cnt <= '0; vk_entry <= K_MUL; kret <= M_AL2; mst <= M_K; end
+              if (cnt[3]) begin cnt <= '0; m_entry <= K_MUL; kret <= M_AL2; mst <= M_K; end
               else cnt[3] <= 1'b1;
             end
           end
@@ -1341,7 +1402,7 @@ module r3d_geo
           end else begin
             xw_we <= 4'(1 << lane); xw_addr <= 8'(R_GA); for (int l = 0; l < 4; l++) xw_data[l] <= vw_q;
             lane <= lane + 2'd1;
-            if (lane == 2'd3) begin cnt <= '0; vk_entry <= K_ADD; kret <= M_AL3; mst <= M_K; end
+            if (lane == 2'd3) begin cnt <= '0; m_entry <= K_ADD; kret <= M_AL3; mst <= M_K; end
           end
         end
         M_AL3: if (!SETUP_CR) begin                                     // square root of each lane into vpw 20 + l
@@ -1361,7 +1422,7 @@ module r3d_geo
           for (int l = 0; l < 4; l++) xw_data[l] <= (!cnt[0] && lane[0]) ? negf(vw_q) : vw_q;
           lane <= lane + 2'd1;
           if (lane == 2'd3) begin
-            if (!cnt[0]) begin cnt <= '0; vk_entry <= K_ADD; kret <= M_AL4; mst <= M_K; end
+            if (!cnt[0]) begin cnt <= '0; m_entry <= K_ADD; kret <= M_AL4; mst <= M_K; end
             else cnt[0] <= 1'b0;
           end
         end
@@ -1376,7 +1437,7 @@ module r3d_geo
         M_AL5: if (!SETUP_CR) begin
           xw_we <= 4'(1 << lane); xw_addr <= 8'(R_GB); for (int l = 0; l < 4; l++) xw_data[l] <= vw_q;
           lane <= lane + 2'd1;
-          if (lane == 2'd3) begin cnt <= '0; vk_entry <= K_DIV; kret <= M_AL7; mst <= M_K; end
+          if (lane == 2'd3) begin cnt <= '0; m_entry <= K_DIV; kret <= M_AL7; mst <= M_K; end
         end
         M_AL7: if (!SETUP_CR) begin                                     // ht into vpw 28 + l
           if (cnt == 5'd0) begin x_raddr <= 7'(R_GO); cnt <= 5'd1; end
@@ -1396,7 +1457,7 @@ module r3d_geo
           xw_we <= 4'(1 << cnt[1:0]); xw_addr <= cnt[2] ? 8'(R_GC) : 8'(R_GA);
           for (int l = 0; l < 4; l++) xw_data[l] <= vw_ra[0] ? negf(vw_q) : vw_q;
           cnt <= cnt + 5'd1;
-          if (cnt == 5'd7) begin cnt <= '0; vk_entry <= K_SUB; kret <= M_PJ1; mst <= M_K; end
+          if (cnt == 5'd7) begin cnt <= '0; m_entry <= K_SUB; kret <= M_PJ1; mst <= M_K; end
         end
         M_PJ1: if (!FRUSTUM_SM) begin
           if (cnt == 5'd0) begin x_raddr <= 7'(R_GO); cnt <= 5'd1; end
@@ -1408,7 +1469,7 @@ module r3d_geo
             xw_we <= 4'(1 << cnt[1:0]); xw_addr <= cnt[2] ? 8'(R_GC) : 8'(R_GA);
             for (int l = 0; l < 4; l++) xw_data[l] <= vw_ra[0] ? negf(vw_q) : vw_q;
             cnt <= cnt + 5'd1;
-            if (cnt == 5'd15) begin cnt <= '0; vk_entry <= K_ADD; kret <= M_PJ2; mst <= M_K; end
+            if (cnt == 5'd15) begin cnt <= '0; m_entry <= K_ADD; kret <= M_PJ2; mst <= M_K; end
           end
         end
         M_PJ2: if (!FRUSTUM_SM) begin
@@ -1427,7 +1488,7 @@ module r3d_geo
           xw_we <= 4'(1 << cnt[1:0]); xw_addr <= 8'(R_GB);
           for (int l = 0; l < 4; l++) xw_data[l] <= cnt[0] ? vw_q : F_TWO;
           cnt <= cnt + 5'd1;
-          if (cnt == 5'd3) begin cnt <= '0; vk_entry <= K_DIV; kret <= M_PJ4; mst <= M_K; end
+          if (cnt == 5'd3) begin cnt <= '0; m_entry <= K_DIV; kret <= M_PJ4; mst <= M_K; end
         end
         // the projection columns: lane0 (P00 0 0 0), lane1 (0 P11 0 0),
         // lane2 (P02 P12 P22 -1), lane3 (0 0 P23 0)
@@ -1455,7 +1516,7 @@ module r3d_geo
           xw_we <= 4'(1 << cnt[1:0]); xw_addr <= cnt[2] ? 8'(R_SB) : 8'(R_SC);
           for (int l = 0; l < 4; l++) xw_data[l] <= vw_q;
           cnt <= cnt + 5'd1;
-          if (cnt == 5'd7) begin cnt <= '0; vk_entry <= K_SMFR; kret <= M_VR0; mst <= M_K; end
+          if (cnt == 5'd7) begin cnt <= '0; m_entry <= K_SMFR; kret <= M_VR0; mst <= M_K; end
         end
 
         // ---- the viewport record (R62): words 0x20-0x25 into vpw 0-5, then
@@ -1468,11 +1529,11 @@ module r3d_geo
 
         // ---- node culling (CULL): Supermodel's sphere test, verdict to the walker
         M_CU0: if (CULL && own_m) begin
-          if (!bc_top_ok) begin vk_entry <= K_COPYB; vk_spa <= top_slot; kret <= M_CU1; bc_top_ok <= 1'b1; mst <= M_K; end
+          if (!bc_top_ok) begin m_entry <= K_COPYB; vk_spa <= top_slot; kret <= M_CU1; bc_top_ok <= 1'b1; mst <= M_K; end
           else mst <= M_CU1;
         end
-        M_CU1: if (CULL) begin vk_entry <= K_CULLU; kret <= M_CU2; mst <= M_K; end
-        M_CU2: if (CULL) begin vk_entry <= K_CULLT; kret <= M_CU3; cnt <= '0; cu_o <= 1'b0; mst <= M_K; end
+        M_CU1: if (CULL) begin m_entry <= K_CULLU; kret <= M_CU2; mst <= M_K; end
+        M_CU2: if (CULL) begin m_entry <= K_CULLT; kret <= M_CU3; cnt <= '0; cu_o <= 1'b0; mst <= M_K; end
         M_CU3: if (CULL) begin
           logic [31:0] a1, rr;
           logic [5:0]  e6;
@@ -1481,9 +1542,11 @@ module r3d_geo
           rr = {1'b0, (e6 <= 6'd31) ? 8'({2'b00, e6} + 8'd127) : 8'({2'b00, e6} + 8'd63), a1[24:2]};
           x_raddr <= 7'(R_CT);
           cnt <= cnt + 5'd1;
+          // the verdict every M_CU3 cycle: the walker reads it only with cu_v, which the cnt == 2 cycle sets (the
+          // count's compare was in front of cu_out's 27 loads: 110 MHz release fit, cnt -> cu_out -1.31 ns)
+          cu_out <= rlt(rr, x_rdata[0]) || rlt(rr, x_rdata[1]) || rlt(rr, x_rdata[2]) || rlt(rr, x_rdata[3]);
           if (cnt == 5'd2) begin
             cu_v <= 1'b1;
-            cu_out <= rlt(rr, x_rdata[0]) || rlt(rr, x_rdata[1]) || rlt(rr, x_rdata[2]) || rlt(rr, x_rdata[3]);
             cnt <= '0; mst <= M_MREL;
           end
         end
@@ -1520,7 +1583,7 @@ module r3d_geo
           cnt <= cnt + 5'd1;
           if (cnt == 5'd15) begin cnt <= '0; mst <= M_MBK; end
         end
-        M_MBK: begin vk_entry <= K_MM; vk_spa <= top_slot; vk_spd <= sp; kret <= M_MBD; mst <= M_K; end
+        M_MBK: begin m_entry <= K_MM; vk_spa <= top_slot; vk_spd <= sp; kret <= M_MBD; mst <= M_K; end
         M_MBD: begin top_slot <= sp; lv_we <= 1'b1; lv_wa <= sp; lv_wd <= sp; bc_top_ok <= 1'b1; mst <= M_MREL; end
 
         // ===================================================================
@@ -1533,10 +1596,10 @@ module r3d_geo
           d_req <= !d_req; m_req <= 1'b1; mst <= M_MODEL0;
         end
         M_MODEL0: if (own_m) begin
-          if (!bc_top_ok) begin vk_entry <= K_COPYB; vk_spa <= top_slot; kret <= M_MODEL1; bc_top_ok <= 1'b1; mst <= M_K; end
+          if (!bc_top_ok) begin m_entry <= K_COPYB; vk_spa <= top_slot; kret <= M_MODEL1; bc_top_ok <= 1'b1; mst <= M_K; end
           else mst <= M_MODEL1;
         end
-        M_MODEL1: begin vk_entry <= K_MODEL; kret <= SM_CULL ? M_FT0 : M_CHD; mst <= M_K; end
+        M_MODEL1: begin m_entry <= K_MODEL; kret <= SM_CULL ? M_FT0 : M_CHD; mst <= M_K; end
         // the model matrix (TR rows 0-3, columns 0-2) into the facing test, a
         // word a cycle through the external read port, the engine idle
         M_FT0: begin x_raddr <= 7'(R_TR); ft_row <= '0; ft_col <= '0; mst <= M_FT2; end
@@ -1559,7 +1622,7 @@ module r3d_geo
           else mst <= M_CHE;                              // nothing to transform
         end
         M_CHT: begin
-          vk_entry <= (c_tl > 5'd12) ? K_TL : K_TL3;
+          m_entry <= (c_tl > 5'd12) ? K_TL : K_TL3;
           k_tbank <= c_bank; k_ring <= c_ring; vk_cls <= 2'd1;
           kret <= M_CHE; mst <= M_K;
         end
@@ -1714,7 +1777,7 @@ module r3d_geo
           xw_we <= 4'hf; xw_addr <= 8'(R_CS) + 8'd1;
           xw_data[0] <= ay; xw_data[1] <= (cplane == 3'd0) ? 32'd0 : paxis(cplane, cba_q[127:0]);
           xw_data[2] <= (cplane == 3'd0) ? ax : ay; xw_data[3] <= 32'd0;
-          vk_entry <= K_CLIP; vk_cls <= 2'd0; vk_start <= 1'b1;
+          p_entry <= K_CLIP; vk_cls <= 2'd0; vk_start <= 1'b1;
           pst <= P_X7;
         end
         P_X7: if (!vk_busy && !vk_start) begin x_raddr <= 7'(R_CZ); pst <= P_X8; end
@@ -1786,9 +1849,9 @@ module r3d_geo
         // ---- project the queue: wait for its output half, then PROJ ----------
         P_PJ0: if (!po_busy[pbuf] && eb_cnt != 2'd2) begin p_req <= 1'b1; pst <= P_PJ1; end
         P_PJ1: if (own_p) begin
-          if (pq_n <= 5'd4) vk_entry <= K_PROJ1;
-          else if (pq_n <= 5'd12) vk_entry <= K_PROJ3;
-          else vk_entry <= K_PROJ;
+          if (pq_n <= 5'd4) p_entry <= K_PROJ1;
+          else if (pq_n <= 5'd12) p_entry <= K_PROJ3;
+          else p_entry <= K_PROJ;
           k_pbuf <= pbuf; vk_cls <= 2'd2; vk_start <= 1'b1;
           pst <= P_PJ2;
         end
@@ -1805,10 +1868,10 @@ module r3d_geo
         // SETUP_LOAD: a kernel per four triangles, textured first
         P_SU0: if (SETUP_LOAD) begin
           if (su_rt != 8'd0) begin
-            vk_entry <= K_SETUP4; vk_start <= !SETUP_PORT; su_rt <= (su_rt > 8'd4) ? su_rt - 8'd4 : 8'd0;
+            p_entry <= K_SETUP4; vk_start <= !SETUP_PORT; su_rt <= (su_rt > 8'd4) ? su_rt - 8'd4 : 8'd0;
             su_w <= 5'd18; pst <= SETUP_PORT ? P_SU2 : P_SU1;
           end else if (su_ru != 8'd0) begin
-            vk_entry <= K_SETUP2; vk_start <= !SETUP_PORT; su_ru <= (su_ru > 8'd4) ? su_ru - 8'd4 : 8'd0;
+            p_entry <= K_SETUP2; vk_start <= !SETUP_PORT; su_ru <= (su_ru > 8'd4) ? su_ru - 8'd4 : 8'd0;
             su_w <= 5'd12; pst <= SETUP_PORT ? P_SU2 : P_SU1;
           end else begin p_req <= 1'b0; pst <= P_PJ3; end
         end
@@ -1927,7 +1990,7 @@ module r3d_geo
         case (kst)
           K_IDLE: if (stg_busy[skb] && !so_full[skb]) begin s_req <= 1'b1; kst <= K_OWN; end
           K_OWN: if (own_s) begin
-            vk_entry <= g_tex[skb] ? K_SETUP4 : K_SETUP2; vk_cls <= 2'd3; k_pbuf <= skb; k_sbuf <= skb;
+            s_entry <= g_tex[skb] ? K_SETUP4 : K_SETUP2; vk_cls <= 2'd3; k_pbuf <= skb; k_sbuf <= skb;
             vk_start <= 1'b1; kst <= K_RUN;
           end
           K_RUN: if (!vk_busy && !vk_start) begin
@@ -1939,9 +2002,37 @@ module r3d_geo
           default: if (!own_s) kst <= K_IDLE;
         endcase
       end
+      // p_quiet's next value: the polygon machine is in P_IDLE next only from P_IDLE (no chunk queued; with pq_np
+      // zero, which P_IDLE does not move, its projection exit cannot be taken), from P_GAP, or from P_PJ3 back to
+      // P_IDLE; pq_np moves only in P_Q0 and P_PJ2
+      case (pst)
+        P_IDLE:  p_quiet_q <= cq_cnt == 3'd0 && cq_cnt_n == 3'd0 && pq_np == 5'd0;
+        P_GAP:   p_quiet_q <= cq_cnt_n == 3'd0 && pq_np == 5'd0;
+        P_PJ3:   p_quiet_q <= !own_p && pj_ret == P_IDLE && cq_cnt_n == 3'd0 && pq_np == 5'd0;
+        default: p_quiet_q <= 1'b0;
+      endcase
     end
   end
 
+
+  // cb_cl's next value: the polygon machine's moves into and out of P_CL0, P_X1 / P_X2 and P_Q0 / P_Q1
+  always_ff @(posedge clk) begin
+    if (rst) cb_cl <= 3'b000;
+    else case (pst)
+      P_C:   cb_cl <= (a_wi + 3'd1 == a_nv && acc && a_oc == 7'h7f) ? 3'b100 : 3'b000;
+      P_D:   cb_cl <= acc ? 3'b100 : 3'b001;
+      P_CL0: cb_cl <= (cplane == 3'd7 || clip_zero) ? 3'b100 :
+                      (cb_n == 5'd0 || cur_and[cplane] || !cur_or[cplane]) ? 3'b001 : 3'b000;
+      P_CLA: cb_cl <= 3'b001;
+      P_XC:  cb_cl <= own_p ? 3'b000 : 3'b001;
+      P_X0:  cb_cl <= own_p ? 3'b010 : 3'b000;
+      P_X1:  cb_cl <= 3'b010;
+      P_Q0:  cb_cl <= (src_n < 5'd3 || pq_n + src_n > 5'd16) ? 3'b000 : 3'b100;
+      P_Q1:  cb_cl <= (cnt_q == 2'd3 && ei + 5'd1 == src_n) ? 3'b000 : 3'b100;
+      P_PJ3: cb_cl <= (!own_p && pj_ret == P_Q0) ? 3'b100 : 3'b000;
+      default: cb_cl <= 3'b000;
+    endcase
+  end
 
   // ---- the int16 converter, shared: viewport words in M_VPW (the polygon
   // machine is idle there, M_VPD), else u (P_B) and v (P_C) of the vertex
@@ -1983,13 +2074,12 @@ module r3d_geo
     // u/v word of vertex as_i, read in P_A (data in P_B, held in P_C)
     pu_ra = {cp, as_i[1:0]};
     // clip pool
-    case (pst)
-      P_CL0: cb_ra = e_last;
-      P_X1, P_X2: cb_ra = e_prev;
-      P_Q0, P_Q1: cb_ra = e_qe;
-      default: cb_ra = e_cur;
-    endcase
+    // (the state's class, which register names the entry, as a register: below)
+    cb_ra = cb_cl[0] ? e_last : cb_cl[1] ? e_prev : cb_cl[2] ? e_qe : e_cur;
   end
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && cb_ra != cb_ra_of(pst, e_last, e_prev, e_qe, e_cur)) $fatal(1, "r3d_geo: cb_cl");
+`endif
 
   // ---- queue counters (main <-> polygon <-> emitter) -----------------------
   always_ff @(posedge clk) begin
@@ -2001,7 +2091,15 @@ module r3d_geo
       cq_cnt <= cq_cnt + {2'd0, cq_push} - {2'd0, cq_pop};
     end
   end
-  assign p_quiet = (pst == P_IDLE) && cq_cnt == 3'd0 && pq_np == 5'd0;
+  // the polygon machine's and the batch count's idle tests as registers, from their next values (the main machine's
+  // M_VPD / M_END waits ANDed them into every state bit's next value: 110 MHz merged fits, pst.P_IDLE -> mst.*
+  // -1.64 ns, eb_cnt -> mst.* -1.26 ns). cq_cnt's and eb_cnt's next values come from registers.
+  assign cq_cnt_n = cq_cnt + {2'd0, cq_push} - {2'd0, cq_pop};
+  assign p_quiet = p_quiet_q;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && (p_quiet_q != ((pst == P_IDLE) && cq_cnt == 3'd0 && pq_np == 5'd0) || ebz_q != (eb_cnt == 2'd0)))
+    $fatal(1, "geo: the idle tests registered");
+`endif
 
   // ===========================================================================
   // emitter: a word stream, one record at a time (m2-notes section 15)
@@ -2090,7 +2188,7 @@ module r3d_geo
       default: e_vw = vw_q;
     endcase
   end
-  assign e_quiet = (est == E_IDLE) && eb_cnt == 2'd0 &&
+  assign e_quiet = (est == E_IDLE) && ebz_q &&
                    (!SETUP_OUT || (s_st == S_IDLE && sl == 2'd0 && stg_busy == 2'd0 && kst == K_IDLE &&
                                    tq_cnt == 5'd0 && !tq_we && so_full == 2'd0 && !so_set));
 
@@ -2242,8 +2340,9 @@ module r3d_geo
   // batches: polygon -> emitter
   always_ff @(posedge clk) begin
     if (rst) begin
-      eb_cnt <= '0; eb_wp <= '0; eb_rp <= '0; po_busy <= '0;
+      eb_cnt <= '0; eb_wp <= '0; eb_rp <= '0; po_busy <= '0; ebz_q <= 1'b1;
     end else begin
+      ebz_q <= 2'(eb_cnt + {1'b0, eb_push} - {1'b0, SETUP_OUT ? s_pop : eb_pop}) == 2'd0;
       if (eb_push) begin eb_buf[eb_wp] <= eb_wbuf; eb_np[eb_wp] <= eb_wnp; eb_first[eb_wp] <= eb_wfirst; eb_wp <= !eb_wp; end
       if (SETUP_OUT ? s_pop : eb_pop) eb_rp <= !eb_rp;
       eb_cnt <= eb_cnt + {1'b0, eb_push} - {1'b0, SETUP_OUT ? s_pop : eb_pop};

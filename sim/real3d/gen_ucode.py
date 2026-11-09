@@ -41,14 +41,14 @@
 # cycles. The last word of a kernel is valid = 0 with rb = 1.
 #
 # Timing (r3d_vpu.sv; the register files are synchronous): a MAC issued at t
-# writes at the end of t+12 and is readable from t+13. DIV issued at t writes
+# writes at the end of t+13 and is readable from t+14. DIV issued at t writes
 # lane k at the end of t+15+k, readable from t+16+k. A write must land after
 # every earlier read of the old value has issued.
 
 import os
 import sys
 
-MAC_W = 12         # write cycle after issue
+MAC_W = 13         # write cycle after issue (r3d_fp_add PIPE_B2 in the engine: study D-50)
 R3 = '--3r' in sys.argv   # (set True for the set-up output ROM)
 # a third lane-register read (port C, r3d_vpu SETUP_3R): c from any register
 DIV_W = 15         # lane 0 write cycle after issue; lane k at +k

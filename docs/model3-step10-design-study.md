@@ -1107,7 +1107,9 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-48 | (2026-11-08) No area change may cost a game any cycles, even inside a frame's budget, and none that could make a game slower; this narrows D-43 / D-44's "a throughput trade must hold each frame's budget". The room for sound (D-45) has to come from cycle-free changes: shared logic, storage moved to M10K, dead logic removed, per-board parameters. Under it R131's edge product on the walk's adders (`PB` = 1) is left off, and R129's iterative double front, R129's speed-feature switches and R130's DSP alignment shift (a standalone Fmax drop) are not taken. A change that makes a game faster and saves area, as R131's overlapped front, is welcome. |
 | D-49 | (2026-11-08) Texture decode, contour and texture alpha follow Supermodel's New3D renderer, not MAME's, wherever nothing from the hardware says otherwise (R134, R135). It supersedes the MAME-style decode the core had for formats 1-6 and the texture-alpha kind. Where the board or the real cabinet shows the hardware differs from Supermodel (Daytona 2's car shadow, R137), the hardware wins and Supermodel is no evidence for that case. |
 | D-50 | (2026-11-08) The system clock's goal is 120 MHz with every corner closed; closing 110 MHz is the step on the way. For timing work only, D-48 is read in time, not cycles: a change may add a clock cycle where the game, timed in seconds at the faster clock, is at least as fast as it is now at 110 MHz. The trade is measured on the bench per change (cycles before and after, scaled by the two clocks) before it is taken, and a cycle that costs more than the clock gains is not taken. Area changes stay under D-48 as written. |
-| D-51 | (2026-11-08) Sound goes on the HPS's ARM: the 68000 and the two SCSPs emulated there, the samples streamed to the FPGA's audio out. This takes D-45's fallback as the plan and frees its ~4,500 ALM reservation; the ~1,000 ALM for I/O stays in the FPGA. It must still meet the zero-added-latency rule and leave MiSTer Main its share of the CPU. Area work waits until 120 MHz (D-50) is close to closing, and then runs on its own branch. The blocks outside the CPU and the Real3D (bus, SDRAM and DDR3 ports, SCSI, texture upload, tile generator, I/O, JTAG, loader, security: about 5,370 ALM in `tm1_s2`) are the first place to look. |
+| D-51 | (2026-11-08) Sound goes on the HPS's ARM: the 68000 and the two SCSPs emulated there, the samples streamed to the FPGA's audio out. This takes D-45's fallback as the plan and frees its ~4,500 ALM reservation; the I/O stays in the FPGA (its ~1,000 ALM was an overstatement: about 400 more than the core has now, R143). It must still meet the zero-added-latency rule and leave MiSTer Main its share of the CPU. Area work waits until 120 MHz (D-50) is close to closing, and then runs on its own branch. The blocks outside the CPU and the Real3D (bus, SDRAM and DDR3 ports, SCSI, texture upload, tile generator, I/O, JTAG, loader, security: about 5,370 ALM in `tm1_s2`) are the first place to look. |
+| D-52 | (2026-11-09) The CPU gets its own clock domain at 110 MHz; SDRAM, DDR3, the bus, the Real3D and the rest go to 120 MHz (R141). The crossing is the CPU's own ports: the m_* master port, the D-cache snoop and ext_int; the timebase stays in the CPU's domain. Each domain closes on its own and its clock is its own setting. The CPU's goal stays 120 MHz, so the split is the way there, not the end. (At 120 Daytona 2's loop still misses its deadline by 3%; the Real3D DMA's speed and the rasteriser stand between it and 60 Hz: R141.) The CPU's clock rises as it closes. CPU changes stay under D-48 (no added cycles) even after that: at 120 Daytona 2's loop has about 3% to spare, so a cycle the CPU loses is a frame rate the game loses. Geometry alone at 120 (split A in R141) is the fallback. |
+| D-53 | (2026-11-09) The SCSP DSP goes in the FPGA; the 68000 and the slots stay on the HPS's core 0 (R145). One core holds the average but not the worst seconds of play, and MiSTer Main spins on core 1, so taking time there would risk its input handling. The DSP follows Supermodel's pipeline, bit-exact against the ARM version under the same fuzz. About 700 ALM (my Model 2 core's `m2_scsp_dsp` is 537 for one chip), so area work starts now rather than waiting for 120 MHz, on its own branch, under D-48. |
 
 ### Open
 
@@ -12512,3 +12514,440 @@ but fitted about 315 ALM larger in the full build (41,415 / 41,419 / 41,278), an
 and −2.91 ns on seeds 1-3, the worst paths moved into blocks it did not touch (the rasteriser's interpolator and
 reciprocal, the geometry, the extra-memory pipe), and seed 3's hold went negative at all four corners (−0.31 ns). At 98% the area a change adds is paid in every other block's
 placement, so a CPU change now has to be priced in fitted ALM as well as spike Fmax.
+
+**R141 — Pricing the clock split (D-52): with the CPU alone at 110 and the rest at 120, the CPU's crossing costs about
+2% of its busy time and no frames on the traces I have, for about 120-170 ALM; the Real3D keeps every frame 120 MHz
+gives it. The crossing cuts almost no failing paths, so every block on the 120 side still has to close inside itself.**
+
+*Method.* Bench and desk only, no RTL (`sm3-builds/tc/clk`). Geometry from the geometry bench (rounds 2-3, no MAC
+stage); frames as max(geometry, rasteriser) against the 57.52 Hz vsync; the CPU from the 48-frame system bench (frames
+1301-1348, VF3 and Daytona 2 only: there is no Scud Race or Bass Fishing checkpoint). Areas are estimates, not fits.
+
+*Split A, geometry alone at 120.* Geometry is not latency-bound. The memory latency is 12-20 clocks at 110, and a
+crossing of +4 clocks a round trip costs 1.0-1.5% of geometry time:
+
+| Game | Frames against all 110: all 120 | A, +0 | A, +4 |
+|---|---|---|---|
+| Scud Race | +11.4% (late frames 150 to 96) | +10.9% | +8.6% (108 late) |
+| Daytona 2 (MAME lists / Supermodel rows) | +4.95% / +5.9% | +4.95% / +3.85% | +4.95% / +3.85% |
+| VF3 | 0 | 0 | 0 |
+
+About 170 ALM, 0 M10K: no FIFO exists at the geometry's output stream today, and each of the three read ports needs one.
+Of fb_s3's 843 failing geometry endpoints at 100 °C, 809 start inside the geometry and about 52 sit on its output stream;
+none are on the read ports.
+
+*Split B, everything but the CPU at 120.* The CPU's bus transactions per frame are 12,901 (VF3) and 10,214 (Daytona 2),
+memory wait 19.4% and 11.2% of busy. With the crossing at +k CPU clocks a round trip, less the memory side's own wait
+scaled by 110/120:
+
+| Game | +2 | +3 | +4 | +3 with posted writes |
+|---|---|---|---|---|
+| VF3 | +0.81% | +2.02% | +3.23% | +1.77% |
+| Daytona 2 | +1.06% | +2.06% | +3.06% | +2.01% |
+
+Real3D writes wait 0 cycles today, so a posted-write buffer (about 30 ALM) gains little. VF3's CPU work bursts (0.81 and
+0.39 of a vblank) cross no vblank at +3.2%. The crossing is about 120-140 ALM, 0 M10K. No failing path crosses the
+CPU's port in fb_s3 or merge4_s3 apart from the reset into the CPU (64 endpoints, −0.55 ns), which the round-2
+`rst_cpu` change already fixes. On the 120 side, fb_s3 has 2,565 failing endpoints without the CPU: the rasteriser
+1,072 (−1.22 ns, about 10 MHz short standalone), the geometry 843 (−1.83), the texture unit 201, the rest under 160 each.
+On the CPU side, 938 endpoints would still fail at 110 from fb_s3's placement (−1.65 ns at 100 °C).
+
+*What it leaves on the table.* Daytona 2's game loop on the trace is 2.02 M CPU cycles every second vblank: 1.055
+vblanks at 110 MHz, so 30 Hz. With the CPU at 120 it would be 0.967 vblanks, 60 Hz with about 3% to spare. Split B
+keeps it at 30 Hz: no loss against 110, but not that gain either. The trace has the R107-era Real3D and the bench's
+100 MHz-era SDRAM timing, so the board's FPS counter has to confirm it. If it holds, the CPU's own clock is the lever
+for Daytona 2, and D-52 leaves it free to rise.
+
+*Wrong turn.* I expected the split to remove failing paths at the boundary. It removes almost none: the failures are
+inside the blocks.
+
+**R142 — The sound board on the MiSTer's ARM (D-51), first measurement on the board: with the DSP programs translated
+to ARM code it is bit-exact but not yet real time, 108% of one A9 core on VF3 and 120% on Scud Race. My desk model
+had said 64-69%.**
+
+*The build.* arcsnd's Model 3 session (branch `model3` in `sm3-builds/arcsnd`): Supermodel's SCSP and sound board on
+arcsnd's Musashi 68000, each SCSP DSP program translated to ARM code once it has been unchanged for 64 samples, and a
+fast path for silent slots. On the desk it matches the straight port sample for sample on five captures (VF3, Scud
+Race, Lost World, Bass Fishing, Daytona 2), and 30,000 random DSP programs match the interpreter. It costs 3.35x fewer
+ARM instructions than the straight port (VF3: 2,155 to 643 M a second, counted under qemu-arm).
+
+*The board* (2026-11-09, `model3_bench` 74486f07, run on core 0 with `nice -n -10`, the VF3 set loaded on the
+`tm1_s2` core and MiSTer Main on core 1, which it keeps fully busy):
+
+| Set | Sound | A9 time | Share of core 0 | Worst frame | Output hash |
+|---|---|---|---|---|---|
+| VF3 | 121.69 s | 133.48 s | 108.4% | 158.9%; 4,832 of 7,000 frames over 100% | 4b03e758, as on the desk |
+| Scud Race | 86.92 s | 105.82 s | 120.4% | 158.4%; 3,869 of 5,000 over 100% | 949e3e10, as on the desk |
+
+Timer A re-arms at a median of 51 samples, the arcade figure (R976 of my Model 2 study).
+
+*What it means.* The instruction counts were right. At 800 MHz the A9 retires about 0.74 instructions a clock on this code (643 M a second over 867 M clocks on VF3, 704 M over 963 M on Scud Race), not the
+1.56 of the llvm-mca stream model, nor the 0.9 I had taken as the pessimistic case. Real time with the margin I want
+(under about 70%) needs about 1.6x on VF3 and 1.75x on Scud Race, before the Digital Sound Board is added for Scud
+Race and Daytona 2. Main takes all of core 1, so the sound has core 0 alone.
+
+*Wrong turn.* I priced the A9 from a pipeline model. The board run took a few minutes and should have come first.
+
+*The board at 120 (2026-11-09, `fb_s3`, the committed tree with every clock at 120 MHz, RBF 53947478, setup −2.41 /
+−2.56 ns at slow 100 °C / −40 °C).* Daytona 2 runs exactly as at 110: 30 fps everywhere except the third attract
+scene (the swinging board, about 3-4 minutes in), which is 60 at both clocks. No glitch was visible. So the trace's
+0.967 vblanks at 120 is wrong for these scenes.
+
+*The cause, on a fresh bench run* (c3a4f62's RTL as the system bench at 110 and 120 MHz timings, from the frame-1300
+checkpoint transplanted, an early 30 Hz attract scene; `sm3-builds/tc/cpu/d2`). The game paces on the decrementer: the
+vblank handler (1D74) reloads it, it fires 0.88 vblank later (handler 1BBC counts byte 0x100033), and the pacing
+function (4C6FC) waits for that count, so a loop is one vblank only if the CPU reaches 4C6FC within 1.000 vblank of the
+loop's start. It polls no Real3D or tile-generator status bit.
+
+| Per loop (vblanks) | 120 MHz | 110 MHz |
+|---|---|---|
+| Loop | 2.000 | 2.000 |
+| CPU reaches 4C6FC (deadline 1.000) | 1.028-1.032 | 1.116-1.124 |
+| ... of it polling for the Real3D DMA (loop at 52A0) | 0.131 | 0.138 |
+| Geometry busy | 0.50-0.51 | 0.54-0.55 |
+| Rasteriser busy | 1.05-1.10 | 1.16-1.18 |
+
+So the CPU is the limiter after all. It misses by 3% at 120 and 12% at 110, which is why the clock change showed nothing:
+both clocks are over the line. The 48-frame trace (1.055 / 0.967) was the R107-era tree. The DMA carries 13,864 words a
+loop in 7 moves at about 32 clocks a word (15 MB/s), and the CPU waits for nearly all of the longest one. Supermodel's
+move is instant, and a bursting PCI DMA on the cabinet would be several times faster than ours. That is the biggest single
+lever on the loop, and a move toward the hardware. The rasteriser is next: at 1.05-1.10 vblanks a drawn frame, it would
+hold the scene at 30 by itself even with the CPU fixed. Supermodel runs every attract scene at 60. Its frames 7,800-9,000
+carry 28-35% less CPU work, which fits the board's one 60 Hz scene, though that is not yet confirmed on the bench.
+
+*Wrong turn.* I first read the board's unchanged frame rate as a fixed wait that does not scale with the clock. Both
+clocks were simply over the deadline.
+
+**R143 — Wiring the MiSTer's controls to the I/O board costs about 400 ALM, not the ~1,000 D-51 carried. The I/O chip
+is already in the core; its inputs are tied to idle values.**
+
+*What the core has.* `m3_io` (the 315-5649 and the 93C46) is in: 164 ALM in `tm1_s2`, 118 of them the EEPROM. Its inputs
+are constants (`m3_system.sv`: `in0` 8'hFF, test and service high, `in2` / `in3` the MRA configuration's idle bytes), the
+ADC returns constants, and `hps_io` takes no joystick, analog or paddle port. Every game so far has run in attract.
+
+*What my Model 2 core paid* (`dv24-2a` s1755 fit):
+
+| Block | ALM |
+|---|---|
+| `m2_2a_inputs` (the per-game mapping, guns included) | 210.5, of which the analog cabinet inputs 168 |
+| `m2_315_5649` with its 93C46 (Model 3 has its own: `m3_io`) | 211.8 |
+| `hps_io`'s own logic, with the joystick, analog, trigger and paddle ports | 285.4, against Model 3's 95.4 |
+
+So the hookup is about 210 ALM of mapping plus up to about 190 in `hps_io`, about 400 ALM in all; the I/O chip itself is
+already paid for. D-51's ~1,000 is the area plan's reservation (R105, R110, carried in D-45), not a measurement.
+
+
+**R144 — The Real3D DMA's 32 clocks a word: half of it is the high culling RAM (8E), written as two copies of 16-bit
+single SDRAM requests behind a one-deep posted write. Posting the writes brings Daytona 2's loop under its deadline at
+120 MHz, until the rasteriser backs up.**
+
+*Where the clocks go* (bench, one Daytona 2 loop at 120 MHz: 13,864 words in 442k clocks, `sm3-builds/tc/cpu/d2`):
+
+| Part | Count | Clocks each | Share |
+|---|---|---|---|
+| Line writes to 8E | 589 | 2.9 to acknowledge, 357 for the beats | 48% |
+| Line reads of work RAM | 1,709 | 41 to acknowledge (26 of it the D-cache snoop), 29 for the beats | 27% |
+| Line writes to 98 (polygon RAM, DDR3) | 1,126 | 17.5 + 39 | 14% |
+
+`r3d_mem` writes 8E's two SDRAM copies a halfword at a time (four requests a word, about 45 clocks), and `r3d_cmd` holds
+one posted write, so the DMA engine waits for each word. Polygon RAM goes to DDR3 in 64-bit beats, about 5 clocks a word.
+
+*The hardware.* The PCI is 33 MHz, 32 bits (132 MB/s at most). The Step 1.x 53C810A bursts 2-16 dwords at over 110 MB/s
+(its datasheet), so a memory-to-memory move tops out near 55 MB/s. Daytona 2's Step 2.x DMA device (PCI 0x178611DB) has no
+datasheet I can find; Supermodel and MAME move instantly and time nothing. So the cabinet's rate is not pinned, but our
+15 MB/s is below any bursting PCI master.
+
+*A bench model* (posted-write FIFO in `r3d_cmd`, reads not waiting for the drain, the swap still waiting): moves fall to
+14.9 clocks a word (32 MB/s) and the DMA wait from 0.131 to 0.032 vblank. At 120 MHz the CPU reaches the pacing function
+at 0.918 vblank and the game runs at 60 Hz for nine loops, then the rasteriser (busy 100% from loop 3, 1.05-1.10 vblank a
+frame) backs the frames up and a loop misses. At 110 the CPU arrives at 1.001-1.006: still just over. The Real3D write
+log is identical to base in order, and a planted FIFO fault is caught. As modelled the FIFO needs about 3,100 entries
+(24 M10K), which is not usable. Writing 8E's copies as SDRAM bursts would let a 16-32 entry MLAB FIFO do (est. 30-60 ALM).
+
+*Wrong turn.* The first form made reads wait for the FIFO to drain. The DMA device's status read then held the bus for
+about 200k clocks and the CPU gained only 0.012 vblank.
+
+**R145 — The sound board on the ARM, second board run (2026-11-09, `model3_bench` s15 8dde4f0b, the VF3 set on `tm1_s2`):
+with the cache-aware changes the average fits core 0, but the worst seconds of play do not, and MiSTer Main leaves
+nothing of core 1 free.**
+
+The gameplay streams are Supermodel captures with scripted input (fights won in VF3, a race in Scud Race); every hash
+matched the desk.
+
+| Stream | Share of core 0 | Worst second | Worst frame |
+|---|---|---|---|
+| VF3 play (173 s) | 86.5% | 105.8% | 140.3% |
+| Scud Race play (209 s) | 76.8% | 104.0% | 126.3% |
+| VF3 attract | 87.2% (was 108.4%, R142) | 113.1% | 135.1% |
+| Scud Race attract | 88.9% (was 120.4%) | 105.3% | 126.4% |
+
+MiSTer Main is pinned to core 1 and used 1,004 ticks in 10 s: all of it. The bench on core 1 at nice 19 got 87 ticks in
+60 s (1.5% of the core). At nice 0 the scheduler split core 1 evenly, 2,999 ticks to the bench and 3,000 to Main. So Main
+spins rather than sleeps: core 1 has room only if Main gives way, and what that does to its input and OSD handling is
+not measured. One core cannot hold the worst seconds without a buffer of about 100 ms, which the lag-free rule does not
+allow. The desk model's averages were 4-8 points low (82% and 69% for play).
+
+**R146 — The Real3D and system round 2: R139's round-1 tree in four full fits, and the cycle-exact changes that followed.**
+
+*Round 2: the round-1 tree in four full fits.* `tr1_s1` (this tree alone, seed 1) and `tm1_s1`-`s3` (merged with the
+CPU's r14), 110 MHz, release qsf. Work in `sm3-builds/tc/r3d2/`: `tree` (`tc/merge/tree` with the changes below;
+= `snap/t8`), `cen/` (the 20,000-endpoint census of every fit, both slow corners), `rank5.txt` (non-CPU families across
+`c7_s1` and the four fits), `q/` (full paths), `fits/`, `logs/`, `exp/`.
+
+What the full fits say about round 1 (slow 100 °C; endpoints / TNS ns; `c7_s1` → the four new fits):
+
+| Family | `c7_s1` | `tr1_s1` | `tm1_s1` | `tm1_s2` | `tm1_s3` |
+|---|---|---|---|---|---|
+| `hps_io → m3_loader` | 105 / −44.6 | 0 | 0 | 0 | 0 |
+| fog | 52 / −22.3 | 1 / −0.2 | 2 / −0.8 | 1 / −0.2 | 7 / −1.4 |
+| texel internal | 37 / −22.0 | 30 / −4.8 | 17 / −4.8 | 16 / −0.9 | 17 / −9.4 |
+| `r3d_rast → texel` | 62 / −13.2 | 0 | 2 / −0.6 | 2 / −0.4 | 3 / −0.8 |
+| store internal | 58 / −14.3 | 24 / −5.1 | 8 / −1.2 | 0 | 2 / −0.5 |
+| `m3_bus` | 44 / −16.6 | 0 | 1 / −0.0 | 2 / −0.2 | 2 / −0.6 |
+| `m2_sdram` | 15 / −8.1 | 0 | 3 / −0.3 | 0 | 9 / −3.3 |
+| geometry `D_HDR` paths (`dst.D_HDR` from) | 119 endpoints, worst −1.41 | 0 | 0 | 0 | 0 |
+| `r3d_geo → r3d_geo` | 81 / −36.4 | 107 / −59.5 | 254 / −160.0 | 165 / −80.2 | 115 / −35.9 |
+| z band internal | 15 / −4.2 | 281 / −105.8 | 168 / −42.8 | 3 / −0.0 | 85 / −24.6 |
+| `r3d_rast_edge → r3d_div_lane` | 0 | 150 / −68.0 | 0 | 90 / −39.3 | 0 |
+| texture cache internal | 10 / −3.0 | 19 / −6.1 | 141 / −59.1 | 32 / −6.6 | 25 / −5.5 |
+| all non-CPU | 1,107 / −364.6 | 1,061 / −369.5 | 1,302 / −520.8 | 634 / −212.1 | 873 / −288.3 |
+
+- Every family round 1 worked on is gone or down to a few endpoints in all four fits. The non-CPU total did not
+  move (`tr1_s1` against `c7_s1`, the same seed: −369.5 against −364.6 ns): the failures went to other families,
+  and three seeds of one tree spread −212 to −521 ns. The fits say what the standalone fits said: past the logic
+  depth that was removed, the rest is placement, and seeds move it more than restructuring does.
+- The −40 °C geometry question (round 1: standalone −1.4 MHz on five seeds, unresolved). The paths the two geometry
+  changes took off (`dst.D_HDR` into the stall, `ms_pop`, `xb_r`, the stream's `rp` and its MLAB) had 119 / 158
+  failing endpoints in `c7_s1` (100 °C / −40 °C, worst −1.41 / −1.28 ns) and have none in any of the four fits.
+  The stream's registered valid (`wv_q`) leads paths into the header registers at worst −0.18 ns in `tr1_s1` and
+  passes in the three merged fits. The geometry's own failures in the new fits are elsewhere (below), in logic
+  neither change touched. So the full fits keep both changes: what they bought shows, and nothing they added fails.
+- The ranking (`rank5.txt`; summed over the four fits, slow 100 °C): `r3d_geo` −336 ns (in all four), the z band −173
+  (four), `edge → div_lane` −107 (two), the texture cache −77 (four), `r3d_fp_add` −37 / −65 at −40 °C (four),
+  colour −48 (four), `r3d_texup` −48 (four), `r3d_vpu → r3d_fp_mul` −49 (three), the ring M10K into colour −29 (two),
+  `r3d_geo → r3d_ram` −29 (four), `r3d_geo → fogvp` −30 (two), `m3_tilegen_fetch` −18 (four), `rst_s` into the CPU's
+  divider −21 (two), `rst_rast` into the rasteriser's tables −21 (three), `sysmem f2sdram → r3d_mem` −8 (one, −2.04).
+
+*Round 2's changes* (cycle-exact; each with an assert or a bench that sees its fault):
+
+| Block | Path (fits) | Change | Proof |
+|---|---|---|---|
+| `r3d_rast_tcache` | `sw_n` → `sw_n != 0` → `hold` → `a_go` → A's ~110 enables (three fits, −1.34) | the hold a register: `hold_q` is `sw_nz \|\| sw_q` a cycle on, which is `sw_nz \|\| inval`; the sweep's other tests on `sw_nz` | assert (`tc_hold` fires) |
+| `r3d_div_lane` | `w_act` / `m_busy` → `t_go` → `go` → 140 enables a lane (two fits, −0.97) | the dividend and divisor follow the inputs while the lane is idle; only q, r, k_r wait on start | bench (`div_nr`: 96,569 pixels wrong) |
+| `r3d_rast_div` | (the same: `go` into the triangle's fields, ~200 enables) | the fields follow the inputs while the divider takes one (`i_ready`); the edge reads them only with `o_valid` | assert (`div_fld`) |
+| `r3d_rast_front` | (the same: the band) | the band follows `t_ready` | assert (`front_b2`); the weaker fault `!t_ready` is masked: the band input holds while the divider is busy |
+| `r3d_rast_fogvp` | the geometry's word → the record's mantissa compare → `e`, `r` (two fits, −0.93) | the compare as a subtract's borrow | assert (`fogvp_mlt`) |
+| `r3d_geo` | `pst` state OR → `xw_data`'s hold, 128 bits (`P_X1 → xw_data` −1.84) | the engine port's words need no hold (r3d_vpu reads them only with their write enables): a default each cycle (P_X1 / P_X3's word; `xb_data` M_VPW's) | geometry bench |
+| `r3d_geo` | `vq_r` / `cnt` → `cnt`'s decode → `xb_data` (all four fits; −1.32) | M_VPW's word from a one-hot of `cnt` (`vsel`) | assert (`vsel`) |
+| `r3d_geo` | `aw` → outcode compare tree → `a_oc` → `acc`, P_C's exit (−1.79) | the outcodes' `\|a\| < \|w\|` as a subtract's borrow | bench (`oc_lt`: 20 of 20 frames wrong) |
+| `r3d_geo` | `cnt` → `cnt == 2` → `cu_out`'s 27 loads (`tr1_s1` −1.31) | the verdict loaded every M_CU3 cycle; the walker reads it only with `cu_v` | bench |
+| `r3d_geo` | `pst.P_IDLE` / `eb_cnt` → the idle tests → M_VPD / M_END's waits → every `mst` bit (−1.64, −1.26) | `p_quiet` and `eb_cnt == 0` as registers from their next values (`p_quiet`'s by cases: P_IDLE with nothing queued, P_GAP, P_PJ3 back to P_IDLE) | assert (`p_quiet`, `ebz`) |
+| `m3_system` | `rst_s[2]` → the CPU (the FP divider: −1.11) | a preserved copy of `rst_s[2]` for the CPU, as `rst_geo` and `rst_rast` are | assert; system bench |
+
+*Standalone* (8.333 ns; seeds 1 / 2 / 3, mean; slow 100 °C / −40 °C):
+
+| Block | Variant | ALM | Fmax 100 °C | Fmax −40 °C |
+|---|---|---|---|---|
+| `r3d_geo` | base (round 1's tree; 5 seeds) | 7,655 | 123.26 / 127.55 / 123.14 / 125.36 / 123.21 (124.50) | 119.57 / 122.46 / 121.12 / 121.76 / 121.89 (121.36) |
+| | round 2 (`snap/t8`) | 7,689 | 123.03 / 125.71 / 120.51 (123.08) | 120.98 / 119.02 / 122.93 (120.98) |
+| `r3d_rast` | base (round 1's tree, `rast_r4`) | 8,137 | 108.21 / 112.13 / 114.10 (111.48) | 108.13 / 113.38 / 111.98 (111.16) |
+| | round 2 (`snap/t8`) | 8,152 | 106.07 / 110.66 / 114.48 (110.40) | 105.73 / 113.88 / 118.09 (112.57) |
+
+- The geometry is 31 ALM larger (the outcodes' three borrow chains, `vsel`, the idle registers; its sub-blocks within
+  ±6, the fitter's noise) and its means are −1.4 / −0.4 MHz, inside both variants' seed spreads (5.2 / 3.9 MHz for
+  this round, 4.4 / 2.9 for the base). Its worst standalone paths are in units round 2 did not change (`r3d_fp_add`'s
+  stage C, `r3d_fp_mul`'s overflow, the walker) but one: the culling verdict's M10K read into `cu_out` (119.0 MHz at
+  −40 °C in one seed; 123.4 in the base's), whose enable round 2 simplified and whose data path it did not touch. Three
+  seeds do not show a drop, and do not rule one out; a full fit decides.
+- The rasteriser is 15 ALM larger (the store +12.5, the z band +10.4, the edge +7.5 and the texture cache +7.4,
+  none of them changed but the cache; the divider −10.4, the lanes −9.4, fog −10.4, the texel filter −11.0) and its
+  means are −1.1 / +1.4 MHz, inside the seed spreads (8.4 / 12.4 MHz this round, 5.9 / 5.3 for the base). Every
+  family round 2 changed moved up: the texture cache into its tag RAM (`tcache → dpram_rlo1`, the hold) from
+  108.2 / 114.1 / 130.5 to 124.3 / 131.0 / 131.1 MHz, the divider into the edge from 121.6 to 125.3 at worst, colour's
+  ring M10K from 115.0 to 128.3. The worst path in two seeds of three is the z band's own advance (`a_x → b_a0`, `a_x →
+  a_p1`; 106.1 and 110.7 MHz, 110.8 to 116.1 in the base), RTL this round did not touch; in the third it is the cache's
+  skid valid (`sk_v`, 114.5 MHz) through `i_ready` into the z band's `a_go` and its M10K write enable: the same `a_go`
+  chain, entered from the cache's skid (`i_ready` is unchanged; 154.7 MHz or better in the base's three seeds). So the rasteriser standalone
+  is the z band (not done, below), and its spread is placement.
+
+*Proof, round 2:* the whole rasteriser on sh1's nine sets (`t6`, every rasteriser change): every FRAME and STALL line
+identical to `c7`, 0 wrong, 0 violations. The geometry (400 frames × 3 games) identical to base in every line,
+per-frame cycles included, for `g5` (the registered clip address, since taken out), `g6`, `g7` and `g8` (the tree).
+The whole system (Daytona 2 from a fresh boot, configuration, extra memory, fixed CROM and NVRAM through ioctl, 40 frames) against `tc/merge/tree`: identical in every line but the simulator's speed (69,372,010 cycles, 14,705,360 SDRAM reads); built from `snap/t6`, which differs from the tree only in the geometry's polygon machine, which the boot does not reach. Lint unchanged (rasteriser, geometry, system); `quartus_map --analyze_file` on every changed file, 0 errors.
+
+*Wrong turns, round 2:*
+- The clip pool's read address as a register (`cb_ra_q`), formed from the polygon machine's next state: the pool's
+  263 address loads were behind the state's select (`P_CL0` / `P_Q1 → cba_q → xw_data` −1.77). Bit-exact on the
+  geometry bench, but its input is the next state, which waits on the outcodes and the accept: standalone the geometry
+  fell to 110.3 / 108.3 MHz (seed 1), `aw → MLAB rdaddr_reg` −0.74 ns. Taken out.
+- The light intensity's clamp registered beside `vq_r` (`dq_r`): it put `cnt → vw's MLAB → the clamp` at 122.5 MHz.
+  Taken out; `vsel` stays.
+- `p_quiet` from the mirrored next state (`pst_n`) made `eb_first → p_quiet_q` a 123.9 MHz path through the ring flags
+  P_IDLE's projection exit reads; with pq_np zero that exit cannot be taken, so the case form needs none of it.
+
+*Not done, round 2:*
+- The z band (four fits, −173 ns): `a_go` into A's and B's ~270 enables, the scoreboard compare in front. A skid would
+  make `s_ready` a register, but it moves cycles (D-48); the scoreboard's next state has two compare layers.
+- The clip pool's address select (above): needs the next state without the outcodes, which I have not found a cheap
+  form for.
+- `r3d_fp_add` stage B (four fits): the byte normalise's zero tests after the sum; the parallel form costs about 40
+  ALM an adder, six adders.
+- `r3d_texup`, colour's DSP and ring M10K, `r3d_vpu → r3d_fp_mul`, `m3_tilegen_fetch` (x through the map add, the
+  stencil and the name lookup into the next state: it can be cut only by precomputing from S_SETUP's next values),
+  `rst_rast` into the rasteriser's tables (the loads would have to leave the reset, which is exact only if a record
+  rewrites every field it uses), `sysmem f2sdram → r3d_mem` (the HPS port's ready, combinational by Avalon, from a fixed
+  site: one fit).
+
+**R147 — Real3D timing toward 120 MHz (D-50): four cycle-exact cuts kept, the z band's registered advance taken
+out, the cycle trades priced on the bench**
+
+*What I believed:* the z band's `a_go` (the worst Real3D family in every 110 MHz full fit, −173 ns over four) needed
+a skid, which moves cycles; the clip pool's select needed the polygon machine's next state (round 2's `cb_ra_q` took
+the geometry to 110 MHz). At 120 MHz the Real3D's failing set is about eight times 110's: −8,005 ns summed over the
+same four fits (the geometry −1,171, the z band −815, `edge → div_lane` −531, the texture cache −431, `r3d_texup` −342,
+`r3d_vpu → r3d_fp_mul` −351, `r3d_fp_add` −272 / −393 at −40 °C, colour −258).
+
+*What is now known:*
+- The z band needs no skid: `s_ready` already reaches the span path through a register (the skid in `r3d_rast`). Its
+  `a_go` can be made a register exactly (`a_ok`, from the state as it will stand: the incoming pair's or A's range
+  against the scoreboard's next range, the tag flags' next values, B, C and P from the advance), and every FRAME and
+  STALL line of sh1's nine sets stays. But it does not pay. Standalone at 8.0 ns the first form cost the z band 296
+  ALM (746 → 1,042) and its own next-state input became the worst path (`sk_v → a_ok`, 101.9 MHz); the second (the
+  next count from registered flags, the pushed range's compares chosen after, two registers, the next value made for
+  each advance and incoming valid and chosen by them last) cost 320 ALM and gave 112.94 / 111.30 MHz against the
+  base's 112.75 / 113.85. The z band stays as it was. What it costs is the 32 scoreboard compares the next value needs
+  (the incoming pair's and A's), against 16.
+- The clip pool's select needs only the state's class (which of `e_last`, `e_prev`, `e_qe`, `e_cur` it reads at):
+  three one-hot flip-flops set by the moves into and out of P_CL0, P_X1 / P_X2 and P_Q0 / P_Q1. The outcodes end at
+  those, not at the pool's address. Exact (assert every cycle). It covers both `tm3` geometry worsts: `pst[0] → xw_data`
+  / `ay` (`tm3_s2`, −2.73 ns at 110 MHz) was the state's decode, two levels, in front of the MLAB's address.
+- The engine's entry was one register written by three machines, so its input was the priority of their states
+  (`tm3_s1`'s worst: `pst[1]` → two state compares → `vk_cls`'s decode → `vk_entry`, five levels, −2.49 ns). Each
+  machine now has its own and the engine's owner chooses; an assert holds that each changes only while its machine owns
+  the engine.
+- Ring B (the colour's inputs) is read a cycle early at the filter's next tag and registered again, as D1 and D2 were
+  (R104). The record's words in `r3d_rast` load outside the reset (the intake's `o_valid` is low through it). The two
+  took `r3d_rast`'s own logic from 942 to 840 ALM.
+- `r3d_texup`'s `room` and `ring_hi` are registers, a cycle late: `room` lets at most one word past its limit, which
+  keeps eight spare; `ring_hi` starts an upload a cycle later. The ring bench (Daytona 2's boot textures, held and
+  not): the sheets identical, cycles −0.008% / 0.
+- Of the four worst paths of tm2 / tm3 at 110 MHz, three are placement: `rast_interp ss15~DUPLICATE → o_shade` (one LUT,
+  12.1 ns of routing across 32 rows), `rast_recip r1s → r1s4` (no LUT, 9.5 ns), the geometry's `ref_i → ay` (two LUTs,
+  9.6 ns across 20 columns).
+
+*Standalone* (8.0 ns; seeds 1 / 2 / 3, mean; slow 100 °C / −40 °C):
+
+| Block | Variant | ALM | Fmax 100 °C | Fmax −40 °C |
+|---|---|---|---|---|
+| `r3d_rast` | base (`merge3`) | 8,149 | 112.08 / 110.95 / 115.22 (112.75) | 112.20 / 113.78 / 115.57 (113.85) |
+| | the z band's `a_ok`, first form | 8,332 | 110.63 / 109.71 / 101.90 (107.41) | 110.64 / 108.80 / 101.64 (107.03) |
+| | the z band's `a_ok`, second form | 8,386 | 107.24 / 114.59 / 117.00 (112.94) | 105.69 / 113.58 / 114.63 (111.30) |
+| | kept (`snap/r3`) | 8,132 | 117.70 / 106.87 / 114.31 (112.96) | 119.25 / 109.71 / 114.97 (114.64) |
+| `r3d_geo` | base (`merge3`) | 7,701 | 122.52 / 121.45 / 119.85 (121.27) | 121.83 / 120.02 / 114.50 (118.78) |
+| | kept (`snap/r3`) | 7,691 | 126.84 / 116.85 / 120.39 (121.36) | 124.50 / 115.66 / 120.60 (120.25) |
+| | + the multiplier's operands (not kept) | 7,742 | 118.51 / 121.54 / 124.05 (121.37) | 115.55 / 122.77 / 120.82 (119.71) |
+
+Neither block makes 125 MHz in every seed; the means move by less than the seeds spread (10 MHz).
+
+*The cycle trades* (D-50: each frame no slower at 120 MHz than at 110; each priced by building the cycle into the bench):
+
+| Trade | Cycles | Worst frame | ALM | Status |
+|---|---|---|---|---|
+| a MAC cycle (`r3d_fp_add` stage B, or `vpu → fp_mul`, or `fp_mul → fp_add`; MAC_W 13, micro-code regenerated) | geometry +3.40% / +3.10% / +3.70% (VF3 / Bass Fishing / Daytona 2) | +4.1% (Daytona 2 f011730, +2.55% of a frame); time ratio 0.971 | −8 (one seed, the sum registered) | waits for a decision |
+| a colour stage | ≤ +0.06% mean on every set | +0.13% of a frame (dt2sm) | +10 (an output register) | not taken |
+| the clip pool's address registered, a cycle when it changes | +0.16% to +0.44% | +0.5% of a frame | — | not needed (the class register is exact) |
+| `r3d_texup`'s `f_room` from `have ≤ 448` | +0.19% to +0.26% of upload time | — | — | not taken |
+| a tile generator chunk a clock longer | 0 of a frame; the slowest line 3,150 → 3,229 of 4,100 clocks | — | — | not taken |
+
+*Wrong turns:*
+- The z band's `a_ok` (both forms, above): exact, and more area than the base's fan-out it removes.
+- The multiplier's significands with their hidden bit formed in the VPU's operand stage (`r3d_fp_mul` PRE_SIG), so the
+  product's inputs are registers alone: exact (400 frames × 3, and an assert), but +74 ALM in the VPU (the copies
+  were not taken into the DSPs' input registers) and the hidden bit's test moved onto the register file's M10K output
+  (115.6 MHz at −40 °C). A function inside its generate loop failed Quartus 17's analysis (10221) where Verilator took
+  it.
+
+*How:* sh1's nine sets on the kept tree (every FRAME and STALL line of `c7`); the geometry on 400 frames × 3 games
+(every line of round 2's); planted faults on every assert (the z band's eight, ring B, the entry's two, the class
+select's three, the multiplier's); Verilator lint unchanged; `quartus_map --analyze_file` on every changed file, 0
+errors; the fits above.
+
+**R148 — The geometry's MAC a cycle longer (D-50): the adder's add and byte normalise split; +3.1-3.7% geometry
+cycles for +5.0 / +6.6 MHz standalone and 72 ALM less; the frames it costs at 120 MHz**
+
+*What I believed:* the engine's adders (`r3d_fp_add`, four in `r3d_vpu`) were the geometry's most common failing family
+at 120 MHz (`r3d_fp_add` −272 / −393 ns summed over four 110 MHz fits, read at 120; `r3d_vpu → r3d_fp_mul` −351). Under
+D-48 a pipeline stage was out; D-50 allows it if each frame at 120 MHz is no slower than at 110. A probe (the sum
+registered after the adder, the micro-code regenerated) priced it at +3.1-3.7% geometry cycles and showed one seed at
+127.6 / 124.0 MHz.
+
+*What is now known:*
+- The stage that pays is inside the adder, between stage B's add (28 bits, the sticky borrow) and its byte normalise
+  (the zero tests and the byte shift, NORM_B): `r3d_fp_add` PIPE_B2. The byte count's exponent (exp − 8 bytes + 1) is
+  formed in the new stage beside the shift, so C subtracts only its own count. The engine writes back at +12 (was
+  +11), the micro-code is regenerated with MAC_W 13 (`gen_ucode.py`), and kernels are 0-7 cycles longer (TL +1,
+  SETUP4 / SETUP2 +6, MM / MODEL / CULL +4 to +8). DIV is unchanged. Same results.
+- Standalone (`r3d_geo`, 8.0 ns, seeds 1 / 2 / 3, slow 100 °C / −40 °C):
+
+| Variant | ALM | Fmax 100 °C | Fmax −40 °C |
+|---|---|---|---|
+| without the stage (`geo_r3`) | 7,691 | 126.84 / 116.85 / 120.39 (121.36) | 124.50 / 115.66 / 120.60 (120.25) |
+| PIPE_B2 (`geo_m4mac2`) | 7,619 | 124.32 / 124.47 / 130.36 (126.38) | 124.78 / 125.06 / 130.60 (126.81) |
+
+  The VPU is 87 ALM smaller (each split adder about 20 ALM smaller: the fitter no longer duplicates the add for the
+  normalise), and the worst seed is 124.3 MHz against 115.7.
+- Geometry cycles (400 frames a game; Scud Race 378), triangle for triangle the same as without the stage:
+
+| Game | mean | worst frame over a quarter frame | longest frame (cycles) |
+|---|---|---|---|
+| VF3 | +3.40% | +3.97% | 1,435,668 → 1,487,564 |
+| Bass Fishing | +3.10% | +3.77% | 1,336,029 → 1,378,808 |
+| Daytona 2 | +3.70% | +4.14% (+2.55% of a frame) | 2,121,212 → 2,202,491 |
+| Scud Race | +3.64% | +4.06% | 3,067,760 → 3,171,930 |
+
+  The worst frame's time at 120 MHz against 110 without the stage is 0.971 (Daytona 2): D-50 is met on every frame.
+- Frames, each frame's time as max(geometry, rasteriser) against the 57.52 Hz vsync (the rasteriser from sh1's runs,
+  MAME's lists and Supermodel's rows): against 110 MHz without the stage, no frame on any game is later, and the frames
+  over a period fall (Scud Race 150 → 123 of 378, Daytona 2 24 → 8 and 32 → 11). Against 120 MHz without the stage, the
+  stage pushes 27 of Scud Race's 378 frames past a vsync (its geometry is the longer in 303 of them, at about 79% of a
+  110 MHz frame on average), Daytona 2's 4 / 3 of 400, VF3's and Bass Fishing's none. So the stage pays only if it is
+  what lets the geometry close 120: alone it costs Scud Race about 7% of its frames against a 120 MHz build that
+  closes without it.
+- Full fits at 120 MHz, seed 3 (one each; fb_s3 is commit 1 with the 120 MHz PLL):
+
+| Fit | setup 100 °C / −40 °C | TNS 100 °C / −40 °C | failing (100 °C; without u_cpu) | hold, four corners | HDMI | ALM |
+|---|---|---|---|---|---|---|
+| fb_s3 | −2.411 / −2.555 | −2,861 / −2,263 | 5,898; 2,565 | +0.091 / +0.081 / +0.107 / +0.066 | +0.033 | 40,942 |
+| merge4b_s3 (rounds 2-3, PIPE_B2) | −2.652 / −2.594 | −3,482 / −2,607 | 6,587; 2,278 | +0.159 / +0.142 / +0.134 / +0.095 | +0.181 | 40,934 |
+| r3m_s3 (round 3 + PIPE_B2) | −2.966 / −2.802 | −4,368 / −3,104 | 7,446; 2,664 | +0.178 / +0.123 / +0.131 / +0.106 | −0.677 | 41,011 |
+| r2_s3 (round 2) | −2.428 / −2.597 | −4,307 / −3,162 | 7,543; 3,684 | +0.143 / +0.173 / +0.133 / +0.103 | −0.373 | 41,063 |
+
+  The CPU, unchanged in all four, sets the worst slack in each and moves from 3,333 to 4,309 / 4,782 / 3,859 failing
+  endpoints: seed 3 alone cannot rank these trees. Without the CPU, the merged tree has the fewest (2,278 against
+  2,565). The geometry's endpoints do not fall in any of them (843 → 901 / 941 / 1,236): standalone it closes 124-130
+  MHz, in the full design the placement has it.
+
+*Wrong turns:*
+- The byte count's exponent formed in stage B for every NORM_B adder, the facing unit's (not split) included: there
+  the subtract came after the zero tests in one stage, and its stage B fell to 108.2 MHz (geometry 117.18 / 109.82 MHz
+  standalone, `sA_small → s1_expb`). Now only where B is split; the merged full fit `merge4_s3` had it (−2.709 /
+  −2.632, ALM 40,899).
+- The probe's register after the adder priced the cycles correctly but is not where the delay is.
+
+*How:* the geometry on 400 frames × 3 games and Scud Race's 378 (every triangle field against the model; base and the
+stage identical in every line but cycles); planted faults (write-back at +11 with the split adder, PIPE_B2 off with
+the +12 write-back, the sticky held at 0, the exponent's + 1 dropped: each fails every frame); the whole system (Daytona
+2 from a fresh boot, 40 frames: identical, 69,372,010 cycles; it does not reach the engine); `quartus_map
+--analyze_file` on every changed file; Verilator lint unchanged; the fits above.
+
+*The merged tree at 120 MHz, three seeds* (`sm3-builds/tc/merge4`: rounds 2-3, PIPE_B2, round 2's `rst_cpu`, on c3a4f62 with the 120 MHz PLL; `fb` is c3a4f62 with the same PLL):
+
+| Mean of seeds 1-3 | `fb` | `merge4b` |
+|---|---|---|
+| Setup 100 °C / −40 °C | −2.928 / −2.979 ns | −2.816 / −2.645 ns |
+| TNS 100 °C / −40 °C | −3,976 / −3,090 ns | −3,468 / −2,678 ns |
+| Failing endpoints, 100 °C (without the CPU) | 6,990 (3,057) | 6,049 (2,188) |
+| Geometry endpoints / worst, 100 °C | 877 / −2.121 | 771 / −2.036 |
+| ALM | 40,901 | 40,977 |
+
+Hold is positive at every corner in all six fits, and HDMI in all three of `merge4b`'s. The geometry stays about 2 ns short of 120 MHz in the full build although it closes 124-130 MHz alone, so the stage has not yet paid for its Scud Race frames there; I keep it because the tree is better on every mean. `merge4b_s3` (RBF de82cc13) on the board, 2026-11-09: Daytona 2 looks right, at the same frame rate as at 110 (R141).

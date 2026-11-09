@@ -165,8 +165,14 @@ module r3d_rast_tcache #(
   logic [DB:0]   pix_n, rd_n;              // pixels into the FIFO, pixels read
   logic [SB:0]   sw_n;                     // tag sweep: sets left
   logic          sw_q;                     // the cycle after the sweep: C's rows were read under it
+  // the sweep as the register sw_nz (= sw_n != 0, below), and the hold as a register of its own: hold_q is
+  // sw_nz || sw_q one cycle on, which is sw_nz || inval (sweeping, or a sweep starts; sw_q is the cycle after).
+  // The sweep counter's zero test was in front of a_go, c_go and A's enables (sw_n -> a_ln / a_row, -1.34 ns in a
+  // 110 MHz merged fit).
   wire           sweeping = sw_n != '0;
-  wire           hold = sweeping || sw_q;
+  logic          sw_nz;                    // = sweeping, as a register
+  logic          hold_q;
+  wire           hold = hold_q;
 
   // ---- W: the tag write of the last allocation, and Wq the one before -------------------------
   logic          w_v, wq_v;
@@ -176,7 +182,7 @@ module r3d_rast_tcache #(
   logic [RW-1:0] w_base;                   // the set's row before W's entry
   always_comb begin
     twe = w_v; twa = w_set; twd = put(w_base, w_way, w_tg);
-    if (sweeping) begin twe = 1'b1; twa = SB'(sw_n - 1'b1); twd = '0; end
+    if (sw_nz) begin twe = 1'b1; twa = SB'(sw_n - 1'b1); twd = '0; end
   end
 
   // ---- L0 -----------------------------------------------------------------------------------
@@ -193,7 +199,6 @@ module r3d_rast_tcache #(
   logic [19:0]   sk_a [4];
   logic [3:0]    sk_use;
   logic [PW-1:0] sk_pay;
-  logic          sw_nz;                    // = sweeping, as a register
   assign i_ready = !sk_v && !sw_nz;
   wire           l0_free = !l0_v || c_go;
   logic [17:0]   l0_ln [4];
@@ -201,6 +206,7 @@ module r3d_rast_tcache #(
 
 `ifdef VERILATOR
   always_ff @(posedge clk) if (!rst && sw_nz != sweeping) $fatal(1, "tcache: sw_nz");
+  always_ff @(posedge clk) if (!rst && hold_q != (sweeping || sw_q)) $fatal(1, "tcache: hold registered");
 `endif
 
   // ---- C: compare -----------------------------------------------------------------------------
@@ -467,15 +473,16 @@ module r3d_rast_tcache #(
   always_ff @(posedge clk) begin
     if (rst) begin
       l0_v <= 1'b0; c_v <= 1'b0; a_v <= 1'b0; o_valid <= 1'b0; r_v <= 1'b0; ph_v <= 1'b0; sk_v <= 1'b0;
-      sw_nz <= 1'b1;
+      sw_nz <= 1'b1; hold_q <= 1'b1;
       w_v <= 1'b0; wq_v <= 1'b0; sw_q <= 1'b0; c_mw <= '0; c_mq <= '0;
       alloc_n <= '0; iss_n <= '0; done_n <= '0; pix_n <= '0; rd_n <= '0; rd_n1 <= (DB+1)'(1);
       fq_full <= 1'b0; pf_full <= 1'b0;
       sw_n <= (SB+1)'(SETS); rr <= '0; bb_wp <= '0; bb_rp <= '0; wk <= 2'd0;
     end else begin
-      if (inval && !sweeping) begin sw_n <= (SB+1)'(SETS); sw_nz <= 1'b1; end
-      else if (sweeping) begin sw_n <= sw_n - 1'b1; sw_nz <= sw_n != (SB+1)'(1); end
-      sw_q <= sweeping;
+      if (inval && !sw_nz) begin sw_n <= (SB+1)'(SETS); sw_nz <= 1'b1; end
+      else if (sw_nz) begin sw_n <= sw_n - 1'b1; sw_nz <= sw_n != (SB+1)'(1); end
+      sw_q <= sw_nz;
+      hold_q <= sw_nz || inval;
       // L0 and its skid
       if (l0_free) begin
         if (sk_v) begin
@@ -514,7 +521,7 @@ module r3d_rast_tcache #(
         a_hit <= c_hit; a_ok <= ~c_use; a_use <= c_use; a_pay <= c_pay;
         a_qb <= c_use & c_hit;
         for (int b = 0; b < 4; b++) a_wo[b] <= WAYS'(1) << c_hway[b];
-      end else if (sweeping) begin
+      end else if (sw_nz) begin
         for (int b = 0; b < 4; b++) a_row[b] <= '0;   // a row read before the upload is not written back
       end else begin
         for (int b = 0; b < 4; b++) a_row[b] <= a_rowe[b];
@@ -526,10 +533,10 @@ module r3d_rast_tcache #(
       // W, Wq
       w_v <= alloc; w_set <= a_set_mb; w_way <= vic; w_tg <= a_tag_mb; w_base <= a_rowe[mb];
       for (int b = 0; b < 4; b++) a_wm[b] <= a_go ? (set_of(c_ln[b]) == a_set_mb) : a_ss[b][mb];
-      wq_v <= w_v && !sweeping; wq_set <= w_set; wq_way <= w_way; wq_tg <= w_tg;
+      wq_v <= w_v && !sw_nz; wq_set <= w_set; wq_way <= w_way; wq_tg <= w_tg;
       for (int b = 0; b < 4; b++) begin    // tra is C's set next cycle
         c_mw[b] <= alloc && tra[b] == a_set_mb;
-        c_mq[b] <= w_v && !sweeping && tra[b] == w_set;
+        c_mq[b] <= w_v && !sw_nz && tra[b] == w_set;
       end
       if (alloc) begin rr <= vic + WB'(1); alloc_n <= alloc_n + 1'b1; end
       fq_full <= (alloc && !fq_dn) ? (fq_c == NB'(F - 1)) : (!alloc && fq_dn) ? (fq_c == NB'(F + 1)) : (fq_c == NB'(F));

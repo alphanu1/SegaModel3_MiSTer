@@ -99,6 +99,9 @@ module r3d_rast_fogvp (
           if (i_last) begin
             logic [31:0] d, z;
             logic [23:0] ma;
+            /* verilator lint_off UNUSEDSIGNAL */
+            logic [23:0] mlt;               // (its borrow, bit 23)
+            /* verilator lint_on UNUSEDSIGNAL */
             logic        dz, zbad;
             k <= '0; k3 <= 1'b0; k5 <= 1'b0;
             d = k3 ? i_data : dens;
@@ -109,8 +112,14 @@ module r3d_rast_fogvp (
             kzero <= dz || zbad;
             ma = {1'b1, d[22:0]};
             mb <= {1'b1, z[22:0]};
-            if (ma < {1'b1, z[22:0]}) begin r <= {ma, 1'b0}; e <= 10'(d[30:23]) - 10'(z[30:23]) + 10'sd126; end
+            // the mantissas' compare as a subtract's borrow, a carry chain (a LUT tree from the geometry's word
+            // through the select into r and e: 110 MHz merged fit, out_data -> e -0.93 ns)
+            mlt = {1'b0, d[22:0]} - {1'b0, z[22:0]};
+            if (mlt[23]) begin r <= {ma, 1'b0}; e <= 10'(d[30:23]) - 10'(z[30:23]) + 10'sd126; end
             else begin r <= {1'b0, ma}; e <= 10'(d[30:23]) - 10'(z[30:23]) + 10'sd127; end
+`ifdef VERILATOR
+            if (mlt[23] != (ma < {1'b1, z[22:0]})) $fatal(1, "fogvp: the record's compare as a borrow");
+`endif
             q <= '0; cnt <= '0; acc <= '0;
             busy <= 1'b1;
           end

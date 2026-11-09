@@ -140,7 +140,7 @@ pll pll
 // The system clock (outclk_1). A diagnostic build at another rate changes this
 // and the PLL's outclk_1 / outclk_2 together; m3_system derives every real-time
 // count from it (pixel enable, timebase, SDRAM refresh, EEPROM, MIDI, UART).
-localparam int SYS_HZ = 110_000_000;
+localparam int SYS_HZ = 120_000_000;
 
 // memory: out of reset on PLL lock, and stays out (study rules)
 reg [2:0] mem_rst_s = 3'b000;

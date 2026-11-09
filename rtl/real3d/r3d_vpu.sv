@@ -51,9 +51,10 @@
 //
 // Timing (cycles from issue, the cycle the micro-word is out of the ROM):
 // register files and side memories are read synchronously (+1), operands are
-// registered at +1, product at +5, sum at +10 (the adder's align stage is
-// split, PIPE_A2), chosen for write-back at +11 and written from a register
-// at the end of +12, readable by an instruction issued at +13. DIV lane k is
+// registered at +1, product at +5, sum at +11 (the adder's align stage is
+// split, PIPE_A2, and its add from its byte normalise, PIPE_B2: study D-50),
+// chosen for write-back at +12 and written from a register at the end of +13,
+// readable by an instruction issued at +14. DIV lane k is
 // written at the end of +15+k. The micro-code generator (sim/real3d/gen_ucode.py) schedules
 // around these figures, so the engine has no interlocks. A word with valid = 0
 // holds the sequencer for ra more cycles. The external port loads and reads
@@ -214,7 +215,7 @@ module r3d_vpu
   assign bc0_v = bc0_q[r_bk0];
   assign bc1_v = bc1_q[r_bk1];
 
-  // ---- control pipeline to write-back (+11) --------------------------------
+  // ---- control pipeline to write-back (+12) --------------------------------
   typedef struct packed {
     logic       v;
     logic       div;
@@ -225,7 +226,7 @@ module r3d_vpu
     logic       wrf, wbc, wside;
     logic [4:0] dstb;
   } wctl_t;
-  wctl_t wq [1:11];
+  wctl_t wq [1:12];
   always_ff @(posedge clk) begin
     wq[1].v     <= u_valid;
     wq[1].div   <= u_div;
@@ -237,10 +238,10 @@ module r3d_vpu
     wq[1].wbc   <= u_wbc;
     wq[1].wside <= u_wside;
     wq[1].dstb  <= u_dstb;
-    for (int q = 2; q <= 11; q++) wq[q] <= wq[q-1];
+    for (int q = 2; q <= 12; q++) wq[q] <= wq[q-1];
   end
   logic mac10;
-  assign mac10 = wq[11].v && !wq[11].div;
+  assign mac10 = wq[12].v && !wq[12].div;
 
   // ---- divide / reciprocal: four lanes through one unit ---------------------
   logic [31:0] opA [4], opB [4];
@@ -371,14 +372,14 @@ module r3d_vpu
       .out_valid(pv), .result(prod), .overflow(), .underflow(p_unf), .invalid());
     logic [31:0] sum;
     logic        sv;
-    r3d_fp_add #(.SUBNORM(SUBNORM), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP), .NORM_B(1'b1)) u_add (
+    r3d_fp_add #(.SUBNORM(SUBNORM), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP), .NORM_B(1'b1), .PIPE_B2(1'b1)) u_add (
       .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(c_d[4]), .sub(1'b0),
       .out_valid(sv), .result(sum), .overflow(), .underflow(s_unf), .invalid());
 
-    // post-op at +11: which constant replaces the sum, pz +0 or pk the clamp
-    // (1.0 Supermodel, 255 MAME). Only the flags are decided at +11; they are
+    // post-op at +12: which constant replaces the sum, pz +0 or pk the clamp
+    // (1.0 Supermodel, 255 MAME). Only the flags are decided at +12; they are
     // registered beside the raw result and applied on the way into each
-    // memory at +12, the cycle that otherwise only routes the register to the
+    // memory at +13, the cycle that otherwise only routes the register to the
     // memory's input (the clamp's compare and its 32-bit select in front of
     // the write-back register missed 10 ns at -40C, R73's lateack_s3)
     logic        pz, pk;
@@ -390,12 +391,12 @@ module r3d_vpu
       neg    = sum[31] && !isnan && !iszero;
       pz = 1'b0; pk = 1'b0;
       if (SM_LIGHT) begin
-        if (wq[11].post == 2'd1 && neg) pz = 1'b1;
-        else if ((wq[11].post == 2'd1 || wq[11].post == 2'd2) && !sum[31] && !isnan && sum[30:0] > 31'h3f80_0000)
+        if (wq[12].post == 2'd1 && neg) pz = 1'b1;
+        else if ((wq[12].post == 2'd1 || wq[12].post == 2'd2) && !sum[31] && !isnan && sum[30:0] > 31'h3f80_0000)
           pk = 1'b1;
       end else begin
-        if ((wq[11].post == 2'd1 || wq[11].post == 2'd3) && neg) pz = 1'b1;
-        else if (wq[11].post == 2'd3 && !sum[31] && !isnan && sum[30:0] > 31'h437f_0000) pk = 1'b1;
+        if ((wq[12].post == 2'd1 || wq[12].post == 2'd3) && neg) pz = 1'b1;
+        else if (wq[12].post == 2'd3 && !sum[31] && !isnan && sum[30:0] > 31'h437f_0000) pk = 1'b1;
       end
     end
 
@@ -403,8 +404,8 @@ module r3d_vpu
     assign div_wb = dv[11] && d_ov && dl[11] == l && dcur.lanes[l];
 
     // write-back: the result, the divide's or the external port's, chosen at
-    // +11 and registered with its post-op flags; each memory is written at
-    // +12 from the register, the flags' constant put in on the way
+    // +12 and registered with its post-op flags; each memory is written at
+    // +13 from the register, the flags' constant put in on the way
     logic        we_n, bwe_n;
     logic [7:0]  wa_n;
     logic [4:0]  bwa_n;
@@ -413,20 +414,20 @@ module r3d_vpu
     // both write in one cycle), chosen once for both files
     logic        mac_l;
     logic [31:0] rr;
-    assign mac_l = mac10 && wq[11].lanes[l];
+    assign mac_l = mac10 && wq[12].lanes[l];
     assign rr = mac_l ? sum : d_res;
     always_comb begin
       we_n = 1'b0; wa_n = ext_waddr; wd_n = ext_wdata[l];
-      if (mac_l && wq[11].wrf) begin
-        we_n = 1'b1; wa_n = wq[11].dst; wd_n = rr;
+      if (mac_l && wq[12].wrf) begin
+        we_n = 1'b1; wa_n = wq[12].dst; wd_n = rr;
       end else if (div_wb && dcur.wrf) begin
         we_n = 1'b1; wa_n = dcur.dst; wd_n = rr;
       end else if (!running && ext_we[l]) begin
         we_n = 1'b1;
       end
       bwe_n = 1'b0; bwa_n = ext_baddr; bwd_n = ext_bdata;
-      if (mac_l && wq[11].wbc) begin
-        bwe_n = 1'b1; bwa_n = wq[11].dstb; bwd_n = rr;
+      if (mac_l && wq[12].wbc) begin
+        bwe_n = 1'b1; bwa_n = wq[12].dstb; bwd_n = rr;
       end else if (div_wb && dcur.wbc) begin
         bwe_n = 1'b1; bwa_n = dcur.dstb; bwd_n = rr;
       end else if (!running && ext_bwe && ext_bbank == l) begin
@@ -437,9 +438,9 @@ module r3d_vpu
     logic        wpz, wpk, spz, spk;
     always_ff @(posedge clk) begin
       we <= we_n && !rst; wa <= wa_n; wd_r <= wd_n;
-      wpz <= mac_l && wq[11].wrf && pz; wpk <= mac_l && wq[11].wrf && pk;
+      wpz <= mac_l && wq[12].wrf && pz; wpk <= mac_l && wq[12].wrf && pk;
       bc_we[l] <= bwe_n && !rst; bc_waddr[l] <= bwa_n; bwd_r <= bwd_n;
-      sw_we[l] <= mac10 && wq[11].wside && wq[11].lanes[l] && !rst;
+      sw_we[l] <= mac10 && wq[12].wside && wq[12].lanes[l] && !rst;
       swd_r <= sum; spz <= pz; spk <= pk;
     end
     // the micro-code puts post-op results only in the lane registers, and, with
@@ -450,23 +451,23 @@ module r3d_vpu
     assign sw_data[l] = SM_LIGHT ? swd_r : spz ? 32'd0 : spk ? PK : swd_r;
 `ifdef VERILATOR
     always_ff @(posedge clk)
-      if (mac10 && wq[11].lanes[l] && (pz || pk) && (wq[11].wbc || (SM_LIGHT && wq[11].wside)))
+      if (mac10 && wq[12].lanes[l] && (pz || pk) && (wq[12].wbc || (SM_LIGHT && wq[12].wside)))
         $error("r3d_vpu: a post-op result into a memory without the post-op select");
 `endif
 
 `ifdef VERILATOR
     // subnormal monitor: operands at +2 (multiplier and divider inputs), the
-    // product and the addend at +6, the sum at +11; flushed results by flag
+    // product and the addend at +6, the sum at +12; flushed results by flag
     always_comb begin
       sn_ev[l] = 1'b0;
       if (wq[2].v && wq[2].lanes[l] && (issub(opA[l]) || issub(b_op))) sn_ev[l] = 1'b1;
       if (wq[6].v && !wq[6].div && wq[6].lanes[l] && (issub(prod) || issub(c_d[4]) || p_unf)) sn_ev[l] = 1'b1;
-      if (mac10 && wq[11].lanes[l] && (issub(sum) || s_unf)) sn_ev[l] = 1'b1;
+      if (mac10 && wq[12].lanes[l] && (issub(sum) || s_unf)) sn_ev[l] = 1'b1;
     end
 `endif
   end
   endgenerate
-  always_ff @(posedge clk) sw_addr <= wq[11].dst[6:0];
+  always_ff @(posedge clk) sw_addr <= wq[12].dst[6:0];
 
 `ifdef VERILATOR
   // pool occupancy: instructions issued, and lane operations (issue x lanes)

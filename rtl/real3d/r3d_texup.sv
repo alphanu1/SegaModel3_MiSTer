@@ -195,8 +195,14 @@ module r3d_texup #(
   // forward), and from half full an upload of everything flushed starts without
   // waiting for go (ring_hi). In steady running the ring is never half full.
   wire  [PW-1:0] occ     = wp - (busy ? dp : rp);
-  wire           room    = occ < PW'((1 << RW) - 8);
-  wire           ring_hi = occ >= PW'(1 << (RW - 1));
+  // room and ring_hi as registers, a cycle late (timing: dp through the subtract and the compare into the append's
+  // and the VROM block's enables). Late is safe: room admits at most one word past the limit, which keeps 8 spare;
+  // ring_hi only starts an upload a cycle later.
+  logic          room, ring_hi;
+  always_ff @(posedge clk) begin
+    room    <= occ < PW'((1 << RW) - 8);
+    ring_hi <= occ >= PW'(1 << (RW - 1));
+  end
   assign t_ready = !a_v && !v_on && !p2_busy && room;
 
   wire  [7:0]  htype = hdr[28:21];

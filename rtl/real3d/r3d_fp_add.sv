@@ -61,7 +61,11 @@ module r3d_fp_add #(
   // and takes the bytes off the exponent; C counts the last zero bits (0 to 7) in the top byte and
   // shifts by those. Same results, same latency; C was the leading-zero count and a 28-bit shift by a
   // 5-bit amount in one stage.
-  parameter bit NORM_B = 1'b0
+  parameter bit NORM_B = 1'b0,
+  // PIPE_B2 (Model 3 study R1xx, D-50): a register between stage B's add and its byte normalise -- LATENCY one
+  // more. B's add (28 bits, with the sticky borrow) and the byte shift's zero tests behind it were the adder's
+  // slowest stage at 120 MHz (sA_sticky -> s1_sum). Same results.
+  parameter bit PIPE_B2 = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst_n,
@@ -269,6 +273,25 @@ module r3d_fp_add #(
                  ? ({1'b0, sA_big} - {1'b0, sA_small} - {27'd0, sA_sticky})
                  : ({1'b0, sA_big} + {1'b0, sA_small});
 
+  // PIPE_B2: the sum and what travels with it, registered (q_*); passed straight through when it is 0
+  logic        q_valid, q_sign, q_eff_sub, q_sticky, q_invalid, q_nan, q_inf, q_both_zero, q_zero_sign;
+  logic [7:0]  q_exp;
+  logic [27:0] q_sum;
+  generate if (PIPE_B2) begin : g_b2
+    always_ff @(posedge clk or negedge rst_n) begin
+      if (!rst_n) q_valid <= 1'b0;
+      else begin
+        q_valid <= sA_valid;  q_sign <= sA_sign;  q_exp <= sA_exp;  q_sum <= sum_raw;  q_eff_sub <= sA_eff_sub;
+        q_sticky <= sA_sticky;  q_invalid <= sA_invalid;  q_nan <= sA_nan;  q_inf <= sA_inf;
+        q_both_zero <= sA_both_zero;  q_zero_sign <= sA_zero_sign;
+      end
+    end
+  end else begin : g_b1
+    assign q_valid = sA_valid;  assign q_sign = sA_sign;  assign q_exp = sA_exp;  assign q_sum = sum_raw;
+    assign q_eff_sub = sA_eff_sub;  assign q_sticky = sA_sticky;  assign q_invalid = sA_invalid;
+    assign q_nan = sA_nan;  assign q_inf = sA_inf;  assign q_both_zero = sA_both_zero;  assign q_zero_sign = sA_zero_sign;
+  end endgenerate
+
   logic        s1_valid, s1_sign, s1_nan, s1_inf, s1_invalid, s1_both_zero;
   logic        s1_zero_sign;
   logic [7:0]  s1_exp;
@@ -281,13 +304,18 @@ module r3d_fp_add #(
   logic [1:0]  nb_c;                       // bytes shifted
   always_comb begin
     nb_c = 2'd0;
-    if (!sum_raw[27]) begin
-      if (sum_raw[26:3] == 24'd0) nb_c = 2'd3;
-      else if (sum_raw[26:11] == 16'd0) nb_c = 2'd2;
-      else if (sum_raw[26:19] == 8'd0) nb_c = 2'd1;
+    if (!q_sum[27]) begin
+      if (q_sum[26:3] == 24'd0) nb_c = 2'd3;
+      else if (q_sum[26:11] == 16'd0) nb_c = 2'd2;
+      else if (q_sum[26:19] == 8'd0) nb_c = 2'd1;
     end
-    sum_b = sum_raw << {nb_c, 3'd0};
+    sum_b = q_sum << {nb_c, 3'd0};
   end
+  // NORM_B with PIPE_B2: C's exponent less its own count, formed here: exp - 8 bytes + 1 (with a carry out the bytes
+  // are 0, so it is also the carry's exp + 1). Only when B is split: in B's single stage the subtract after the
+  // byte test lengthened it (the facing unit's adder, 108.2 MHz standalone at -40 C)
+  localparam bit XB = NB && PIPE_B2;
+  logic signed [9:0] s1_expb;
   // B's bytes, for C's exponent (taken off there, beside C's count: in B the select after the sum's zero
   // tests was the stage's slowest path). A zero sum's exponent differs from the unsplit form's, but a
   // zero sum packs as zero before the exponent is looked at.
@@ -297,19 +325,20 @@ module r3d_fp_add #(
     if (!rst_n) begin
       s1_valid <= 1'b0;
     end else begin
-      s1_valid        <= sA_valid;
-      s1_sign         <= sA_sign;
-      s1_exp          <= sA_exp;
-      s1_sum          <= NB ? sum_b : sum_raw;
+      s1_valid        <= q_valid;
+      s1_sign         <= q_sign;
+      s1_exp          <= q_exp;
+      s1_sum          <= NB ? sum_b : q_sum;
       s1_c            <= nb_c;
-      s1_sticky       <= sA_sticky;
-      s1_invalid      <= sA_invalid;
-      s1_nan          <= sA_nan;
-      s1_inf          <= sA_inf;
+      s1_expb         <= $signed({2'b00, q_exp}) - $signed({5'd0, nb_c, 3'd0}) + 10'sd1;
+      s1_sticky       <= q_sticky;
+      s1_invalid      <= q_invalid;
+      s1_nan          <= q_nan;
+      s1_inf          <= q_inf;
       // Exact cancellation returns +0 under round-to-nearest.
-      s1_exact_cancel <= sA_eff_sub && (sum_raw == 28'd0) && !sA_sticky;
-      s1_both_zero    <= sA_both_zero;
-      s1_zero_sign    <= sA_zero_sign;
+      s1_exact_cancel <= q_eff_sub && (q_sum == 28'd0) && !q_sticky;
+      s1_both_zero    <= q_both_zero;
+      s1_zero_sign    <= q_zero_sign;
     end
   end
 
@@ -352,7 +381,7 @@ module r3d_fp_add #(
       // Carry out of the significand: shift right one, exponent up one.
       shifted  = s1_sum >> 1;
       lost_bit = s1_sum[0];
-      exp_adj  = $signed({2'b00, s1_exp}) + 10'sd1;
+      exp_adj  = XB ? s1_expb : $signed({2'b00, s1_exp}) + 10'sd1;
     end else if (SUBNORM && ({2'b00, s1_exp} < {5'd0, lzc})) begin
       // R852: the full shift would take the exponent below 1 -- shift only to
       // exponent 1 (s1_exp >= 1, so by at most 25); bit 26 stays clear and
@@ -369,7 +398,8 @@ module r3d_fp_add #(
       // (NORM_B: B has shifted by its bytes; a zero sum shifts by nothing more, as it is zero)
       shifted  = NB ? (s1_sum << (lzf - 5'd1)) : (s1_sum << (lzc - 5'd1));
       lost_bit = 1'b0;
-      exp_adj  = NB ? $signed({2'b00, s1_exp}) - $signed({5'd0, s1_c, 3'd0}) - $signed({5'd0, lzf}) + 10'sd1
+      exp_adj  = XB ? s1_expb - $signed({5'd0, lzf})
+                    : NB ? $signed({2'b00, s1_exp}) - $signed({5'd0, s1_c, 3'd0}) - $signed({5'd0, lzf}) + 10'sd1
                     : $signed({2'b00, s1_exp}) - $signed({5'd0, lzc}) + 10'sd1;
     end
   end

@@ -246,10 +246,16 @@ module m3_system
   // (preserve) so each block's reset fans out from a flip-flop of its own (rst_s[2] into the
   // rasteriser's registers was -0.52 ns at 100 MHz; study R104)
   (* preserve *) logic rst_geo = 1'b1, rst_rast = 1'b1;
+  // and one for the CPU (rst_s[2] into the FP divider's registers, -1.11 ns in a 110 MHz merged fit)
+  (* preserve *) logic rst_cpu = 1'b1;
   always_ff @(posedge clk) begin
     rst_geo  <= rst_s[1];
     rst_rast <= rst_s[1];
+    rst_cpu  <= rst_s[1];
   end
+`ifdef VERILATOR
+  always_ff @(posedge clk) if ({rst_geo, rst_rast, rst_cpu} != {3{rst}}) $fatal(1, "m3_system: the reset copies");
+`endif
   logic por_n;                       // power-on: the EEPROM and the I/O latches
   always_ff @(posedge clk) por_n <= mem_rst_n;
 
@@ -358,7 +364,7 @@ module m3_system
   localparam bit XC_ON  = XCAP    && OV_ON;
 
   ppc_cpu #(.PVR(PVR), .ISB(ISB)) u_cpu (
-    .clk, .rst,
+    .clk, .rst(rst_cpu),
     .m_req(m_req[0]), .m_cmd(m_cmd[0]), .m_addr(m_addr[0]), .m_be(m_be[0]), .m_wdata(m_wdata[0]),
     .m_ack(m_ack[0]), .m_wnext(m_wnext[0]), .m_rvalid(m_rvalid[0]), .m_rdata,
     // the D-cache snoop (D-41): the 53C810's RAM accesses, from m3_bus
