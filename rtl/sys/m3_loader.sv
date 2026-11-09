@@ -116,8 +116,10 @@ module m3_loader #(
   localparam logic [1:0] K_SDR = 2'd0, K_X = 2'd1, K_EE = 2'd2;
 
   localparam int FD = 512, FA = 9;
-  (* ramstyle = "M10K" *) logic [AW+1:0] f_adr [FD];    // {class, address}
-  (* ramstyle = "M10K" *) logic [15:0]   f_dat [FD];
+  // no_rw_check: an entry is read only while the FIFO is not empty, and a write goes to wp only while it is not
+  // full, so the two addresses never meet
+  (* ramstyle = "M10K, no_rw_check" *) logic [AW+1:0] f_adr [FD];    // {class, address}
+  (* ramstyle = "M10K, no_rw_check" *) logic [15:0]   f_dat [FD];
   logic [FA:0] wp, rp;
   wire  [FA:0] lvl = wp - rp;
   wire         f_empty = (wp == rp);
@@ -210,6 +212,15 @@ module m3_loader #(
   logic [1:0]  h_k;
   logic [AW-1:0] h_adr;
   logic [15:0]   h_dat;
+  // the drain's read: the two RAMs into their own output registers on the drain's read condition, outside the
+  // reset's branch (area pass, Model 2 R988: read inside the reset's else, Quartus read a clock early and
+  // forwarded the writes, Warning 276020, 82 flip-flops of pass-through in merge4b_s3). h_k, h_adr and h_dat
+  // load in the same clocks as before.
+  wire f_re = !rst && !wbusy && !f_empty && mem_ready && !rd_armed;
+  always_ff @(posedge clk) if (f_re) begin
+    {h_k, h_adr} <= f_adr[rp[FA-1:0]];
+    h_dat        <= f_dat[rp[FA-1:0]];
+  end
 
   always_ff @(posedge clk) begin
     ee_we <= 1'b0;
@@ -236,8 +247,7 @@ module m3_loader #(
         sdr_wr_req <= 1'b0;
         if (h_k == K_SDR && sdr_wr_ack && !ack_d) begin wbusy <= 1'b0; rp <= rp + 1'b1; end
         if (h_k == K_X && x_ack) begin x_req <= 1'b0; wbusy <= 1'b0; rp <= rp + 1'b1; end
-      end else if (!f_empty && mem_ready && !rd_armed) begin
-        {h_k, h_adr} <= f_adr[rp[FA-1:0]]; h_dat <= f_dat[rp[FA-1:0]];
+      end else if (f_re) begin
         rd_armed <= 1'b1;
       end else if (rd_armed) begin
         if (h_k == K_EE) begin

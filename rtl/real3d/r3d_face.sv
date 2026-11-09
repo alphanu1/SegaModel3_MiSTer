@@ -189,9 +189,11 @@ module r3d_face #(
   // ---- memories ------------------------------------------------------------
   logic        a_we, b_we;
   logic [4:0]  a_wa, b_wa;
-  logic [31:0] a_wd, b_wd, a_q, b_q;
+  logic [31:0] a_wd, b_wd, a_q;
   r3d_ram #(.W(32), .A(5)) u_a (.clk, .we(a_we), .wa(a_wa), .wd(a_wd), .ra(op_aa), .rq(a_q));
-  r3d_ram #(.W(32), .A(5)) u_b (.clk, .we(b_we), .wa(b_wa), .wd(b_wd), .ra(op_ba), .rq(b_q));
+  // B in an M10K (area pass): its registered read is br_q, which was b_q registered every clock; r3d_ram's callers
+  // never read a word in the cycle it is written
+  r3d_ram #(.W(32), .A(5), .SYNC(1'b1), .BLOCK(1'b1)) u_b (.clk, .we(b_we), .wa(b_wa), .wd(b_wd), .ra(op_ba), .rq(br_q));
 
   // ---- the multiply-add ----------------------------------------------------
   // t: read; t+1 convert; t+2 multiplier in; t+11 sum (the adder's align
@@ -205,6 +207,12 @@ module r3d_face #(
   logic [31:0] prod, sum /* verilator public_flat_rd */, sd1, sd2;
   typedef struct packed { logic v; logic [2:0] k; logic [1:0] j, slot; logic par; } wb_t;
   wb_t         wb [1:11] /* verilator public_flat_rd */;
+  // the write-back tag at +11 (area pass): v from the chain of registers (it is reset), {k, j, slot, par} from
+  // r3d_dline, the words wb[1] held ten clocks before, as the chain gave them (wb[2 .. 11] hold only v)
+  wb_t         wb11;
+  logic [7:0]  wbf11;
+  r3d_dline #(.W(8), .D(10)) u_wbf (.clk, .en(1'b1), .d({wb[1].k, wb[1].j, wb[1].slot, wb[1].par}), .q(wbf11));
+  assign wb11 = {wb[11].v, wbf11};
 
   // raw 24-bit integer (signed, or unsigned with !sgd) x 2^(eb - 127) to
   // FP32, exact. One converter for the position, normal and NP words. The
@@ -228,7 +236,7 @@ module r3d_face #(
   always_ff @(posedge clk) begin
     logic [7:0] eb;
     logic       sg;
-    ar_q <= a_q; br_q <= b_q; ak_q <= op_ak; bc_q <= op_bc;
+    ar_q <= a_q; ak_q <= op_ak; bc_q <= op_bc;
     sg = !(LOD && op_ak == A_NP) && a_q[23];
     ar_s <= sg; ar_m <= sg ? (~a_q[23:0] + 24'd1) : a_q[23:0];
     eb = (ak_q == A_NRM) ? 8'd105 : (LOD && ak_q == A_NP) ? (step15 ? 8'd113 : 8'd115) : step15 ? 8'd116 : 8'd120;
@@ -244,7 +252,7 @@ module r3d_face #(
     for (int q = 2; q <= 5; q++) c0_d[q] <= c0_d[q - 1];
     sd1 <= sum; sd2 <= sd1;
     wb[1] <= '{v: op_v && op_wk != W_NO, k: op_wk, j: op_wj, slot: op_wslot, par: op_wpar};
-    for (int q = 2; q <= 11; q++) wb[q] <= wb[q - 1];
+    for (int q = 2; q <= 11; q++) wb[q].v <= wb[q - 1].v;
     if (rst) for (int q = 1; q <= 11; q++) wb[q].v <= 1'b0;
   end
 
@@ -258,20 +266,20 @@ module r3d_face #(
   // ---- write-back (t+11): V into A, N and Q into B, the verdict, B, C -----
   logic wv /* verilator public_flat_rd */, wn /* verilator public_flat_rd */, wd /* verilator public_flat_rd */;
   logic wq, wbo, wc;
-  assign wv = wb[11].v && wb[11].k == W_V;
-  assign wn = wb[11].v && wb[11].k == W_N;
-  assign wd = wb[11].v && wb[11].k == W_D;
-  assign wq = LOD && wb[11].v && wb[11].k == W_Q;
-  assign wbo = LOD && wb[11].v && wb[11].k == W_B;
-  assign wc = CMUL && wb[11].v && wb[11].k == W_C;
+  assign wv = wb11.v && wb11.k == W_V;
+  assign wn = wb11.v && wb11.k == W_N;
+  assign wd = wb11.v && wb11.k == W_D;
+  assign wq = LOD && wb11.v && wb11.k == W_Q;
+  assign wbo = LOD && wb11.v && wb11.k == W_B;
+  assign wc = CMUL && wb11.v && wb11.k == W_C;
   assign in_hold = wv;
   assign t_hold  = wn || wq;
   always_comb begin
     a_we = wv || in_we;
-    a_wa = wv ? {wb[11].slot, 1'b0, wb[11].j} : {fp, in_word};
+    a_wa = wv ? {wb11.slot, 1'b0, wb11.j} : {fp, in_word};
     a_wd = wv ? sum : {8'd0, in_d};
     b_we = wn || wq || t_we;
-    b_wa = wn ? {wb[11].par, wb[11].j, 2'd3} : wq ? {wb[11].par, 2'd3, 2'd3} : {t_buf, t_row, t_col};
+    b_wa = wn ? {wb11.par, wb11.j, 2'd3} : wq ? {wb11.par, 2'd3, 2'd3} : {t_buf, t_row, t_col};
     b_wd = (wn || wq) ? sum : t_d;
   end
   logic s_nan, s_zero;
@@ -299,7 +307,7 @@ module r3d_face #(
         v_valid <= 1'b1;
         v_gt <= !sum[31] && !s_zero && !s_nan;
         v_lt <= sum[31] && !s_zero && !s_nan;
-        full[wb[11].slot] <= 1'b0; started[wb[11].slot] <= 1'b0;
+        full[wb11.slot] <= 1'b0; started[wb11.slot] <= 1'b0;
       end
       // a period starts with the next filled slot whose matrix is in, and
       // runs while it or the polygon before it has work

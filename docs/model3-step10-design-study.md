@@ -1082,7 +1082,7 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-23 | FPSCR bit 20 follows Supermodel: mtfsf, mtfsfi and mtfsb write it and mffs reads it back. The PEM lists it only as "Reserved" (PEM Rev 2, Table 2-4) and documents nothing more, so D-17's rule applies. R29 already builds it this way. |
 | D-24 | Following R52, a 256-entry branch target buffer and 603e-style dual issue (two instructions dispatched a cycle to different units, 603e manual §6) are estimated and measured before either goes into the core. The BTB is built and verified standalone first. Dual issue is costed in area and Fmax from standalone prototypes of its register-file ports, forwarding and pairing logic, in variants, and then decided. |
 | D-25 | D-19 refined: Real3D documentation and real-hardware footage outrank Supermodel. Supermodel is followed where it corrects real behaviour that MAME gets wrong (lighting values, culling, colour table, transparency). Its additions for a PC renderer are left out unless the hardware shows them, for example per-fragment lighting (R51: Gouraud) or anything that costs area for no measurable image change. So row 18's per-polygon normal memory (+252 ALM, no measurable change, R55) comes out, and row 6's LOD (400–600 ALM, about 0.1% of pixels) is not built. Both stay as model switches, to come back if the hardware footage shows them. Area keeps the first call on every block (R54). |
-| D-26 | The core is built with `MISTER_DUAL_SDRAM`. The second SDRAM takes the analog I/O board's header, so there is no analog video and no analog audio jack; HDMI carries both. That drops the framework's VGA path (OSD for VGA, the VGA scaler output, csync and subcarrier, the analog audio DACs), which Model 2 measured at about 600 ALM and 5 M10K in vga_osd and vga_scaler_out alone (Model 2A study, framework list). Measured on this core in R57. Model 2's other framework switches (`MISTER_DOWNSCALE_NN`, `_DISABLE_ADAPTIVE`, `_DISABLE_YC`, `_DISABLE_ALSA`) are taken too, but **not** Model 2's audio-filter patch: this core keeps the framework's audio filter. |
+| D-26 | (Suspended until the second SDRAM is fitted, R150.) The core is built with `MISTER_DUAL_SDRAM`. The second SDRAM takes the analog I/O board's header, so there is no analog video and no analog audio jack; HDMI carries both. That drops the framework's VGA path (OSD for VGA, the VGA scaler output, csync and subcarrier, the analog audio DACs), which Model 2 measured at about 600 ALM and 5 M10K in vga_osd and vga_scaler_out alone (Model 2A study, framework list). Measured on this core in R57. Model 2's other framework switches (`MISTER_DOWNSCALE_NN`, `_DISABLE_ADAPTIVE`, `_DISABLE_YC`, `_DISABLE_ALSA`) are taken too, but **not** Model 2's audio-filter patch: this core keeps the framework's audio filter. |
 | D-27 | Hard per-block ALM budgets, totalling about 40,830 against a 41,000 working ceiling. Framework plus CPU 17,780 (R57's measured 17,266, plus the D-21/D-22 FPU at +910 and a BTB at about +200, less about 600 of test harness). Real3D geometry 8,550. Rasteriser 8,000. Sound 3,000 (68000 plus both SCSPs on one engine plus glue). Everything else 3,500 (tile generator, SDRAM and DDR3 controllers, PCI bridge, I/O and SCRIPTS, Real3D command and texture upload). Dual issue does not fit and is not built; the CPU stays single-issue and gains CPI through cheap levers. Every block works to its number with §8.4 sharing first, and a block over its number is paid back from another block, recorded in an R-entry. |
 | D-28 | The rasteriser runs at 100 MHz, every cycle, at half R46's width: 2 Z tests and 1 shaded, bilinear-textured pixel a clock (4 texels a clock), the same throughput as 4 + 2 at 50 MHz (VF3 p99 about 66% of a frame). Halving the lanes, texel ports and DSPs is how it meets D-27's 8,000 ALM. The whole Real3D, CPU and SDRAM then share one 100 MHz clock, with no crossings inside the core. D-3's 50 MHz Real3D clock is withdrawn (R50 already moved the geometry). Every rasteriser block closes at 100 MHz. |
 | D-29 | Sound keeps FM: it is used, so `FM` stays on in the shared SCSP engine. The sound engine runs at 80 MHz, as Model 2's does (R59), from the main PLL with an 800 MHz VCO (100 / 80 / 50 MHz), with one crossing to the SDRAM. Translucency is the plain blend (R62 mode 0, MAME's), with no extra M10K; modes 1 and 2 stay as parameters. |
@@ -1110,6 +1110,9 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-51 | (2026-11-08) Sound goes on the HPS's ARM: the 68000 and the two SCSPs emulated there, the samples streamed to the FPGA's audio out. This takes D-45's fallback as the plan and frees its ~4,500 ALM reservation; the I/O stays in the FPGA (its ~1,000 ALM was an overstatement: about 400 more than the core has now, R143). It must still meet the zero-added-latency rule and leave MiSTer Main its share of the CPU. Area work waits until 120 MHz (D-50) is close to closing, and then runs on its own branch. The blocks outside the CPU and the Real3D (bus, SDRAM and DDR3 ports, SCSI, texture upload, tile generator, I/O, JTAG, loader, security: about 5,370 ALM in `tm1_s2`) are the first place to look. |
 | D-52 | (2026-11-09) The CPU gets its own clock domain at 110 MHz; SDRAM, DDR3, the bus, the Real3D and the rest go to 120 MHz (R141). The crossing is the CPU's own ports: the m_* master port, the D-cache snoop and ext_int; the timebase stays in the CPU's domain. Each domain closes on its own and its clock is its own setting. The CPU's goal stays 120 MHz, so the split is the way there, not the end. (At 120 Daytona 2's loop still misses its deadline by 3%; the Real3D DMA's speed and the rasteriser stand between it and 60 Hz: R141.) The CPU's clock rises as it closes. CPU changes stay under D-48 (no added cycles) even after that: at 120 Daytona 2's loop has about 3% to spare, so a cycle the CPU loses is a frame rate the game loses. Geometry alone at 120 (split A in R141) is the fallback. |
 | D-53 | (2026-11-09) The SCSP DSP goes in the FPGA; the 68000 and the slots stay on the HPS's core 0 (R145). One core holds the average but not the worst seconds of play, and MiSTer Main spins on core 1, so taking time there would risk its input handling. The DSP follows Supermodel's pipeline, bit-exact against the ARM version under the same fuzz. About 700 ALM (my Model 2 core's `m2_scsp_dsp` is 537 for one chip), so area work starts now rather than waiting for 120 MHz, on its own branch, under D-48. |
+| D-54 | (2026-11-09) What the area work (D-53) may not take: no split into Step 1.x and Step 2.x cores (D-42 stands, one core; −724 ALM at map, R128); the FPS counter stays until the core is tested at full speed (−168 at map); and no edits to the framework's `sys/`, which stays stock (hps_io's video_calc, the OSD, the audio filter and pll_hdmi_adj are left alone). The rest is the zero-cycle list: storage out of flip-flops into MLAB or M10K, RAMs without bypass logic, §8.4's techniques. |
+| D-55 | (2026-11-09) The FPGA SCSP DSP (D-53) keeps its two 32K-word effect rings in M10K, not DDR3: 128 of its 135 M10K, no ALM, and no dependent DDR3 traffic against the rasteriser (D-48). The area work (D-54) may use what M10K is left after that. The sound path's fixed delay starts at the design's 256 samples (5.8 ms) and is cut on the board if it is not good; the DSP itself adds one sample. |
+| D-56 | (2026-11-09) The rasteriser's pair queue (R149) is taken although it is not zero-cycle frame by frame: the mean replay falls 4-9% on every census set and Daytona 2's system frames by 13.6%, while 7-38 frames of about 400 a set (none in VF3) are up to 360 clocks slower (0.02% of a frame), contour verdicts returning later behind a fuller queue. An exception to D-48 for this change only: the frame rate it gives outweighs the rare 0.02%. |
 
 ### Open
 
@@ -12667,6 +12670,25 @@ log is identical to base in order, and a planted FIFO fault is caught. As modell
 *Wrong turn.* The first form made reads wait for the FIFO to drain. The DMA device's status read then held the bus for
 about 200k clocks and the CPU gained only 0.012 vblank.
 
+*Built (bench RTL, `sm3-builds/tc/cpu/d2/tree`, `M3_R3B` + `M3_DMAFAST`).* `r3d_mem` gathers 8E writes into aligned
+four-word groups and writes each copy as one eight-column burst (the controller's existing write-burst mode on port 4),
+W before R, both before any copy or swap; `r3d_cmd` holds 32 posted writes in MLAB, the swap waits for them, reads do
+not. A move costs 14.9 clocks a word and 8E drains at about 5.6.
+
+| Per loop (vblanks) | 110 base | 110 bursts | 120 base | 120 bursts |
+|---|---|---|---|---|
+| CPU reaches 4C6FC (deadline 1.000) | 1.116-1.124 | 1.019-1.024 | 1.028-1.032 | 0.929-0.941 |
+| DMA wait | 0.138 | 0.046 | 0.131 | 0.041 |
+| Loop | 2.000 | 2.000 | 2.000 | 1.000, 15 of 15 |
+
+At 120 MHz Daytona 2's loop now makes 60 Hz on every loop measured, steady; the rasteriser is then busy all the time
+(R149's FIFO is its fix). At 110 it misses by 2%: the CPU's own work is 0.975 vblank there, so no DMA change can give it
+margin; one snoop a move and overlapped line writes (priced, not built) are worth about 0.019 vblank. The Real3D write
+log is identical to base in order at both clocks, both 8E copies match at the saved idle point, and two planted faults
+(a FIFO word, burst columns a word late) are caught. VF3's first 897,272 Real3D writes are identical; it then makes a
+frame on time that base made late, and only timing moves. Cost by `quartus_map`: `r3d_mem` +172 ALM, `r3d_cmd` +10,
+`m2_sdram` +4, about +196 with the column mux, no M10K.
+
 **R145 — The sound board on the ARM, second board run (2026-11-09, `model3_bench` s15 8dde4f0b, the VF3 set on `tm1_s2`):
 with the cache-aware changes the average fits core 0, but the worst seconds of play do not, and MiSTer Main leaves
 nothing of core 1 free.**
@@ -12951,3 +12973,292 @@ the +12 write-back, the sticky held at 0, the exponent's + 1 dropped: each fails
 | ALM | 40,901 | 40,977 |
 
 Hold is positive at every corner in all six fits, and HDMI in all three of `merge4b`'s. The geometry stays about 2 ns short of 120 MHz in the full build although it closes 124-130 MHz alone, so the stage has not yet paid for its Scud Race frames there; I keep it because the tree is better on every mean. `merge4b_s3` (RBF de82cc13) on the board, 2026-11-09: Daytona 2 looks right, at the same frame rate as at 110 (R141).
+
+**R149 — Daytona 2's rasteriser at 1.07 vblanks in the system against 0.43 on the census frames: the frames, not the
+memory. The early attract overdraws about 15 times, two thirds of the pairs fail Z, and each rejected pair still takes a
+z-band cycle while the pixel stage idles. A FIFO of passed pairs between the z band and the pixel stage is the lever
+there, not the texture cache.**
+
+Measured in a copy of the d2 system bench with the rasteriser's profile counters (frames 1300-1312, the faster-DMA
+model, 120 MHz, `sm3-builds/tc/r3d4/d2`):
+
+| | System, 9 drawn frames | Census, 400 frames |
+|---|---|---|
+| Busy per drawn frame | 2,237,679 cycles (1.073 vblanks) | 905,804 (0.43) |
+| Pixels tested / shaded | 2,924,603 / 968,561 (33% pass) | about 482,000 / 330,000 (68%) |
+| Pixel stage idle on Z-rejected pairs | 43.9% | 8.0% |
+| Pixel stage idle on the front | 3.8% | 31% |
+| Texture misses | 5.0% | 21.6% |
+
+"Busy" counts the same replay in both. Texture fills in the system take 41.9 cycles from acknowledge to first beat (the
+bench model 13-40), but misses are 5% of the frame, so memory latency is not the cause.
+
+| Variant (system frames) | Busy per drawn frame | Vblanks at 120 MHz | Cost (est.) |
+|---|---|---|---|
+| Base | 2,237,679 | 1.073 | |
+| 16-pair FIFO | 2,086,567 (−6.8%) | 1.000 | about 60 ALM in MLAB, or 3 M10K |
+| 64-pair FIFO | 2,017,178 (−9.9%) | 0.967 | 3 M10K, about 20 ALM |
+| 16 fills in flight + 64 KiB cache (D-33's options) | 2,203,275 (−1.5%) | 1.056 | about 50 ALM, 26-32 M10K |
+| 64-pair FIFO + D-33's options | 1,983,243 (−11.4%) | 0.951 | about 3 + 29 M10K |
+
+On the census frames the order was the reverse (16 fills −6.3%, 64 KiB −3.9%, 16-pair FIFO −1.6%). So D-33 stays open
+until the board's DDR3 is measured, and the FIFO comes first. After it the floor is the pairs themselves, one a clock,
+about 0.70 vblank; more needs a second Z-test lane, not priced. The Pro-1000 sheet's 50 M pixels a second per pixel
+processor, with one to four per geometry unit, and its "basic system performance is specified as 30 Hz, but 60 Hz update
+is also available", is the only hardware figure, and Model 3's configuration is not public.
+
+*Wrong turn.* I quoted the system's 1.05-1.10 and the bench's census frames as if they measured the same scene. They
+did not, and the census put the texture cache first.
+
+**R150 — `MISTER_DUAL_SDRAM` was on in every build since the first commit, with the analog I/O board still on the
+header. It is off now, until the second SDRAM is fitted.**
+
+D-26 set it from the start (`Model3.qsf` sourced `sys/sys_dual_sdram.tcl`, which sets the macro and the SDRAM2 pins).
+On 2026-11-02 I said it could not be set yet: the analog board is still plugged in, its DIP switch is not set for a
+second SDRAM, and the board gives the 15 kHz analog video and audio. That was never acted on, and R97's addendum and the
+framework-switch census later recorded it as "already on" without asking why. So every RBF so far had no analog video
+and no analog audio; HDMI carried both, which is why nothing looked wrong. `Model3.sv` drives the SDRAM2 pins as 'Z under
+the macro, so the analog board was not driven.
+
+The change: `Model3.qsf` no longer sources `sys_dual_sdram.tcl`; the framework is not edited. Turning it off brings back
+`vga_out` and `vga_scaler_out` (277 ALM in R57's measurement) and the analog audio DACs, to be measured in the next fit.
+That area comes out of D-53's budget. The second SDRAM's own wiring (XMEM 2, `m3_system`) is unchanged and waits for the
+modules.
+
+*Wrong turn.* An instruction given in conversation and never written into the study was lost. Decisions go into the
+decisions table when they are made.
+
+**R151 — Area pass under D-48 on 40bd38c, 120 MHz: −421 ALM for +22 M10K, every bench cycle-identical.
+- Delay lines in M10K free about 310 ALM for 14 M10K.
+- Five registered-read MLABs moved to M10K free about 150 for 5.
+- The RAMs Quartus forwarded writes for, plus `m3_jtag` in M10K, free about 200 for 3, measured by block.
+
+The same delay lines in MLAB freed nothing (R128 was right). At 98% the whole-build "ALMs needed" hides a 200-ALM
+change, so fitted per-block figures are the measurement.**
+
+Work in `sm3-builds/area/`:
+- `tree`: 40bd38c by `git archive`, byte-identical to `tc/merge4/tree`'s RTL;
+- `work`: the kept tree;
+- `v/r1` … `v/r8`, `v/k1`, `v/k2`: the rows; `v/nodual`: the qsf with dual SDRAM off (R150);
+- `map`: full-design `quartus_map`, release qsf; `miter`: old-against-new leaf benches; `flt`: planted faults;
+- `an`: `--analyze_file` in a scratch copy; `logs`: every bench.
+
+Fits are in `sm3-builds/area_base_s3`, `area_all_s3`, `area_r45_s3` and `area_k_s3`. All are 120 MHz, seed 3,
+release, dual SDRAM off, one seed each.
+
+D-48 applies: no cycle and no Fmax. D-54: no Step 1.x / 2.x split (D-42 stands), the FPS counter stays, and no edits
+to sys/. D-55's SCSP DSP takes 135 M10K (128 for its effect rings), so this pass may use about 65.
+
+*What I believed:*
+- **That the blocks outside the CPU and the Real3D (D-51's list, about 5,370 ALM) were too big.** Against my
+  Model 2 core (`dv24-2a` s1755) they are not:
+
+  | Block | Model 3 (`cm1_s2`) | Model 2 (s1755) |
+  |---|---|---|
+  | tile generator | 714 | 1,122 |
+  | `m2_sdram` | 583 | 827 |
+  | `m3_bus` against `m2_cpu_bridge` | 828 | 632 |
+  | `m3_93c46` | 118 | 131 |
+
+  The loader (186 against 48) is the one outlier; most of it is the game configuration and the extra memory.
+- **That debug logic was left in the release build.** It is not:
+  - `m3_system`'s own logic is 77 ALM;
+  - `RELEASE` drops the overlay, `CPI_MON`, `FBUSY` and `XCAP`;
+  - `Model3.sv` leaves `rt_*`, `tr_*` and `ev_*` open, so they go.
+- **That framework switches were unset.** All were set. What is left there is in sys/ (D-54):
+  - `hps_io`'s `video_calc`, 322;
+  - the VGA OSD, 489;
+  - the audio filter, 418 and 8 DSP;
+  - `pll_hdmi_adj`, 532.
+- **That delay lines moved into MLAB would free about half their flip-flops' worth of ALMs.** Some blocks look bound
+  by their registers (`merge4b_s3`):
+
+  | Block | ALM | LUTs | Registers |
+  |---|---|---|---|
+  | `r3d_vpu` | 1,015 | 877 | 2,096 |
+  | the geometry's `r3d_recip` | 363 | 438 | 783 |
+  | `ppc_fpu_rsqe` | 259 | 185 | 546 |
+  | `r3d_rast_recip` | 190 | 236 | 431 |
+
+  I read R110's tile generator queue (19 ALM from 188 flip-flops) as a logic-bound block's result, and
+  §8.4's "registers alone buy about nothing" as not covering these. R128 row 16 had warned that a 4- to 11-deep line
+  fills an eighth to a third of a 32-deep MLAB.
+
+*What I know now:*
+
+**1. In MLAB the delay lines free nothing** (`area_all_s3` against `area_base_s3`, every row in):
+
+| Block | Δ ALM | Δ registers | MLAB ALM |
+|---|---|---|---|
+| `r3d_vpu` (`c_d`, `wq`) | +24 | −1,229 | +200 |
+| `r3d_recip` | +2 | −467 | +100 |
+| `r3d_face` | +11 | −84 | |
+| `r3d_rast_interp` | +11 | −160 | |
+| `ppc_fpu_rsqe` | −20 | −264 | +40 |
+
+In `r3d_recip` the logic fell by 98 ALM and the MLABs took 100. An MLAB is a whole LAB of 10 ALMs, used 4 to 10 deep
+of its 32, and the flip-flops had cost about one ALM per ten. R128's warning holds, and so does §8.4's line, for
+register-heavy blocks too.
+
+**2. In M10K they do.** `r3d_dline` is a fixed delay of D enabled steps (D ≥ 3):
+- each enabled clock writes the block at p and reads it at p − (D − 2) into the block's address register;
+- its output register is q, the line's last step;
+- 2^A ≥ D, so the word read has not been written over, and the read address is never the one being written;
+- the pointer needs no reset: the delay holds from D steps on, whatever value it starts at.
+
+`ppc_fpu_rsqe` has the same, inline: its side word from `ra_q.sd` to stage E, used when the chain is three registers or more.
+
+`area_k_s3` against `area_r45_s3` (rows 4 and 5 in both):
+
+| Change | Block, Δ ALM | M10K | ALM per M10K |
+|---|---|---|---|
+| `tg_shadow` (64 × 32, registered read) | `m3_bus` −48 | 1 | 48 |
+| `ppc_fpu_rsqe` side word (80 bits, 4 deep) | −67 | 2 | 33 |
+| `r3d_face`: `wb` line (8 bits, D 10) and B (32 × 32; `br_q` was its read registered every clock) | −58 | 2 | 29 |
+| `m3_93c46` EEPROM (64 × 16, registered read) | −28 | 1 | 28 |
+| geometry `r3d_recip`: M at 3 and 8, A at 7, {v, s, re, special, tin} at 9 | −95 | 4 | 24 |
+| `r3d_vpu`: `c_d` (4 lanes × 32, D 4) and `wq` (25, D 10) | −69 | 5 | 14 |
+| `r3d_rast_recip`: m at 3 and 7, with the stage enable | −27 | 2 | 13 |
+| store `nx`, `nxp` (8 × 20, registered reads) | −16 | 2 | 8 |
+| **whole build** | **41,201 → 40,759 (−442)** | **350 → 369 (+19)** | 23 |
+
+- The changed blocks sum to about −407; the remaining ±40 is the untouched blocks moving between fits.
+- Registers −1,733, ALUTs −290.
+
+**3. The RAMs Quartus forwarded writes for, and `m3_jtag`** (`area_r45_s3` against `area_base_s3`):
+
+| Block | Δ ALM | Δ registers | M10K |
+|---|---|---|---|
+| store `rre` / `rro` (each bank read into its own register, parity select after) | −58 | −119 | 0 |
+| tile generator `nram` (`nbuf <= nram[nra]`) | −51 | −82 | 0 |
+| loader `f_adr` / `f_dat` (read into their own registers outside the reset, `no_rw_check`) | −48 | −119 | 0 |
+| `m3_jtag` `dev` in M10K (R128) | −41 | −1 | +3 |
+| **whole build** | **41,180 → 41,201 (+21)** | **−390**; ALUTs −310; MLAB ALM −50 | **347 → 350** |
+
+- The changed blocks give −198. On this seed the CPU (+66) and the geometry (+70), both untouched, took it back.
+- At 98% the fitter places about 41,130-41,150 ALM whatever the design holds (R125). The whole-build "needed" moves
+  with the recoverable estimate (730 → 667) rather than with logic.
+- On identical RTL (`merge4b_s3` against `area_base_s3`, dual SDRAM aside) blocks moved by up to ±56 (`r3d_vpu`).
+- No Warning 276020 is left. The causes:
+  - the loader read inside its reset branch's else;
+  - the store had a select in front of the read register;
+  - the tile generator read asynchronously on a registered address. That is exact as a registered read only because
+    every use of `nbuf` is in `S_PATA`, and the edge into `S_PATA` (from `S_CHUNK` or `S_NLK`) never writes.
+
+**4. Dual SDRAM off (R150) costs 246 ALM.** `merge4b_s3` → `area_base_s3`, the same RTL:
+- 40,934 → 41,180 ALM;
+- `vga_out` 120 and `vga_scaler_out` 142 are new;
+- M10K stays at 347, DSP at 88.
+
+**5. The fits:**
+
+| Fit | Rows | ALM | M10K | Setup slow 100 °C / −40 °C | Hold (least, all four corners) | HDMI setup |
+|---|---|---|---|---|---|---|
+| `merge4b_s3` | (dual SDRAM on) | 40,934 | 347 | | | |
+| `area_base_s3` | none | 41,180 | 347 | −3.769 / −3.640 | +0.081 | +0.029 |
+| `area_all_s3` | 4, 5, delay lines in MLAB | 41,209 | 350 | −2.711 / −2.626 | +0.089 | +0.085 |
+| `area_r45_s3` | 4, 5 | 41,201 | 350 | −2.702 / −2.636 | +0.077 | −0.016 |
+| `area_k_s3` | 4, 5, delay lines and five MLABs in M10K | 40,759 | 369 | −3.106 / −2.989 | +0.106 | −0.053 |
+
+Every SDRAM pin is packed in every fit. In `area_k_s3`:
+- The worst path is the D-cache's (−3.106, untouched); the CPU core is −2.890.
+- The M10K outputs make families of their own:
+
+  | Family | Endpoints | Worst |
+  |---|---|---|
+  | `c_d` into the adder's first stage | 27 | −1.088 (the base had the same family at −1.078) |
+  | face B's write-data input | 10 | −1.059 |
+  | face `wb` into the geometry's machine | 20 | −0.904 (the base: 52 at −2.932) |
+  | `wq` into the write-back | 3 | −0.585 |
+
+- None is the worst family. One seed cannot separate the 0.4 ns against `area_r45_s3`, or the HDMI −0.053, from
+  placement.
+
+**6. Proof** (base = `tree`, new = the kept `work`):
+- **Leaf miters**, old module against new, every output every clock, random operands with zeros, subnormals,
+  infinities and NaNs over-weighted. Run for the MLAB and the M10K forms:
+  - `r3d_recip`: 3 seeds × 10 M cycles, 0 differing.
+  - `r3d_rast_recip`, enable random: 3 × 10 M, 0 differing.
+  - `ppc_fpu_rsqe` at QA/QC/DLY = 110, 111, 112, 100, 011, 113, 101 (the 100 case keeps its registers): 5 M each, 0 differing.
+- **Geometry bench**, 400 frames each of VF3, Bass Fishing and Daytona 2: every line identical, per-frame cycles included.
+- `test_real3d_face` and `test_real3d_face_lod`: 15 lines identical, cycles a polygon included.
+- **Rasteriser bench**, MIP 1, p0, sh1's nine sets: every FRAME and STALL line identical, 0 pixels wrong. The sets
+  are dt2, vf3, bass, dt2sm, vf3sm and basssm (400 frames each), scud (378), lw (391) and dt2b (393).
+- **Daytona 2 system bench**, fresh boot with the configuration, extra memory and fixed CROM through ioctl, 40 frames
+  at CLK_HZ 120 MHz: every line identical but the host's kHz and seconds. That covers the cycle and PC of each frame,
+  the loader's checks and 17,891,348 SDRAM reads.
+- **Unit benches**, each line for line as the base:
+  - `test_tilegen`, both configurations, quick and hostile memories, slowest-line and mean clocks included;
+  - `test_loader_sw`;
+  - `test_jtag`;
+  - `test_io` (the 93C46 against the Supermodel trace);
+  - `test_bus` (two masters against a reference, the tile generator's registers included).
+- **Planted faults**, each caught:
+
+  | Fault | Caught by | Result |
+  |---|---|---|
+  | MLAB `r3d_dline` read p − (D − 2) | recip miter | 989,207 of 1 M cycles |
+  | M10K `r3d_dline` read p − (D − 1) | recip miter | 989,206 of 1 M |
+  | M10K `r3d_dline` read p − (D − 1) | rast recip miter | 873,878 of 1 M |
+  | recip `u_m8` D 7 | recip miter | 525,515 of 1 M |
+  | recip `am9lo` from the wrong stage | recip miter | 299,229 of 1 M |
+  | rast recip line without its enable | rast recip miter | 559,861 of 1 M |
+  | rsqe read one off, MLAB form | rsqe miter | 996,351 of 1 M |
+  | rsqe read one off, M10K form | rsqe miter | 996,351 of 1 M |
+  | vpu `c_d` D 3 | geometry bench, VF3 | the first triangle wrong |
+  | vpu `wq` D 11 | geometry bench, VF3 | every line differs |
+  | face `wb` D 9 | face bench | 2 wrong, 3 left over, the unit stalls |
+  | face B read at op_ba ^ 1 | face bench | 150,036 of 300,000 wrong |
+  | store parity inverted | rasteriser bench, VF3 | 150,201 pixels wrong in the first frame |
+  | store `nx` read at wl ^ 1 | rasteriser bench | its `nx registered` assertion fires |
+  | tile generator `nbuf` at nra ^ 1 | tile generator bench | four runs of four FAIL |
+  | loader `h_dat` at rp + 1 | system bench | "1 beats wrong", FAIL |
+  | `tg_shadow` read at addr ^ 1 | bus bench | FAIL |
+  | 93C46 data bit 0 flipped | I/O bench | 64 mismatches |
+
+  The 93C46 read at ra ^ 1 is *not* caught: the trace's EEPROM words read alike. `no_rw_check` has no fault to plant,
+  since Verilator ignores it; the comments carry the proof that the addresses never meet.
+- **Lint** as the base's. `lint_tilegen` and the face targets run with -Wall.
+- **`quartus_map --analyze_file`** on all twelve files, in a scratch copy: 0 errors, 0 warnings.
+
+**7. The MLAB sweep** (`area_base_s3`, 73 MLABs, 1,860 ALM). Approximate ALM is cells / 2:
+
+| MLAB | ALM | Read | Zero-cycle M10K? |
+|---|---|---|---|
+| `m3_jtag` `dev`, `tg_shadow`, `m3_93c46` `ee`, face B, store `nx` / `nxp` | 49, 32, 16, 16, 10, 10 | registered | done (rows 5, k2) |
+| geometry `u_pqm` | 10 | asynchronous, into enabled registers | no: the address is only known in the cycle |
+| rasteriser `wdf`, interp `dlv` | 10, 2 | registered | yes, not built: the pixel side, beside the z band FIFO work |
+| geometry clip buffers `cba` / `cbb` | 70, 64 | asynchronous at a state decode | only with the next state's address (R110), which is on the geometry's worst paths |
+| geometry `remi`, the 12 vertex stores, `vpw`, `sl`, `fb`, `rasm`, face A | 50, 192, 16 each | asynchronous at a state decode, or used combinationally | as above |
+| CPU GPR / FPR files, SPRs, segment registers, cache state MLABs | 32-35 each, 13 MLABs | asynchronous, on the CPU's critical paths | no |
+| FIFOs read through when empty: xmem ring, mstream, 53C810, `r3q`, band `fq`, texture-cache `bb` / `fq` / `pfn`, `tq`, `bq`, the port's `wbuf` / `bd`, the readers' `qe` / `qo` | 5-32 each | asynchronous at the head | no: a word written into an empty FIFO is read the next clock, which a block's old data cannot give |
+| walker `vp_mem` / `rs_mem`, z band `pf` | 34, 23, 34 | asynchronous | no; `pf` is the z band's |
+
+*Wrong turns:*
+- **The delay lines in MLAB** (§1), proven exact and freeing nothing. R128's estimate and its reason were both right.
+- **Row 7's field.** I planned `rd_q`, the 546 flip-flops' obvious name. With DLY = 1 it is one register deep. The
+  heavy word is the side word `sd` (80 bits kept: special result, class, flags, tag), carried through five registers.
+  I started its line at `ra_q.sd`, not at stage A's input, because the source notes a −2.10 ns path into
+  `ra_q.sd.f` at 120 MHz.
+- **The tile generator's first form.** `no_rw_check` on `nram` alone did not remove its Warning 276020. For an
+  asynchronous read of a registered address Quartus forwards whatever the attribute says. It took the registered
+  read and the proof that no write meets it.
+- **The map's ALMs:** −345 for the MLAB rows, which fitted +28. The map does not price an MLAB at a whole LAB.
+- **The rows-4-and-5 fit came out +21 on the whole build** for −198 in its blocks. At 98% fill only the per-block
+  figures move with the logic.
+- My first `r3d_dline` gave its pointer an initial value; lint failed -Wall on PROCASSINIT. It needs none.
+- The face fault in the geometry bench hung (no frame in 25 minutes). The face's own bench catches it.
+- A map chain copies the tree as each map starts, so the tile generator's second form reached it between rows 1 and 3.
+
+*Not done:*
+- The rasteriser's colour, texel and interp pipelines (2-3 stages, fields beside logic). They sit downstream of the
+  z band, where the pair FIFO is going in.
+- `wdf` and `dlv`.
+- DSP blocks as delay lines (24 DSP free at 88 / 112).
+- A second seed of `area_k_s3`, to separate its 0.4 ns from placement.
+
+*Budget.* The kept changes take M10K 347 → 369 (+22). With D-55's 135 that is 504 of 553, so 49 are left; of the
+pass's 65, 43 are unused. They free about 600 ALM by block (−198 rows 4 and 5, −407 the M10K rows): 41,180 → 40,759
+on the whole build. That is short of the about 1,450 coming in (DSP about 700, inputs about 400, the DMA bursts +196,
+the bridge about 150) and the 246 the analogue output took. Nothing else zero-cycle of that size is in the MLAB list
+or the register chains.

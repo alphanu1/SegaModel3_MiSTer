@@ -318,7 +318,7 @@ module m3_bus
   logic [7:0]  midi_ctrl;
   logic [15:0] midi_cnt;
   logic [7:0]  irq_set, irq_clr;
-  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] tg_shadow [0:63];
+  (* ramstyle = "M10K, no_rw_check" *) logic [31:0] tg_shadow [0:63];   // M10K (area pass): read registered, as tg_sh_q
   logic [31:0] tg_sh_q;
   // power-up contents: zero, as Supermodel's registers read before any write
   // (VF3 reads F1180000 once, at boot, and gets 0)

@@ -162,7 +162,10 @@ module r3d_rast_recip (
     endcase
   endfunction
 
-  logic [23:0] m0, m1, m2, m3, m4, m5, m6, m7, m8;
+  logic [23:0] m0, m3, m7, m8;
+  // m at stages 3 and 7 from r3d_dline delay lines (area pass), the words the enabled chain m1 .. m7 held there
+  r3d_dline #(.W(24), .D(3)) u_m3 (.clk, .en, .d(m0), .q(m3));
+  r3d_dline #(.W(24), .D(7)) u_m7 (.clk, .en, .d(m0), .q(m7));
   logic        p0, p1q, p2q, p3, p4, p5, p6, p7, p8;   // m = 2^23
   logic [11:0] t0, t1, t2;
   logic [35:0] pr1;
@@ -187,19 +190,19 @@ module r3d_rast_recip (
     // 0: seed
     m0 <= m; p0 <= (m[22:0] == 23'd0); t0 <= seed(m[22:16]);
     // 1: m t (Q2.34)
-    m1 <= m0; p1q <= p0; t1 <= t0; pr1 <= m0 * t0;
+    p1q <= p0; t1 <= t0; pr1 <= m0 * t0;
     // 2: e1s = (2^35 - m t) >> 16
-    m2 <= m1; p2q <= p1q; t2 <= t1; e1 = 36'h8_0000_0000 - pr1; e1s <= e1[35:16];
+    p2q <= p1q; t2 <= t1; e1 = 36'h8_0000_0000 - pr1; e1s <= e1[35:16];
     // 3: r1s = (t e1s) >> 9 (Q.20)
-    m3 <= m2; p3 <= p2q; r1 = t2 * e1s; r1s <= r1[29:9];
+    p3 <= p2q; r1 = t2 * e1s; r1s <= r1[29:9];
     // 4: m r1s (Q.43)
-    m4 <= m3; p4 <= p3; r1s4 <= r1s; pr2 <= m3 * r1s;
+    p4 <= p3; r1s4 <= r1s; pr2 <= m3 * r1s;
     // 5: ds = (2^43 - m r1s) >>> 4
-    m5 <= m4; p5 <= p4; r1s5 <= r1s4; d = 46'sh800_0000_0000 - $signed({1'b0, pr2}); ds <= d[28:4];
+    p5 <= p4; r1s5 <= r1s4; d = 46'sh800_0000_0000 - $signed({1'b0, pr2}); ds <= d[28:4];
     // 6: r1s ds (Q.59)
-    m6 <= m5; p6 <= p5; r1s6 <= r1s5; c6p <= $signed({1'b0, r1s5}) * ds;
+    p6 <= p5; r1s6 <= r1s5; c6p <= $signed({1'b0, r1s5}) * ds;
     // 7: r2 = (r1s << 30) + (c >>> 9) ~ 2^73 / m; q0 = r2 >> 26
-    m7 <= m6; p7 <= p6; csh = c6p >>> 9;
+    p7 <= p6; csh = c6p >>> 9;
     r2 = $signed({2'b00, r1s6, 30'd0}) + $signed({{6{csh[46]}}, csh});
     q07 <= r2[50:26];
     // 8: m q0

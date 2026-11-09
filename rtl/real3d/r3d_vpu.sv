@@ -226,7 +226,13 @@ module r3d_vpu
     logic       wrf, wbc, wside;
     logic [4:0] dstb;
   } wctl_t;
+  // wq[1] and wq[2] are registers (the divide issues at +2); +3 to +12 is r3d_dline, its last clock wq[12]
+  // (area pass: 10 x 25 flip-flops before). The subnormal monitor's +6 tap is the bench's alone.
   wctl_t wq [1:12];
+  r3d_dline #(.W($bits(wctl_t)), .D(10)) u_wq (.clk, .en(1'b1), .d(wq[2]), .q(wq[12]));
+`ifdef VERILATOR
+  always_ff @(posedge clk) for (int q = 3; q <= 6; q++) wq[q] <= wq[q-1];
+`endif
   always_ff @(posedge clk) begin
     wq[1].v     <= u_valid;
     wq[1].div   <= u_div;
@@ -238,7 +244,7 @@ module r3d_vpu
     wq[1].wbc   <= u_wbc;
     wq[1].wside <= u_wside;
     wq[1].dstb  <= u_dstb;
-    for (int q = 2; q <= 12; q++) wq[q] <= wq[q-1];
+    wq[2] <= wq[1];
   end
   logic mac10;
   assign mac10 = wq[12].v && !wq[12].div;
@@ -361,19 +367,19 @@ module r3d_vpu
     end
     assign opB[l] = b_op;
 
-    logic [31:0] prod, c_d [1:4];
+    // the addend four clocks behind c_op, beside the product: r3d_dline, three clocks in an MLAB and the last in
+    // its output register, every clock the word of the four-register line it replaces (c_d[1:4], 518 flip-flops
+    // in merge4b_s3)
+    logic [31:0] prod, c_d4;
     logic        pv, p_unf, s_unf;
-    always_ff @(posedge clk) begin
-      c_d[1] <= c_op;
-      for (int q = 2; q <= 4; q++) c_d[q] <= c_d[q-1];
-    end
+    r3d_dline #(.W(32), .D(4)) u_cd (.clk, .en(1'b1), .d(c_op), .q(c_d4));
     r3d_fp_mul #(.SUBNORM(SUBNORM)) u_mul (
       .clk, .rst_n(!rst), .in_valid(1'b1), .a(opA[l]), .b(b_op),
       .out_valid(pv), .result(prod), .overflow(), .underflow(p_unf), .invalid());
     logic [31:0] sum;
     logic        sv;
     r3d_fp_add #(.SUBNORM(SUBNORM), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP), .NORM_B(1'b1), .PIPE_B2(1'b1)) u_add (
-      .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(c_d[4]), .sub(1'b0),
+      .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(c_d4), .sub(1'b0),
       .out_valid(sv), .result(sum), .overflow(), .underflow(s_unf), .invalid());
 
     // post-op at +12: which constant replaces the sum, pz +0 or pk the clamp
@@ -461,7 +467,7 @@ module r3d_vpu
     always_comb begin
       sn_ev[l] = 1'b0;
       if (wq[2].v && wq[2].lanes[l] && (issub(opA[l]) || issub(b_op))) sn_ev[l] = 1'b1;
-      if (wq[6].v && !wq[6].div && wq[6].lanes[l] && (issub(prod) || issub(c_d[4]) || p_unf)) sn_ev[l] = 1'b1;
+      if (wq[6].v && !wq[6].div && wq[6].lanes[l] && (issub(prod) || issub(c_d4) || p_unf)) sn_ev[l] = 1'b1;
       if (mac10 && wq[12].lanes[l] && (issub(sum) || s_unf)) sn_ev[l] = 1'b1;
     end
 `endif

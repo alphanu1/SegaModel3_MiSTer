@@ -267,10 +267,10 @@ module r3d_rast_store #(
   // list its start S modulo 2^RB (0 when empty: the region's top). A record fits when O + beats < S (S = 0
   // read as 2^RB): the region's last beat is never used, which is what keeps O below 2^RB. The sweep
   // clears every pointer to 0.
-  (* ramstyle = "MLAB, no_rw_check" *) logic [RB-1:0] nx [8];
+  (* ramstyle = "M10K, no_rw_check" *) logic [RB-1:0] nx [8];    // M10K (area pass): read registered, as nx_q
   logic [RB-1:0] nx_q;
   // (PAIR) a copy of nx read at the pass's other list, the bound the record must not cross
-  (* ramstyle = "MLAB, no_rw_check" *) logic [RB-1:0] nxp [8];
+  (* ramstyle = "M10K, no_rw_check" *) logic [RB-1:0] nxp [8];   // M10K (area pass): read registered, as nxp_q
   logic [RB-1:0] nxp_q;
   logic          nx_we;
   logic [2:0]    nx_wa;
@@ -561,10 +561,18 @@ module r3d_rast_store #(
   (* ramstyle = "M10K" *) logic [31:0] rro [16];
   logic [3:0]  rr_wa;
   logic [31:0] rr_q;
+  // each bank read into its own output register and the parity select after them (area pass, Model 2 R985):
+  // a select in front of the register made Quartus read a clock early and forward the writes (Warning 276020,
+  // 72 flip-flops of pass-through in merge4b_s3). rr_q is every clock the word the register held.
+  logic [31:0] rre_q, rro_q;
+  logic        rr_odd;
   always_ff @(posedge clk) begin
     if (p_rv && ps == P_CKW) begin rre[rr_wa] <= m_dout[31:0]; rro[rr_wa] <= m_dout[63:32]; end
-    rr_q <= pr[0] ? rro[pr[4:1]] : rre[pr[4:1]];
+    rre_q  <= rre[pr[4:1]];
+    rro_q  <= rro[pr[4:1]];
+    rr_odd <= pr[0];
   end
+  assign rr_q = rr_odd ? rro_q : rre_q;
 
   // the FIFO: beats, {marker, word} by word parity; markers fill both halves
   // marker word: [31] 0 NEWGEN 1 BANDEND, [5:0] band

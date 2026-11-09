@@ -75,7 +75,7 @@ module m3_93c46 #(
   output logic [15:0] dump_q
 );
 
-  (* ramstyle = "MLAB, no_rw_check" *) logic [15:0] ee [64];
+  (* ramstyle = "M10K, no_rw_check" *) logic [15:0] ee [64];   // M10K (area pass): read registered, as q
   initial for (int i = 0; i < 64; i++) ee[i] = 16'hffff;
 
   logic        we;
