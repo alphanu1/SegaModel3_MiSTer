@@ -13262,3 +13262,158 @@ pass's 65, 43 are unused. They free about 600 ALM by block (−198 rows 4 and 5,
 on the whole build. That is short of the about 1,450 coming in (DSP about 700, inputs about 400, the DMA bursts +196,
 the bridge about 150) and the 246 the analogue output took. Nothing else zero-cycle of that size is in the MLAB list
 or the register chains.
+
+**R152 — Scud Race's race HUD (grey speedometer and CONDITION panels, blocks behind the digits) is a stale palette: the
+game's palette-upload ring laps because the core has no tile-generator port timing. The tile generator RTL is exact.**
+
+On the board (`inp2_s2`, 2026-11-09) Scud Race's race HUD is wrong and Daytona 2's is right. Every wrong element is on
+the tile generator's above-3D layers 0 and 1; the Real3D's parts (the dial track, the course map) are right, and
+`m3_tilegen` matches Supermodel on six race dumps with 0 pixels different. The race's tile RAM drawn with the palette of
+the selection screen before it reproduces the photo element for element. Scud Race queues palette uploads in a 128-entry
+ring at 0x100A00 (filled at 0x3808, the count wrapping at 0x7F) and drains it in the vblank IRQ (0x1B28 to 0x38C0, a
+1.64 ms time-base budget). The race start queues 176 entries while the main loop copies about 24,500 CROM words a frame
+into tile RAM. On the board the tile generator's slow CPU port paces that loop and the ring never laps (Supermodel's count
+peaks at 81); the core has no pacing, so the ring laps and 5,848 of the race's 11,362 colours are never written.
+Supermodel 0d1dd3d (2026-10-25, from gm_matthew's Scud Race Plus hardware measurements) added this port timing for the
+same symptom; with it switched off, Supermodel draws the board's HUD exactly, and at 50% of the board's rate it still
+fails. Not a regression: `m3_bus` never had the timing, and the race was unreachable before the controls.
+
+*The fix* (`sm3-builds/hud`, on `area` 60b7bdb): `m3_bus` holds the CPU for tile RAM and palette accesses by
+Supermodel's model (busy 5 VRAM clocks after an access, tile RAM only in fetch slots during the first 32 tile pairs of
+a line, an access landing 12.6 clocks after it is taken, bus reads waiting for all to land), in sixteenths of a clock,
+behind `TG_TIMING`. A new bench checks every access against Supermodel's `BusAccessCycles` at 110 and 120 MHz (all in
+Supermodel's clock but a fetch-slot write a clock early, where Supermodel rounds up); 9 planted faults caught. +94 ALM
+at map. It adds waits on purpose, toward the hardware: about 133 tile writes a frame in the race, under 0.8% of a frame.
+
+*Wrong turn and limit.* The core's whole-system bench runs at 29 s a frame, too slow to reach the race (about 2.4 h), so
+the symptom was reproduced in Supermodel with its timing off, and the fix proven against Supermodel's timing model. The
+board build is the confirmation.
+
+**R153 — The geometry's clip pool and vertex store in M10K (on 60b7bdb, 120 MHz): −380 ALM of MLAB for +19
+M10K, cycle-identical. Net in the geometry −226 to −337 ALM fitted, after the logic the next-address reads need
+(+168 ALUTs). Its worst path improves, −1.254 against −1.883 / −2.329. Each memory is read a clock early at the address its next state will hold. Each had a write
+meeting the read that a block's old data cannot give, which an MLAB's asynchronous read hid:
+- the clip pool: one write, needing 7 bits forwarded;
+- the vertex store: the engine's own word, needing a 32-bit word forwarded.
+
+Two seeds of 60b7bdb differ by 1,057 "ALMs needed" on identical logic.**
+
+Work in `sm3-builds/area2/`:
+- `tree`: 60b7bdb by `git archive`;
+- `work`: the change; `wvs` and `dbg`: the steps;
+- `v/cb`, `v/vs`, `v/vs2`: the forms fitted or mapped;
+- `flt`: planted faults; `logs`: every bench; `map`: full-design maps.
+
+Fits are in `sm3-builds/area2_k_s2` (60b7bdb, seed 2), `area2_vs_s3` (the first form) and `area2_vs2_s3` (the
+kept form). All are 120 MHz, release, dual SDRAM off. D-48 applies (no cycle, no Fmax); D-55 leaves this pass about
+43 M10K.
+
+*What I believed* (R151 §7):
+- That the clip pool (32 × 263 as two MLABs) and the 12 vertex-store MLABs (32 × 32) could go to M10K at no cycle
+  if their read address were formed a clock early. That makes about 330 ALM of MLAB for 19 M10K.
+- That R110's "a cycle a clip step" came only from the address, not from the data: a block read registered at the
+  next state's address gives, in each clock, the word an asynchronous read of the current address gives.
+
+*What I know now:*
+
+**1. Reading a clock early is exact for the address and not for the data.** In both memories a word is written at
+the clock edge that registers the read, and the next clock uses it:
+- **The clip pool.** P_C's last vertex is written at P_D's clock, and P_CL0 reads it at `e_last` for its outcode
+  (`pside`). The comment above P_C already said "the clip reads the vertex just written". P_CL0 uses only the
+  outcodes, and `cba_wd` still holds the word written (it is loaded only in P_C and P_XB, a clock before each
+  write). So 7 bits are forwarded (`cb_byp`), about 8 ALM.
+- **The vertex store.** The polygon machine reads a vertex the clock after the engine writes it into the store. The
+  engine's word for the lane the next read names is held a clock and forwarded after the lane select (`vf_d`, three
+  hits). Daytona 2 needs it for x and for the shade within its first frames; VF3's 114 frames came out the same
+  without it, so the output alone would not have shown it.
+
+**2. The next read addresses.**
+- **The vertex store** is read only in P_A, P_B and P_C, which follow from P_POLY, P_A / P_C and P_B
+  unconditionally. Its next address is `{ref_i, 1}`, `ref_of(ra_q, as_i + 1)` or `ref_of(ra_q, 0)`. The middle one
+  is now a register, `ref_nn`, loaded a step ahead: cp, and so ra_q, does not move from P_POLY's move into P_A until
+  the polygon's last P_C.
+- **The clip pool's** next address comes from the next values of `cb_cl` and of the four entry registers, case by
+  case as the polygon machine loads them. Its class is taken only in the states whose next state reads the pool:
+  P_C and P_PJ3 have none, and P_C's term (its outcodes from `aw` in the same clock) had been the first form's
+  worst path into the block.
+- **Both halves of the pool** are always written together, so they are one 263-bit memory: 7 M10K rather than 8.
+
+**3. The fits** (per-block ALMs needed, with children):
+
+| Fit | RTL | Seed | ALM | M10K | Geometry ALM (MLAB) | Setup slow 100 °C / −40 °C | Hold, least | HDMI setup |
+|---|---|---|---|---|---|---|---|---|
+| `area_k_s3` (R151) | 60b7bdb | 3 | 40,759 | 369 | 7,375 (680) | −3.106 / −2.989 | +0.106 | −0.053 |
+| `area2_k_s2` | 60b7bdb | 2 | 39,701 | 369 | 7,264 (680) | −3.001 / −2.459 | +0.038 | −0.041 |
+| `area2_vs_s3` | first form | 3 | 39,411 | 388 | 7,079 (300) | −2.588 / −2.590 | +0.061 | −0.247 |
+| `area2_vs2_s3` | kept form | 3 | 39,540 | 388 | 7,038 (300) | −3.355 / −3.000 | +0.093 | +0.010 |
+
+- **The two seeds of 60b7bdb have the same ALUTs and registers** (58,484 / 50,795 and 50,717). The fitter placed
+  about 40,900-41,000 ALM in both. Its recoverable estimate was 926 in one and 2,094 in the other, so "ALMs needed"
+  fell by 1,057. A seed moves the whole-build figure by more than this pass saves; the measurement is the changed
+  block's logic and MLAB ALMs.
+- **R151's timing on two seeds:** setup −3.106 / −2.989 and −3.001 / −2.459 ns. In both the CPU sets the worst path.
+  R151's delay lines in M10K set their own families: −1.088 at seed 3, and −1.835 at seed 2, where the face's
+  write-back line feeds the geometry's main machine. The base had that family at −2.932, from registers.
+- **The first form's new families** (`area2_vs_s3`):
+
+  | Family | Endpoints | Worst |
+  |---|---|---|
+  | into the pool's read address, from `aw` through P_C's outcode | 35 | −2.333 |
+  | into the forwarding registers, through `ref_of`'s shift | 41 | −1.811 |
+  | from the vertex store's outputs | 7 | −1.080 |
+  | `cb_byp` | 2 | −1.565 |
+
+  The kept form takes the first two out (§2). In `area2_vs2_s3` the pool's address has 3 endpoints at worst −0.218 and the forwarding 5 at worst −0.166. The
+  geometry's worst path is −1.254 (−1.883 / −2.329 on 60b7bdb's two seeds). The worst path overall is the CPU core's
+  (−3.355), which the change does not touch; on this seed it is 0.25-0.35 ns worse than on 60b7bdb's two, which I
+  read as placement.
+- **The geometry, kept form against 60b7bdb:**
+
+  | | 60b7bdb seed 3 | 60b7bdb seed 2 | kept form |
+  |---|---|---|---|
+  | ALMs needed | 7,375 | 7,264 | 7,038 |
+  | MLAB ALM | 680 | 680 | 300 |
+  | ALUTs | 9,780 | 9,780 | 9,948 (+168) |
+  | registers | 8,453 | 8,430 | 8,464 |
+  | M10K | 62 | 62 | 81 (+19) |
+
+  That is −226 to −337 ALM, about 15 ALM an M10K.
+
+**4. Proof** (base = `tree`):
+- **Geometry bench**, 400 frames each of VF3, Bass Fishing and Daytona 2: every line identical, cycles included.
+  The bench also ran these checks every clock, all quiet:
+  - the old MLABs read asynchronously beside the new blocks, every word used compared against them;
+  - the clip pool's next-address registers compared against the registers a clock later;
+  - `ref_nn`.
+- **Face bench:** 15 lines identical.
+- **Daytona 2 system boot**, 40 frames: every line identical but the host's speed. The boot draws little 3D (76 records), so the geometry bench is the proof that counts.
+- **Planted faults**, with the bench's checks taken out so the output is what catches them:
+
+  | Fault | Result |
+  |---|---|
+  | the pool's outcode forwarding removed | the clip decisions change: frame cycles 1,077,647 → 1,078,363 |
+  | `e_qe`'s next value at `cnt_q` = 2 | triangle 350's poly word wrong |
+  | the vertex store's half bit wrong in P_A / P_C | triangle 0 wrong |
+  | `ref_nn` one vertex ahead | triangle 2 wrong |
+
+  With the checks in, forwarding off for x or for the shade fires the vertex-store check on Daytona 2. With the
+  checks out, forwarding off for any one of the three makes no difference to VF3's first 114 frames.
+- **Lint** as the base's (the checkers reset rather than use `initial`).
+- **`quartus_map --analyze_file`:** 0 errors, 0 warnings.
+
+*Wrong turns:*
+- **The vertex store without forwarding.** I took the r3d_ram header's "callers never read a word in the cycle it is
+  written" to cover a read registered a clock early. It does not: the engine's word is read the next clock. The
+  bench's MLAB copies caught it on the first frame.
+- **The first checker compared the copies' whole contents.** Unwritten words differ between copies (the bench's
+  random fill), so it now compares only words written since reset.
+- **The first clip-pool checker compared every clock.** It fired in P_C, where the pool's word is not used; it now
+  checks in the states that use it.
+- **The first form put P_C's outcode decode and `ref_of`'s shift in front of the new registers** (§3).
+
+*Not done:*
+- **The emission records (`u_remi`, 32 × 97, about 50 ALM for 3 M10K).** Its asynchronous read feeds `po_ra`, the
+  projection output's M10K address, so in M10K it would put two block RAMs in series in one clock.
+- **The geometry's other stores** (`vpw`, `sl`, `fb`, `rasm`, face A): 16 ALM each for an M10K, each with its own next address.
+
+*Budget.* This pass uses 19 M10K; with R151's 22 that is 41 of the 65. 369 + 19 + 135 = 523 of 553, so 30 are left.
