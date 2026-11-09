@@ -27,6 +27,8 @@
 //   m3_tilegen (VRAM in SDRAM, port 1) + m3_compose (the layer from DDR3) -> video
 //   m3_loader: the MRA's downloads -> SDRAM (download port), the extra memory,
 //              the 93C46, the game configuration (study R100)
+//   m3_inputs: MiSTer's joysticks, sticks, triggers and paddle -> m3_io's ports
+//              and ADC, by the configuration's input profile (INPUTS)
 //
 // R100 (Daytona 2, Step 2.1): the game configuration (MRA index 4) picks the
 // step at run time; STEP2 builds the Step 2.x hardware (the Real3D DMA front
@@ -151,7 +153,15 @@ module m3_system
   //   SDR_PW_DLY   with SDR_PW: a posted line write waits this many clocks before its bursts unless needed (m3_sdr_port PW_DLY)
   parameter int          SDR_PW_DLY  = 0,
   //   BUS_R3P      m3_bus: writes to the Real3D's host port posted in an eight-word buffer, the bus freed (m3_bus R3P)
-  parameter bit          BUS_R3P     = 1'b0
+  parameter bit          BUS_R3P     = 1'b0,
+  // ---- the cabinet's controls (m3_inputs): INPUTS 0 ties m3_io's inputs idle (in0 FF, test and service high,
+  //   ports C and D the configuration's idle bytes, the ADC 00), the core before them; INP_DRIVE, INP_GUN,
+  //   INP_FISH build the driving, analog-gun and fishing profiles (off: those games read the generic ports)
+  parameter bit          INPUTS      = 1'b1,
+  parameter bit          INP_DRIVE   = 1'b1,
+  parameter bit          INP_GUN     = 1'b1,
+  parameter bit          INP_FISH    = 1'b1,
+  parameter bit          INP_LEAN    = 1'b0        // the driving block without "Steering", "Steering smoothing", "Analog control"
 ) (
   input  logic        clk,
   input  logic        mem_rst_n,
@@ -191,6 +201,22 @@ module m3_system
   output logic [7:0]  v_r, v_g, v_b,
   input  logic        overlay_en,
   input  logic        fps_en,        // the frame counter (FPS) shown
+
+  // the cabinet's controls (hps_io, clk_sys; INPUTS)
+  input  logic [15:0] joystick_0,    // player 1: 3:0 right, left, down, up; 15:4 the J1 buttons
+  input  logic [15:0] joystick_1,    // player 2
+  input  logic [15:0] joy_l0,        // player 1's left stick {Y, X}, signed
+  input  logic [15:0] joy_l1,        // player 2's left stick
+  input  logic [15:0] joy_r0,        // player 1's right stick
+  input  logic  [7:0] joy_lt0,       // player 1's analogue triggers (hps_io 0x46)
+  input  logic  [7:0] joy_rt0,
+  input  logic  [7:0] paddle0,
+  input  logic        st_pedswap,    // the driving OSD lines (m3_cab_inputs)
+  input  logic  [1:0] st_ssens,
+  input  logic  [1:0] st_ssm,
+  input  logic        st_rsteer,
+  input  logic  [1:0] st_wheel,
+  output logic        inp_drive,     // the driving profile is loaded (the OSD shows its lines)
 
   output logic        led,
   output logic        uart_tx,
@@ -299,6 +325,7 @@ module m3_system
   logic [15:0][4:0] cfg_bank /* verilator public_flat_rd */;
   logic [7:0]  cfg_in2 /* verilator public_flat_rd */, cfg_in3 /* verilator public_flat_rd */;
   logic [7:0]  cfg_dsw /* verilator public_flat_rd */;   // the DIP bank (R133)
+  logic [7:0]  cfg_prof /* verilator public_flat_rd */, cfg_pflg;   // the input profile and its flags
   m3_loader #(.AW(AW), .BACKUP(SDR_BACKUP), .FIX8(SDR_FIX8),
               .VROM_X((VROM_LOC != 0) && (VROM_LOC == XMEM)), .VROM_AT(27'h400_0000)) u_ld (   // R100: VROM placement
     .clk, .rst(!mem_rst_n), .mem_ready, .x_ok(ddr_ok),
@@ -306,7 +333,7 @@ module m3_system
     .sdr_wr_req(ld_req), .sdr_wr_addr(ld_addr), .sdr_wr_din(ld_din), .sdr_wr_be(ld_be), .sdr_wr_ack(ld_ack),
     .x_req(lx_req), .x_addr(lx_addr), .x_din(lx_din), .x_ack(lx_ack),
     .ee_we(ee_ld_we), .ee_a(ee_ld_a), .ee_d(ee_ld_d),
-    .cfg_step, .cfg_flags, .cfg_bank, .cfg_in2, .cfg_in3, .cfg_dsw,
+    .cfg_step, .cfg_flags, .cfg_bank, .cfg_in2, .cfg_in3, .cfg_dsw, .cfg_prof, .cfg_pflg,
     .rom_loaded, .busy(loader_busy), .overflow(ld_ovf), .bytes(ld_bytes));
 
   // R100: the game configuration, static while the game runs (it changes only
@@ -527,9 +554,38 @@ module m3_system
     .p_req(p_req[0]), .p_we(p_we[0]), .p_addr(p_addr[0]), .p_din(p_din[0]), .p_be(p_be[0]), .p_long(p_long[0]),
     .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]), .wb_col, .wb_din, .wb_be);
 
+  // the cabinet (m3_inputs): the sticks, triggers and paddle registered once here, beside the logic they feed
+  // (Model 2 R842: hps_io's analog outputs straight into the steering block failed clk_sys there)
+  logic [7:0]      io_in0, io_in2, io_in3;
+  logic            io_test_b_n, io_service_b_n;
+  logic [7:0][7:0] io_an;
+  generate if (INPUTS) begin : g_inputs
+    logic [15:0] jl0_q, jl1_q, jr0_q;
+    logic  [7:0] lt0_q, rt0_q, pad0_q;
+    always_ff @(posedge clk) begin
+      jl0_q <= joy_l0; jl1_q <= joy_l1; jr0_q <= joy_r0;
+      lt0_q <= joy_lt0; rt0_q <= joy_rt0; pad0_q <= paddle0;
+    end
+    m3_inputs #(.SYS_MHZ(CLK_MHZ), .DRIVE(INP_DRIVE), .GUN(INP_GUN), .FISH(INP_FISH), .LEAN(INP_LEAN)) u_inputs (
+      .clk, .rst_n(!rst), .prof(cfg_prof), .pflg(cfg_pflg), .idle_c(cfg_in2), .idle_d(cfg_in3),
+      .joystick_0, .joystick_1, .joy_analog(jl0_q), .joy_ranalog(jr0_q), .joy_analog_1(jl1_q), .paddle(pad0_q),
+      .trig_rt(rt0_q), .trig_lt(lt0_q),
+      .st_pedswap, .st_ssens, .st_ssm, .st_rsteer, .st_wheel,
+      .in0(io_in0), .test_b_n(io_test_b_n), .service_b_n(io_service_b_n), .in2(io_in2), .in3(io_in3), .an(io_an),
+      .drive(inp_drive));
+  end else begin : g_noinputs
+    assign io_in0 = 8'hFF; assign io_test_b_n = 1'b1; assign io_service_b_n = 1'b1;
+    assign io_in2 = cfg_in2; assign io_in3 = cfg_in3; assign io_an = '0; assign inp_drive = 1'b0;
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire _unused_inp = &{1'b0, joystick_0, joystick_1, joy_l0, joy_l1, joy_r0, joy_lt0, joy_rt0, paddle0,
+                         st_pedswap, st_ssens, st_ssm, st_rsteer, st_wheel, cfg_prof, cfg_pflg};
+    /* verilator lint_on UNUSEDSIGNAL */
+  end endgenerate
+
   m3_io #(.EE_TWP(EE_TWP_C), .EE_LOAD(1'b1)) u_io (
     .clk, .por_n, .rst_n(!rst), .sel(io_sel), .we(io_we), .off(io_off), .wbyte(io_wbyte), .rbyte(io_rbyte),
-    .in0(8'hFF), .test_b_n(1'b1), .service_b_n(1'b1), .in2(cfg_in2), .in3(cfg_in3), .dsw(cfg_dsw), .pa_q(io_pa),
+    .in0(io_in0), .test_b_n(io_test_b_n), .service_b_n(io_service_b_n), .in2(io_in2), .in3(io_in3), .an(io_an),
+    .dsw(cfg_dsw), .pa_q(io_pa),
     .ee_ld_we, .ee_ld_a, .ee_ld_d);       // R100: the MRA's <nvram>
 
   m3_jtag u_jtag (

@@ -5,7 +5,10 @@
 //  Stage A of study D-37: the 603e, the MPC105 bus and memory map, board RAM
 //  and the ROMs in SDRAM from the MRA, interrupts, the 53C810, the tile
 //  generator and video out; the Real3D is a status-handshake stub, and there
-//  is no sound and no cabinet I/O. The work is in rtl/sys/m3_system.sv; this
+//  is no sound. The cabinet's controls come from hps_io's joysticks, sticks,
+//  triggers and paddle through m3_inputs, by the MRA's input profile
+//  (VERILOG_MACRO "M3_NO_INPUTS=1" leaves them out: the core before them,
+//  CONF_STR included). The work is in rtl/sys/m3_system.sv; this
 //  is the framework's emu around it. The debug overlay (hex) is on by
 //  default; sim/system/notes.md has its layout. The CPU's performance counters
 //  go out on UART_TXD once a second (m3_cpu_mon's "P nn value" lines).
@@ -15,7 +18,7 @@
 //  generated program and reporting on UART_TXD (tools/cputest-capture.sh),
 //  with the template's test picture.
 //
-//  Based on Template_MiSTer 0874acd (THIRD_PARTY.md).
+//  Based on Template_MiSTer e901a9f (THIRD_PARTY.md).
 //
 //============================================================================
 //
@@ -91,9 +94,29 @@ localparam CONF_STR = {
 	"O[4],Debug overlay,On,Off;",
 	"O[5],FPS counter,Off,On;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+`ifndef M3_NO_INPUTS
+	// the driving profile's lines (Scud Race, Daytona USA 2), shown only for it
+	// (status_menumask bit 0): Model 2's lines and status bits (its R816-R958),
+	// on Model 3's whole-byte ADC, where full stick is full lock (m3_cab_inputs)
+	"h0O[28],Pedals,Normal,Swapped;",
+`ifndef M3_INP_LEAN
+	"h0O[30:29],Steering,Full,5/4,3/4,Half;",
+	"h0O[51:50],Steering smoothing,Off,Light,Wheel;",
+`endif
+	"h0O[54],Right stick,Pedals only,Pedals+steer;",
+`ifndef M3_INP_LEAN
+	"h0O[71:70],Analog control,Standard,Wheel A,Wheel B;",
+`endif
+`endif
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
+`ifndef M3_NO_INPUTS
+	// the buttons, in the generic profile's order (VF3's); each MRA's <buttons
+	// names> gives its profile's (rtl/io/m3_inputs.sv). Last in the menu block,
+	// as on Model 2 (between the R items it broke the OSD's Reset there)
+	"J1,B1,B2,B3,B4,Start,Coin,Test,Service,B9,B10,B11,B12;",
+`endif
 	"V,v",`BUILD_DATE
 };
 
@@ -102,6 +125,10 @@ wire [127:0] status;
 wire         ioctl_download, ioctl_wr, ioctl_wait;
 wire  [15:0] ioctl_index, ioctl_dout;
 wire  [26:0] ioctl_addr;
+wire  [31:0] joystick_0, joystick_1;
+wire  [15:0] joy_l0, joy_l1, joy_r0;
+wire   [7:0] joy_lt0, joy_rt0, paddle0;
+wire         inp_drive;
 
 // WIDE: 16-bit ioctl words, the address rising by 2 (m3_loader)
 hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
@@ -112,7 +139,19 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.gamma_bus(),
 	.buttons(buttons),
 	.status(status),
-	.status_menumask(16'd0),
+	.status_menumask({15'd0, inp_drive}),
+`ifndef M3_NO_INPUTS
+	.joystick_0(joystick_0),
+	.joystick_1(joystick_1),
+	.joystick_l_analog_0(joy_l0),
+	.joystick_l_analog_1(joy_l1),
+	.joystick_r_analog_0(joy_r0),
+	.joystick_lt_analog_0(joy_lt0), .joystick_rt_analog_0(joy_rt0),   // Main's 0x46 (Template e901a9f)
+	.paddle_0(paddle0),
+`endif
+	// the force feedback request (Template 76dd8f5; FFB 0): no drive board yet
+	.joystick_0_ffb(56'd0), .joystick_1_ffb(56'd0), .joystick_2_ffb(56'd0),
+	.joystick_3_ffb(56'd0), .joystick_4_ffb(56'd0), .joystick_5_ffb(56'd0),
 	.ioctl_download(ioctl_download),
 	.ioctl_index(ioctl_index),
 	.ioctl_wr(ioctl_wr),
@@ -172,7 +211,21 @@ always @(posedge clk_sys) begin
 	end
 end
 
-m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .SDR_BXOR(1'b1), .SDR_L16(1'b1), .SDR_LW1(1'b1),
+`ifdef M3_NO_INPUTS
+localparam bit INPUTS = 1'b0;
+assign {joystick_0, joystick_1, joy_l0, joy_l1, joy_r0, joy_lt0, joy_rt0, paddle0} = '0;
+`else
+localparam bit INPUTS = 1'b1;
+`endif
+// VERILOG_MACRO "M3_INP_LEAN=1": the driving block without Model 2's "Steering", "Steering smoothing" and
+// "Analog control" (Wheel A / B), their OSD lines with them; each reads as its default (m3_cab_inputs)
+`ifdef M3_INP_LEAN
+localparam bit INP_LEAN = 1'b1;
+`else
+localparam bit INP_LEAN = 1'b0;
+`endif
+
+m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN), .SDR_BXOR(1'b1), .SDR_L16(1'b1), .SDR_LW1(1'b1),
             .SDR_PAIR(1'b1), .SDR_PW(1'b1),
             .BUS_FAST(1'b1), .BUS_R3P(1'b1), .SDR_FREQ(1'b1), .SDR_FWD(1'b1), .SDR_FDSP(1'b1),
             .SDR_PW_DLY(8), .ISB(1'b1)) sys3
@@ -188,6 +241,10 @@ m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .SDR_BXOR(1'b1), .SDR_L16(1'b1), .S
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY),
 	.ce_pix(ce_pix), .v_hs(v_hs), .v_vs(v_vs), .v_hblank(v_hb), .v_vblank(v_vb),
 	.v_r(v_r), .v_g(v_g), .v_b(v_b), .overlay_en(~status[4]), .fps_en(status[5]),
+	.joystick_0(joystick_0[15:0]), .joystick_1(joystick_1[15:0]), .joy_l0(joy_l0), .joy_l1(joy_l1), .joy_r0(joy_r0),
+	.joy_lt0(joy_lt0), .joy_rt0(joy_rt0), .paddle0(paddle0),
+	.st_pedswap(status[28]), .st_ssens(status[30:29]), .st_ssm(status[51:50]), .st_rsteer(status[54]),
+	.st_wheel(status[71:70]), .inp_drive(inp_drive),
 	.led(run_led), .uart_tx(UART_TXD), .tb_fast(1'b0),
 	.rom_loaded(), .frame(), .tr_v(), .tr_master(), .tr_we(), .tr_addr(), .tr_be(), .tr_data(),
 	.ev_v(), .ev_kind(), .ev_data(),

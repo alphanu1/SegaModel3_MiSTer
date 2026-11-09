@@ -13417,3 +13417,135 @@ the clock edge that registers the read, and the next clock uses it:
 - **The geometry's other stores** (`vpw`, `sl`, `fb`, `rasm`, face A): 16 ALM each for an M10K, each with its own next address.
 
 *Budget.* This pass uses 19 M10K; with R151's 22 that is 41 of the 65. 369 + 19 + 135 = 523 of 553, so 30 are left.
+
+**R154 — The cabinet's controls: hps_io's joysticks, sticks, triggers and paddle into the 315-5649 by an input
+profile per game; the framework to Template e901a9f.** Work in `sm3-builds/inputs/` (tree: `git archive c3a4f62`,
+110 MHz; the main working tree untouched). Rests on R143 (the cost estimate), D-51 (the I/O stays in the FPGA), R133
+(Lost World's analog gun path, `SER_ST` 0x00) and R100 (the game configuration, index 4).
+
+*What I believed.* R143: the I/O chip was in and only its inputs were tied off, so the hookup would cost about 210 ALM
+of mapping (Model 2's `m2_2a_inputs`) plus up to about 190 in `hps_io`. And that Model 2's mapping would carry over
+nearly as it is.
+
+*What was done.*
+- `sys/` is upstream Template_MiSTer e901a9f, file for file (my Model 2 core's `sys/` differs from it only in
+  `sys_top.v`'s `IHRES(512)` / `OHRES(2048)`, which I did not take). `hps_io` now has the analogue triggers (Main's
+  UIO 0x46) and the force feedback request (FFB 0, tied off). The other upstream changes: `LFB_*` inputs on the emu port
+  (unused), the analog audio pins driven from registers (live now that dual SDRAM is off, with their
+  FAST_OUTPUT_REGISTER in `sys_analog.tcl`), `ascal`'s gray-counter revert and o_state reset, `yc_out`
+  (compiled out by `MISTER_DISABLE_YC`).
+- `rtl/io/m3_inputs.sv` (from Model 2's `m2_2a_inputs.sv`, 4d79cd47) and `rtl/io/m3_cab_inputs.sv` (from
+  `m2_cab_inputs.sv`): one fixed button order a profile, the MRA's `<buttons names>` following it, chosen by the
+  configuration's byte 20 (`m3_loader`; byte 21 its flags). `m3_io`'s ADC returns `an[]` (it returned 00).
+  `m3_system` parameters `INPUTS`, `INP_DRIVE`, `INP_GUN`, `INP_FISH`; `Model3.sv` macro `M3_NO_INPUTS` leaves the
+  whole hookup out, CONF_STR included.
+- The profiles (MAME 0.289 model3.cpp INPUT_PORTS and Supermodel 036af1c `ReadInputs`, Games.xml):
+
+| Profile | Games | Port C / D | ADC | Buttons (J 4 on) |
+|---|---|---|---|---|
+| 0 generic | VF3 (no byte 20) | B1-B4, stick; P2 on D | 00 | Punch Kick Guard Escape Start Coin Test Service (P2 the same; P2's Test / Service are Test B / Service B) |
+| 1 driving | Scud Race, Daytona 2 | C 3:0 VR1-VR4, 7:4 four-speed H (Supermodel's shift4); D FF | 0 steering 80 centre, 1 accelerator, 2 brake, 00 at rest | Model 2 Daytona's order: Coin Start Test Service VR1 VR4 Accel Brake Gear Up Gear Down VR2 VR3 |
+| 2 analog guns | Lost World | bit 0 trigger, bit 1 Supermodel's second trigger | 0 P1 X, 1 P1 Y, 2 P2 X, 3 P2 Y: 0x80 + the left stick | Trigger Trigger 2 Start Coin Test Service, P2 on joystick 1 |
+| 3 fishing | Bass Fishing | Cast / Select on C bits 4 / 5 active high (Supermodel's bassdx; flags bit 0: MAME's bits 0 / 1 active low) | 0 rod Y, 1 rod X (left stick), 3 reel (RT, Reel button FF), 4 / 5 stick Y / X (right stick, d-pad full) | Cast Select Reel Start Coin Test Service |
+
+  Port B bank 0 is MAME's / Supermodel's for all: coin 1, coin 2, test A, service A, start 1, start 2.
+
+*Where Model 3 differs from Model 2, and why.*
+- The ADC range. MAME's model3 ports have no PORT_MINMAX (steering 80 at centre, pedals 00 at rest) and Supermodel's
+  axes run 00-FF; Model 2's are 20-E0. Feeding Model 2's 20-E0 would have held the accelerator at 1/8 at rest and
+  never reached full lock or full throttle. So the pedals are 00-FF ({m, m[6]} of the seven-bit magnitude), a trigger
+  its own 0-255, the steering 0x80 + the axis; the default sensitivity is Full (entry 0), which is the one where full
+  stick is full lock, as 3/4 was on Model 2; the smoothing rates are 4/3 of Model 2's so lock to lock takes the same time.
+- The shifter. Model 2's Daytona is a five-position table; Model 3's is a four-speed H read as microswitch pairs.
+  MAME gives each gear one bit (0x40, 0x80, 0x10, 0x20); Supermodel gives 1 = 0x50 low, 2 = 0x60, 3 = 0x10, 4 = 0x20.
+  I took Supermodel's: it is the emulator these games run in, the core's idle port C has read Supermodel's first-gear
+  AF since R100, and both traces of Scud Race read AF at rest. Gear Up / Down step it from first gear.
+- Bass Fishing's buttons: MAME and Supermodel disagree (bits 0 / 1 active low against bits 4 / 5 active high, port C
+  resting at CF, from Supermodel's 2021 controls fix). Supermodel's is the default and MAME's is one flag away. The
+  board decides.
+- Lost World: Supermodel's analog path (R133), the left stick as the gun (a USB or Sinden gun on MiSTer is a
+  joystick with absolute axes). No mouse, no crosshair of the core's own (the game draws its own), no serial gun board.
+- Not taken from Model 2: Desert Tank, the Virtua Cop guns' driver, Over Rev / STCC, Sky Target, Manx TT's motion
+  base, Zero Gunner.
+
+*Bench.*
+- `tb_m3_inputs` (`make -f sim/system/system.mk test_inputs`): `m3_inputs` and `m3_cab_inputs` against a reference
+  written from MAME's and Supermodel's ports, every profile, random joysticks, sticks, triggers, paddle and idle
+  bytes, every output compared, plus the d-pad's steering ramp: 557,727 / 557,690 / 557,739 checks on three seeds,
+  0 fail, with the full block and with `LEAN` alike. Four planted faults (coin 1 read from Start, Bass's buttons
+  active low, gear 2's pattern, the gun's Y from X) fail 7,999, 4,007, 1,690 and 6,063 checks.
+- `m3_io` against VF3's Supermodel trace (`test_io`), with the ADC now an input: 30,163 reads, 0 mismatches.
+- The system bench (`tb_m3_system`, Model3.sv's options, a new `--inp F:name=value` schedule driving hps_io's
+  ports), the bus trace's 315-5649 reads decoded by `tools/ioreads.py` (bank and channel followed):
+  - VF3, generic profile, from reset (the game reads ports B, C, D from bench frame 36): Coin -> port B FE, Start
+    EF, Punch + Kick + Guard + Escape with up-left -> C 50, P2 Start + Coin + right -> B DD, D BF, P2 Test +
+    Service -> bank 1 3F, the left stick down-right / up-left past the dead zone -> C AF / 5F, P2 buttons + down
+    -> D E0, Service A -> B F7, P2's left stick left -> D 7F; the same again from frame 160, and Test A -> B FB
+    at 200-204. Every value as designed, in the frames it was held.
+  - Scud Race, driving profile (port C from frame 47, the ADC once at 162, once at 216 and every frame from 313):
+    VR1 -> C AE; Gear Up, Up, Down, Down, Down -> 9F, EF, 9F, AF, FF (2, 3, 2, 1, N); VR2 + VR3 + VR4 in neutral
+    -> F1; Coin -> B FE. ADC: the right stick up -> accelerator FF (frame 162); left stick X +127 / -127 / +64 ->
+    steering FF / 01 / C0; right trigger 0x80 -> accelerator 80; left trigger full -> brake FF; right stick up /
+    down -> accelerator / brake FF; Accel / Brake buttons -> FF; Wheel A with the left stick's Y up ->
+    accelerator FF; "Steering 5/4" with X +64 -> D0; paddle 0x30 -> 30; d-pad right -> FF, released -> 80.
+  - Not shown: a game reacting to an input on screen. VF3 had drawn nothing by bench frame 249 (its warning
+    screen came at about 300 before), and the Test press at 200 changed nothing visible; it was still in its
+    start-up uploads. Lost World (its analog path is chosen near Supermodel frame 421) and Bass Fishing were not
+    run on the system bench, only in `tb_m3_inputs`.
+
+*Fit* (Quartus 17.0, 110 MHz, M3_RELEASE as `cm1_s2`, seed 2; dual SDRAM off, see below).
+- `inp1_s2` (the full driving block): **did not fit**, 4,198 LABs needed of 4,191. Synthesis against `cm1_s2`:
+  `m3_inputs` 386 ALUT (the driving block 278), `hps_io` +80, `m3_io` +26, `vga_out` + `vga_scaler_out` +529,
+  the audio DACs +38 ALUT.
+- So the driving block's three refinements are build options (`M3_INP_LEAN`): "Steering", "Steering smoothing"
+  and "Analog control" out, each reading as its default (Full, Off, Standard), output for output (`tb_m3_inputs`).
+  Model 2's three-flop synchronisers on the OSD bits are gone in both builds (hps_io runs on clk_sys). Synthesis:
+  `m3_inputs` 386 -> 224 ALUT, the map estimate 40,934 -> 40,826 ALM.
+- `inp2_s2` (lean): 41,409 / 41,910 ALM (99%), 347 M10K, 88 DSP. Setup sys_clk -2.122 / -1.979 ns at the slow
+  corners (`cm1_s2` -1.610 / -1.300), +2.370 / +3.509 fast; HDMI -0.275 / -0.208 slow (`cm1_s2` -0.097 / -0.223);
+  hold +0.242 / +0.163 / +0.133 / +0.117 ns sys_clk, all clocks positive at all four corners. The worst paths are
+  the CPU's and the geometry's as before; new among the 200 worst is `hps_io`'s download path, `gp_outr[19]` ->
+  `ioctl_addr` at -1.45 ns slow. RBF `sm3-builds/inputs/inp2_s2_228260a4.rbf`
+  (228260a41d80dabb8e792ff2ac6f99fb). Not loaded.
+- Fitted ALM against `cm1_s2`:
+
+| Block | `cm1_s2` | `inp2_s2` | Change |
+|---|---|---|---|
+| `m3_inputs` (with `m3_cab_inputs`) | 0 | 107.5 | +107.5 (the driving block 45.3) |
+| `hps_io` | 419.3 | 473.4 | +54.1 |
+| `m3_io` | 167.2 | 181.1 | +13.9 |
+| the input hookup | | | **about +176** |
+| `vga_out` / `vga_scaler_out` | 0 / 0 | 115.3 / 142.7 | +258.0 |
+| `audio_out`'s DACs (`sd_l`, `sd_r`) | 0 | 18.9 | +18.9 |
+| the analog board's path (dual SDRAM off, R150) | | | **about +277** |
+| everything (`sys_top`) | 41,062.5 | 41,408.5 | +346 (the fitter packed the CPU 137 and the geometry 64 tighter) |
+
+*Dual SDRAM.* The board build is without `MISTER_DUAL_SDRAM` (R150): the tree's `Model3.qsf` no longer sources
+`sys_dual_sdram.tcl` and sources `sys/sys_analog.tcl`, as the Template's qsf and my Model 2 core's do. Model3.qsf
+already carried 0874acd's analog pins and IO standards (expanded in by an earlier analyze; 36 locations, all equal),
+but not e901a9f's FAST_OUTPUT_REGISTER on AUDIO_L / R / SPDIF, which go with its registered audio pins.
+
+*Still open.* Bass Fishing's button wiring (Supermodel against MAME) and Supermodel's port G 0x01 for bassdx
+(`ReadInputs` 0x18, "prevents an I/O error after a while"; the MRA's default is 7F); Lost World's guns from a
+mouse; the drive board (FFB is wired to 0); the full driving block, when the area allows (R143 / D-51); the
+download path's new negative slack.
+
+*Wrong turns.*
+- The first system-bench build failed: c3a4f62's `tb_m3_system.cpp` reads `r3d_geo.ms_wv`, which Verilator inlines;
+  the `tc/r3d3` Verilator config's `public_flat_rd` for it is needed (not this change's).
+- The first bench runs stopped at the loader's VROM window check: this tree has `VROM_LIN` on, so the bench needs
+  `--xlin`.
+- I scheduled VF3's first inputs after frame 145, believing the bench's boot RAM test put the game about 81
+  frames behind Supermodel; with `--tb-fast` the game read its ports from frame 36, so the first schedule (60-96)
+  was the one seen and the second repeated it.
+- I took Scud's first ADC read (frame 162) to mean it reads the ADC every frame from there. It read once, again
+  at 216, and every frame from 313 (in step with the older s15 bench: 148, 203, 304), so the analog schedule was
+  run again from the frame-200 checkpoint.
+- The first fit was built with the full driving block, on R143's estimate of about 400 ALM for the hookup; with
+  the analog board's path back as well it was 7 LABs over. R143's figure holds for the hookup alone (about 176
+  fitted, lean); it did not count the +277 of R150.
+- My first reference model in `tb_m3_inputs` applied both Gear Up and Gear Down when they rose in the same clock;
+  Model 2's block (and so this one) lets Gear Down win. The reference was changed to Model 2's rule, not the RTL.
+- Quartus 17 called Model 2's `pedal_ax == -8'sd128` a constant overflow; it is now `joy_ranalog[15:8] == 8'h80`,
+  the same comparison, and the steering, pedal and dead-zone arithmetic was constant-folded in Quartus (40 values,
+  0 differ).

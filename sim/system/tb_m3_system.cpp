@@ -13,6 +13,10 @@
 //              [--ddr-busy PCT] [--ddr-lat LO HI]
 //              [--cfg FILE] [--xmem FILE] [--fix8 FILE] [--nvram FILE] [--prof-vrom FILE]   (study R100)
 //              [--sw FILE]   (the MRA's <switches> as index 254, after the rest as Main sends it: IMG.i254.bin; R133)
+//              [--inp F:name=value,...]...   (the cabinet's controls from frame F on, as hps_io gives them:
+//              j0 j1 the joysticks (3:0 right, left, down, up; 15:4 the J1 buttons), l0 l1 r0 the sticks
+//              {Y, X} signed, lt rt the triggers, pad the paddle, st the driving OSD bits {wheel[1:0],
+//              rsteer, ssm[1:0], ssens[1:0], pedswap}; each named one keeps its value until changed)
 //
 // --sdr-bxor: the model was built with SDR_BXOR (study R107); sdram_dev applies the same bank hash.
 // --prof2 FILE: the CPU's cycles by cause, its memory port and the SDRAM ports, a line a frame (prof2.h).
@@ -44,6 +48,9 @@
 // and are checked in the SDRAM; the rest is put straight into the model (a
 // 98 MiB ioctl stream is hours of simulation), and the end of the download
 // releases the game, as on the board.
+//
+// --tgw prints, each frame, the clocks the CPU was held in m3_bus's B_DEC by the tile generator's bus timing
+// (TGT, study R152) and how many accesses were held.
 //
 // --trace writes every bus access outside RAM and CROM reads in Supermodel's
 // trace format (sim/system/bustrace.py). --dump writes the tile generator's
@@ -130,14 +137,18 @@ int main(int argc, char **argv) {
   std::set<long> dump_at, ppm_at, r3d_at;
   std::string r3d_dir;
   bool quiet = false, tb_fast = false, fatal_stop = true;
+  bool tgw = false;                     // --tgw: per frame, the CPU's clocks held by m3_bus's TGT (R152)
+  uint64_t tgw_clk = 0, tgw_acc = 0, tgw_c0 = 0; bool tgw_prev = false;
   uint32_t tb_pc = 0xFFF00198;          // where --tb-fast ends (0: the first instruction in RAM)
   int vrom_x = -1;
   bool save_idle = false; std::string vt_fn;
+  std::vector<std::pair<long, std::string>> inp;   // --inp: (frame, "name=value,...")
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto nx = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
     if (a == "--image") img_fn = nx();
     else if (a == "--cfg") cfg_fn = nx();
+    else if (a == "--inp") { std::string v = nx(); size_t c = v.find(':'); inp.push_back({std::strtol(v.c_str(), nullptr, 0), v.substr(c + 1)}); }
     else if (a == "--sw") sw_fn = nx();
     else if (a == "--xmem") xmem_fn = nx();
     else if (a == "--fix8") fix8_fn = nx();
@@ -155,6 +166,7 @@ int main(int argc, char **argv) {
     else if (a == "--ppm-at") ppm_at = parse_list(nx().c_str());
     else if (a == "--window") window = std::strtol(nx().c_str(), nullptr, 0);
     else if (a == "--quiet") quiet = true;
+    else if (a == "--tgw") tgw = true;
     else if (a == "--prof") prof = true;
     else if (a == "--check-lw") lwc.on = true;
     else if (a == "--sdr-bxor") sd.bxor = true;   // the build's SDR_BXOR (R107): the device array takes the bank hash back
@@ -510,8 +522,37 @@ int main(int argc, char **argv) {
   }
   uint32_t pv_lpc = 0;
   int pv_left = 0; bool pv_on = false; uint32_t pv_frame = t->frame;
+  // --inp: the controls, applied at the start of their frame (and any already due when the run starts)
+  std::stable_sort(inp.begin(), inp.end(), [](auto &x, auto &y) { return x.first < y.first; });
+  size_t inp_i = 0;
+  auto inp_apply = [&]() {
+    while (inp_i < inp.size() && inp[inp_i].first <= long(t->frame)) {
+      std::string const &w = inp[inp_i].second;
+      size_t p0 = 0;
+      while (p0 < w.size()) {
+        size_t c = w.find(',', p0); if (c == std::string::npos) c = w.size();
+        std::string it = w.substr(p0, c - p0); size_t e = it.find('=');
+        std::string k = it.substr(0, e); unsigned v = unsigned(std::strtoul(it.substr(e + 1).c_str(), nullptr, 0));
+        if (k == "j0") t->joystick_0 = v; else if (k == "j1") t->joystick_1 = v;
+        else if (k == "l0") t->joy_l0 = v; else if (k == "l1") t->joy_l1 = v; else if (k == "r0") t->joy_r0 = v;
+        else if (k == "lt") t->joy_lt0 = v; else if (k == "rt") t->joy_rt0 = v; else if (k == "pad") t->paddle0 = v;
+        else if (k == "st") { t->st_pedswap = v & 1; t->st_ssens = (v >> 1) & 3; t->st_ssm = (v >> 3) & 3; t->st_rsteer = (v >> 5) & 1; t->st_wheel = (v >> 6) & 3; }
+        else { std::fprintf(stderr, "--inp: unknown %s\n", k.c_str()); std::exit(2); }
+        p0 = c + 1;
+      }
+      std::printf("frame %u: inputs %s\n", t->frame, w.c_str());
+      inp_i++;
+    }
+  };
+  uint32_t inp_frame = ~0u;
   while (t->frame < uint32_t(nframes) || (save_idle && idle_n < 8)) {
+    if (t->frame != inp_frame) { inp_frame = t->frame; inp_apply(); }
     tick();
+    if (tgw) {
+      bool const h = t->rootp->m3_system__DOT__u_bus__DOT__bs == 1 && t->rootp->m3_system__DOT__u_bus__DOT__tg_hold;
+      if (h) { tgw_clk++; if (!tgw_prev) tgw_acc++; }
+      tgw_prev = h;
+    }
     {
       auto *q = t->rootp;
       bool const msa = q->m3_system__DOT__u_geo__DOT__u_ms__DOT__active, msv = q->m3_system__DOT__u_geo__DOT__u_ms__DOT__in_vrom;
@@ -760,6 +801,11 @@ int main(int argc, char **argv) {
         std::printf("\n"); std::fflush(stdout);
         for (int k = 0; k < 6; k++) pf_inf[k] = pf_infw[k] = pf_pndw[k] = 0;
         pf_cyc = pf_ins = 0; for (auto &w : pf_w) w = 0; for (auto &n : pf_n) for (auto &c : n) c = 0;
+      }
+      if (tgw) {
+        std::printf("tgw frame %u: %" PRIu64 " clocks held of %" PRIu64 " (%.2f%%), %" PRIu64 " accesses held\n", frame_seen, tgw_clk,
+                    cyc - tgw_c0, 100.0 * double(tgw_clk) / double(cyc - tgw_c0 ? cyc - tgw_c0 : 1), tgw_acc);
+        tgw_clk = tgw_acc = 0; tgw_c0 = cyc;
       }
       if (!quiet && (frame_seen % 10 == 0 || frame_seen < 5)) {
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

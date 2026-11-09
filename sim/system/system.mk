@@ -41,11 +41,11 @@ R3D_SYS = rtl/real3d/r3d_ucode_pkg.sv rtl/real3d/r3d_fp_add.sv rtl/real3d/r3d_fp
 BUS_RTL  ?= rtl/sys/m3_bus.sv
 TEXUP_RTL ?= rtl/real3d/r3d_texup.sv    # R100: with M3_STEP2_TEX, sm3-builds/dt2/handoff2/rtl/r3d_texup.sv
 SYS_DEFS ?= +define+M3_STEP2_BUS=1 +define+M3_STEP2_TEX=1
-SYS_RTL = $(R3D_SYS) rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/sys/m3_jtag.sv rtl/io/m3_93c46.sv rtl/io/m3_io.sv rtl/sys/m3_sdr_port.sv $(BUS_RTL) \
+SYS_RTL = $(R3D_SYS) rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/sys/m3_jtag.sv rtl/io/m3_93c46.sv rtl/io/m3_io.sv rtl/io/m3_cab_inputs.sv rtl/io/m3_inputs.sv rtl/sys/m3_sdr_port.sv $(BUS_RTL) \
           rtl/io/m3_scripts.sv rtl/mem/m2_sdram.sv rtl/video/m2_video_timing.sv rtl/viewer/m3v_overlay.sv \
           rtl/dbg/m3_frame_busy.sv rtl/dbg/m3_fps.sv rtl/sys/m3_xmem.sv rtl/sys/m3_5881.sv rtl/sys/m3_sec.sv rtl/sys/m3_loader.sv rtl/sys/m3_system.sv
 
-.PHONY: test_jtag test_jtag_fault lint_sys test_io test_sdr_port test_bus system test_xmem test_sec test_texup2
+.PHONY: test_jtag test_jtag_fault lint_sys test_inputs test_io test_sdr_port test_bus system test_xmem test_sec test_texup2
 
 # r3d_texup's three-word texture port (R100; Step 1.5 and later, D-46) against its FIFO
 # path, on 64 MiB of VROM (Daytona 2) and on 32 MiB (--v32: a Step 1.5 set). TEXUP2_RTL:
@@ -108,6 +108,16 @@ test_jtag: $(SYS_OBJ)/jtag/Vm3_jtag
 test_jtag_fault: $(SYS_OBJ)/jtag/Vm3_jtag
 	@echo "== m3_jtag, one TDO expectation flipped (must FAIL)"
 	! ./$(SYS_OBJ)/jtag/Vm3_jtag $(TRACE) --fault
+
+# m3_inputs and m3_cab_inputs (the cabinet's controls by input profile) against a reference written from
+# MAME's and Supermodel's ports
+$(SYS_OBJ)/inputs/Vm3_inputs: rtl/io/m3_cab_inputs.sv rtl/io/m3_inputs.sv sim/system/tb_m3_inputs.cpp
+	@$(VERILATOR) $(VFLAGS) --top-module m3_inputs -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/inputs rtl/io/m3_cab_inputs.sv rtl/io/m3_inputs.sv sim/system/tb_m3_inputs.cpp >/dev/null
+
+test_inputs: $(SYS_OBJ)/inputs/Vm3_inputs
+	@echo "== m3_inputs: the controls by profile against MAME's and Supermodel's ports"
+	./$(SYS_OBJ)/inputs/Vm3_inputs 1
+	./$(SYS_OBJ)/inputs/Vm3_inputs 2
 
 $(SYS_OBJ)/io/Vm3_io: rtl/io/m3_93c46.sv rtl/io/m3_io.sv sim/system/tb_m3_io.cpp
 	@$(VERILATOR) $(VFLAGS) --top-module m3_io -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/io rtl/io/m3_93c46.sv rtl/io/m3_io.sv sim/system/tb_m3_io.cpp >/dev/null

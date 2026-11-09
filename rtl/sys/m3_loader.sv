@@ -30,7 +30,9 @@
 //      bit 7 empty, bits 3:0 its 8 MiB slot in SDRAM), bytes 18-19 the idle
 //      inputs on 315-5649 ports C and D (default FF FF; Daytona 2's 4-speed
 //      shifter rests in a gear, so its port C reads AF, as in Supermodel),
-//      byte 20 not used.
+//      byte 20 the input profile (m3_inputs: 0 the generic / fighting ports,
+//      VF3's; 1 driving; 2 analog guns; 3 fishing), byte 21 its flags
+//      (default 00 00)
 // 254  the MRA's <switches> (Main's DIP Switches page): byte 0 the CPU board's
 //      DIP bank, 315-5649 port G (bit 7 SW1 ... bit 0 SW8, 0 = ON). Main sends
 //      it after the last <rom>, and again whenever a switch is changed; the
@@ -99,6 +101,7 @@ module m3_loader #(
   output logic [15:0][4:0] cfg_bank,  // {empty, slot[3:0]} by bank
   output logic [7:0]  cfg_in2, cfg_in3, // idle inputs, ports C and D
   output logic [7:0]  cfg_dsw,          // the DIP bank, port G (index 254; R133)
+  output logic [7:0]  cfg_prof, cfg_pflg, // the input profile and its flags (bytes 20, 21; m3_inputs)
 
   output logic        rom_loaded,
   output logic        busy,         // a download in progress or draining
@@ -154,7 +157,7 @@ module m3_loader #(
   // (c7_s1: ioctl_index -> cfg_bank -0.95 ns, 105 endpoints). Every cfg_* value and every order between them
   // is as before, one cycle later; the FIFO, ioctl_wait, busy and rom_loaded still run on the port itself.
   // Nothing reads the configuration in that cycle: the game is held in reset while the loader is busy.
-  logic        q_dl, q_wr, q_cfg, q_ix0, q_sw, q_a0, q_a9, q_alo;
+  logic        q_dl, q_wr, q_cfg, q_ix0, q_sw, q_a0, q_a9, q_a10, q_alo;
   logic [3:0]  q_a41;
   logic [15:0] q_d;
   logic        q_cfg_d, q_dl0_d, q_cfg_seen;
@@ -166,6 +169,7 @@ module m3_loader #(
     q_sw  <= ioctl_index == 16'd254;
     q_a0  <= ioctl_addr[26:1] == 26'd0;
     q_a9  <= ioctl_addr[26:1] == 26'd9;
+    q_a10 <= ioctl_addr[26:1] == 26'd10;
     q_alo <= ioctl_addr[26:5] == 22'd0;
     q_a41 <= ioctl_addr[4:1];
     q_d   <= ioctl_dout;
@@ -182,6 +186,7 @@ module m3_loader #(
     if (rst) begin
       q_cfg_seen <= 1'b0; q_cfg_d <= 1'b0; q_dl0_d <= 1'b0;
       cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
+      cfg_prof <= 8'h00; cfg_pflg <= 8'h00;
       for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
     end else begin
       q_cfg_d <= q_dlc;
@@ -190,6 +195,7 @@ module m3_loader #(
       if (q_dlc && q_wr) begin
         q_cfg_seen <= 1'b1;
         if (q_a9) begin cfg_in2 <= q_d[7:0]; cfg_in3 <= q_d[15:8]; end
+        if (q_a10) begin cfg_prof <= q_d[7:0]; cfg_pflg <= q_d[15:8]; end
         if (q_alo) begin
           if (q_a41 == 4'd0) begin cfg_step <= q_d[7:0]; cfg_flags <= q_d[15:8]; end
           else if (q_a41 <= 4'd8) begin
@@ -202,6 +208,7 @@ module m3_loader #(
         q_cfg_seen <= 1'b0;
         if (!q_cfg_seen) begin
           cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
+          cfg_prof <= 8'h00; cfg_pflg <= 8'h00;
           for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
         end
       end
