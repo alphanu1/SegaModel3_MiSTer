@@ -1106,6 +1106,8 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-47 | (2026-11-07) The instruction cache is 32 KB, twice the 603e's 16 KB, behind `m3_system`'s `ISB` parameter (on in `Model3.sv`; 0 builds the 603e's 16 KB). It costs 12 M10K (324 to 336 of 553) and about 64 ALM, and takes Daytona 2's work CPI down 8.7% and VF3's 1.9% with R121's other two changes, halving Daytona 2's instruction fills. On the `ppc_cpu` spike it costs about 1.7 MHz at slow −40 °C, inside D-44's margin as far as five seeds resolve. It is a step away from the 603e's size taken for speed, not accuracy: the cache's behaviour (physically tagged, icbi clearing both possible sets) is unchanged, and so is anything a program can observe except timing. If M10K runs short for sound (D-45), this is the first thing to give back. |
 | D-48 | (2026-11-08) No area change may cost a game any cycles, even inside a frame's budget, and none that could make a game slower; this narrows D-43 / D-44's "a throughput trade must hold each frame's budget". The room for sound (D-45) has to come from cycle-free changes: shared logic, storage moved to M10K, dead logic removed, per-board parameters. Under it R131's edge product on the walk's adders (`PB` = 1) is left off, and R129's iterative double front, R129's speed-feature switches and R130's DSP alignment shift (a standalone Fmax drop) are not taken. A change that makes a game faster and saves area, as R131's overlapped front, is welcome. |
 | D-49 | (2026-11-08) Texture decode, contour and texture alpha follow Supermodel's New3D renderer, not MAME's, wherever nothing from the hardware says otherwise (R134, R135). It supersedes the MAME-style decode the core had for formats 1-6 and the texture-alpha kind. Where the board or the real cabinet shows the hardware differs from Supermodel (Daytona 2's car shadow, R137), the hardware wins and Supermodel is no evidence for that case. |
+| D-50 | (2026-11-08) The system clock's goal is 120 MHz with every corner closed; closing 110 MHz is the step on the way. For timing work only, D-48 is read in time, not cycles: a change may add a clock cycle where the game, timed in seconds at the faster clock, is at least as fast as it is now at 110 MHz. The trade is measured on the bench per change (cycles before and after, scaled by the two clocks) before it is taken, and a cycle that costs more than the clock gains is not taken. Area changes stay under D-48 as written. |
+| D-51 | (2026-11-08) Sound goes on the HPS's ARM: the 68000 and the two SCSPs emulated there, the samples streamed to the FPGA's audio out. This takes D-45's fallback as the plan and frees its ~4,500 ALM reservation; the ~1,000 ALM for I/O stays in the FPGA. It must still meet the zero-added-latency rule and leave MiSTer Main its share of the CPU. Area work waits until 120 MHz (D-50) is close to closing, and then runs on its own branch. The blocks outside the CPU and the Real3D (bus, SDRAM and DDR3 ports, SCSI, texture upload, tile generator, I/O, JTAG, loader, security: about 5,370 ALM in `tm1_s2`) are the first place to look. |
 
 ### Open
 
@@ -5542,7 +5544,7 @@ The first data path spends 3.9 ns on one route, so routing at 97% full is part o
   tRC 7 = 63.6 against 60; tRAS 5 = 45.5 against 42; CL 2, which the part allows to 133 MHz). Refresh follows `CLK_HZ`
   (7.7 µs). The read capture depth (CL + 2, fixed in `Model3.sv`) was found on the board at 90-100 MHz. At 110 MHz the
   return sits about 0.8 ns closer to the capture edge, so it must be confirmed on the board, or the depth made selectable.
-- **Video.** The pixel enable (16 MHz) and the HDMI path derive from `CLK_HZ` (7-bit accumulator, good to 127 MHz).
+- **Video.** The pixel enable (16 MHz) and the HDMI path derive from `CLK_HZ` (7-bit accumulator; good to 112 MHz, not the 127 MHz I first wrote, R138).
 
 *Plan:*
 1. The CPU's four paths above, each benched (core 200 seeds, CPU subsystem, cache) and checked against the CPU spike's
@@ -12039,3 +12041,474 @@ a texel block is entirely see-through, for example) would need its own design. T
 not poke out past the front-left fender. Supermodel draws the same wedge as the core, so Supermodel is wrong here too,
 and "Supermodel draws it there too" is no evidence. The wedge is a fault, still open; the mechanism the hardware uses
 is being looked for (`sm3-builds/shd`).
+
+**R138 — Two of `m3_system`'s real-time accumulators overflow above 111-112 MHz, so a 120 MHz build would have run
+the timebase at 7.5 MHz instead of 16.5 MHz and given no pixel enable at all; and `m2_sdram`'s row timings break a
+-6 part's tRC and tRAS at 120 MHz. Both now follow the clock; at 100 and 110 MHz nothing changes.**
+
+*What I believed.* R-entry "SDRAM at 110 MHz" above recorded the pixel enable as "a 7-bit accumulator, good to 127 MHz",
+and the SDRAM's fixed cycle counts as holding for a -6 part. Both were checked at 110 MHz only.
+
+*What is true.*
+- The timebase (`tb_acc`, 8 bits) adds 33 and compares against 2 × `CLK_MHZ`. Its largest sum is 2 × `CLK_MHZ` + 32,
+  which passes 255 above 111 MHz and wraps.
+- The pixel enable (`ce_acc`, 7 bits) adds 16 and compares against `CLK_MHZ`. Its largest sum is `CLK_MHZ` + 15, which
+  passes 127 above 112 MHz. It is good to 112 MHz, not 127.
+- `m2_sdram`'s defaults are tRC 7 and tRAS 5 clocks. At 120 MHz that is 58.3 ns against 60 and 41.7 ns against 42.
+  tRCD and tRP (2 clocks, 16.7 ns against 15) and CL 2 (to 133 MHz) still hold.
+
+*How I found it.* Moving the `timing-120` branch to 120 MHz, I went through every count derived from `CLK_HZ`. A
+bench of the two accumulators, the old form beside the new, over 1 ms (`sm3-builds/acc/tb.sv`, iverilog):
+
+| Clock | Timebase ticks, old / new (want 16,500) | Pixel enables, old / new (want 16,000) | Cycles where old and new differ |
+|---|---|---|---|
+| 100 MHz | 16,500 / 16,500 | 16,000 / 16,000 | 0 |
+| 110 MHz | 16,500 / 16,500 | 16,000 / 16,000 | 0 |
+| 120 MHz | 7,499 / 16,500 | 0 / 16,000 | 34,749 |
+
+*The change* (`rtl/sys/m3_system.sv`):
+- `tb_acc` is 9 bits and `ce_acc` 8 bits, with the constants widened to match.
+- `T_RC` and `T_RAS` are passed to `m2_sdram` from `CLK_MHZ`, rounded up to whole clocks for 60 ns and 42 ns and never
+  below the old 7 and 5: 7 and 5 up to 116 MHz, 8 and 6 at 120.
+- `quartus_map --analyze_file` is clean, and Verilator gives the same warnings as before. At 100 and 110 MHz the
+  build is cycle-identical, since every value and every parameter is unchanged.
+- *Wrong turn:* my first form had no floor, so at 100 MHz, the system bench's clock, tRC came out as 6. That is in
+  spec for 60 ns, but it changed the bench: `rom_loaded` 1,761 cycles sooner and 141,828 more SDRAM reads in 40
+  frames of Daytona 2's boot. With the floor the 100 MHz counts are the board-proven ones again.
+
+*Still open at 120 MHz.* The SDRAM read-capture depth (CL + 2, fixed in `Model3.sv`) was found on the board at
+90-100 MHz. At 120 MHz the return sits closer to the capture edge, so it has to be confirmed on the board, or the
+depth made selectable. Two extra row-cycle clocks cost a little bandwidth on row misses; the bench prices that
+before 120 MHz goes to the board, under D-50.
+
+**R139 — 110 MHz closure outside the CPU: of `c7_s1`'s non-CPU failures (1,107 endpoints, −364.6 ns of the
+design's −1,569 ns TNS), the rasteriser's are logic depth and almost everything else is placement. Standalone at
+8.333 ns the rasteriser is 110.7 / 110.9 MHz; the geometry (125.2 / 123.9), the walker, the facing unit, `r3d_texup`,
+`r3d_mem`, `m3_bus` (134.0), `m2_sdram` (172.4) and `m3_loader` (195.1) reach 125 MHz alone and fail only in the full
+fit, where interconnect is 55-75% of every failing path.
+Sixteen cycle-exact changes in twelve files, every bench identical to `c7_s1` in output and cycles, act on the
+families worth 579 endpoints and −221 ns of that TNS: in the rasteriser every family changed but two now reaches
+125 MHz alone in every seed (the store's table read is at 120-123, the texture cache's own logic at 116-129), and the
+block is 68 ALM smaller; `m3_bus` goes to 153.2 / 154.0 MHz for −108 ALM. The rasteriser's own Fmax
+moves only from 110.7 / 110.9 to 111.5 / 111.2 MHz: its worst path is now in families I did not change (the z band's
+advance, the texture cache's MLAB write, the colour unit's M10K read), which swing 108-128 MHz between seeds and
+builds. Three seeds spread 6-11 MHz here, more than most single changes move.** Work in `sm3-builds/tc/r3d/`: `tree`
+(the main tree at `c7_s1`, `tc/base`, with these changes; = `snap/t4`), `snap/t2`-`t4` (the RTL each round fitted),
+`fits/` (standalone fits, three seeds a variant), `c7paths/` (full paths of `c7_s1`'s worst endpoint per family),
+`logs/`, `miter/loader`, `exp/` (planted faults), `STATUS.md`. D-48 applies (no cycle added to any game, no feature
+switched off); D-44 (110 MHz; no block's standalone Fmax may drop); §8.3; §8.4's method (standalone fits,
+old-against-new miters, real-code benches, planted faults). The CPU (`ppc_*`) is not in this entry. Desk only:
+benches, `quartus_map --analyze_file`, standalone fits; no full fit, not the board.
+
+*What I believed* (R104, R109, R125, R130, R131):
+- The 110 MHz release was short by many small paths outside the CPU, 0.5-1.6 ns each, and timing follows area on a
+  98%-full part, so most would close only with area.
+- The rasteriser stood at about 116 / 114 MHz standalone (R131) and the geometry at 127.9 / 125.1 (R130): both close
+  to 125 except for what R135 added (the texel's dilation selects, the colour unit's product).
+- `hps_io → m3_loader`, the largest non-CPU family (105 endpoints), was the download FIFO's write.
+
+*What I know now:*
+- R130 and R131 fitted at 9.091 ns; at 8.333 ns the base rasteriser is 110.74 / 110.85 MHz (seeds 1-3, slow 100 °C /
+  −40 °C, 8,204 ALM) and the geometry 125.19 / 123.92 (7,671 ALM). The target period moves the result by several MHz,
+  so standalone numbers are comparable only at one target.
+- `hps_io → m3_loader` is not the FIFO. All 105 endpoints are the game configuration's registers (`cfg_bank` 71,
+  `cfg_step`, `cfg_in2/3`, `cfg_dsw`, `cfg_flags`), from `ioctl_index` through the index and address decodes:
+  six levels from a register at the HPS side of the chip, 6.4 of the path's 9.3 ns interconnect.
+- The `m2_sdram` worst path (−1.65 ns, the design's fourth worst) ends in `sd_a[9]`'s I/O register: its last hop is
+  5.6 ns of the 11.5. Only the logic in front of it can go (`|tag_v`); the hop is the pins' placement.
+- Interconnect is 55-75% of every failing non-CPU path's delay in `c7_s1` (`c7_levels.txt`, the worst path of 35
+  families). The geometry's paths are 2-2.5 ns slower in the full fit than standalone.
+- Which family is which (standalone Fmax of the family's own worst path, base, seeds 1-3):
+
+| `c7_s1` family (slow 100 °C: endpoints / TNS ns / worst ns) | Standalone, base | Kind |
+|---|---|---|
+| `hps_io → m3_loader` 105 / −44.6 / −0.95 | 195.1 (the loader alone) | placement: the index decode in series with the configuration's enables, from `hps_io` across the chip (6 levels, interconnect 6.4 of 9.3 ns) |
+| `r3d_geo → r3d_geo` 81 / −36.4 / −1.16; `→ dpram_7no1` 5 / −4.5 / −1.41; `→ r3d_mstream` 11 / −2.8 | ≥ 128 (`D_HDR → MLAB` 131) | placement. The geometry's own worst standalone paths are others: `P_Q0 → xw_data` 122.5, `cu_out` 123.4, `eb_first → P_PJ0` 124.0, `r3d_fp_add` 124.8 |
+| `r3d_rast_fogvp` 52 / −22.3 / −0.93 | 108.6 | logic |
+| `r3d_rast_texel` 37 / −22.0 / −1.22; `r3d_rast → texel` 62 / −13.3 | 110.7 | logic |
+| `r3d_texup` 53 / −20.2 / −0.73 | 144.9 (R109) | placement |
+| `r3d_fp_add` 52 / −17.6 / −0.64 (lane 2 only) | 124.8-128 | placement (one lane of four), at 125 standalone |
+| `dpram_llo1` 40 + 28 / −24.8; `r3d_rast_store` 58 / −14.3; `altsyncram_2nk1 → store` 9 / −2.5 | 114.8, 116.7, 118.3 | logic |
+| `r3d_walker` 45 / −16.7 | ≥ 133.7 | placement |
+| `m3_bus` 44 / −16.6 / −0.99 | 134.0 | placement, with 7 levels: the MPC106 register select and the target decode into `m_rdata` and `pci_addr` (the bus's own worst standalone path, `addr → m_rdata`, 129.5-136.9) |
+| `r3d_rast_zspan` 54 / −10.2 | ≥ 125 | placement |
+| `altsyncram_8kk1 → r3d_rast_colour` 24 / −10.2 / −0.82 | 121.7 | logic: the ring's M10K through the kind decode and the 8 × 8 product |
+| `r3d_face` 57 / −16.3 | ≥ 129.6 | placement |
+| `m2_sdram` 15 / −8.1 / −1.65 | 172.4 | the pins (above) |
+| `r3d_rast_store → r3d_geo` 13 / −8.1 / −1.13 | — | the two blocks' distance (the store's `w_ready` into the emitter's state) |
+| `m3_ddr_arb → m3_ddr3p / r3d_mem` 34 / −7.1 | not fitted alone | interconnect 6.1-7.6 of 9.1 ns |
+| `r3d_rast_tcache` 10 / −3.0; `dpram_rlo1 → altsyncram_3mn1` 12 / −3.4 | 113.7, 123.8 | logic |
+| `m3_loader → m3_bus / r3d_texup` 13 / −5.4 / −1.11 | — | the step's compares from `cfg_step`, which holds while a game runs |
+
+*The changes* (each bit- and cycle-exact on every bench; "assert" is a Verilator check of the new form against the
+old one, fired by a planted fault):
+
+| Block | Path | Change | Proof |
+|---|---|---|---|
+| `m3_loader` | `ioctl_index` → `cfg_*` (105 endpoints) | the configuration runs a cycle behind the port, on registered copies of `ioctl_download`, `ioctl_wr`, the index and address decodes and the word; the FIFO, `ioctl_wait`, `busy` and `rom_loaded` stay on the port. The FIFO's class reads `cfg_flags[0]` with that cycle's update bypassed (`flags0`) | miter against the old loader: 4 × 20,000 random downloads (the index changing with the download, writes every cycle), every other output equal every cycle and the configuration a cycle later; 0 differing cycles. Without `flags0`: 28 and 20 |
+| `m3_system` | `cfg_step` → `m3_bus` `m_rdata`, `r3d_texup` | `step2`, `step15`, `jstep` registered: a cycle after `cfg_step`, with the game in reset | system bench |
+| `m2_sdram` | `tag_v` → `\|tag_v` → S_IDLE → `sd_a` / `cmd` | `pipe_busy` a register formed from the tags' next state (the shift and the cycle's injection) | assert; `test_sdr_port`, `_r107` |
+| `m3_bus` | `pci_addr` → MPC106 select → `rd_int` → `m_rdata`; `addr` → target → `pci_addr`'s enable | B_INT and the write cycle take the target and the MPC106 register registered (`tgt_q`, `cq_q`): both come a cycle or more after `addr`, `pci_addr` and the registers settle | assert; `test_bus`, `_r107` |
+| `r3d_geo` | `D_HDR` → header decode → stall → `ms_pop` → `xb_r` and the stream's `rp` | `hk_nw` (header word to the facing test) a register beside `hk` | assert; geometry bench |
+| `r3d_mstream` | (the same) | `w_valid` a register: the next count's zero test from the count's own compares beside push and pop | assert; geometry bench |
+| `r3d_rast_fogvp` | `mb` → compare → guard → `o_k` (108.6 MHz); `k` → word select → compare → `r` (−0.93) | the divide's compare as the step subtract's borrow (one carry chain); `k3`, `k5` registered beside `k` | assert |
+| `r3d_rast_texel` | stage 3: selects → decode → subtract → `dt4`/`db4` (110.7 MHz, −1.22) | stage 4 holds the decoded texels; the differences are taken in stage 5a, in front of the products | bench (`texel_d5` fault: 100,113 and 116,902 pixels wrong) |
+| `r3d_rast_texel` | `v1b` → mirror → row add → corner add → `aw` (107.2 MHz at −40 °C) | `{y01, x01} + {v, 0} + u`, one three-input add (x01 < 2^11) | assert |
+| `r3d_rast_store` | MLAB → fit → W_ADDR's ~80 enables (114.8 MHz) | the fit, the start beat and the next pointer formed a cycle early from `wk` (W_ADDR follows the record's last word and lasts a cycle) | assert |
+| `r3d_rast_store` | `pal` → `pal ? ea : eo` → run compare → P_RE (−0.81) | the bin entry in hand (`ecur`) a register | assert |
+| `r3d_rast_store` | table M10K → close test → `wq_addr` (30 enables, 116.7 MHz) | W_BQ loads the run write's fields whether or not it goes; the port reads them only with `wq_req` | bench (0 port-rule violations) |
+| `r3d_rast_tcache` | `rd_n` → `pix_n − rd_n` → compare → `a_done` → `c_go` → `c_mw` (113.7 MHz) | the pixel FIFO's and the fill queue's full flags as registers: three compares of the count, chosen by the two moves | assert |
+| `r3d_rast_tcache` | the gate's reader number → `fs` (114.2 MHz at −40 °C) | `P − 1 − (P − q − 1)` is `q`: the last subtract goes | assert |
+| `r3d_rast_band` | `rd_a1` → row add → rectangle compares → `cm_wd` (116.3 MHz) | the flush's clear words decided as the read address moves to `rd_a1` | assert; bench (`band_cin` fault: 41,068 pixels wrong) |
+| `r3d_rast_intake` | the store's queue word → `+ 9` → compare → `emx_e` (121.9 MHz) | the max compare without the add: `e + 9 > emx` as `emx < 9` or `e > emx − 9`, both registers | assert |
+
+*Proof:*
+- Whole rasteriser (sh1's nine sets: Daytona 2, VF3 and Bass Fishing on MAME's lists and on the geometry model's
+  Supermodel rows, Scud Race, Lost World, the second Daytona 2 run; 3,562 frames, MIP 1, p0): rounds 1, 2, 3 and the
+  final tree — every FRAME and STALL line identical to `sh1/logs/c7_*`, 0 pixels wrong, 0 port-rule violations, 0
+  store overflows.
+- Geometry (`SETUP_OUT`, `LOD_WORD`, Supermodel's rows, culling; 400 frames each of VF3, Bass Fishing, Daytona 2):
+  every triangle field matches the model on every frame, and the log, per-frame cycles included, is identical to base's.
+- `system.mk`: `test_bus`, `test_xmem`, `test_io`, `test_loader_sw`, `test_sdr_port`, `test_sdr_port_r107`,
+  `test_bus_r107` identical to base's.
+- Whole system (`tb_m3_system`, Model3.sv's options), Daytona 2 from a fresh boot, its configuration, extra memory,
+  fixed CROM, image window and NVRAM through ioctl, 40 frames: identical to base's in every line but the simulator's
+  speed (69,372,010 cycles, 14,705,360 SDRAM reads, 163,840 writes). The boot is in its wait loop from frame 2, so this
+  proves the loader, the step and the memory side, not the bus's MPC106 path (`test_bus` and the assert do). It was
+  built from round 3's tree, which differs from the final one only in the fog unit the boot never reaches.
+- Lint (Verilator 5.052 `-Wall`): texel (three PARTs), colour, rasteriser, geometry, store, fog, loader and the system
+  unchanged against base. `quartus_map --analyze_file` (17.0.0 Build 595, scratch project): every changed file, 0 errors.
+- Planted faults (`logs/flt_r2.log`, `flt_r3.log`, `gflt.log`, `sflt.log`): each assert above fires with its fault on
+  25 frames of Daytona 2 and VF3 (geometry: 20 frames; `m2_sdram`, `m3_bus`: their benches); the texel subtract and the
+  band's flush word, faulted where no assert looks, give 100,113-116,902 and 41,068 pixels wrong. The fog record ending at word 3 never occurs in any bench, and
+  the loader's directed bench passes without `flags0`: only the miter finds that one.
+
+*Standalone* (8.333 ns, Quartus 17.0, no physical synthesis, slow 100 °C / −40 °C; seeds 1 / 2 / 3, mean):
+
+| Block | Variant | ALM (mean) | Fmax 100 °C | Fmax −40 °C |
+|---|---|---|---|---|
+| `r3d_rast` (MIP 1) | base | 8,204 | 111.96 / 111.68 / 108.57 (110.74) | 110.72 / 111.19 / 110.63 (110.85) |
+| | round 1: fog, texel stage 4/5, store (fit, `ecur`) | 8,138 | 113.01 / 115.23 / 116.93 (115.06) | 107.15 / 114.16 / 114.65 (111.99) |
+| | round 2: + texel add, tcache flags, band, intake, store W_BQ, the colour product | 8,163 | 100.86 / 101.05 / 99.00 (100.30) | 101.83 / 101.64 / 100.00 (101.16) |
+| | round 3: round 2 less the colour product, + fog compares side by side, tcache gate | 8,146 | 118.91 / 114.00 / 109.58 (114.16) | 113.80 / 113.29 / 110.78 (112.62) |
+| | round 4 (the tree): round 3 with round 1's fog | 8,137 | 108.21 / 112.13 / 114.10 (111.48) | 108.13 / 113.38 / 111.98 (111.16) |
+| `r3d_geo` (`SETUP_OUT`, `LOD_WORD`) | base | 7,671 | 127.36 / 121.37 / 126.84 (125.19) | 125.90 / 122.49 / 123.37 (123.92) |
+| | the tree (`hk_nw`, `w_valid`) | 7,657 | 123.26 / 127.55 / 123.14 (124.65) | 119.57 / 122.46 / 121.12 (121.05) |
+| | seeds 4, 5: base | 7,658 | 119.06 / 127.28 | 118.01 / 124.21 |
+| | seeds 4, 5: the tree | 7,653 | 125.36 / 123.21 | 121.76 / 121.89 |
+| | five seeds: base / the tree | 7,666 / 7,655 | 124.38 / 124.50 | 122.80 / 121.36 |
+| `m3_bus` (`STEP2`, `FAST`, `R3P`) | base | 1,787 | 129.53 / 136.86 / 135.59 (133.99) | 128.16 / 138.39 / 134.64 (133.73) |
+| | the tree (`tgt_q`, `cq_q`) | 1,679 | 153.05 / 157.65 / 148.77 (153.16) | 155.86 / 159.52 / 146.61 (154.00) |
+| `m3_loader` | base | 341 | 210.35 / 204.83 / 170.01 (195.06) | 209.29 / 200.68 / 171.82 (193.93) |
+| | the tree (the configuration a cycle behind) | 348 | 167.11 / 183.39 / 198.57 (183.02) | 165.04 / 180.21 / 192.64 (179.30) |
+| `m2_sdram` (the system's 18 parameters) | base | 1,045 | 168.18 / 172.98 / 176.12 (172.43) | 164.47 / 168.61 / 174.22 (169.10) |
+| | the tree (`pb_r`) | 1,044 | 178.67 / 176.12 / 175.84 (176.88) | 178.35 / 171.41 / 171.82 (173.86) |
+
+- The bus loses 108 ALM: `cq` had two readers (`rd_int` and the write's lane merge), and one register now serves both.
+- The loader's standalone worst, base and tree, is the FIFO's pointer into its M10K address, which I did not change;
+  its 12 MHz drop is inside its 40 MHz spread between seeds, and it stays above 165 MHz. Its `c7_s1` family comes from
+  `hps_io`, which is not in a standalone fit.
+
+- Per block in the rasteriser's fit (round 4 against base, mean ALM of three seeds): the texel filter (`u_tb`) −31.7,
+  the store −24.1, fog −18.2, the texture cache −12.1, the band −8.8, the intake +1.4, the address stages (`u_tf`)
+  +15.6 (the three-input add); blocks I did not change move by up to ±12 (the edge −12.1, the z band +8.6): the fitter's
+  noise. Total −67.7.
+- The rasteriser by family (worst Fmax of the family in each seed, MHz, slow 100 °C; base has the 4,000-endpoint
+  list for seed 3 only, the 30 worst for seeds 1 and 2; `logs/famtab_r4.txt`):
+
+| Family | Base | Round 4 | Changed |
+|---|---|---|---|
+| texel stage 3 (`r3d_rast → texel`) | 111.7 / 114.5 | 135.4 / 142.1 / 143.5 | yes |
+| texel internal | 112.0 / 122.7 | 127.1 / 127.9 / 133.5 | yes |
+| fog | 108.6 | 127.1 / 128.5 / 130.8 (−40 °C 125.6-128.4) | yes |
+| store internal | 118.3 | 139.9 / 142.6 / 142.8 | yes |
+| store pointer MLAB → store (the fit) | 114.8 | ≥ 154.7 | yes |
+| store table M10K → store | 112.3 / 112.7 / 124.1 | 120.6 / 121.5 / 123.1 | yes |
+| band internal | 122.6 | 138.8 / 139.9 / 146.6 | yes |
+| store → intake | 123.8 | 131.1 / 131.3 / 132.3 | yes |
+| texture cache internal | 122.6 (−40 °C 116.1 / 122.0) | 116.1 / 120.4 / 129.0 | yes |
+| z band internal | 115.0 / 124.3 | 110.8 / 112.1 / 116.1 | no |
+| texture cache → its fill MLAB | 132.1 | 108.2 / 114.1 / 130.5 | no |
+| colour's ring M10K → `b1` | 121.9 | 115.0 / 123.0 / 126.0 | no |
+| texel table M10K → stage 1 | 123.0 | 118.5 / 127.9 / 132.6 | no |
+| band's buffer M10K → `p2` | 125.4 | 117.9 / 128.3 / 136.0 | no |
+- The geometry's worst paths in every tree seed are in units I did not change (`r3d_fp_add` stages B and C,
+  `r3d_fp_mul`'s overflow, `r3d_recip`, the `vq_r → xb_data` path); `hk_nw` and `w_valid` are on none of its 4,000 worst
+  endpoints. On five seeds the tree is +0.1 MHz at 100 °C and −1.4 MHz at −40 °C on the means (medians 126.84 → 123.26
+  and 123.37 → 121.76); base's −40 °C seeds spread 118.0-125.9 and the tree's 119.6-122.5. Five seeds do not resolve a
+  drop of that size, and D-44 forbids one if it is real: the two files (`r3d_geo.sv`, `r3d_mstream.sv`) are separate
+  from the rest, and are mine to keep or drop on a full fit's evidence.
+
+*Wrong turns:*
+- The colour unit's product with the texel as its operand (`m = t × k`: the product matters only for `mod`, which
+  excludes `sol`, so the kind's select can leave the multiply's input) made the rasteriser 100 MHz: Quartus moved the
+  product from its registered DSP form to a combinational DSP with the select behind it (`b1~_Duplicate_1`,
+  −1.58 ns). Taken out in round 3.
+- The band's sweep (C_CLR) clear words decided a cycle early: the fog rectangle's bank changes with `f_start`, so a
+  sweep's first word needs the new rectangle in the cycle it arrives. The bench's own assert stopped it on Daytona 2's
+  first frame. Taken out; the flush's clear (the band two ahead) is safe, as the rectangle holds through a band.
+- The fog record's three mantissa compares side by side (round 3) put `dens` / `kz` → `r` at 109.6 MHz in one seed
+  and cost 25 ALM over round 1's form. Taken out in round 4.
+- R135's texel path was not its selects but what follows them: the decode, then the subtract. Moving the subtract,
+  not the selects, took the stage off the list.
+- Editing a fit script while a fit ran from it broke that seed's post-processing (bash reads a script as it runs);
+  scripts in use are replaced by a rename.
+
+*Not done:*
+- Placement families: `r3d_texup`, the walker, the facing unit, `r3d_fp_add`, `r3d_rast_zspan`, `m3_ddr_arb`, the
+  store-to-geometry handshake, the remaining `r3d_geo` paths. They meet 125 MHz standalone; by the study's "timing
+  follows area" they are the area pass's, or a floorplan's, not more restructuring's.
+- The rasteriser's paths still under 125 MHz standalone. Not changed here: the z band's advance (110.8-119.9), the
+  texture cache's fill-queue MLAB write (108.1-130.5), the colour unit's ring M10K into `b1` (114.5-126.0), the texel's
+  table into stage 1 (113.5-132.6), the band's buffer M10K into `p2` (116.4-136.0), the `quiet` counter's OR of every
+  unit's valid. Changed but not enough: the store's table read (120.0-123.1), the texture cache's A stage (116.1-129.0).
+  The z band's is `a_go` into A's and B's ~270 enables (fanout 168); without a skid (which D-48 rules out, as it moves
+  cycles) it needs the scoreboard test a cycle early.
+- The geometry's own standalone paths under 125 (`P_Q0 → xw_data`, `cu_out`, `eb_first → P_PJ0`, the adders' stages B
+  and C).
+- `hps_io` (the framework's), and the colour unit's M10K → product.
+- A candidate not taken: the replay's P_RQ fields loaded every cycle (`fwp → pq_addr`, 122.2 MHz), as W_BQ's are.
+- No full fit, so the integrated effect is unmeasured.
+
+*Afterwards:* the full build with R140's CPU is at the end of R140. The two geometry files stay: their families (the
+`D_HDR` header, `ms_pop`, `xb_r` and the stream's `rp`, 119 and 158 failing endpoints in `c7_s1`) have none in any of
+the four full fits since.
+
+**R140 — CPU timing at 110 MHz without a cycle: the D-cache's registers at the last level of every copy
+of EX's hold and of MEM's commits, the double unit's last stage as one-hot kinds, and about fifteen smaller
+restructurings. `c7_s1`'s worst family nearly leaves the `ppc_cpu` spike (672 failing endpoints at 120 MHz, worst
+−1.73 ns, five-seed means, to about 100 and −0.84), TNS falls by a third, and the area-neutral candidate `r14` runs
+100.92 / 100.50 MHz at slow 100 °C / −40 °C against the base's 97.00 / 98.18, five seeds each (+3.9 / +2.3).
+Every change together (`r13`, three seeds) gives 98.95 / 98.49 for about 300 ALUTs more. 118 MHz standalone is not in reach this way: each seed's worst path is a different one of about ten
+families, and several have no level left to take without a register in the path.** D-48 applies: no cycle may be added and no feature switched off. D-44
+applies (110 MHz; no block's standalone Fmax may drop). The method is R108's: the `ppc_cpu` spike (R108, R129 §6),
+each change cycle-identical by construction and checked against the form it replaces every cycle. Nothing a program
+can see changes, so the 603e manual decides nothing here. Work in `sm3-builds/tc/cpu/`, from `tc/base` (the main
+tree, `c7_s1`'s RTL). Desk only: spikes, maps, the CPU bench, the 48-frame bench, unit benches; no full fit, not the
+board.
+
+*What I believed:*
+- From `c7_s1`'s census (3,267 failing endpoints at slow 100 °C, TNS −1,569 ns, worst −2.59 ns) that the CPU's
+  worst families were separate structural paths, each a level or two too deep: the D-cache into EX's operands and
+  the single unit's selects (406 + 23 endpoints), core to core (716), the double unit's last stage into the single
+  unit (FEF, 108), the queue head into EX (60), the I-cache's RAM addresses (148 + 42 + 43). Taking those levels out
+  would lift the spike's 97-99 MHz (R129 §6) toward 118, the margin for the full build's congestion.
+- R120's reading of the top family: `d_rdy` through EX's hold into the single unit's operand selects.
+
+*What I know now:*
+
+**1. The full build's worst family is the D-cache's state through EX's hold, made worse by two retimings.**
+`c7_s1` path 1 (−2.59 ns): `r_post_NEW_REG138`, a register the fitter made by moving `d_rdy_q` back into its own
+next-state logic, → `rdy_c` (82 loads) → two LUTs → `qh_x` → `f_hold` → `fc_q`'s enable → `fc_q[60]_NEW2468` →
+`u_sfma|Mux178~0_OTERM4621`: `fc_q` moved forward through the single unit's operand select. In the spike the same
+family appears without the retiming:
+- `cp_act` → `d_idle` (the OR of seventeen D-cache registers) → `sync_wait_q` → `qh_x` → `f_hold` → `fa_q`'s
+  enable, −1.75 ns at 120 MHz;
+- `d_valid_q` → `mh_1` → `mem_hold` → `iu_clr` → the BAT decode → `bat_*`'s enables, −1.67 ns.
+
+In each, the D-cache's register entered an OR tree at the bottom, three or four levels before the hold or the
+commit, then a decode, then 64 to 700 enables. The FEF family (−2.24) is the double unit's S8 chain, retimed the same
+way: `out_res` moved forward into the single unit's operand select.
+
+**2. Built** (all in `rtl/cpu`; cumulative snapshots `r1` … `r13` in `tc/cpu/snaps`; each with a Verilator check of
+the new form against the old every cycle, behind `R140_NOCHK` for the planted-fault runs). Spike map ALUTs are each
+step's delta (`ppc_cpu` spike, `quartus_map` alone; base 19,711):
+
+| # | Path (where found, slack) | Change | ALUTs |
+|---|---|---|---|
+| 1 | `cp_act` → `d_idle` → `sync_wait_q` → `qh_x` → `f_hold` (spike, −1.75 at 120 MHz) | `d_idle` from a preserved register, `d_idle_q`: its next value from the next state of each of its seventeen registers (R, X, DQ, MQ, the fill, the copy, the zeroing, the write-back, the single access, the memory port, SB, the tag write, the sweep, the fill beat), each as that register's own assignment in the same priority; d_req (late from EX) at the last LUT | r1 +15 |
+| 2 | `d_valid_q` → `mh_1` → `mem_hold` → `iu_clr` → BAT decode → `bat_*` (spike, −1.67) | MEM's hold as `mh_e` (registers) and `m_dvok` (= !mh_dw \|\| d_valid, one LUT); `m_ok` = `m_okb` && `m_dvok`; one write enable per BAT register (`bat_we_e`, decoded from registers) with `m_dvok` at the enable; `iu_clr_e` / `iu_sel_e` the same | (r1) |
+| 3 | `d_rdy`'s logic → two LUTs → `qh_x` → `f_hold` → `fc_q` (c7_s1, −2.59) | each of EX's three hold copies (ex_hold, the queue's, the FP registers') as a part from registers, one for `d_rdy` / `d_idle`, one for `d_valid` / `d_eok`; `d_rdy_q` preserved, which stops the backward retiming | r2 +3 |
+| 4 | `r7_q.sd.cvt` → ovf → ovf_dis → the result chain → `out_res` (c7_s1, −1.94; −2.24 through the retimed `out_res`) | the double unit's S8 result as one-hot kinds (cvt, special, zero, overflow, rounded to zero or flushed, normal) ANDed with their values and ORed (`res8f`): a fraction bit is one LUT after kinds two or three levels deep; `res8` stays for FPRF | r3 +18 |
+| 5 | `s_v` → its set compare → `st_mru` → `pw` → `dq[pw]` → LU2's alignment → `op_a` (c7_s1, −1.93) | the state write's bypass compare registered beside `rd_set_q` (`sbyp_q`); a written set's MRU is its hit way, so `pw` is one LUT after the state MLAB | (r3) |
+| 6 | `d_valid_q` → `ans_wb` → `rl_x` → `x_k` → `x_pre` → `op_x` (spike, −2.02) | each LU2 reload one LUT of d_valid / d_eok and registers, choosing WB's word at the operand register's input | (r3) |
+| 7 | (1) | `d_idle_q` with d_req last | r4 −27 |
+| 8 | (5), the way select | `EWL` (ppc_cpu parameter): the D-cache gives all four ways' words and `pw`; the core aligns each way's word and chooses the way last | r5 +119 |
+| 9 | `ex_s0ok` → `ex_xcm` → `mis_hold` → `fh_e` → `f_hold` (spike, −1.63); `m.rp` → `mh_3` → `mh_e` → `m_advb` → `m_okb` (spike, −1.78) | `mis_hold` with ex_s0ok and the interrupt one level from it; `m_okb` from MEM's terms directly (with m.rp clear, mh_3 is the small unit's term); the hold copies with mis_hold, ser_wait and md_wait at the last LUT | r6 −16 |
+| 10 | `stm`'s read → I-cache `i_data` (c7_s1, −1.20) | the MRU way's word chosen last, every other source's kept apart | r7 +59 |
+| 11 | `mf_f` / `m.lr` → `mf_nowe` → `mf_val` → `r_early` → `op_y` (spike, −1.53); `h0` → `id_xfea` → `id_xz` → `x_k` (−1.36); `wb_iss` → `lu2_wbo` → `lu_rest1` → `load_use_d1` → `q_pop` (−1.18); `wb_got` → `mh_dw` → `m_dvok` | the move-from value as four six-input groups into `r_early`; `id_xz` one LUT of the head's predecode; `load_use_d1` with WB's request state last; `m_dvok` one LUT; `d_req` as EX's state, the translation, the core's holds, and the D-cache's terms last | r8 −50 |
+| 12 | `fb_q` → the operand select → `Add3` → `Add4` → `sh_big` → R1's `sh` (spike, −1.28) | the single unit's ea + ec − eb − 996 as a carry-save sum and one add with the constant (a ternary adder; Quartus 17's constant fold checked on 16 vectors) | r9 +46 |
+| 13 | `wb_fpw` → `fl_go` → `fw_dat` → the FPR file (c7_s1, −1.46) | with FLW, the WB side's write index, data and single bit chosen by `fw_wbs` (one LUT), not `fl_go`: wherever there is a WB-side write the two agree | r10 −26 |
+| 14 | `op_y` → the micro-TLB compare → `xl_rp` → `d_req` → `m.valid` (spike, −1.88); `ex_fbl` → `fb_x` → the 52-bit zero test → `nan` → frsqrte's `ra_q.sd.f` (−2.10) | m.valid's next value with `xl_rp` at the last LUT; frsqrte's fraction bits below 51 need e1 alone (a NaN's payload is b_f, and a zero fraction is zero) | r11 +46 |
+| 15 | `wb_got` → `mg_wb` → `mg_bx` → `mg_dp` → `mg_dat` → `wb_result` (c7_s1, −1.38) | the merge's byte for each of mg_wb's two cases from registers, mg_wb last | r12 +101 |
+| 16 | `op_y` → `mis_hold` → `f_hold` → `fa_q`'s enable (75 loads, a 2.7 ns route; spike, −1.68); `m.rp` → `ex_adv` → `pend_g` → `pend` (−1.52); `wb_fpw` → `fl_go` → `mh_2` → MEM's commits (c7_s1, −1.0 to −1.15); `m.result` → the zero detect → `br_mis` → `redirect` → `imm4_q` (c7_s1, −1.38) | two enable copies per FP operand register, one a half; `pend_g` with EX's hold from `f_hold`, last; `mh_2` / `qh_2` without `fl_go` (an FP load in WB is never a small-unit result leaving it); `imm4_q` loaded on the replay's redirect alone (from registers) and on ID's advance without the redirect: after any other redirect id_s0 is set and its value is overwritten before it is read (a shadow of the old form is compared wherever imm4_q is read) | r13 +7 |
+
+`r14` is `r13` without the four that cost 46 to 119 ALUTs each (8, 10, 12, 15: EWL off by default, the I-cache,
+the single unit and the merge as in the base): spike map 19,667 ALUTs, 44 under the base. Of the four, only EWL
+showed a gain on its own family (§4).
+
+**3. The spike** (ar_cpu's `ppc_cpu` template, ISB = 1 and PVR 1.3 as m3_system, 120 MHz target; Fmax slow 100 °C /
+−40 °C; TNS from the STA report):
+
+| Build | seeds | Fmax 100 °C / −40 °C, MHz (per seed) | mean | worst slack / TNS, 100 °C | worst slack / TNS, −40 °C | ALMs needed (fit) |
+|---|---|---|---|---|---|---|
+| base | 5 | 99.20 / 100.86, 97.74 / 96.99, 92.52 / 92.11, 97.51 / 100.20, 98.05 / 100.73 | **97.00 / 98.18** | −1.98 / −1,204 ns | −1.86 / −852 ns | 14,111 |
+| r2 | 3 | 96.63 / 93.30, 92.47 / 91.61, 101.24 / 100.82 | 96.78 / 95.24 | −2.01 / −1,238 | −2.18 / −858 | 13,872 |
+| r4 | 1 | 101.38 / 100.96 | | −1.53 / −724 | −1.57 / −437 | 13,875 |
+| r7 | 2 | 97.57 / 97.11, 95.86 / 94.36 | 96.72 / 95.73 | −2.01 / −978 | −2.12 / −756 | 13,871 |
+| r11 | 3 | 94.95 / 96.45, 96.95 / 98.14, 98.71 / 97.18 | 96.87 / 97.26 | −1.99 / −1,037 | −1.95 / −737 | 14,110 |
+| r13 | 3 | 98.59 / 100.54, 97.55 / 94.38, 100.70 / 100.55 | 98.95 / 98.49 | −1.78 / −1,063 | −1.83 / −714 | 14,213 |
+| **r14** | 5 | 101.70 / 99.97, 97.69 / 97.65, 102.31 / 101.66, 99.67 / 100.12, 103.21 / 103.10 | **100.92 / 100.50** | −1.58 / −810 | −1.62 / −467 | 14,048 |
+
+Seed spread on one RTL is 6.7 MHz (base) and 5.5 MHz (r14). r14's 100 °C mean is 3.9 MHz over the base's, about
+2.6 standard errors of the difference; at −40 °C 2.3 MHz, about 1.3. TNS falls 33% at 100 °C and 45% at −40 °C.
+r13, the same with EWL, the I-cache's select, the single unit's sum and the merge, fits 165 ALMs larger than r14
+and its three-seed mean sits between the two. EWL does win its own family (the state MLAB into the operands: −0.62
+ns against r14's −1.44, §4); whether the 300 ALUTs cost the rest of the CPU its placement, three seeds cannot say.
+R129's base (four seeds of the same template) was 96.91 / 98.02.
+
+**4. By family** (`tools/famtab.py`, slow 100 °C, 120 MHz target: worst slack, mean over the seeds / failing
+endpoints, mean; base and r2 list the 2,000 worst endpoints, so their counts are a floor; later runs 8,000):
+
+| family | base (5) | r11 (3) | r13 (3) | r14 (5) |
+|---|---|---|---|---|
+| D-cache -> core / FPU | -1.73 ns / 672 | -0.52 ns / 56 | -0.99 ns / 143 | -0.84 ns / 103 |
+| core -> core | -1.77 ns / 484 | -1.64 ns / 1002 | -1.63 ns / 1048 | -1.40 ns / 982 |
+| FMA -> single unit / FMA | -0.74 ns / 12 | -1.44 ns / 16 | -0.65 ns / 19 | -0.51 ns / 9 |
+| core -> single unit | -1.04 ns / 19 | -1.24 ns / 15 | -0.85 ns / 15 | -0.82 ns / 18 |
+| state MLAB (D) -> core | -1.51 ns / 89 | -1.08 ns / 29 | -0.62 ns / 16 | -1.44 ns / 69 |
+| fetch queue -> core | -1.13 ns / 23 | -1.25 ns / 55 | -1.31 ns / 40 | -1.15 ns / 48 |
+| core -> fetch queue | -1.32 ns / 100 | -1.28 ns / 228 | -1.20 ns / 224 | -1.01 ns / 200 |
+| I-cache (any) -> RAM / I-cache / queue / core | -1.39 ns / 192 | -1.85 ns / 322 | -1.27 ns / 323 | -1.28 ns / 229 |
+| core -> I-cache / its RAM | -1.09 ns / 82 | -1.40 ns / 33 | -1.29 ns / 84 | -1.01 ns / 72 |
+| core -> D-cache | -1.50 ns / 25 | -1.17 ns / 23 | -1.54 ns / 29 | -1.41 ns / 31 |
+| BTB | -0.53 ns / 3 | -1.45 ns / 19 | -0.13 ns / 5 | -0.67 ns / 2 |
+| core -> FP register file | 0.00 ns / 0 | -0.32 ns / 18 | -0.53 ns / 34 | -0.33 ns / 14 |
+| all listed (TNS / endpoints) | -1170 ns / 1905 | -1037 ns / 2119 | -1063 ns / 2339 | -810 ns / 2031 |
+
+**5. Why Fmax follows only partly.** The worst path of each run (slow 100 °C):
+
+| run | worst | family |
+|---|---|---|
+| base s1 | −1.748 | `dcache.cp_act` → `fetchq.h1` (d_idle into the pop) |
+| base s2 | −1.898 | `core.m.valid` → `fetchq.h0r` (MEM's hold into the pop) |
+| base s3 | −2.475 | `core.m.mtca` → `core.redir_k_q` (the CR forward into the branch's redirect) |
+| r2 s1 | −2.016 | `dcache.d_valid_q` → `core.op_x` (LU2's reload; fixed in r3) |
+| r2 s2 | −2.481 | `core.bat_bepi` → `dcache.d_rdy_q` (the DBAT compare into d_req) |
+| r2 s3 | −1.545 | `icache.i_data` → `fetchq.h0` (the predecode into the queue) |
+| r4 s1 | −1.531 | `core.mf_f` → `core.op_y` (the move-from value; r8) |
+| r7 s1 | −1.916 | `icache.ta_idx` → the I-cache data RAM's address (the tag check into rd_a) |
+| r7 s2 | −2.099 | `core.ex_fbl` → `fpu_rsqe.ra_q` (the FP bypass into frsqrte; r11) |
+| r11 s1 | −2.199 | `icache.f_line` → the data RAM's address (the fill's hazard into pfast and rd_a) |
+| r11 s2 | −1.982 | `icache.i_data` → `fetchq.h0` |
+| r11 s3 | −1.798 | `core.qe_m` → `core.op_s` (the forward select) |
+| base s4 | −1.922 | `core.ex_u.op` → `core.m.sprv` (MEM's SPR value) |
+| base s5 | −1.866 | `dcache.uq_v` → `core.fa_q` (d_idle into the FP operand enables) |
+| r14 s1 | −1.500 | `core.op_y` → `dcache.d_valid_q` (EX's sum through d_req into the posted answer) |
+| r14 s2 | −1.903 | the D-cache's state MLAB → `core.op_y` (LU2's early word, with EWL off) |
+| r14 s3 | −1.441 | the D-cache tag RAM → the D-cache (the compare) |
+| r14 s4 | −1.700 | `core.ex_s0ok` → `dcache.d_idle_q` (EX's d_req into the idle register) |
+| r14 s5 | −1.356 | the I-cache tag RAM → the I-cache |
+
+Nineteen runs, about fourteen families. Taking the worst one out of a seed hands the floor to the next, which sits within a
+few hundred picoseconds: the I-cache's read address (the tag check, the fill's hazard and the pre-read into `rd_a`, then
+29 RAM ports), the fetch queue's pop (EX's hold and the load-use hazard into 282 entry bits through four pop
+copies), the predecode into the queue, EX's translation into `d_req` (the adder, the DBAT and micro-TLB compares,
+`xl_rp`), the operand capture's forward selects, the FP bypass into the units' first stages, the branch's CR
+forward. Each is five to seven LUTs with 1 to 2.7 ns routes. 118 MHz is 8.47 ns: about four levels and their routes.
+Several of these have no level left to take without a register in the path, which D-48 rules out.
+
+**6. Area.** Whole-design `quartus_map` with `c7_s1`'s release qsf (`c7_s1`'s own map: 40,323 ALMs needed, 57,801 ALUTs,
+51,322 registers, `ppc_cpu` 19,987 ALUTs):
+
+| Build | ALMs needed | ALUTs | registers | `ppc_cpu` ALUTs |
+|---|---|---|---|---|
+| r14 | 40,248 (−75) | 57,833 (+32) | 51,325 (+3) | 19,974 (−13) |
+| r13 | 40,408 (+85) | 58,077 (+276) | 51,320 (−2) | 20,288 (+301) |
+
+So r14 is area-neutral at the map's resolution (R129: whole-design deltas under about 50 ALUTs are not a
+measurement); r13 costs about 300 ALUTs in the CPU, nearly all of it EWL (+119), the I-cache (+59), the merge
+(+101) and the single unit's sum (+46) by the spike maps. M10K and DSP are unchanged (spike: 59 M10K). The fits'
+ALMs needed move with packing, not logic: r2 fitted 240 ALMs under the base for +18 ALUTs.
+
+**7. Cycles.** Every variant benched is cycle-identical: the CPU bench's 19 logs byte for byte, and the 48-frame bench's
+`.p2` profiles byte for byte for both games (VF3 busy / work CPI 2.699 / 2.703, Daytona 2 2.774 / 2.927, the same
+1,065,577 and 1,021,082 busy cycles a vblank as R129).
+
+*How:*
+- Spikes: `tc/cpu/spikes/` (`subspike2.sh`, `queue2.sh`; seed 1 of each variant keeps its database; one Quartus job
+  of mine at a time through fe119's `qlaunch.sh`). Spike maps: `spikes/mapspk.sh`. Full maps: `tools/fullmap.sh`,
+  with `c7_s1`'s `Model3.qsf` (M3_RELEASE = 1).
+- Paths: `tools/fpaths.tcl` and `tools/fam_paths.py` (one full path per register family); the full build's from
+  `c7_s1`'s database (`c7/c7_cpu_full.txt`, 1,500 paths).
+- Lint: Verilator -Wall with R104_CHECK on `ppc_cpu` (`tools/lint.sh`): identical to the base's 111 warnings
+  through r13, except one fewer from r3 on (`r8`[2:0] in ppc_fpu_fma: the S8 loop reads r8 by index). r14 (EWL = 0)
+  has one more, `d_ew4` unused in ppc_core.
+- `quartus_map --analyze_file` (17.0) on every changed file of every variant, in a scratch copy: 0 errors, 0
+  warnings.
+- The CPU bench (R129's 19 runs: R116's 16 and the three `--xpage`; `tools/bench.sh`, `tools/bcmp.sh`): r1, r3,
+  r9, r10, r11, r12, r13 and r14 identical to the base's logs byte for byte (instructions, cycles, every count).
+- The 48-frame bench (R129's: frames 1301-1348, mem112's o114 checkpoints through the transplant, `s48/one.sh`,
+  ISB = 1): the base reproduces R129's `tlb` run byte for byte; r2, r10, r11, r13 and r14 identical to it, both
+  games, both `.p2` files and both logs but for the wall clock. The transplant gives the three new registers their
+  values: `d_idle_q` from the seventeen registers, `sbyp_q` = (s_set == rd_set_q), the imm4 shadow from imm4_q.
+- The FPU fast-port unit bench (`test_fpu_fast`, seeds 1 and 2) on r3, r9, r11 and r14: 152,317 directed and
+  4,719,074 / 4,720,235 checked, 0 failures, every count identical. The cache unit benches (`test_dcache`,
+  `test_icache`, eight seeds each) on r8: identical to the base, 16 PASS.
+- Planted faults (one textual change each, the new checks off; `tc/cpu/faults`): one hold copy without its d_idle
+  term is caught by the existing copy check; an LU2 reload without d_eok fails three of four runs; mh_dw without
+  wb_got trips the mem_hold products check; S8's overflow fraction for every rounding mode fails the FPU bench.
+  Not reached by the CPU bench, and caught by the D-cache unit bench with the checks on (with them off its cycles
+  change and its reference still passes): d_idle_q without the single access's term, and the MRU bypass compared
+  against the wrong set. The CPU bench never fills a set past way 0, and never syncs behind an uncached access.
+  Not reached by any run, checks on or off: a BAT register written while WB still waits for an older load.
+
+*Wrong turns:*
+- My first spike of r2 read as a loss (two seeds: 94.55 / 92.45 MHz against the base's 96.49 / 96.65); the third
+  seed was 101.24 / 100.82. On this spike a three-seed mean moves ±2 MHz on one RTL and its worst path is a
+  different family each seed, so the family table, not Fmax, says whether a change did what it was for; only five
+  seeds a side resolved r14's gain.
+- I read r11's three seeds (96.87 / 97.26) as "Fmax does not move" and wrote the entry that way before r14's five
+  seeds came in.
+- Four changes (EWL, the I-cache, the single unit's sum, the merge) went in on the paths' evidence and cost 46 to
+  119 ALUTs each before I priced them; the spike maps came last. They are out of r14 and kept in r13.
+- `R1C`, the checks' switch, first landed in ppc_core's parameter list (I placed it after the first `);` after
+  `module`); lint caught it.
+- The planted-fault runs first had nothing to compare against: f1 and f2 "passed" with the same cycles as each
+  other, and only an unfaulted run of the same four (`f0_ref`) showed the CPU bench never reaches them.
+- I edited `spikes/queue.sh` in place while a queue was running it (the loop was already read; harmless) and
+  `s48/one.sh` with `sed -i` while a run was in it (a new file, so the running shell kept the old one; the next run,
+  r2, used my `ppc_cpu.sv` with ISB set by sed in place of du1's, which differs only in comments and the FAST
+  pass-through).
+- Swapping a queue from r12 to r14 I killed the chain's shell after its next step had started, so two full maps of
+  r14 ran for half a minute; both were killed and the map run again alone.
+- My first full map of r13 used the main tree's `Model3.qsf`, which has M3_RELEASE commented out: 41,573 ALMs
+  needed against `c7_s1`'s 40,323, nearly all of it outside the CPU. The maps now take `c7_s1`'s qsf.
+
+*Not done:* 
+- 118 MHz on the spike. r14 is about 101 MHz; the next families (the I-cache's read address, the queue's pop,
+  EX's translation into d_req, LU2's early word without EWL, the operand capture's selects, the FP bypass into the
+  units) each need one or two more levels out. The two I would take next: the I-cache's tag hazard (`t_haz`) and
+  tag check (`chk_a`) registered beside `ta_idx`, from the next state of the tag-write and fill registers, so
+  `pfast` and `rd_a` see registers; and the queue's load-use hazard folded into the registered compares (`qe_m`
+  with MEM's load-ness, as `qf_m` has its write), so the pop is two levels from registers.
+- A full fit of r14 (the census shows whether the full build's −2.59 ns family has gone as it did in the spike).
+- r13's four extras one at a time on the spike; they are in the tree as snapshots and EWL as a parameter.
+- A planted fault that reaches the BAT write before WB's answer, and one for each of r6-r13's changes (their
+  checks ran clean through every bench, but only the faults in r1-r4 were planted).
+- The −40 °C means' difference is inside two standard errors; five more seeds of each would settle it.
+
+
+*The full build with R139* (`tc/merge/tree`: R139's twelve files and r14's five; 110 MHz, `M3_RELEASE`, seeds 1-3,
+against `c7_s1` on seed 1; R139's tree alone as `tr1_s1`):
+
+| Build | Setup, slow 100 °C / −40 °C (ns) | TNS (ns) | Least hold (ns) | ALM | Worst path |
+|---|---|---|---|---|---|
+| `c7_s1` | −2.59 / −2.55 | −1,569 / −1,172 | +0.084 | 41,091 | `r_post` (the retimed `d_rdy_q`) → the single unit |
+| `tr1_s1` (R139 alone) | −2.15 / −1.78 | −1,001 / −705 | +0.091 | 41,037 | `r3d_geo` `ax` → `cba_wd` (no logic level) |
+| `tm1_s1` | −1.90 / −1.94 | −1,265 / −908 | +0.096 | 41,100 | `fa_q` → the single unit |
+| `tm1_s2` | −1.85 / −1.85 | −654 / −417 | +0.076 | 41,105 | `op_x` → `d_idle_q` |
+| `tm1_s3` | −2.04 / −2.12 | −1,050 / −767 | +0.105 | 41,008 | the HPS port → `r3d_mem` |
+
+M10K 347 and DSP 88 in every one. The HDMI clock misses by 0.006 ns at one corner in seeds 1 and 2. The whole-system
+bench of the merged tree (Daytona 2 from a fresh boot, 40 frames) matches the base in every line but the
+simulator's speed; Verilator gives the base's warnings.
+
+*Board* (`tm1_s2`, 2026-11-08): the games look and run as on `c7_s1`.
+
+*What came after, and did not go in.* A second CPU round (`r16`: the I-cache's tag check registered, EWL on, the
+load-use compares, the BAT pairs and five more) ran 102.25 / 101.55 MHz on the spike against r14's 100.92 / 100.50,
+but fitted about 315 ALM larger in the full build (41,415 / 41,419 / 41,278), and the full build got worse: −4.26, −2.68
+and −2.91 ns on seeds 1-3, the worst paths moved into blocks it did not touch (the rasteriser's interpolator and
+reciprocal, the geometry, the extra-memory pipe), and seed 3's hold went negative at all four corners (−0.31 ns). At 98% the area a change adds is paid in every other block's
+placement, so a CPU change now has to be priced in fitted ALM as well as spike Fmax.

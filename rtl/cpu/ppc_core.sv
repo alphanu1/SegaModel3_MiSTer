@@ -141,6 +141,10 @@ module ppc_core
   // LU2_FL = 1: the early word joins the operand registers' last LUT (beside EX's own late result);
   // 0: it joins the capture (x_pre), a LUT before
   parameter bit LU2_FL = 1'b1,
+  // EWL = 1 (R140): the early word comes as all four ways' words (d_ew4) and the predicted way (d_epw), and
+  // each way's word is aligned before the way is chosen, so the way (from the D-cache's state MLAB, the
+  // later of the two) is one level from the operand registers' last LUT; 0: d_eword, the way's word
+  parameter bit EWL = 1'b0,
   // SQ1 ... SQ5: the single unit's stage boundaries (ppc_fpu_sfma R1 ... R5); each one taken out takes a
   // cycle off the fast port's latency LS (6 with all five)
   parameter bit SQ1 = 1'b1, SQ2 = 1'b1, SQ3 = 1'b1, SQ4 = 1'b1, SQ5 = 1'b1,
@@ -209,6 +213,8 @@ module ppc_core
   input  logic [31:0] d_rdata,
   input  logic [31:0] d_eword,      // LU2: the predicted way's word in a load's lookup cycle (combinational)
   input  logic        d_eok,        // LU2: d_rdata is the d_eword of the cycle before (a register)
+  input  logic [3:0][31:0] d_ew4,   // EWL: each way's word at the lookup (d_eword is d_ew4[d_epw])
+  input  logic [1:0]  d_epw,        // EWL: the predicted way
   output logic        d_resv,       // with d_req: lwarx (the D-cache snoops its line, D-41)
   output logic        d_cond,       // with d_req: stwcx. (verification)
   input  logic        res_kill,     // the reservation is lost to a snooped write (ppc_dcache)
@@ -270,6 +276,12 @@ module ppc_core
   // before the record
   output logic [10:0] rt_dly
 );
+  // (R140) the restructurings' own checks; R140_NOCHK turns them off for the planted-fault runs
+`ifdef R140_NOCHK
+  localparam bit R1C = 1'b0;
+`else
+  localparam bit R1C = 1'b1;
+`endif
 
   localparam logic [31:0] MSR_MASK   = 32'h0007_FF73;  // implemented MSR bits
   localparam logic [31:0] SRR1_KEEP  = 32'h0000_FF73;  // MSR bits saved in SRR1
@@ -841,8 +853,11 @@ module ppc_core
   // 5.5.2.2.2); mtsr / mtsrin change one segment register. Only the entries of that set (tlbie, and the
   // load of this side's TLB) or of that segment are then emptied; the others still hold what the TLB and
   // the segment registers give, as the 603e's other TLB entries stay valid. A BAT write empties all.
-  wire  iu_clr  = m_ok && (m_bat || (!UTS && (m.srw || m.tlbie || m.tlbl)));
-  wire  iu_sel  = UTS && m_ok && (m.srw || m.tlbie || (m.tlbl && m.insn[6]));
+  // (R140: from registers, m_dvok last)
+  (* keep = 1 *) wire iu_clr_e = m_okb && (m_bat || (!UTS && (m.srw || m.tlbie || m.tlbl)));
+  (* keep = 1 *) wire iu_sel_e = UTS && m_okb && (m.srw || m.tlbie || (m.tlbl && m.insn[6]));
+  wire  iu_clr  = iu_clr_e && m_dvok;
+  wire  iu_sel  = iu_sel_e && m_dvok;
   always_ff @(posedge clk) begin
     if (rst) begin
       f_fpend <= 1'b0;
@@ -1259,7 +1274,16 @@ module ppc_core
   wire lu_rest1   = lu_e || (lu_m && !(lu2_w0 && lu2_wbo));    // d_valid = 1
   wire lu_wb      = wb_valid && wb_live_q && wb_rd_we && lu_q(qe_w, q_pd.ua, q_pd.ub, q_pd.us);
   (* keep = 1 *) wire load_use_d0 = !id_xuea && (lu_rest || lu_wb);
-  (* keep = 1 *) wire load_use_d1 = !id_xuea && (lu_rest1 || (lu_wb && wb_sp1));
+  // (R140) d1 with WB's request state last: lu_rest1's term behind lu2_wbo (wb_out) as its own part, so
+  // wb_valid / wb_iss / wb_got are one LUT from load_use_d1 (ppc_cpu spike: wb_iss -> lu2_wbo -> lu_rest1 ->
+  // load_use_d1 -> h_tk -> q_pop -> the queue's entry 1, -1.18 ns at 120 MHz)
+  (* keep = 1 *) wire lu_d1e = !id_xuea && (lu_e || (lu_m && !lu2_w0) || (lu_wb && wb_sp1));
+  (* keep = 1 *) wire lu_d1o = !id_xuea && lu_m && lu2_w0;            // waits unless WB's answer is out
+  (* keep = 1 *) wire load_use_d1 = lu_d1e || (lu_d1o && !(wb_valid && wb_iss && !wb_got));
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && load_use_d1 != (!id_xuea && (lu_rest1 || (lu_wb && wb_sp1)))) $fatal(1, "load_use_d1 by parts");
+`endif
   wire load_use   = d_valid ? load_use_d1 : load_use_d0;
 `ifdef R104_CHECK
   // (the equivalence checks of the R104 restructuring: off in the planted-fault runs, which would
@@ -1575,7 +1599,12 @@ module ppc_core
   logic [31:0] fea_q, fea4_q;
   logic [31:0] fimm_q;                                 // step 1's immediate: 4, or after a replay fea4_q
   wire        id_xfea  = q_pd.fdx && id_s1;
-  wire        id_xz    = id_xzero || id_xfea || id_xuea;
+  // (R140: one LUT of the head's predecode and id_s1, keep; through id_xfea it was two, in front of x's
+  // forward select: ppc_cpu spike, h0 -> id_xfea -> id_xz -> x_k -> x_pre -> op_x, -1.36 ns at 120 MHz)
+  (* keep = 1 *) wire id_xz = (!q_pd.xs && q_pd.az && q_pd.ra0) || (id_s1 && (q_pd.fdx || q_pd.uea));
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (R1C && !rst && id_xz != (id_xzero || id_xfea || id_xuea)) $fatal(1, "id_xz flat");
+`endif
   wire        id_yreg  = q_pd.yreg && !(id_s1 && (q_pd.fdx || q_pd.uea));   // !id_xfea && !id_xuea
   // y's immediate, by the predecoded form (the decoder's id_u.imm, built here
   // from the raw fields)
@@ -1583,9 +1612,28 @@ module ppc_core
   // lmw / stmw: d + 4 x step without an adder in ID, counted as the step
   // advances like id_rs_q (the adder was in front of y's capture)
   logic [31:0] imm4_q;
+  // (R140) imm4_q is read only in a later step (!id_s0). Every redirect but a replay's leaves id_s0 set, and the
+  // next later step follows a step 0 leaving ID, which loads imm4_q from the word, so its value after any other
+  // redirect is never read: it loads on the replay's redirect alone (im_rp, from registers and WB's hold; with
+  // m_kp and WB held the only redirect is a fired trap's) and on ID's advance without the redirect. The
+  // redirect (MEM's zero detect, the branch's mispredict) was three levels in front of its 32 enables (c7_s1:
+  // m.result -> the zero detect -> br_mis -> redirect -> imm4_q, -1.38 ns at 110 MHz)
+  wire         im_rp  = m_kp && m.rp && !sl_flt && (!wb_hold || wb_trap);
+  wire         im_adv = id_valid && !ex_hold && !load_use && !fp_haz;
+`ifdef VERILATOR
+  logic [31:0] imm4_c;                                 // the old form, for the check
   always_ff @(posedge clk)
-    if (redirect)    imm4_q <= {{16{m.insn[15]}}, m.insn[15:0]} + {25'd0, m.step, 2'b00};   // a replay resumes here
-    else if (id_adv) imm4_q <= (id_s0 ? {{16{q_hi[15]}}, q_hi[15:0]} : imm4_q) + 32'd4;
+    if (redirect)    imm4_c <= {{16{m.insn[15]}}, m.insn[15:0]} + {25'd0, m.step, 2'b00};
+    else if (id_adv) imm4_c <= (id_s0 ? {{16{q_hi[15]}}, q_hi[15:0]} : imm4_c) + 32'd4;
+  always_ff @(posedge clk) begin
+    if (R1C && !rst && im_rp != (redirect && m_kp && m.rp && !sl_flt)) $fatal(1, "imm4_q: the replay's redirect");
+    if (R1C && !rst && id_valid && !id_s0 && q_pd.immk == 3'd4 && imm4_q != imm4_c)
+      $fatal(1, "imm4_q %08X read against the old form %08X", imm4_q, imm4_c);
+  end
+`endif
+  always_ff @(posedge clk)
+    if (im_rp)       imm4_q <= {{16{m.insn[15]}}, m.insn[15:0]} + {25'd0, m.step, 2'b00};   // a replay resumes here
+    else if (im_adv) imm4_q <= (id_s0 ? {{16{q_hi[15]}}, q_hi[15:0]} : imm4_q) + 32'd4;
   always_comb begin
     case (q_pd.immk)
       3'd1:    id_imm = {16'd0, q_hi[15:0]};
@@ -1649,9 +1697,24 @@ module ppc_core
   logic [31:0] e_al;                                   // d_eword aligned
   logic [3:0]  x_le, y_le, a_le, s_le;                 // [r]: result byte r takes e_al
   logic [3:0]  x_lz, y_lz, a_lz, s_lz;                 // ... takes zero
+  // (EWL: each way's word aligned, keep, then the way)
+  wire [3:0][31:0] e_alw;
+  genvar ewg, ewr;
+  generate if (EWL) begin : g_ewl
+    for (ewg = 0; ewg < 4; ewg = ewg + 1) begin : g_ew
+      for (ewr = 0; ewr < 4; ewr = ewr + 1) begin : g_r
+        (* keep = 1 *) wire [7:0] a = LU2_AL ? d_ew4[ewg][31 - 8*e_jq[ewr] -: 8] : d_ew4[ewg][31 - 8*ewr -: 8];
+        assign e_alw[ewg][31 - 8*ewr -: 8] = a;
+      end
+    end
+  end else begin : g_newl
+    assign e_alw = '0;
+  end
+  endgenerate
   always_comb
     for (int r = 0; r < 4; r++) begin
-      e_al[31 - 8*r -: 8] = LU2_AL ? d_eword[31 - 8*e_jq[r] -: 8] : d_eword[31 - 8*r -: 8];
+      e_al[31 - 8*r -: 8] = EWL ? e_alw[d_epw][31 - 8*r -: 8] :
+                            LU2_AL ? d_eword[31 - 8*e_jq[r] -: 8] : d_eword[31 - 8*r -: 8];
       x_le[r] = x_ld && e_dq[r]; x_lz[r] = x_ld && !e_dq[r];
       y_le[r] = y_ld && e_dq[r]; y_lz[r] = y_ld && !e_dq[r];
       a_le[r] = a_ld && e_dq[r]; a_lz[r] = a_ld && !e_dq[r];
@@ -1660,7 +1723,20 @@ module ppc_core
   // lu2_cf: confirmed (EX's first cycle, the load's answer in WB, and it is the early word); lsh: EX holds;
   // lu2_rl: the answer is here and is not the early word: reload (all three below, after ans_wb)
   logic       lu2_cf, lsh, lu2_rl;
-  wire        rl_x = lu2_rl && ex_lso[0], rl_y = lu2_rl && ex_lso[1], rl_a = lu2_rl && ex_lso[2], rl_s = lu2_rl && ex_lso[3];
+  // (R140) each operand's reload is one LUT of the D-cache's d_valid and d_eok and registers (rl_e*), and it
+  // chooses WB's word last, at the operand register's input: through ans_wb and lu2_rl it was two levels
+  // in front of the forward select and the capture (ppc_cpu spike: d_valid_q -> ans_wb -> rl_x -> x_k ->
+  // x_pre -> op_x, -2.02 ns at 120 MHz)
+  (* keep = 1 *) wire rl_ex = LU2 && ex_lsw && wb_out && ex_lso[0];
+  (* keep = 1 *) wire rl_ey = LU2 && ex_lsw && wb_out && ex_lso[1];
+  (* keep = 1 *) wire rl_ea = LU2 && ex_lsw && wb_out && ex_lso[2];
+  (* keep = 1 *) wire rl_es = LU2 && ex_lsw && wb_out && ex_lso[3];
+  wire        rl_x = rl_ex && d_valid && !(ex_lsf && d_eok), rl_y = rl_ey && d_valid && !(ex_lsf && d_eok),
+              rl_a = rl_ea && d_valid && !(ex_lsf && d_eok), rl_s = rl_es && d_valid && !(ex_lsf && d_eok);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && {rl_s, rl_a, rl_y, rl_x} != ({4{lu2_rl}} & ex_lso)) $fatal(1, "LU2 reloads by operand against lu2_rl");
+`endif
 `ifdef VERILATOR
 `ifndef LU2_NOCHK
   // (LU2_NOCHK: off in the planted-fault runs, which the benches' comparison must catch)
@@ -1715,7 +1791,7 @@ module ppc_core
                                          input logic [31:0] vl, input logic [31:0] vw);
     fw_mux = (k == 2'd0) ? b : (k == 2'd1) ? vm : (k == 2'd2) ? vl : vw;
   endfunction
-  (* keep = 1 *) wire [1:0] x_k = rl_x ? 2'd2 : fw_k(x_m, x_wb, wb_live);   // (LU2's reload: WB's arriving word)
+  (* keep = 1 *) wire [1:0] x_k = fw_k(x_m, x_wb, wb_live);   // (LU2's reload, WB's arriving word: at op_x, R140)
   // y's select (R108): ID's term (id_yreg) one LUT from the queue head (the update-load kind
   // predecoded, pd.uea), WB's terms from registers, and MEM's valid bit and select into y_k itself:
   // y_k is two LUTs from the head and one from m.valid (it was three from the head: h0 -> id_yreg ->
@@ -1723,13 +1799,13 @@ module ppc_core
   (* keep = 1 *) wire       y_id = id_yreg;
   (* keep = 1 *) wire       y_wl = wb_valid && qf_w[1] && !wb_live;
   (* keep = 1 *) wire       y_w  = wb_valid && qf_w[1];
-  (* keep = 1 *) wire [1:0] y_k = {rl_y || (y_id && !(m.valid && qf_m[1]) && y_w), !rl_y && y_id && ((m.valid && qf_m[1]) || y_wl)};
+  (* keep = 1 *) wire [1:0] y_k = {y_id && !(m.valid && qf_m[1]) && y_w, y_id && ((m.valid && qf_m[1]) || y_wl)};
 `ifdef VERILATOR
   always_ff @(posedge clk)
-    if (!rst && y_k != (rl_y ? 2'd2 : fw_k(y_m, y_wb, wb_live))) $fatal(1, "y_k by ID's term last against fw_k");
+    if (!rst && y_k != fw_k(y_m, y_wb, wb_live)) $fatal(1, "y_k by ID's term last against fw_k");
 `endif
-  (* keep = 1 *) wire [1:0] a_k = rl_a ? 2'd2 : fw_k(a_m, a_wb, wb_live);
-  (* keep = 1 *) wire [1:0] s_k = rl_s ? 2'd2 : fw_k(s_m, s_wb, wb_live);
+  (* keep = 1 *) wire [1:0] a_k = fw_k(a_m, a_wb, wb_live);
+  (* keep = 1 *) wire [1:0] s_k = fw_k(s_m, s_wb, wb_live);
   // The capture as two LUTs side by side, the base (register file or
   // immediate) and the forward (MEM, WB's arriving word, WB), and the choice
   // between them in x_pre below: one LUT of five inputs, so a forward select
@@ -1991,8 +2067,21 @@ module ppc_core
     if (!rst && (mf4c != ({32{mf_f[4]}} & m.crm) || mf4o != ({32{mf_f[4]}} & ~m.crm)))
       $fatal(1, "mfcr's registered CR masks against mf_f[4] and m.crm");
 `endif
-  wire  [31:0] mf_now  = mf_nowe | mf_c0v;
-  wire  [31:0] mf_val  = mf_nowe | ({32{mf_t[0]}} & dec_q) | ({32{mf_t[1]}} & tb_q[31:0]) | ({32{mf_t[2]}} & tb_q[63:32]);
+  // (R140) the move-from value as four groups of at most six inputs (keep), each one LUT from registers, so
+  // EX's early result is two levels from them: as mf_nowe, then mf_val, then r_early, MEM's LR into op_y was
+  // five (ppc_cpu spike: mf_f -> mf_nowe -> r_early -> y_pre -> op_y, -1.53 ns at 120 MHz)
+  (* keep = 1 *) wire [31:0] mfg_a = ({32{mf_b}} & ex_mfv) | ({32{mf_f[0]}} & m.xer) | ({32{mf_f[1]}} & m.lr);
+  (* keep = 1 *) wire [31:0] mfg_b = ({32{mf_f[2]}} & m.ctr) | ({32{mf_f[3]}} & m.sprv) | (mf4o & cr_q);
+  (* keep = 1 *) wire [31:0] mfg_c = mf4c & m_crw;
+  (* keep = 1 *) wire [31:0] mfg_d = ({32{mf_t[0]}} & dec_q) | ({32{mf_t[1]}} & tb_q[31:0]) | ({32{mf_t[2]}} & tb_q[63:32]);
+  wire  [31:0] mf_now  = mfg_a | mfg_b | mfg_c | mf_c0v;
+  wire  [31:0] mf_val  = mfg_a | mfg_b | mfg_c | mfg_d;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && (mf_now != (mf_nowe | mf_c0v) || mf_val != (mf_nowe | ({32{mf_t[0]}} & dec_q) | ({32{mf_t[1]}} & tb_q[31:0]) |
+                                                              ({32{mf_t[2]}} & tb_q[63:32]))))
+      $fatal(1, "the move-from value by groups");
+`endif
 
   // ALU
 
@@ -2159,7 +2248,16 @@ module ppc_core
   // (an exception in the uop's place, ex_xcm, is not held for; a replay or
   // the alignment exception, known late, holds the cycle and then leaves as
   // without a split, with no access: ex_s0ok says the first word went)
-  wire        mis_hold = ex_valid && mis_x && !ex_sp1 && !ex_xcm;
+  // (R140: ex_xcm's terms in two parts, so ex_s0ok and the interrupt are one level from mis_hold, and
+  // mis_hold one from each copy of EX's hold: ppc_cpu spike, ex_s0ok -> ex_xcm -> mis_hold -> fh_e ->
+  // f_hold -> fa_q's enable, -1.63 ns at 120 MHz)
+  (* keep = 1 *) wire xcm_ni = ex_ifault || xc_fpx || ex_fpun;     // ex_xcm without the interrupt
+  (* keep = 1 *) wire xci0   = irq_req && ex_first;                // xc_irq but for ex_s0ok
+  wire        mis_hold = ex_valid && mis_x && !ex_sp1 && !xcm_ni && !(xci0 && !ex_s0ok);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && mis_hold != (ex_valid && mis_x && !ex_sp1 && !ex_xcm)) $fatal(1, "mis_hold by parts");
+`endif
   wire        algn    = ls_mem && (((ex_u.fp || ex_u.reserve || ex_u.cond || (ex_lsm && ex_first)) && boff != 2'd0) ||
                                    (msr_q[MSR_DR] && !db_any && ex_u.fp && ex_fd0 && ea_lo[11:0] == 12'hFFC));
   // a store's lanes and data: the value left-justified (vl), shifted to EA's
@@ -2533,24 +2631,56 @@ module ppc_core
   wire sync_wait = ex_valid && ex_u.sync && (wb_mayh || (m.valid && m_iss) || !d_idle);
   // (ex_hold_o: every hold but a split's first cycle, mis_hold, which still
   // makes its request and sends its first word to MEM)
-  wire   ex_hold_o = mem_hold || md_wait || fp_wait || ser_wait || sync_wait || (ex_valid && ex_ls && !d_rdy) || lsh;
+  // (R140) Each copy of EX's hold as three parts: one of every term formed inside the core (from registers,
+  // two or three levels), then the D-cache's registers last: d_rdy and d_idle (h*_a), d_valid and d_eok (h*_b).
+  // Left to synthesis, d_rdy and d_idle went in at the bottom of the OR tree, three or four levels before the
+  // hold (ppc_cpu spike: d_idle -> sync_wait_q -> qh_x -> f_hold -> fa_q's enable; the full build's worst,
+  // d_rdy's logic -> two LUTs -> qh_x -> f_hold -> fc_q, then into the single unit's operand select).
+  (* keep = 1 *) wire ex_vls  = ex_valid && ex_ls;
+  (* keep = 1 *) wire ex_vsy  = ex_valid && ex_u.sync;
+  (* keep = 1 *) wire m_vdw   = m.valid && mh_dw;                     // MEM waits on WB's unanswered request
+  (* keep = 1 *) wire lsf_wo  = ex_lsf && wb_out;                     // lu2_cf but for d_valid and d_eok
+  // ex_hold's copy
+  (* keep = 1 *) wire hx_r = mh_e || fp_wait || (ex_vsy && (wb_mayh || (m.valid && m_iss)));   // (from registers)
+  (* keep = 1 *) wire hx_a = (ex_vls && !d_rdy) || (ex_vsy && !d_idle);
+  (* keep = 1 *) wire hx_b = (m_vdw && !d_valid) || (LU2 && ex_lsw && !(lsf_wo && d_valid && d_eok));
+  wire   ex_hold_o = hx_r || md_wait || ser_wait || hx_a || hx_b;
   assign ex_hold = ex_hold_o || mis_hold;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && ex_hold_o != (mem_hold || md_wait || fp_wait || ser_wait || sync_wait || (ex_valid && ex_ls && !d_rdy) || lsh))
+      $fatal(1, "ex_hold_o by parts against its terms");
+`endif
   // the queue's copy (q_take above): the same terms, kept apart
-  (* keep = 1 *) wire qh_1 = m.valid && wb_valid && wb_iss && !wb_got && (!d_valid || wb_sp1);
-  (* keep = 1 *) wire qh_2 = m.valid && wb_valid && wb_fl && (FLW ? fl_v && !fl_go : !(wb_got && wb_c2 && !fr_at[0] && !wb_blk));
+  (* keep = 1 *) wire qh_1 = m.valid && wb_valid && wb_iss && !wb_got && wb_sp1;
+  (* keep = 1 *) wire qh_2 = m.valid && wb_valid && wb_fl && (FLW ? fl_v && (fr_at[0] || wb_blk) : !(wb_got && wb_c2 && !fr_at[0] && !wb_blk));
   (* keep = 1 *) wire qh_3 = m.valid && ((m_rpq && !sl_done) || (m.fsm && (fr_at[1] || wb_blk)));
   (* keep = 1 *) wire qh_4 = m.valid && ((m.fpser && !m_fsok) || (m.icbi && !m_ibdone && !icbi_ack));
-  (* keep = 1 *) wire qh_x = md_wait || fp_wait || ser_wait_q || sync_wait_q || (ex_valid && ex_ls && !d_rdy) || mis_hold || lsh;
   // (the queue's copies of ser_wait and sync_wait take MEM's request from
   // m_rpq, a copy of m.rp of their own: m.rp drives some 65 loads, and led
   // the queue pop's paths in the R63 batch-7 full builds)
   wire  m_issq      = m.req && !m_rpq;
   wire  ser_wait_q  = ex_valid && ex_serz && (wb_mayh || (m.valid && (m_issq || m.fld)));
   wire  sync_wait_q = ex_valid && ex_u.sync && (wb_mayh || (m.valid && m_issq) || !d_idle);
-  assign q_hold = qh_1 || qh_2 || qh_3 || qh_4 || qh_x;
+  // (the terms from registers in one part, qh_r; the deeper ones, mis_hold, ser_wait_q and md_wait, beside
+  // it in the last LUT)
+  (* keep = 1 *) wire qh_r = qh_1 || qh_2 || qh_3 || qh_4 || fp_wait || (ex_vsy && (wb_mayh || (m.valid && m_issq)));
+  (* keep = 1 *) wire qh_a = (ex_vls && !d_rdy) || (ex_vsy && !d_idle);
+  (* keep = 1 *) wire qh_b = (m_vdw && !d_valid) || (LU2 && ex_lsw && !(lsf_wo && d_valid && d_eok));
+  assign q_hold = qh_r || mis_hold || ser_wait_q || md_wait || qh_a || qh_b;
   // a third copy for the FP operand registers' 194 enables (R63 batch 3:
   // EX's hold into fa_q / fb_q / fc_q)
-  (* keep = 1 *) wire f_hold = qh_1 || qh_2 || qh_3 || qh_4 || qh_x;
+  (* keep = 1 *) wire fh_r = qh_1 || qh_2 || qh_3 || qh_4 || fp_wait || (ex_vsy && (wb_mayh || (m.valid && m_issq)));
+  (* keep = 1 *) wire fh_a = (ex_vls && !d_rdy) || (ex_vsy && !d_idle);
+  (* keep = 1 *) wire fh_b = (m_vdw && !d_valid) || (LU2 && ex_lsw && !(lsf_wo && d_valid && d_eok));
+  (* keep = 1 *) wire f_hold = fh_r || mis_hold || ser_wait_q || md_wait || fh_a || fh_b;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (R1C && !rst && f_hold != ex_hold) $fatal(1, "f_hold");
+  always_ff @(posedge clk)
+    if (R1C && !rst && q_hold != (qh_1 || qh_2 || qh_3 || qh_4 || md_wait || fp_wait || ser_wait_q || sync_wait_q ||
+                           (ex_valid && ex_ls && !d_rdy) || mis_hold || lsh || (m.valid && mh_dw && !d_valid)))
+      $fatal(1, "q_hold by parts against its terms");
+`endif
 `ifdef VERILATOR
   always_ff @(posedge clk) if (!rst && q_hold != ex_hold) $fatal(1, "q_hold");
   always_ff @(posedge clk) if (!rst && m.valid && m_rpq != m.rp) $fatal(1, "m_rpq");
@@ -2584,11 +2714,30 @@ module ppc_core
     qf_w <= wb_hold  ? (ex_hold ? qe_hk[3] : qe_hf[3]) & {4{wb_rd_we}} : (ex_hold ? qe_hk[2] : qe_hf[2]) & {4{qf_wm}};
   end
 
-  assign d_req   = ex_valid && !ex_hold_o && (is_ld || (is_st && st_ok)) && !xl_rp && !ex_xcm && !m_kp && !algn;
+  // (R140) as three parts and the D-cache's own registers' hold terms (hx_a, hx_b) at the last LUT: EX's own
+  // state (dq_e), the translation (dq_t, late from EX's sum) and the core's holds (dq_h)
+  (* keep = 1 *) wire dq_e = ex_valid && (is_ld || (is_st && st_ok)) && !ex_xcm && !m_kp;
+  (* keep = 1 *) wire dq_t = !xl_rp && !algn;
+  (* keep = 1 *) wire dq_h = !(hx_r || md_wait || ser_wait);
+  assign d_req   = dq_e && dq_t && dq_h && !hx_a && !hx_b;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && d_req != (ex_valid && !ex_hold_o && (is_ld || (is_st && st_ok)) && !xl_rp && !ex_xcm && !m_kp && !algn))
+      $fatal(1, "d_req by parts");
+`endif
   // a split's first word goes into MEM as a uop of its own (m.sp0) when it
   // makes its request; otherwise (a replay, an exception) MEM takes nothing
   // this cycle, and the uop goes next cycle as without a split
   wire   mis_go = mis_hold && !ex_hold_o && !xl_rp && !ex_xcm && !algn;
+  // (R140) MEM's valid bit with the translation's replay (xl_rp, late from EX's sum) at the last LUT: through
+  // mis_go and d_req's shared logic it was two levels in front of m.valid (ppc_cpu spike: op_y -> the
+  // micro-TLB compare -> du_use -> xl_rp -> d_req -> m.valid, -1.88 ns at 120 MHz)
+  (* keep = 1 *) wire mv_a = ex_adv && !m_kp;
+  (* keep = 1 *) wire mv_b = mis_hold && !ex_hold_o && !ex_xcm && !algn && !m_kp;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && (mv_a || (mv_b && !xl_rp)) != ((ex_adv || mis_go) && !m_kp)) $fatal(1, "m.valid's next value by parts");
+`endif
   assign d_we    = is_st && ex_u.cop == 3'd0;
   assign d_addr  = {d_pahi, ea_x[11:2], 2'b00};
   assign d_be    = st_be;                              // a load's lanes too (an inhibited load is made with them)
@@ -2699,10 +2848,22 @@ module ppc_core
   wire         fw_wbp = FLW ? fw_wbs : wb_valid && wb_fpw && (!wb_isld || wb_fpok);
   // the WB-side write this cycle (at most one: the slot waits for a small-unit result), for the scoreboard
   wire         fw_wv  = fw_wbp || fl_go;
-  wire  [4:0]  fw_wr  = fl_go ? fl_frd : wb_frd;
+  // (R140, FLW) the WB side's index and data chosen by fw_wbs (one LUT of WB's registers) where they were
+  // chosen by fl_go: wherever there is a WB-side write it is fw_wbs's (a small-unit result) or the slot's
+  // (fl_go, never with fw_wbs), so the two agree wherever the port writes. Through fl_go (81 loads), WB's
+  // wb_fpw reached the FP register file's write data four levels deep (c7_s1: wb_fpw -> fl_go -> fw_dat ->
+  // the MLAB, -1.46 ns at 110 MHz)
+  wire  [4:0]  fw_wr  = FLW ? (fw_wbs ? wb_frd : fl_frd) : (fl_go ? fl_frd : wb_frd);
   wire         fw_we  = fw_fpu || fw_wv;
   wire  [4:0]  fw_idx = fo_valid ? fo_tag : fw_wr;
-  wire  [63:0] fw_dat = fo_valid ? fo_res : fl_go ? fl_val : !wb_isld ? wb_fdat_q : wb_fsl ? lfs_dbl : {fhi_q, wb_dq};
+  wire  [63:0] fw_dat = fo_valid ? fo_res : FLW ? (fw_wbs ? wb_fdat_q : fl_val) :
+                       fl_go ? fl_val : !wb_isld ? wb_fdat_q : wb_fsl ? lfs_dbl : {fhi_q, wb_dq};
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && fw_we && !fo_valid &&
+        ({fw_wr, fw_dat} != {fl_go ? fl_frd : wb_frd, fl_go ? fl_val : !wb_isld ? wb_fdat_q : wb_fsl ? lfs_dbl : {fhi_q, wb_dq}}))
+      $fatal(1, "FPR write port: the WB side by fw_wbs against fl_go");
+`endif
   // the forward into ID's capture: an FPU result or a small-unit result (both
   // from registers); not a load's word (lfs is converted in WB, lfd's second
   // word arrives in MEM), which is read from the file a cycle later
@@ -2712,7 +2873,8 @@ module ppc_core
   logic        rf_na, rf_nb, rf_nc;
   // (lfs's word converted is always a single value: 1, checked at every read
   // below; its conversion is in front of the write, R63 batch 4)
-  wire         fw_nsv = !(fo_valid ? sv_fo : fl_go ? (fl_sl || fpu_sgl_val({fl_hi, fl_lo})) : !wb_isld ? sv_wbf :
+  wire         fw_nsv = !(fo_valid ? sv_fo : FLW ? (fw_wbs ? sv_wbf : (fl_sl || fpu_sgl_val({fl_hi, fl_lo}))) :
+                          fl_go ? (fl_sl || fpu_sgl_val({fl_hi, fl_lo})) : !wb_isld ? sv_wbf :
                           wb_fsl ? 1'b1 : fpu_sgl_val({fhi_q, wb_dq}));
   ppc_fpregfile u_frf (
     .clk (clk), .ra (id_fa), .rb (id_fb), .rc (id_fc),
@@ -2852,7 +3014,10 @@ module ppc_core
   // each bit's held part apart (keep), so the kill is two LUTs from pend:
   // through m_kp, fp_go and a shared AND it was four (a round-2 cached full
   // build, m.duwi into pend)
-  (* keep = 1 *) wire        pend_g = ex_adv && !m_kp1 && !m_kp2 && !ex_xcm && ex_frw;   // = fp_go && ex_frw
+  // (R140: EX's hold last, from its FP copy f_hold, = ex_hold; through ex_adv, MEM's m.rp reached pend five
+  // levels deep in a ppc_cpu spike, -1.52 ns at 120 MHz)
+  (* keep = 1 *) wire        pg_e   = ex_valid && !m_kp1 && !m_kp2 && !ex_xcm && ex_frw;
+  (* keep = 1 *) wire        pend_g = pg_e && !f_hold;                                   // = fp_go && ex_frw
   (* keep = 1 *) logic [31:0] pend_h;
   always_comb
     for (int i = 0; i < 32; i++)
@@ -2955,10 +3120,16 @@ module ppc_core
     if (ex_fbl[1]) fx_b <= fo_res;
     if (ex_fbl[2]) fx_c <= fo_res;
   end
+  // (R140) each operand register's enable as two copies, one a half (keep): one enable LUT drove 64 to 75
+  // enables with a 2.7 ns route (ppc_cpu spike: op_y -> mis_hold -> f_hold -> fa_q's enable)
+  (* keep = 1 *) wire [5:0] f_en = {{2{!f_hold || fd_l[2]}}, {2{!f_hold || fd_l[1]}}, {2{!f_hold || fd_l[0]}}};
   always_ff @(posedge clk) begin
-    if (!f_hold || fd_l[0]) fa_q <= fd_l[0] ? fo_res : fa_cap;
-    if (!f_hold || fd_l[1]) fb_q <= fd_l[1] ? fo_res : fb_cap;
-    if (!f_hold || fd_l[2]) fc_q <= fd_l[2] ? fo_res : fc_cap;
+    if (f_en[0]) fa_q[31:0]  <= fd_l[0] ? fo_res[31:0]  : fa_cap[31:0];
+    if (f_en[1]) fa_q[63:32] <= fd_l[0] ? fo_res[63:32] : fa_cap[63:32];
+    if (f_en[2]) fb_q[31:0]  <= fd_l[1] ? fo_res[31:0]  : fb_cap[31:0];
+    if (f_en[3]) fb_q[63:32] <= fd_l[1] ? fo_res[63:32] : fb_cap[63:32];
+    if (f_en[4]) fc_q[31:0]  <= fd_l[2] ? fo_res[31:0]  : fc_cap[31:0];
+    if (f_en[5]) fc_q[63:32] <= fd_l[2] ? fo_res[63:32] : fc_cap[63:32];
   end
   always_ff @(posedge clk)
     if (!f_hold) begin
@@ -3278,23 +3449,24 @@ module ppc_core
   // that split; left to itself it merged the result into a tree three levels
   // deep after the rotators and only then muxed the capture in.
   wire [31:0]                r_late  = r_sum | r_rl | r_rr | r_clz | mf_c0v;
-  (* keep = 1 *) wire [31:0] r_early = r_mid | ({32{ex_rsel[7]}} & md_val) | mf_val;
+  (* keep = 1 *) wire [31:0] r_mdv   = {32{ex_rsel[7]}} & md_val;
+  (* keep = 1 *) wire [31:0] r_early = r_mid | r_mdv | mfg_a | mfg_b | mfg_c | mfg_d;   // (R140: mf_val's groups)
   // (LU2: the early word, aligned, or zero for a byte it does not give, beside the capture, and EX's own
   // forward off while an operand is reloaded; x_se ... from registers and the queue head, ahead of the data)
-  wire        x_se = x_ex && !rl_x, y_se = y_ex && !rl_y, a_se = a_ex && !rl_a, s_se = s_ex && !rl_s;
+  wire        x_se = x_ex, y_se = y_ex, a_se = a_ex, s_se = s_ex;   // (R140: a reload chooses at op_*)
   (* keep = 1 *) logic [31:0] x_pre, y_pre, a_pre, s_pre;
   logic [31:0] x_fl, y_fl, a_fl, s_fl;
   always_comb
     for (int b = 0; b < 32; b++) begin
-      x_pre[b] = x_se ? r_early[b] : (x_le[b/8 ^ 3] && !rl_x) ? (LU2_FL ? 1'b0 : e_al[b]) : (x_lz[b/8 ^ 3] && !rl_x) ? 1'b0 : x_cap[b];
-      y_pre[b] = y_se ? r_early[b] : (y_le[b/8 ^ 3] && !rl_y) ? (LU2_FL ? 1'b0 : e_al[b]) : (y_lz[b/8 ^ 3] && !rl_y) ? 1'b0 : y_cap[b];
-      a_pre[b] = a_se ? r_early[b] : (a_le[b/8 ^ 3] && !rl_a) ? (LU2_FL ? 1'b0 : e_al[b]) : (a_lz[b/8 ^ 3] && !rl_a) ? 1'b0 : a_cap[b];
-      s_pre[b] = s_se ? r_early[b] : (s_le[b/8 ^ 3] && !rl_s) ? (LU2_FL ? 1'b0 : e_al[b]) : (s_lz[b/8 ^ 3] && !rl_s) ? 1'b0 : s_cap[b];
+      x_pre[b] = x_se ? r_early[b] : x_le[b/8 ^ 3] ? (LU2_FL ? 1'b0 : e_al[b]) : x_lz[b/8 ^ 3] ? 1'b0 : x_cap[b];
+      y_pre[b] = y_se ? r_early[b] : y_le[b/8 ^ 3] ? (LU2_FL ? 1'b0 : e_al[b]) : y_lz[b/8 ^ 3] ? 1'b0 : y_cap[b];
+      a_pre[b] = a_se ? r_early[b] : a_le[b/8 ^ 3] ? (LU2_FL ? 1'b0 : e_al[b]) : a_lz[b/8 ^ 3] ? 1'b0 : a_cap[b];
+      s_pre[b] = s_se ? r_early[b] : s_le[b/8 ^ 3] ? (LU2_FL ? 1'b0 : e_al[b]) : s_lz[b/8 ^ 3] ? 1'b0 : s_cap[b];
       // (LU2_FL: the early word's bits, gated, for the last LUT)
-      x_fl[b] = LU2_FL && x_le[b/8 ^ 3] && !rl_x && e_al[b];
-      y_fl[b] = LU2_FL && y_le[b/8 ^ 3] && !rl_y && e_al[b];
-      a_fl[b] = LU2_FL && a_le[b/8 ^ 3] && !rl_a && e_al[b];
-      s_fl[b] = LU2_FL && s_le[b/8 ^ 3] && !rl_s && e_al[b];
+      x_fl[b] = LU2_FL && x_le[b/8 ^ 3] && e_al[b];
+      y_fl[b] = LU2_FL && y_le[b/8 ^ 3] && e_al[b];
+      a_fl[b] = LU2_FL && a_le[b/8 ^ 3] && e_al[b];
+      s_fl[b] = LU2_FL && s_le[b/8 ^ 3] && e_al[b];
     end
 
   mem_t mx;
@@ -3801,10 +3973,10 @@ module ppc_core
 
   // the operand registers: loaded as a uop enters EX, or (LU2) an operand's reload while EX holds
   always_ff @(posedge clk) begin
-    if (!ex_hold || rl_x) op_x <= ({32{x_se}} & r_late) | x_fl | x_pre;
-    if (!ex_hold || rl_y) op_y <= ({32{y_se}} & r_late) | y_fl | y_pre;
-    if (!ex_hold || rl_a) op_a <= ({32{a_se}} & r_late) | a_fl | a_pre;
-    if (!ex_hold || rl_s) op_s <= ({32{s_se}} & r_late) | s_fl | s_pre;
+    if (!ex_hold || rl_x) op_x <= rl_x ? ld_val : (({32{x_se}} & r_late) | x_fl | x_pre);
+    if (!ex_hold || rl_y) op_y <= rl_y ? ld_val : (({32{y_se}} & r_late) | y_fl | y_pre);
+    if (!ex_hold || rl_a) op_a <= rl_a ? ld_val : (({32{a_se}} & r_late) | a_fl | a_pre);
+    if (!ex_hold || rl_s) op_s <= rl_s ? ld_val : (({32{s_se}} & r_late) | s_fl | s_pre);
   end
   // LU2: EX's uop that took the early word, until it is confirmed (lu2_cf), reloaded (lu2_rl) or killed
   always_ff @(posedge clk)
@@ -4003,11 +4175,27 @@ module ppc_core
   // as four products of at most six inputs, then their OR (it feeds EX's
   // hold and the fetch queue's pop): a small-unit result (m.fsm) is never a
   // replay, so !m.rp is not needed with it
-  (* keep = 1 *) wire mh_1 = m.valid && wb_valid && wb_iss && !wb_got && (!d_valid || wb_sp1);
-  (* keep = 1 *) wire mh_2 = m.valid && wb_valid && wb_fl && (FLW ? fl_v && !fl_go : !(wb_got && wb_c2 && !fr_at[0] && !wb_blk));
+  // (R140) d_valid is MEM's hold's only late input, so it comes in last: mh_dw (WB's request waits for
+  // its answer, from registers) and m_dvok (d_valid's whole part, one LUT from the D-cache's register); the
+  // rest is mh_e, from registers. Every commit enable as MEM is left is then its own decode and m_okb from
+  // registers, and m_dvok at the last level (the spike's d_valid_q -> mh_1 -> mem_hold -> iu_clr -> the
+  // BAT decode -> bat_*'s enables, -1.67 ns at 120 MHz, was four levels after the register)
+  (* keep = 1 *) wire mh_1 = m.valid && wb_valid && wb_iss && !wb_got && wb_sp1;
+  (* keep = 1 *) wire mh_2 = m.valid && wb_valid && wb_fl && (FLW ? fl_v && (fr_at[0] || wb_blk) : !(wb_got && wb_c2 && !fr_at[0] && !wb_blk));
   (* keep = 1 *) wire mh_3 = m.valid && ((m.rp && !sl_done) || (m.fsm && (fr_at[1] || wb_blk)));
   (* keep = 1 *) wire mh_4 = m.valid && ((m.fpser && !m_fsok) || (m.icbi && !m_ibdone && !icbi_ack));
-  assign mem_hold = mh_1 || mh_2 || mh_3 || mh_4;
+  (* keep = 1 *) wire mh_e = mh_1 || mh_2 || mh_3 || mh_4;
+  (* keep = 1 *) wire mh_dw = wb_valid && wb_iss && !wb_got && !wb_sp1;
+  (* keep = 1 *) wire m_dvok = !(wb_valid && wb_iss && !wb_got && !wb_sp1) || d_valid;   // (!mh_dw || d_valid, one LUT)
+  assign mem_hold = mh_e || (m.valid && !m_dvok);
+  // (R140) mh_2 / qh_2 with FLW: an FP load in WB (wb_fl) is never a small-unit result leaving WB (fw_wbs needs
+  // !wb_isld), so fl_v && !fl_go is fl_v && (fr_at[0] || wb_blk), one LUT; through fl_go, WB's wb_fpw reached
+  // MEM's commits six levels deep (c7_s1: wb_fpw -> du_pg, bat_brpn, fimm_q; -1.0 to -1.15 ns at 110 MHz)
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && FLW && wb_valid && wb_fl && (fl_v && !fl_go) != (fl_v && (fr_at[0] || wb_blk)))
+      $fatal(1, "mh_2 without fl_go");
+`endif
 `ifdef VERILATOR
   always_ff @(posedge clk)
     if (!rst && mem_hold != (m.valid && (wb_hold || (m.rp && !sl_done) || (m.icbi && !m_ibdone && !icbi_ack) ||
@@ -4059,7 +4247,8 @@ module ppc_core
     wb_tsrr1 <= m.srr1;
     wb_tmsr  <= m.msr;
   end
-  assign mem_adv  = m.valid && !mem_hold;
+  (* keep = 1 *) wire m_advb = m.valid && !mh_e;
+  assign mem_adv  = m_advb && m_dvok;
 
   // a load's word to its value: lane, byte reversal, extension
   // (bo: the byte offset; a halfword at 1 is bytes 1-2, inside its word)
@@ -4215,7 +4404,7 @@ module ppc_core
       m_lsp_q <= LU2 && d_req && !d_we && d_op == 3'd0 && mx.is_load && mx.rd_we && !mx.fpw && !mx.sp0 && !mx.sp1 &&
                  !(mx.msize == 2'd1 && mx.msigned) &&
                  (LU2_AL || (!mx.brev && (mx.msize == 2'd2 || (mx.msize == 2'd1 && mx.boff == 2'd2) || (mx.msize == 2'd0 && mx.boff == 2'd3))));
-      m.valid <= (ex_adv || mis_go) && !m_kp;
+      m.valid <= mv_a || (mv_b && !xl_rp);              // ((ex_adv || mis_go) && !m_kp, R140)
     end
     if (!mem_hold) m_rpq <= mx.rp;
     // CR1 as the FPSCR settles, for an arithmetic op with Rc = 1 held in MEM:
@@ -4346,7 +4535,16 @@ module ppc_core
 
   // commit of special registers as the instruction leaves MEM; an exception or
   // a replay in a uop's place (m.xc, m.rp) commits only the exception's
-  wire        m_ok   = mem_adv && !m_noef;
+  // (R140: m_dvok last; and from MEM's terms directly, not through mh_e and m_advb: with m.rp clear,
+  // mh_3 is the small unit's term alone. m.rp -> mh_3 -> mh_e -> m_advb -> m_okb was four levels in front of
+  // the BAT and micro-TLB enables, -1.78 ns in a ppc_cpu spike)
+  (* keep = 1 *) wire m_ok1 = m.valid && !m.rp && !m.xc && !m_algc;
+  (* keep = 1 *) wire m_ok2 = !mh_1 && !mh_2 && !mh_4 && !(m.fsm && (fr_at[1] || wb_blk));
+  (* keep = 1 *) wire m_okb = m_ok1 && m_ok2;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (R1C && !rst && m_okb != (m_advb && !m_noef)) $fatal(1, "m_okb by parts");
+`endif
+  wire        m_ok   = m_okb && m_dvok;
   wire [31:0] dec_nx = (m_ok && m.dec_we) ? m.sprv : tb_tick ? dec_q - 32'd1 : dec_q;
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -4402,6 +4600,15 @@ module ppc_core
   // include everything older
   wire        m_bat   = m.spr_we && m.spr >= 6'd20 && m.spr <= 6'd35;
   wire [3:0]  m_batn  = m.spr[3:0] - 4'd4;              // SPR index 20-35: {D, n, L}
+  // (R140) each BAT register's write from registers (m_okb, MEM's SPR index), m_dvok joined at the enable
+  (* keep = 1 *) logic [15:0] bat_we_e;
+  always_comb
+    for (int k = 0; k < 16; k++) bat_we_e[k] = m_okb && m.spr_we && m.spr == 6'(20 + k);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    for (int k = 0; k < 16; k++)
+      if (R1C && !rst && (bat_we_e[k] && m_dvok) != (m_ok && m_bat && m_batn == 4'(k))) $fatal(1, "BAT write %0d by index", k);
+`endif
   wire [62:0] m_tlbe  = {m.tlbl && (m.insn[6] ? icmp_q[31] : dcmp_q[31]),
                          m.insn[6] ? icmp_q[30:7] : dcmp_q[30:7], m.ya[15:5], rpa_q};
   wire        m_tway  = srr1_q[17];                     // SRR1[WAY]
@@ -4625,16 +4832,17 @@ module ppc_core
   always_ff @(posedge clk) begin
     if (m_ok && m.spr_we && m.spr == 6'd8)  sdr1_q <= {m.sprv[31:16], m.sprv[8:0]};
     if (m_ok && m.spr_we && m.spr == 6'd19) rpa_q  <= {m.sprv[31:12], m.sprv[7:3], m.sprv[1:0]};
-    if (m_ok && m_bat) begin
-      if (!m_batn[0]) begin                             // BATnU: BEPI, BL, Vs, Vp
-        bat_bepi[m_batn[3:1]] <= m.sprv[31:17];
-        bat_bl[m_batn[3:1]]   <= m.sprv[12:2];
-        bat_vs[m_batn[3:1]]   <= m.sprv[1];
-        bat_vp[m_batn[3:1]]   <= m.sprv[0];
-      end else begin                                    // BATnL: BRPN, WIMG, PP
-        bat_brpn[m_batn[3:1]] <= m.sprv[31:17];
-        bat_wimg[m_batn[3:1]] <= m.sprv[6:3];
-        bat_pp[m_batn[3:1]]   <= m.sprv[1:0];
+    for (int k = 0; k < 8; k++) begin
+      if (bat_we_e[2*k] && m_dvok) begin                // BATnU: BEPI, BL, Vs, Vp
+        bat_bepi[k] <= m.sprv[31:17];
+        bat_bl[k]   <= m.sprv[12:2];
+        bat_vs[k]   <= m.sprv[1];
+        bat_vp[k]   <= m.sprv[0];
+      end
+      if (bat_we_e[2*k + 1] && m_dvok) begin            // BATnL: BRPN, WIMG, PP
+        bat_brpn[k] <= m.sprv[31:17];
+        bat_wimg[k] <= m.sprv[6:3];
+        bat_pp[k]   <= m.sprv[1:0];
       end
     end
   end

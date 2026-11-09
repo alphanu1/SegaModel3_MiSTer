@@ -1004,8 +1004,14 @@ module m2_sdram #(
   logic [NP-1:0]            inflight;
   logic                     wr_inflight;
 
-  logic pipe_busy;
-  assign pipe_busy = |tag_v;
+  // pipe_busy is |tag_v, kept as a register beside it: formed from the tags' next state (their shift and this
+  // cycle's injection), so the six-way OR is not in front of the S_IDLE decisions that drive cmd and sd_a
+  // (c7_s1: tag_v -> sd_a / cmd, -1.65 ns)
+  logic pipe_busy, pb_r;
+  assign pipe_busy = pb_r;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (rst_n && pb_r != |tag_v) $fatal(1, "m2_sdram: pipe_busy registered");
+`endif
 
   // The dedicated write port is ready to go: it drives DQ, so it may not be
   // issued while read data is still returning on the same wires.
@@ -1098,7 +1104,7 @@ module m2_sdram #(
       bank_open <= '0;
       for (int b = 0; b < NB; b++) begin bank_row[b] <= '0; ras_cnt[b] <= '0; end
       ras_ok <= '1; rd_ok <= '1;       // R410: idle out of reset
-      tag_v <= '0; tag_p <= '0; tag_w <= '0; tag_last <= '0; tag_pr <= '0; cap <= '0;
+      tag_v <= '0; tag_p <= '0; tag_w <= '0; tag_last <= '0; tag_pr <= '0; cap <= '0; pb_r <= 1'b0;
       ack_cnt <= '0; wack_cnt <= '0; inflight <= '0; wr_inflight <= 1'b0;
       for (int b = 0; b < NB; b++) rd_bank_cnt[b] <= '0;
       p_ack <= '0; wr_ack <= 1'b0; p_dout <= '0;
@@ -1168,6 +1174,8 @@ module m2_sdram #(
           default: ;
         endcase
       end else begin
+        logic tv_set;                   // a tag injected this cycle (pb_r)
+        tv_set = 1'b0;
         sd_dqm <= 2'b00;
 
         for (int b = 0; b < NB; b++)
@@ -1470,7 +1478,7 @@ module m2_sdram #(
             if (row_hit && HITRD && !is_write) begin
               // R112: the first READ now (S_RD's first column: rd_issued is 0 here)
               cmd        <= C_READ;
-              tag_v[cap_depth-1]    <= 1'b1;
+              tag_v[cap_depth-1]    <= 1'b1; tv_set = 1'b1;
               rd_bank_cnt[tbank]    <= cap_depth;
               rd_ok[tbank]          <= 1'b0;
               rd_issued  <= 4'd1;
@@ -1614,7 +1622,7 @@ module m2_sdram #(
             // Injected at the selected depth, not at the top of the
             // pipeline: the tag reaches slot 0 after cap_depth cycles, which
             // is what decides which bus word is called word 0.
-            tag_v[cap_depth-1]    <= 1'b1;
+            tag_v[cap_depth-1]    <= 1'b1; tv_set = 1'b1;
             // PW BITS. This took grant[2:0] -- three bits for a ten-port
             // controller -- so ports 8 and 9 were tagged as 0 and 1 and their
             // read data was delivered to, and acknowledged on, the i960's own
@@ -1714,6 +1722,7 @@ module m2_sdram #(
 
           default: state <= S_IDLE;
         endcase
+        pb_r <= (|tag_v[RD_LAT-1:1]) || tv_set;
       end
     end
   end

@@ -98,7 +98,10 @@ module ppc_fpu_rsqe
     sa.spc     = nan | neg | zero | inf;
     sa.sign    = (nan | zero) & b_s;
     sa.exp     = (nan | neg | zero) ? 11'h7FF : 11'd0;    // +inf -> +0
-    sa.f       = nan ? (b_f | (52'd1 << 51)) : neg ? (52'd1 << 51) : 52'd0;
+    // (R140) below bit 51 a NaN's payload is b_f, and with a zero fraction b_f is zero anyway, so those
+    // bits need e1 alone, not the 52-bit zero test: nan ? (b_f | bit 51) : neg ? bit 51 : 0, exactly
+    // (ppc_cpu spike: ex_fbl -> fb_x -> f0 -> nan -> ra_q.sd.f, -2.10 ns at 120 MHz)
+    sa.f       = {nan | neg, {51{e1}} & b_f[50:0]};
     sa.fprf    = (nan | neg) ? FPRF_QNAN : zero ? (b_s ? FPRF_NINF : FPRF_PINF) : FPRF_PZERO;
     sa.wr      = ~((snan | neg) & ve) & ~(zero & ze);
     sa.frfi_we = ~sa.wr;

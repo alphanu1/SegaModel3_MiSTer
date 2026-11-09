@@ -2361,9 +2361,15 @@ module r3d_geo
   logic        f_nw, f_vw, f_rw, d_fstall;
   logic [1:0]  v0src;
   assign v0src = rsrc(h0[3:0], 2'd0);
+  // hk_nw: header word hk goes to the facing test (1-3, or with LOD_WORD 5), a register beside hk (c7_s1: the
+  // decode in series with dst and the stall, into ms_pop, the stream's rp and xb_r, -1.16 to -1.41 ns)
+  logic hk_nw;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && dst == D_HDR && hk_nw != ((hk >= 3'd1 && hk <= 3'd3) || (LOD_WORD && hk == 3'd5))) $fatal(1, "geo: hk_nw");
+`endif
   always_comb begin
     // normal word, or with LOD_WORD header word 5 (NP, slot word 7)
-    f_nw = SM_CULL && dst == D_HDR && ms_wv && ((hk >= 3'd1 && hk <= 3'd3) || (LOD_WORD && hk == 3'd5));
+    f_nw = SM_CULL && dst == D_HDR && ms_wv && hk_nw;
     f_vw = SM_CULL && dst == D_NEWV && ms_wv && iv == 3'd0 && wk != 2'd3;             // new vertex 0
     f_rw = SM_CULL && ((dst == D_HDR && hk >= 3'd1) || dst == D_CHK) && h0[3:0] != 4'd0 && fk != 2'd3 && !f_nw && f_ready;
     f_we = (f_nw || f_vw || f_rw) && f_ready;     // never into a slot still in use
@@ -2495,7 +2501,7 @@ module r3d_geo
           md_first <= 1'b1;
           // shared vertices of another model are transformed again
           for (int i = 0; i < 4; i++) vref_ok[i] <= 1'b0;
-          tl_n <= '0; ch_n <= '0; ch_start <= ch_wp; hk <= '0;
+          tl_n <= '0; ch_n <= '0; ch_start <= ch_wp; hk <= '0; hk_nw <= 1'b0;
           dst <= D_HDR;
         end
         D_HDR: if (ms_wv && !d_fstall) begin
@@ -2513,7 +2519,8 @@ module r3d_geo
             default: ;
           endcase
           hk <= hk + 3'd1;
-          if (hk == 3'd6) begin hk <= '0; dst <= D_CHK; end
+          hk_nw <= (hk <= 3'd2) || (LOD_WORD && hk == 3'd4);   // word hk + 1
+          if (hk == 3'd6) begin hk <= '0; hk_nw <= 1'b0; dst <= D_CHK; end
         end
         D_CHK: begin
           logic [2:0] nvv, vii;

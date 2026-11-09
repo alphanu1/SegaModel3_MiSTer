@@ -225,6 +225,13 @@ module m3_system
   localparam int EE_TWP_C   = (EE_TWP != 0)   ? EE_TWP   : CLK_HZ / 500;
   localparam int MIDI_GAP_C = (MIDI_GAP != 0) ? MIDI_GAP : CLK_HZ / 3125;
   localparam int T_REFI_C   = CLK_MHZ * 77 / 10;
+  // SDRAM row timings for a -6 part (tRC 60 ns, tRAS 42 ns), rounded up to whole clocks, never below m2_sdram's
+  // 7 / 5 (the counts proven on the board at 90-110 MHz): 7 / 5 to 116 MHz, 8 / 6 at 120. tRCD and tRP (15 ns)
+  // stay at m2_sdram's 2 clocks to 133 MHz.
+  localparam int T_RC_N     = (CLK_MHZ * 60 + 999) / 1000;
+  localparam int T_RAS_N    = (CLK_MHZ * 42 + 999) / 1000;
+  localparam int T_RC_C     = (T_RC_N  > 7) ? T_RC_N  : 7;
+  localparam int T_RAS_C    = (T_RAS_N > 5) ? T_RAS_N : 5;
   localparam logic [26:0] SDR_CROM = 27'h000_0000, SDR_FIXED = 27'h600_0000, SDR_BACKUP = 27'h620_0000,
                           SDR_RAM = 27'h640_0000, SDR_VRAM = 27'h6C0_0000, SDR_FIX8 = 27'h730_0000;
 
@@ -265,7 +272,7 @@ module m3_system
   logic [3:0]  wb_col;
   logic [15:0] wb_din;
   logic [1:0]  wb_be;
-  m2_sdram #(.COL_BITS(COL_BITS), .NP(NSP), .T_REFI(T_REFI_C), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL),
+  m2_sdram #(.COL_BITS(COL_BITS), .NP(NSP), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL),
              .PRI(SDR_PRI), .PRI_CAP(SDR_PRI_CAP), .AGE(SDR_AGE), .AGE_T(SDR_AGE_T), .BXOR(SDR_BXOR),
              .L16({{(NSP-1){1'b0}}, SDR_L16}), .PAIR({{(NSP-1){1'b0}}, SDR_PAIR}),
              .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdram (   // port 0 (the bus) writes in bursts (R101)
@@ -298,9 +305,15 @@ module m3_system
 
   // R100: the game configuration, static while the game runs (it changes only
   // during a download, with the game in reset)
-  wire        step2   = STEP2 && cfg_step >= 8'h20;           // the Step 2.x devices
-  wire        step15  = cfg_step >= 8'h15;                    // 13.11 vertices, full culling nodes
-  wire [1:0]  jstep   = {cfg_step >= 8'h20, cfg_step == 8'h15 || cfg_step == 8'h21};
+  // The step's decodes are registered (c7_s1: cfg_step into m3_bus's read data and r3d_texup's FIFO, -1.1 ns): they
+  // follow cfg_step a cycle later, while the loader is busy and the game in reset.
+  logic       step2, step15;
+  logic [1:0] jstep;
+  always_ff @(posedge clk) begin
+    step2  <= STEP2 && cfg_step >= 8'h20;                     // the Step 2.x devices
+    step15 <= cfg_step >= 8'h15;                              // 13.11 vertices, full culling nodes
+    jstep  <= {cfg_step >= 8'h20, cfg_step == 8'h15 || cfg_step == 8'h21};
+  end
   // VROM in the extra memory: by placement (VROM_LOC), or by the set (Step 2: flags bit 0)
   wire        vrom_x  = (XMEM == 1) && (((VROM_LOC != 0) && (VROM_LOC == XMEM)) || cfg_flags[0]);
   wire        fixed8  = cfg_flags[1];                         // an 8 MiB fixed CROM at SDR_FIX8
@@ -312,13 +325,13 @@ module m3_system
   // the CPU
   // ===========================================================================
   // the timebase and decrementer count at the 66 MHz bus / 4 (D-14): 16.5 MHz
-  logic [7:0] tb_acc;
+  logic [8:0] tb_acc;   // 9 bits: tb_acc + 33 reaches 2 x CLK_MHZ + 32, past 255 above 111 MHz
   logic       tb_tick;
   always_ff @(posedge clk) begin
     if (rst) begin tb_acc <= '0; tb_tick <= 1'b0; end
     else if (tb_fast) tb_tick <= 1'b1;
-    else if (tb_acc + 8'd33 >= 8'(2 * CLK_MHZ)) begin tb_acc <= tb_acc + 8'd33 - 8'(2 * CLK_MHZ); tb_tick <= 1'b1; end
-    else begin tb_acc <= tb_acc + 8'd33; tb_tick <= 1'b0; end
+    else if (tb_acc + 9'd33 >= 9'(2 * CLK_MHZ)) begin tb_acc <= tb_acc + 9'd33 - 9'(2 * CLK_MHZ); tb_tick <= 1'b1; end
+    else begin tb_acc <= tb_acc + 9'd33; tb_tick <= 1'b0; end
   end
 
   logic [1:0]       m_req, m_ack, m_wnext, m_rvalid;
@@ -736,11 +749,11 @@ module m3_system
   // ===========================================================================
   // video: timing, the tile generator, the overlay
   // ===========================================================================
-  logic [6:0] ce_acc;
+  logic [7:0] ce_acc;   // 8 bits: ce_acc + 16 reaches CLK_MHZ + 15, past 127 above 112 MHz
   always_ff @(posedge clk) begin
     if (!mem_rst_n) begin ce_acc <= '0; ce_pix <= 1'b0; end
-    else if (ce_acc + 7'd16 >= 7'(CLK_MHZ)) begin ce_acc <= ce_acc + 7'd16 - 7'(CLK_MHZ); ce_pix <= 1'b1; end
-    else begin ce_acc <= ce_acc + 7'd16; ce_pix <= 1'b0; end
+    else if (ce_acc + 8'd16 >= 8'(CLK_MHZ)) begin ce_acc <= ce_acc + 8'd16 - 8'(CLK_MHZ); ce_pix <= 1'b1; end
+    else begin ce_acc <= ce_acc + 8'd16; ce_pix <= 1'b0; end
   end
 
   logic [9:0] hcnt, vcnt;

@@ -108,6 +108,8 @@ module r3d_rast_intake #(
   logic [2:0]  pnum;          // parameter number
   logic [31:0] pw [3];        // the parameter's words, pdx, pdy, ps
   logic [8:0]  emx;           // running max of E (+9 for the gradients), 0 = none
+  logic [8:0]  emx_m9;        // emx - 9, when emx >= 9
+  logic        emx_l9;        // emx < 9
   logic signed [8:0] emx_e;   // its e: 2 for none, else emx - 124 (study R109: em_e is chosen, not
                               // formed after the max; the max's select and its zero test were in series)
 
@@ -158,6 +160,7 @@ module r3d_rast_intake #(
       em_act  <= 1'b0;
       emx     <= 9'd0;
       emx_e   <= 9'sd2;
+      emx_l9  <= 1'b1;
       pk      <= 2'd0;
       f_v     <= 1'b0;
       s_v     <= 1'b0;
@@ -197,16 +200,24 @@ module r3d_rast_intake #(
           f_v <= 1'b1; f_tag <= 5'(wc - HW); f_kind <= K_VTX;
         end else if (wc == HW + 5'd6) begin
           f_v <= 1'b1; f_tag <= 5'd6; f_kind <= K_RAW;
-          pk <= 2'd0; pnum <= 3'd0; emx <= 9'd0; emx_e <= 9'sd2;
+          pk <= 2'd0; pnum <= 3'd0; emx <= 9'd0; emx_e <= 9'sd2; emx_l9 <= 1'b1;
         end else begin
           // a coefficient: keep it, fold its exponent in
           logic [8:0] ea, mx;
           logic signed [8:0] ee;
-          logic       gt;
-          ea = eadj(i_data, pk != 2'd2);
-          gt = ea > emx;
+          logic       gt, gr;
+          logic [7:0] e;
+          // the compare against the max without the + 9 in front of it (the store's queue word through the
+          // add, the compare and the select into emx_e, 121.9 MHz standalone): with grad, e + 9 > emx is
+          // emx < 9 or e > emx - 9, both registers beside emx (emx_l9, emx_m9); e - 115 and e - 124 beside it
+          e = i_data[30:23]; gr = pk != 2'd2;
+          ea = eadj(i_data, gr);
+          gt = (e != 8'd0) && (gr ? (emx_l9 || {1'b0, e} > emx_m9) : ({1'b0, e} > emx));
           mx = gt ? ea : emx;
-          ee = gt ? $signed(9'(ea - 9'd124)) : emx_e;          // ea > emx: ea is not 0
+          ee = gt ? (gr ? $signed(9'({1'b0, e} - 9'd115)) : $signed(9'({1'b0, e} - 9'd124))) : emx_e;
+`ifdef VERILATOR
+          if (gt != (ea > emx) || (gt && ee != $signed(9'(ea - 9'd124)))) $fatal(1, "intake: the max's compare without the add");
+`endif
 `ifdef VERILATOR
           if (ee != ((mx == 9'd0) ? 9'sd2 : $signed(9'(mx - 9'd124)))) $fatal(1, "intake: em_e chosen");
 `endif
@@ -220,10 +231,11 @@ module r3d_rast_intake #(
             np_left <= np_left - 3'd1;
             pnum    <= pnum + 3'd1;
             pk      <= 2'd0;
-            emx     <= 9'd0; emx_e <= 9'sd2;
+            emx     <= 9'd0; emx_e <= 9'sd2; emx_l9 <= 1'b1;
           end else begin
             pk  <= pk + 2'd1;
             emx <= mx; emx_e <= ee;
+            if (gt) begin emx_m9 <= gr ? {1'b0, e} : 9'({1'b0, e} - 9'd9); emx_l9 <= !gr && e < 8'd9; end
           end
         end
       end

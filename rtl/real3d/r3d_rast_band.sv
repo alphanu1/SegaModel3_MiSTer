@@ -140,6 +140,14 @@ module r3d_rast_band #(
     clr = (x >= sf_x0 && x < sf_x1 && y >= {1'b0, sf_y0} && y < {1'b0, sf_y1}) ? {1'b0, sf_col} : 25'd0;
   endfunction
 
+  function automatic logic inr(input logic [8:0] x, input logic [9:0] y);
+    inr = x >= sf_x0 && x < sf_x1 && y >= {1'b0, sf_y0} && y < {1'b0, sf_y1};
+  endfunction
+  // the flush's clear words decided a cycle early, as the read address moves to rd_a1 (c7_s1 and standalone:
+  // rd_a1 through the band-ahead row's add and the rectangle's compares into cm_wd, 116.3 MHz): the row is
+  // {fband, cm_ra[10:8]} + 16, and fband and the rectangle hold while a band is flushed (checked below)
+  logic [1:0] cin_q;
+
   // shading pipe
   logic [23:0] d1;
   always_comb d1 = p1_k ? brq[cur][1][23:0] : brq[cur][0][23:0];
@@ -230,14 +238,22 @@ module r3d_rast_band #(
         default: cst <= C_IDLE;
       endcase
       if (rd_go) begin cm_rd <= 1'b1; cm_ra <= {crow, rd_k}; rd_k <= rd_k + 8'd1; end
-      if (cm_rd) rd_a1 <= cm_ra;
+      if (cm_rd) begin
+        rd_a1 <= cm_ra;
+        cin_q[0] <= inr({cm_ra[7:0], 1'b0}, {1'b0, fband, cm_ra[10:8]} + 10'd16);
+        cin_q[1] <= inr({cm_ra[7:0], 1'b1}, {1'b0, fband, cm_ra[10:8]} + 10'd16);
+      end
       // a word read back: into the queue as the layer holds it, and cleared for the band two ahead
       if (rd_v) begin
         fq[fq_wp] <= {sh1[24:0], sh0[24:0]};
         fq_wp <= fq_wp + 3'd1;
         cm_cw <= 1'b1; cm_wa <= rd_a1;
-        cm_wd[fbuf][0] <= clr({rd_a1[7:0], 1'b0}, cy);
-        cm_wd[fbuf][1] <= clr({rd_a1[7:0], 1'b1}, cy);
+        cm_wd[fbuf][0] <= cin_q[0] ? {1'b0, sf_col} : 25'd0;
+        cm_wd[fbuf][1] <= cin_q[1] ? {1'b0, sf_col} : 25'd0;
+`ifdef VERILATOR
+        if ((cin_q[0] ? {1'b0, sf_col} : 25'd0) != clr({rd_a1[7:0], 1'b0}, cy) ||
+            (cin_q[1] ? {1'b0, sf_col} : 25'd0) != clr({rd_a1[7:0], 1'b1}, cy)) $fatal(1, "band: the clear decided a cycle early");
+`endif
       end
       if (m_wacc) fq_rp <= fq_rp + 3'd1;
       if (cst != C_ROW) ahead <= ahead + {3'd0, rd_go} - {3'd0, m_wacc};

@@ -57,6 +57,14 @@ module r3d_rast_fogvp (
 
   assign i_ready = !busy;
 
+  // the word count's two decodes the record's last word looks at, kept as registers beside k (c7_s1:
+  // k -> the select of d and z -> the mantissa compare -> r, -0.93 ns)
+  logic k3, k5;
+  // the divide's compare as the subtract's borrow, a carry chain shared with the step's subtract (the
+  // compare was a LUT tree in front of the guard's round-up and o_k: 108.6 MHz standalone)
+  wire [25:0] rsub = {1'b0, r} - {2'b0, mb};
+  wire        rge  = !rsub[25];
+
   // the start term
   wire signed [15:0] st16 = n25[15:0];
   wire signed [31:0] sfull = (32'(st16) <<< 14) + (32'(st16) <<< 6) + 32'sd2048;
@@ -75,7 +83,7 @@ module r3d_rast_fogvp (
   wire [16:0] pr  = 17'(af) + 17'(af >> 8) + 17'd128;
 
   always_ff @(posedge clk) begin
-    if (rst) begin k <= '0; busy <= 1'b0; o_valid <= 1'b0; af_v <= 1'b0; end
+    if (rst) begin k <= '0; k3 <= 1'b0; k5 <= 1'b0; busy <= 1'b0; o_valid <= 1'b0; af_v <= 1'b0; end
     else begin
       o_valid <= 1'b0;
       if (!busy) begin
@@ -87,14 +95,14 @@ module r3d_rast_fogvp (
             3'd5: kz <= i_data;
             default: ;
           endcase
-          k <= k + 3'd1;
+          k <= k + 3'd1; k3 <= k == 3'd2; k5 <= k == 3'd4;
           if (i_last) begin
             logic [31:0] d, z;
             logic [23:0] ma;
             logic        dz, zbad;
-            k <= '0;
-            d = (k == 3'd3) ? i_data : dens;
-            z = (k == 3'd5) ? i_data : kz;
+            k <= '0; k3 <= 1'b0; k5 <= 1'b0;
+            d = k3 ? i_data : dens;
+            z = k5 ? i_data : kz;
             // |density| below 99999 (0x47C34F80), not zero or subnormal; kz > 0, normal
             dz = !({1'b0, d[30:0]} < 32'h47C3_4F80) || d[30:23] == 8'd0;
             zbad = z[31] || z[30:23] == 8'd0 || z[30:23] == 8'hff;
@@ -109,7 +117,7 @@ module r3d_rast_fogvp (
         end
       end else begin
         // a quotient bit, and a multiplier step
-        if (r >= {1'b0, mb}) begin q <= {q[23:0], 1'b1}; r <= (r - {1'b0, mb}) << 1; end
+        if (rge) begin q <= {q[23:0], 1'b1}; r <= rsub[24:0] << 1; end
         else begin q <= {q[23:0], 1'b0}; r <= r << 1; end
         af_v <= 1'b0;
         if (af_v)
@@ -134,7 +142,7 @@ module r3d_rast_fogvp (
           logic [24:0] sg1;
           logic signed [9:0] ee1;
           logic [31:0] k0, k1;
-          g  = r >= {1'b0, mb};
+          g  = rge;
           st = g ? (r != {1'b0, mb}) : (r != 25'd0);
           up = g && (st || q[0]);
           k0 = (kzero || e >= 10'sd255 || e <= 10'sd0) ? 32'd0 : {1'b0, e[7:0], q[22:0]};
@@ -151,5 +159,10 @@ module r3d_rast_fogvp (
       end
     end
   end
+
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && ((k3 != (k == 3'd3)) || (k5 != (k == 3'd5)) || (rge != (r >= {1'b0, mb}))))
+    $fatal(1, "fogvp: k3 / k5 / the borrow");
+`endif
 
 endmodule

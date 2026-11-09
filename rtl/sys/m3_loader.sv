@@ -109,9 +109,8 @@ module m3_loader #(
   wire [5:0] ix   = ioctl_index[5:0];
   wire dl_any     = ioctl_download && (ix == 6'd0 || ix == 6'd1 || ix == 6'd2 || ix == 6'd3 || ix == 6'd4);
   wire dl0        = ioctl_download && ix == 6'd0;
-  wire dl_cfg     = ioctl_download && ix == 6'd4;
+  wire dl_cfg     = ioctl_download && ix == 6'd4;   // (the configuration itself: q_dlc, below)
   wire to_fifo    = dl_any && !dl_cfg;
-  wire dl_sw      = ioctl_download && ioctl_index == 16'd254;   // <switches>
 
   // destination classes in the FIFO
   localparam logic [1:0] K_SDR = 2'd0, K_X = 2'd1, K_EE = 2'd2;
@@ -124,7 +123,9 @@ module m3_loader #(
   wire         f_empty = (wp == rp);
   assign ioctl_wait = ioctl_download && (!mem_ready || lvl >= (FA+1)'(FD - 256));
 
-  // the entry for this word: its class and address
+  // the entry for this word: its class and address. flags0 is cfg_flags[0] with the configuration's update of
+  // this cycle bypassed, so the class is the one the port's own cycle gives (as before the cycle's delay)
+  logic flags0;
   logic [1:0]  n_k;
   logic [AW-1:0] n_a;
   always_comb begin
@@ -133,7 +134,7 @@ module m3_loader #(
       // only for a set whose VROM comes in index 0: a Step 2 set (flags bit 0, VROM on index 1) has banked
       // CROM there (CROM2 and CROM3, slots 8-11), which must stay in SDRAM (R100: the merged builds sent it
       // over the VROM in DDR3)
-      6'd0: if (VROM_X && !cfg_flags[0] && ioctl_addr[26:25] == VROM_AT[26:25]) begin
+      6'd0: if (VROM_X && !flags0 && ioctl_addr[26:25] == VROM_AT[26:25]) begin
               n_k = K_X; n_a = AW'(ioctl_addr[24:1]);                // VROM_AT is 32 MiB aligned
             end
       6'd1: begin n_k = K_X; n_a = ioctl_addr[AW:1]; end
@@ -144,7 +145,68 @@ module m3_loader #(
     endcase
   end
 
-  logic        rd_armed, wbusy, ack_d, dl0_d, done, cfg_seen, any_d, dlc_d;
+  logic        rd_armed, wbusy, ack_d, dl0_d, done, any_d;
+
+  // the game configuration runs a cycle behind the download port, on registered copies of it and of its
+  // decodes, so the index compares and address decodes are not in series with the configuration's enables
+  // (c7_s1: ioctl_index -> cfg_bank -0.95 ns, 105 endpoints). Every cfg_* value and every order between them
+  // is as before, one cycle later; the FIFO, ioctl_wait, busy and rom_loaded still run on the port itself.
+  // Nothing reads the configuration in that cycle: the game is held in reset while the loader is busy.
+  logic        q_dl, q_wr, q_cfg, q_ix0, q_sw, q_a0, q_a9, q_alo;
+  logic [3:0]  q_a41;
+  logic [15:0] q_d;
+  logic        q_cfg_d, q_dl0_d, q_cfg_seen;
+  always_ff @(posedge clk) begin
+    q_dl  <= ioctl_download;
+    q_wr  <= ioctl_wr;
+    q_cfg <= ix == 6'd4;
+    q_ix0 <= ix == 6'd0;
+    q_sw  <= ioctl_index == 16'd254;
+    q_a0  <= ioctl_addr[26:1] == 26'd0;
+    q_a9  <= ioctl_addr[26:1] == 26'd9;
+    q_alo <= ioctl_addr[26:5] == 22'd0;
+    q_a41 <= ioctl_addr[4:1];
+    q_d   <= ioctl_dout;
+  end
+  wire q_dlc = q_dl && q_cfg;
+  wire q_dl0 = q_dl && q_ix0;
+  wire q_dsw = q_dl && q_sw;
+  always_comb begin
+    flags0 = cfg_flags[0];
+    if (q_dlc && q_wr && q_alo && q_a41 == 4'd0) flags0 = q_d[8];
+    if (q_dl0 && !q_dl0_d && !q_cfg_seen) flags0 = 1'b0;
+  end
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      q_cfg_seen <= 1'b0; q_cfg_d <= 1'b0; q_dl0_d <= 1'b0;
+      cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
+      for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
+    end else begin
+      q_cfg_d <= q_dlc;
+      q_dl0_d <= q_dl0;
+      if (q_dlc && !q_cfg_d) cfg_dsw <= 8'h7F;
+      if (q_dlc && q_wr) begin
+        q_cfg_seen <= 1'b1;
+        if (q_a9) begin cfg_in2 <= q_d[7:0]; cfg_in3 <= q_d[15:8]; end
+        if (q_alo) begin
+          if (q_a41 == 4'd0) begin cfg_step <= q_d[7:0]; cfg_flags <= q_d[15:8]; end
+          else if (q_a41 <= 4'd8) begin
+            cfg_bank[{q_a41[2:0] - 3'd1, 1'b0}] <= {q_d[7], q_d[3:0]};
+            cfg_bank[{q_a41[2:0] - 3'd1, 1'b1}] <= {q_d[15], q_d[11:8]};
+          end
+        end
+      end
+      if (q_dl0 && !q_dl0_d) begin
+        q_cfg_seen <= 1'b0;
+        if (!q_cfg_seen) begin
+          cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
+          for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
+        end
+      end
+      // the DIP bank: byte 0 of <switches>
+      if (q_dsw && q_wr && q_a0) cfg_dsw <= q_d[7:0];
+    end
+  end
   logic [1:0]  h_k;
   logic [AW-1:0] h_adr;
   logic [15:0]   h_dat;
@@ -154,12 +216,9 @@ module m3_loader #(
     if (rst) begin
       wp <= '0; rp <= '0; rd_armed <= 1'b0; wbusy <= 1'b0; ack_d <= 1'b0; dl0_d <= 1'b0; done <= 1'b0;
       sdr_wr_req <= 1'b0; x_req <= 1'b0; overflow <= 1'b0; rom_loaded <= 1'b0; bytes <= '0;
-      cfg_seen <= 1'b0; any_d <= 1'b0; dlc_d <= 1'b0;
-      cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
-      for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
+      any_d <= 1'b0;
     end else begin
       ack_d <= sdr_wr_ack;
-      dlc_d <= dl_cfg;
       dl0_d <= dl0;
       any_d <= dl_any;
       if (to_fifo && ioctl_wr) begin
@@ -170,28 +229,6 @@ module m3_loader #(
         end
       end
       if (dl0 && ioctl_wr) bytes <= ioctl_addr + 27'd2;
-      // the game configuration
-      if (dl_cfg && !dlc_d) cfg_dsw <= 8'h7F;
-      if (dl_cfg && ioctl_wr) begin
-        cfg_seen <= 1'b1;
-        if (ioctl_addr[26:1] == 26'd9) begin cfg_in2 <= ioctl_dout[7:0]; cfg_in3 <= ioctl_dout[15:8]; end
-        if (ioctl_addr[26:5] == 22'd0) begin
-          if (ioctl_addr[4:1] == 4'd0) begin cfg_step <= ioctl_dout[7:0]; cfg_flags <= ioctl_dout[15:8]; end
-          else if (ioctl_addr[4:1] <= 4'd8) begin
-            cfg_bank[{ioctl_addr[3:1] - 3'd1, 1'b0}] <= {ioctl_dout[7], ioctl_dout[3:0]};
-            cfg_bank[{ioctl_addr[3:1] - 3'd1, 1'b1}] <= {ioctl_dout[15], ioctl_dout[11:8]};
-          end
-        end
-      end
-      if (dl0 && !dl0_d) begin
-        cfg_seen <= 1'b0;
-        if (!cfg_seen) begin
-          cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
-          for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
-        end
-      end
-      // the DIP bank: byte 0 of <switches>
-      if (dl_sw && ioctl_wr && ioctl_addr[26:1] == 26'd0) cfg_dsw <= ioctl_dout[7:0];
       if (dl0) rom_loaded <= 1'b0;
       if (dl0_d && !dl0) done <= 1'b1;
       // drain: one write per entry, to its class's destination

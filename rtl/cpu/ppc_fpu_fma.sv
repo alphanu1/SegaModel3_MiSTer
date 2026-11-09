@@ -150,6 +150,12 @@ module ppc_fpu_fma
   output logic [63:0]     out_res,
   output fpu_flags_t      out_flags
 );
+  // (R140) the restructurings' own checks; R140_NOCHK turns them off for the planted-fault runs
+`ifdef R140_NOCHK
+  localparam bit R1C = 1'b0;
+`else
+  localparam bit R1C = 1'b1;
+`endif
 
   localparam int EW = 14;  // signed exponents: the product of two denormals reaches -2252
   typedef logic signed [EW-1:0] exp_t;
@@ -1145,6 +1151,40 @@ module ppc_fpu_fma
     if (!cvt8 && flip) res8[63] = ~res8[63];
     if (sgl8) res8[28:0] = 29'd0;
   end
+  // The result as one-hot kinds ANDed with their values and ORed (R140), in place of res8's priority
+  // chain: cvt8, spc8, the zero, ovf_dis, rzero / flush, then the normal value, each in front of the next,
+  // were eight levels from r7_q into out_res (the 110 MHz full build c7_s1: r7_q.sd.cvt -> ovf -> ovf_dis
+  // -> the chain -> out_res, -1.94 ns, and the same into the single unit's operand select once out_res was
+  // retimed forward, -2.24). Every kind is formed from r7_q in two or three levels; a fraction bit is then
+  // one LUT of the kinds and its values. res8 above still gives cls8 (its value bits are not used).
+  (* keep = 1 *) wire k_b   = ~cvt8 & ~spc8 & ~r7_q.zero;                 // none of the first three
+  (* keep = 1 *) wire k_ovd = ~r7_q.tiny & ~sd8.oe & (r7_q.ovf0 | (r7_q.ovf_at & c1));   // ovf_dis but for k_b
+  (* keep = 1 *) wire k_ove = ~r7_q.tiny &  sd8.oe & (r7_q.ovf0 | (r7_q.ovf_at & c1));   // ovf & oe but for k_b
+  (* keep = 1 *) wire k_fla = sd8.ni & r7_q.tiny & ~sd8.ue;
+  (* keep = 1 *) wire k_rzf = r7_q.rzero | (k_fla & (sgl8 ? ~(r7_q.den_at & c1) : (~c1 & ~r8[55])));  // rzero | flush
+  (* keep = 1 *) wire k_ovf = k_b & k_ovd;
+  (* keep = 1 *) wire k_n   = k_b & ~k_ovd & ~k_rzf;
+  (* keep = 1 *) wire k_spc = ~cvt8 & spc8;
+  (* keep = 1 *) wire k_sn  = k_spc | k_n;                                   // the fraction is r8's
+  (* keep = 1 *) wire k_ovm = k_ovf & ~to_inf;                               // ovf_mag's fraction is all ones
+  wire [63:0] cvt_v = {cvt_hi, cvt_lo};
+  wire [10:0] bsn = k_ove ? (c1 ? r7_q.bo1.v : r7_q.bo0.v) :                // the normal value's exponent
+                    (c2 ? r7_q.bnu2.v : c1 ? r7_q.bnu1.v : r7_q.bnu0.v);
+  wire        k_ne  = k_n & ~dbl_den;
+  // ovf_mag's exponent: 7FF to infinity, else 47E (single) or 7FE
+  wire [10:0] ovf_e = to_inf ? 11'h7FF : sgl8 ? 11'h47E : 11'h7FE;
+  logic [63:0] res8f;
+  always_comb begin
+    for (int b = 0; b < 52; b++)
+      res8f[b] = ((cvt8 & cvt_v[b]) | (k_sn & r8[b + 3]) | k_ovm) & ~(sgl8 & (b < 29));
+    for (int e = 0; e < 11; e++)
+      res8f[52 + e] = (cvt8 & cvt_v[52 + e]) | k_spc | (k_ovf & ovf_e[e]) | (k_ne & bsn[e]);
+    res8f[63] = cvt8 ? cvt_v[63] : ((k_b ? r7_q.sign : (spc8 ? r7_q.sign : zsign)) ^ flip);
+  end
+  // (the zero kind is spc8 = 0, cvt8 = 0, zero = 1: its sign is zsign; every other kind's is r7_q.sign)
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (R1C && !rst && r7_v && res8f != res8) $fatal(1, "ppc_fpu_fma: S8 by kinds %016X against the chain %016X", res8f, res8);
+`endif
   // the class with the delivered sign (a NaN's sign is not part of its class)
   wire [4:0] fprf8 = (cls8 == FPRF_QNAN || !res8[63]) ? cls8 :
                      (cls8 == FPRF_PINF)  ? FPRF_NINF  :
@@ -1186,7 +1226,7 @@ module ppc_fpu_fma
     else     out_valid <= r7_v | x_valid;
     out_tag   <= x_valid ? x_tag : sd8.tag;
     out_div   <= ~x_valid & sd8.div;
-    out_res   <= x_valid ? x_res : res8;
+    out_res   <= x_valid ? x_res : res8f;
     out_flags <= x_valid ? x_flags : flags8;
   end
 

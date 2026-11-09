@@ -394,13 +394,21 @@ module m3_bus
     endcase
   end
   wire [31:0] cq = c106_w[pci_reg] ? c106[pci_reg] : c106_def;
+  // The internal targets' reads (B_INT) and writes (do_w) take the target and the MPC106 register registered:
+  // both are used a cycle or more after addr, pci_addr and the registers settled (B_INT and the write cycle
+  // follow B_BEAT, which does not move addr; consecutive accesses are B_IDLE and B_DEC apart), so they read
+  // as before, from registers (c7_s1: pci_addr -> c106 select -> rd_int -> m_rdata -0.99 ns, addr -> the
+  // target decode -> pci_addr's enable -0.70 ns)
+  tgt_t        tgt_q;
+  logic [31:0] cq_q;
+  always_ff @(posedge clk) begin tgt_q <= tgt; cq_q <= cq; end
   wire        be_byte = (be == 4'h8) || (be == 4'h4) || (be == 4'h2) || (be == 4'h1);
 
   // the internal targets' read word (CPU byte order)
   logic [31:0] rd_int;
   always_comb begin
     rd_int = 32'hFFFF_FFFF;
-    case (tgt)
+    case (tgt_q)
       X_IO:    rd_int = {io_rbyte, 24'h00_0000};
       X_MIDI:  rd_int = addr[2] ? 32'h8300_0000 : 32'h0000_0000;
       X_SYS: begin
@@ -416,7 +424,7 @@ module m3_bus
       X_PCIA:  rd_int = bswap(pci_addr);
       X_PCID:  rd_int = (pci_dev == 5'd13) ? bswap((pci_reg == 6'd0) ? (s2 ? 32'h1786_11DB : R3D_ID) : 32'd0)
                       : (s2 && pci_dev == 5'd0) ? (be_byte ? 32'hFFFF_FFFF : (pci_reg == 6'd0) ? 32'h5710_0200
-                                                   : cq)
+                                                   : cq_q)
                       : (pci_dev == 5'd0)  ? ((pci_reg == 6'd0) ? 32'h5710_0100 : 32'd0)
                       : (s2 && pci_dev == 5'd16) ? (((be == 4'hF) && pci_reg == 6'd0) ? bswap(32'h1827_11DB) : 32'd0)
                       : 32'hFFFF_FFFF;                                             // no device: master abort
@@ -458,11 +466,11 @@ module m3_bus
     if (ln_start && ln == 10'd0)   irq_set = irq_set | 8'h0D;
     if (midi_cnt == 16'd0 && midi_ctrl[5]) irq_set[6] = 1'b1;               // the transmitter is free
     if (do_w && be[3]) begin
-      if (tgt == X_TGREG && addr[7:2] == 6'h04) irq_clr = wd[31:24];         // F1180010
-      if (tgt == X_SYS && addr[5:2] == 4'h6)    irq_clr = wd[31:24];         // F0100018 (Supermodel)
-      if (tgt == X_MIDI && (!addr[2] || !wd[29])) irq_clr[6] = 1'b1;         // a data byte, or RTS off
+      if (tgt_q == X_TGREG && addr[7:2] == 6'h04) irq_clr = wd[31:24];         // F1180010
+      if (tgt_q == X_SYS && addr[5:2] == 4'h6)    irq_clr = wd[31:24];         // F0100018 (Supermodel)
+      if (tgt_q == X_MIDI && (!addr[2] || !wd[29])) irq_clr[6] = 1'b1;         // a data byte, or RTS off
     end
-    if (do_w && be[3] && tgt == X_MIDI && !addr[2]) irq_set[6] = 1'b0;       // the byte just written is in flight
+    if (do_w && be[3] && tgt_q == X_MIDI && !addr[2]) irq_set[6] = 1'b0;       // the byte just written is in flight
   end
 
   // writes to internal targets, performed in the cycle do_w is high
@@ -492,7 +500,7 @@ module m3_bus
         endcase
       end
       if (do_w) begin
-        case (tgt)
+        case (tgt_q)
           X_R3D: begin
             case (addr[31:24])
               default: begin
@@ -528,17 +536,21 @@ module m3_bus
           default: ;
         endcase
       end
-      if (do_r && tgt == X_NONE) begin n_unmapped <= n_unmapped + 16'd1; last_unmapped <= addr; end
-      if (do_r && tgt == X_IO) io_sel <= 1'b1;
+      if (do_r && tgt_q == X_NONE) begin n_unmapped <= n_unmapped + 16'd1; last_unmapped <= addr; end
+      if (do_r && tgt_q == X_IO) io_sel <= 1'b1;
     end
   end
-  always_ff @(posedge clk) if (do_w && tgt == X_TGREG) tg_shadow[addr[7:2]] <= bswap(wd);
+  always_ff @(posedge clk) if (do_w && tgt_q == X_TGREG) tg_shadow[addr[7:2]] <= bswap(wd);
   // the MPC106's registers, each byte lane as written (the first write of a register keeps
   // its reset value's other lanes, as Supermodel's byte array does)
-  always_ff @(posedge clk) if (STEP2 && do_w && tgt == X_PCID && s2 && pci_dev == 5'd0) begin
-    c106[pci_reg] <= {be[3] ? wd[31:24] : cq[31:24], be[2] ? wd[23:16] : cq[23:16],
-                      be[1] ? wd[15:8] : cq[15:8], be[0] ? wd[7:0] : cq[7:0]};
+  always_ff @(posedge clk) if (STEP2 && do_w && tgt_q == X_PCID && s2 && pci_dev == 5'd0) begin
+    c106[pci_reg] <= {be[3] ? wd[31:24] : cq_q[31:24], be[2] ? wd[23:16] : cq_q[23:16],
+                      be[1] ? wd[15:8] : cq_q[15:8], be[0] ? wd[7:0] : cq_q[7:0]};
   end
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && (do_w || do_r) && (tgt_q != tgt || ((tgt_q == X_PCID) && cq_q != cq)))
+    $fatal(1, "m3_bus: the target or the MPC106 register registered");
+`endif
   // the I/O chip takes the access the cycle after (its read side effect included)
   always_ff @(posedge clk) begin
     io_we    <= do_w;
