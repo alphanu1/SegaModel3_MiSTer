@@ -1,5 +1,52 @@
 # Handoff
 
+## Paused work and queue (2026-11-10, night)
+
+Everything is paused except Sega Rally 2. Each workstream's notes live in its `sm3-builds/` folder (git-ignored); the
+study's R-entries carry the findings. To pick a stream up, read its folder's notes first.
+
+**Running: Sega Rally 2** (`sm3-builds/srally2`; notes and draft R-entry in `srally2/R-entry.md`).
+- Goal: Sega Rally 2 (`srally2`, zip in `~/roms/Model3/`, not yet on the board) with controls and sound, for the next
+  video. MRA from `sim/system/m3_mra.py`; srally2 added to arcsnd's claims and `roms_table.h` (patch against arcsnd
+  7ccac34, branch `model3`, my fork).
+- The board build is **130 MHz** (PLL outputs 1/2 at 130 MHz, phase_shift2 3846 ps, SYS_HZ 130_000_000, as
+  `sm3-builds/f130/tree`), from main plus the Sega Rally 2 fixes plus **FPS average defaulting to 1 s** (the OSD order
+  "1 s, 5 s, 10 s"; done and benched in `srally2/tree`). Keep only an RBF with hold positive at all four corners:
+  `f130_s3` (dcfab7f8) had hold −0.020 / −0.037 ns at the slow corners; `f130_s2` was fitting.
+
+**Paused, in order of priority:**
+1. **Timing closure** (the top priority; ahead of speed and area). Census done: `sm3-builds/tclose/CENSUS.md` and
+   `tclose/cen/`. 110 MHz at every corner looks reachable; 120 needs LAB headroom and the clock split. Two fix streams
+   were started and stopped early:
+   - non-CPU (`sm3-builds/tc2`): the sound DSP's ring addresses pipelined (free: about 35% spare clocks a sample),
+     MAX_FANOUT on sys_top's `gp_outr[17..20]`/`rack` in the qsf (no sys/ edit), `tq_full` registered, the colour
+     operand fed `texel ^ x` and the texel differences registered, the steering and FPS overlay outputs registered;
+   - CPU C1/C4 (`sm3-builds/tc3`): `fpx_cond` and the other `ser_wait` sources from next values, the BAT/TLB enables a
+     cycle ahead, the fetch-queue compares from the one-hot `o`; cycle-identical as R140.
+   Next after those: CPU C2/C3/C5 (I-cache `rd_a`, `da_av`, D-cache tag compare), geometry G2/G3 (`rst_geo` fan-out,
+   `xw_data` select), then the DSP anchors (f4b) for a few tenths.
+2. **Clock-split test** (branch `clksplit`, created from 8ea120d, empty): the CPU on its own clock at 110 MHz, the rest
+   at 120 and at 130 (D-52; CDC at the CPU's m_* port, snoop, ext_int, reset; outclk_3; set_clock_groups in our sdc).
+   At 130 MHz everything runs faster together, so the board result (R167: Daytona 2's attract and VF3 at 60) cannot
+   say whether the CPU or the Real3D/SDRAM made the difference. These builds would.
+3. **Daytona 2's race** stays at 30 even at 130 MHz (attract is at 60). Map it like R160 (`sm3-builds/d2race`, just
+   started): CPU, geometry and rasteriser per frame at 120 and 130, the game's pacing in a race, Supermodel's race
+   frame rate. Then the same for a cloth-heavy VF3 fight, to see which block's speed gave VF3 its 60.
+4. **CPU re-pipelining study** (desk only): a 603e pipeline laid out for about 150 MHz on its own, with forwarding and
+   prediction redesigned so cycles stay as they are (D-57). Other cores close CPUs at 145-150 MHz, including Namco
+   System 22/23 at 99.9% full; ours was built for cycle count first and retrofitted for timing.
+5. **CPU memory:** reads going ahead of the CPU's posted writes (about −1.6% of Daytona 2's loop, bench first), and the
+   second SDRAM as the CPU's own memory when the modules arrive (−4 to −6% est.; it costs area: a second controller).
+6. **Sound:**
+   - Bass Fishing hiss after a direct game change: arcsnd fix in `sm3-builds/sound/bass` (md5 40d24879, stray session
+     removed, session number in the tag), not yet board-tested or committed; the likely root cause is the sound DSP's
+     failing timing at 120, which item 1's DSP pipelining addresses. The bridge side (+12 ALM) needs a decision.
+   - The bridge's 93 ms watchdog reboots the sound board if a live server stalls that long: raise to 1-2 s.
+   - The arcsnd PR to ppriest: draft `sm3-builds/arcsnd_pr_draft.md`; the README additions (why the DSP is in the FPGA,
+     what a core must carry) are uncommitted in `sm3-builds/arcsnd`. Ben approves the PR text before it is opened.
+7. **Area:** the device is full (4,191 / 4,191 LABs, about 620 ALM free). The only large item left is the CPU's MLAB
+   files into M10K (about 380 ALM, 7 M10K), which needs a speed proof first.
+
 ## Update (2026-11-10)
 
 `main` is ad35700, pushed: a `--no-ff` merge of `area`, which carries `timing-120` (`git revert -m 1 ad35700` undoes

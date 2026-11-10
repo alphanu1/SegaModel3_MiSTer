@@ -15008,3 +15008,15 @@ most, no divider. The second is still m3_system's shared `sec_tick`. A new setti
 - My first stop test used Scud Race's first 500 frames, which are silent: everything passed trivially.
 - I expected the old bridge to fail a restart in the same epoch at frame 1300. It passed: the pointer's read wraps
   through the new attach (above).
+
+**R167 — 130 MHz on the board (2026-11-10, `f130_s3`, RBF dcfab7f8: main 8ea120d's RTL with the PLL and SYS_HZ at
+130 MHz; setup −4.23 / −4.14 ns, hold −0.020 / −0.037 ns at the slow corners, so not a safe build): Daytona 2 runs at a
+full 60 fps.** It fits R160 but does not prove it: at 130 MHz the CPU, the SDRAM, the geometry and the rasteriser all run about
+8% faster together, so the board result alone cannot say which of them was holding a frame. R160's model says the CPU in
+Daytona 2's attract; only a build with one block faster, or the model run per game, can separate them. Under D-57 that 8% has to come from fewer CPU cycles
+or a CPU clock that closes, not from added stages: the CPU's own SDRAM (R144's estimate −4 to −6% of the loop), reads
+going ahead of its posted writes (−1.6%), and timing closure.
+
+*Board, the same 130 MHz build, later.* VF3 runs at 60 fps in attract and in play, where at 120 MHz it dropped to
+29-34 fps on the characters with much floating cloth. The census (R160's VF3 note) put VF3's slow frames on the rasteriser's texture misses, not the CPU, so this gain may be the rasteriser's. Daytona 2's attract is at 60 with a couple of small drops, but
+its race stays at 30; the race is being mapped like R160's attract.
