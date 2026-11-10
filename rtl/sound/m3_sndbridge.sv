@@ -32,6 +32,20 @@
 // newest. After a reset the record ring's tags are cleared to the old epoch's complement before
 // anything is read; the epoch, kept through resets, moves on.
 //
+// THE SERVER GONE: no record taken for 2^WD_BITS samples (4,096, 93 ms) since one was, and the bridge
+// resets itself as a core reset does, but for fs and the MIDI ring: the epoch moves, the ring is
+// cleared, the command pointer goes to 0, the engine is reset and the output is 0. A record left in the ring by a server that stopped or died would
+// otherwise match p again 65,536 samples on and take (count - c) mod 2^17 stale commands into the
+// engine; a server that comes back sees the new epoch and starts a session from the attach, its
+// count from 0 as the bridge's. The server's own restart takes 220 ms or more (200 ms of fs not
+// seen to move), so it always lands in the new epoch. A live server never lets 93 ms pass without a
+// record (the bridge skips what is past SLIP long before): only a server that has stalled that long
+// is restarted (sound/DESIGN.md §19.5).
+//
+// THE OUTPUT: (front + rear) / 2 a side times 2^(GAIN + vol), saturated to 16 bits. GAIN is the fixed
+// level (the engine's 16 bits are its 18-bit DAC's top, a quarter of Supermodel's level with DAC18B);
+// vol is the OSD's Volume, 0 / +6 / +12 dB.
+//
 // AREA: no FIFO and no select on the engine's command port (DDR3's beats are the engine's
 // commands); fs and p 16 bits, the clear counted on p; the addresses the block's high bits and
 // the counters; no poll of the server; the engine's output is the audio.
@@ -43,6 +57,8 @@ module m3_sndbridge #(
   parameter int          D         = 256,               // the play delay, samples (D-55)
   parameter logic [24:0] BLOCK     = 25'h1E4_0000,      // the block's DDR3 word (byte 0x3F200000; the window starts at 0x30000000)
   parameter int          RING_BITS = 15,
+  parameter int          GAIN      = 2,                 // the fixed output gain, 6 dB steps (x 4, +12 dB)
+  parameter int          WD_BITS   = 12,                // no record for 2^WD_BITS samples: the server is gone
   parameter bit          DBG       = 1'b0               // the bench's ports (0 in the core: tied off)
 ) (
   input  logic        clk,
@@ -52,6 +68,9 @@ module m3_sndbridge #(
   input  logic        midi_we,
   input  logic        midi_data,          // 1: the data port
   input  logic  [7:0] midi_byte,
+
+  // the OSD's Volume: 0 Normal, 1 +6 dB, 2 +12 dB (3 as 2)
+  input  logic  [1:0] vol,
 
   // DDR3: one m3_ddr_arb port (m2_ddr3's contract)
   output logic        d_req,
@@ -65,7 +84,7 @@ module m3_sndbridge #(
   input  logic        d_ack,
   input  logic [63:0] d_dout,
 
-  // the core's audio: (front + rear) / 2 a side
+  // the core's audio: (front + rear) / 2 a side, times 2^(GAIN + vol), saturated
   output logic signed [15:0] audio_l,
   output logic signed [15:0] audio_r,
 
@@ -101,6 +120,7 @@ module m3_sndbridge #(
   logic [EB-1:0] err;
   logic          tick;
   logic   [15:0] fs;
+  // the bridge's own reset (wd_rst, below) leaves the sample clock and the sound port running
   assign tick = cyc == '0;
   wire           carry = err >= EB'(MOD - RR);         // the fraction passes 1 this sample
   always_ff @(posedge clk) begin
@@ -113,16 +133,6 @@ module m3_sndbridge #(
       cyc <= carry ? PB'(PER) : PB'(PER - 1);
     end else if (DBG && sim_ff && cyc > PB'(1)) cyc <= PB'(1);
     else cyc <= cyc - 1'b1;
-  end
-
-  // the epoch: moves at every reset and is kept through it (power-up 0)
-  /* verilator lint_off PROCASSINIT */
-  logic [1:0] epoch = 2'd0;             // a power-up value (Quartus keeps it), never reset
-  logic       rst_q = 1'b0;
-  /* verilator lint_on PROCASSINIT */
-  always_ff @(posedge clk) begin
-    rst_q <= rst;
-    if (rst && !rst_q) epoch <= epoch + 2'd1;
   end
 
   // ------------------------------------------------------------------ the DDR3 port and the samples
@@ -145,6 +155,25 @@ module m3_sndbridge #(
   logic        skip;
   logic signed [15:0] f0;
   logic        e_go, e_busy, e_done, e_ready;
+  // the server gone: no record taken for 2^WD_BITS samples since one was (armed). The bridge's own reset
+  // comes with the port idle (no request is dropped) and lasts a clock; the counter's top bit, which it
+  // clears, holds until then
+  logic [WD_BITS:0] wd;
+  logic        armed, e_rst;
+  wire         wd_rst = wd[WD_BITS] && job == J_NONE;
+  wire         srst   = rst || wd_rst;
+  localparam logic [15:0] P0 = 16'(D - 1 - 512);       // p at a core reset; its low 9 bits are D - 1
+
+  // the epoch: moves at every reset, the core's or the bridge's own, and is kept through it (power-up 0)
+  /* verilator lint_off PROCASSINIT */
+  logic [1:0] epoch = 2'd0;             // a power-up value (Quartus keeps it), never reset
+  logic       rst_q = 1'b0;
+  /* verilator lint_on PROCASSINIT */
+  always_ff @(posedge clk) begin
+    rst_q <= srst;
+    if (srst && !rst_q) epoch <= epoch + 2'd1;
+  end
+
   logic [17:0] e_q;
   wire  [15:0] lag  = fs - p;           // >= 0: due; >= 128: past SLIP
   wire         due  = !lag[15];
@@ -155,7 +184,7 @@ module m3_sndbridge #(
   wire cmd_cmd = d_rvalid && job == J_CMD && c != c_end;
   wire [1:0] e_sel = {pop[0], pop[1]};   // 0, 2, 1, 3
   m3_scsp_dsp #(.RING_BITS(RING_BITS)) u_dsp (
-    .clk, .rst_n(!rst),
+    .clk, .rst_n(!e_rst),
     .c_valid(rec_cmd || cmd_cmd), .c_ready(e_ready), .c_kind(d_dout[63:61]),
     .c_addr(d_dout[56:41]), .c_data(d_dout[23:0]),
     .go(e_go), .busy(e_busy), .done(e_done), .out_sel(e_sel), .out_q(e_q), .dac18(e_d18));
@@ -172,14 +201,26 @@ module m3_sndbridge #(
     endcase
   end
   assign d_be = 8'hFF;
-  wire [16:0] mix = {f0[15], f0} + {e_q[17], e_q[17:2]};   // front + rear, halved (floor)
+  wire [16:0] mix = {f0[15], f0} + {e_q[17], e_q[17:2]};   // front + rear
+  // times 2^(GAIN + vol) / 2 (floor), saturated: the sum sign-extended, shifted, and the bits above the
+  // 16 kept checked against its sign
+  localparam int XW = 17 + GAIN + 2;
+  wire  [1:0] vsh = vol[1] ? 2'd2 : vol;
+  wire [XW-1:0] mx = {{(XW-17){mix[16]}}, mix} << (5'(GAIN) + {3'd0, vsh});
+  wire        ovf = mx[XW-1:16] != {(XW-16){mx[XW-1]}};
+  wire [15:0] gq  = ovf ? {mx[XW-1], {15{!mx[XW-1]}}} : mx[16:1];
 
   always_ff @(posedge clk) begin
-    if (rst) begin
-      s <= S_CLR; p <= 16'(D - 1 - 512); c <= '0; c_end <= '0; rec_ok <= 1'b0; retry <= 1'b0;
+    // the sound port: one byte held until it is out (the CPU waits 320 us between bytes); the MIDI ring
+    // and fs run on through the bridge's own reset, so a session that starts later has every byte
+    if (!rst && midi_we && !m_full) begin m_full <= 1'b1; m_byte <= {midi_data, midi_byte}; m_fs <= fs; end
+    if (srst) begin
+      // the bridge's own reset keeps p's high bits (p trails fs); the clear starts at slot D - 1 either way
+      s <= S_CLR; p <= {rst ? P0[15:9] : p[15:9], 9'(D - 1)}; c <= '0; c_end <= '0; rec_ok <= 1'b0; retry <= 1'b0;
       want_rec <= 1'b0; want_cmd <= 1'b0; jd <= 1'b0; pop <= '0; sel_q <= '0;
       job <= J_NONE; d_req <= 1'b0; d_we <= 1'b0; d_addr <= BLOCK; d_blen <= 8'd1; beat <= '0;
-      hdr_pend <= 1'b0; m_full <= 1'b0; m_count <= '0;
+      hdr_pend <= 1'b0;
+      if (rst) begin m_full <= 1'b0; m_count <= '0; end
       e_go <= 1'b0; audio_l <= '0; audio_r <= '0; skip <= 1'b0;
     end else begin
       e_go <= 1'b0; skip <= 1'b0; jd <= 1'b0; sel_q <= e_sel;
@@ -187,17 +228,16 @@ module m3_sndbridge #(
         retry <= 1'b0;
         if (fs[4:0] == 5'd31) hdr_pend <= 1'b1;
       end
-      // the sound port: one byte held until it is out (the CPU waits 320 us between bytes)
-      if (midi_we && !m_full) begin m_full <= 1'b1; m_byte <= {midi_data, midi_byte}; m_fs <= fs; end
 
-      // ---- the DDR3 port: a job at a time, the clear first, then MIDI, the header, the reads
+      // ---- the DDR3 port: a job at a time, MIDI first (a byte is not lost in a clear), then the clear,
+      // the header, the reads
       if (job == J_NONE) begin
         beat <= '0;
         d_req <= s == S_CLR || m_full || hdr_pend || want_rec || want_cmd;
-        if (s == S_CLR) begin
-          job <= J_CLR; d_we <= 1'b1; d_blen <= 8'd64; d_addr <= BLOCK | 25'({1'b1, p[8:0], 6'd0});
-        end else if (m_full) begin
+        if (m_full) begin
           job <= J_MIDI; d_we <= 1'b1; d_blen <= 8'd1; d_addr <= BLOCK | 25'({7'd1, m_count[8:0]});
+        end else if (s == S_CLR) begin
+          job <= J_CLR; d_we <= 1'b1; d_blen <= 8'd64; d_addr <= BLOCK | 25'({1'b1, p[8:0], 6'd0});
         end else if (hdr_pend) begin
           job <= J_HDR; d_we <= 1'b1; d_blen <= 8'd1; d_addr <= BLOCK; m_fs <= fs;
         end else if (want_rec) begin
@@ -249,18 +289,26 @@ module m3_sndbridge #(
         S_HOLD: if (tick || lag != '0) begin s <= S_POP; pop <= '0; end
         S_POP: begin
           // the channels read in the order front L, rear L, front R, rear R (each a clock behind its
-          // select): (front + rear) / 2 a side, from the top 16 bits
+          // select): (front + rear) / 2 a side, from the top 16 bits, with the gain
           pop <= pop + 3'd1;
           case (pop)
             3'd1, 3'd3: f0 <= e_q[17:2];
-            3'd2: audio_l <= mix[16:1];
-            3'd4: begin audio_r <= mix[16:1]; p <= p + 16'd1; s <= S_WAIT; pop <= '0; end
+            3'd2: audio_l <= gq;
+            3'd4: begin audio_r <= gq; p <= p + 16'd1; s <= S_WAIT; pop <= '0; end
             default: ;
           endcase
         end
         default: ;
       endcase
     end
+  end
+
+  // samples since a record was last taken; the engine's reset a register behind the bridge's
+  always_ff @(posedge clk) begin
+    e_rst <= srst;
+    if (srst) begin wd <= '0; armed <= 1'b0; end
+    else if (s == S_REC && jd && rec_ok) begin wd <= '0; armed <= 1'b1; end
+    else if (tick && armed && !wd[WD_BITS]) wd <= wd + 1'b1;
   end
 
   logic [1:0] e_d18;
@@ -278,7 +326,7 @@ module m3_sndbridge #(
                            ((s == S_WAIT && (retry || !due)) || (s == S_HOLD && lag == '0)) : 1'b0;
 
   /* verilator lint_off UNUSEDSIGNAL */
-  wire _unused = &{1'b0, sim_ff, skip, e_d18, e_busy, e_ready, mix[0], d_wacc, d_dout[60:57], d_dout[40:24], d_dout[31:18], sel_q};   // writes are one beat, or the clear's constant
+  wire _unused = &{1'b0, sim_ff, skip, e_d18, e_busy, e_ready, mx[0], d_wacc, d_dout[60:57], d_dout[40:24], d_dout[31:18], sel_q};   // writes are one beat, or the clear's constant
   /* verilator lint_on UNUSEDSIGNAL */
 
 endmodule

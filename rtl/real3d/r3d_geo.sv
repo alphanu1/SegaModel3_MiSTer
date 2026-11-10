@@ -98,6 +98,10 @@ module r3d_geo
   // engine's word of that clock forwarded (area pass, R153: 12 M10K for its 12 MLABs); 0 leaves it in MLAB
   parameter bit VS_M10K    = 1'b1,
   parameter bit BC_M10K    = 1'b1,   // on since study R98 (-140 ALM, +8 M10K)
+  // VP_M10K: the walker's viewport chain (64 x 34) in one M10K for its four MLABs (area pass, R164)
+  parameter bit VP_M10K    = 1'b1,
+  // RA_MRG: the assembly record and the set-up bits in one MLAB (area pass, R164)
+  parameter bit RA_MRG     = 1'b1,
   // FP_DSP: the pool's and the facing test's FP adders shift in DSP blocks
   // (r3d_fp_add DSP_SHIFT, study R98: -316 ALM, +10 DSP, Fmax 111.7 -> 103.5
   // MHz standalone; 0 for a 110 MHz build)
@@ -174,7 +178,7 @@ module r3d_geo
   logic        w_start;
 
   logic        cu_v, cu_out;
-  r3d_walker #(.CULL(CULL), .CTAB(SM_CTAB)) u_walker (
+  r3d_walker #(.CULL(CULL), .CTAB(SM_CTAB), .VP_M10K(VP_M10K)) u_walker (
     .clk, .rst, .start(w_start), .step15, .busy(w_busy), .overflow(w_overflow),
     .mem_req(w_req), .mem_addr(w_addr), .mem_len(w_len), .mem_ack(w_ack),
     .mem_rvalid(w_rvalid), .mem_rdata(cull_rdata),
@@ -668,11 +672,17 @@ module r3d_geo
   logic        ra_we;
   logic [5:0]  ra_wa, ra_ra;
   logic [30:0] ra_wd, ra_q;
-  r3d_ram #(.W(31), .A(5)) u_rasm (.clk, .we(ra_we), .wa(ra_wa[4:0]), .wd(ra_wd), .ra(ra_ra[4:0]), .rq(ra_q));
   logic [2:0]  rs_wd, su_q;      // SETUP_LOAD, SETUP_OUT: the polygon's {fixed shade, double-sided, textured}
-  generate if (SETUP_LOAD || SETUP_OUT) begin : g_su
+  // RA_MRG (area pass, R164): the set-up bits beside the record in one 34-bit MLAB (two LABs), not a second MLAB
+  // of their own: the two had the same write enable, write address and read address
+  generate if ((SETUP_LOAD || SETUP_OUT) && RA_MRG) begin : g_sum
+    r3d_ram #(.W(34), .A(5)) u_rasm (.clk, .we(ra_we), .wa(ra_wa[4:0]), .wd({rs_wd, ra_wd}), .ra(ra_ra[4:0]),
+      .rq({su_q, ra_q}));
+  end else if (SETUP_LOAD || SETUP_OUT) begin : g_su
+    r3d_ram #(.W(31), .A(5)) u_rasm (.clk, .we(ra_we), .wa(ra_wa[4:0]), .wd(ra_wd), .ra(ra_ra[4:0]), .rq(ra_q));
     r3d_ram #(.W(3), .A(5)) u_rsu (.clk, .we(ra_we), .wa(ra_wa[4:0]), .wd(rs_wd), .ra(ra_ra[4:0]), .rq(su_q));
   end else begin : g_nosu
+    r3d_ram #(.W(31), .A(5)) u_rasm (.clk, .we(ra_we), .wa(ra_wa[4:0]), .wd(ra_wd), .ra(ra_ra[4:0]), .rq(ra_q));
     assign su_q = 3'd0;
   end endgenerate
   // emission record: {layer 1, fog 5, fixed 1, double 1, colour 32, transparency 6, param 6, fmt 3,

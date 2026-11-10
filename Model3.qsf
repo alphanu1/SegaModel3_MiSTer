@@ -330,5 +330,5 @@ set_global_assignment -name VERILOG_MACRO "M3_R3B=1"
 # about 2,400 ALM at 100 MHz, study R105). Test builds leave this commented out.
 #set_global_assignment -name VERILOG_MACRO "M3_RELEASE=1"
 # The cabinet's driving block without Model 2's "Steering", "Steering smoothing" and "Analog control"
-# (m3_cab_inputs): with the analog board's VGA path back (dual SDRAM off) the full block does not fit.
-set_global_assignment -name VERILOG_MACRO "M3_INP_LEAN=1"
+# (m3_cab_inputs). Off: the full block is built, with its OSD lines.
+#set_global_assignment -name VERILOG_MACRO "M3_INP_LEAN=1"

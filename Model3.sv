@@ -95,6 +95,8 @@ localparam CONF_STR = {
 	"-;",
 	"O[4],Debug overlay,On,Off;",
 	"O[5],FPS counter,Off,On;",
+	"O[9:8],FPS average,5 s,10 s,1 s;",      // the OSD's default is the first entry (m3_fps avg)
+	"O[7:6],Volume,Normal,+6 dB,+12 dB;",    // on the sound link's fixed gain (m3_sndbridge GAIN), saturating
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 `ifndef M3_NO_INPUTS
 	// the driving profile's lines (Scud Race, Daytona USA 2), shown only for it
@@ -242,12 +244,12 @@ m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN
 	.DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE), .DDRAM_RD(DDRAM_RD),
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY),
 	.ce_pix(ce_pix), .v_hs(v_hs), .v_vs(v_vs), .v_hblank(v_hb), .v_vblank(v_vb),
-	.v_r(v_r), .v_g(v_g), .v_b(v_b), .overlay_en(~status[4]), .fps_en(status[5]),
+	.v_r(v_r), .v_g(v_g), .v_b(v_b), .overlay_en(~status[4]), .fps_en(status[5]), .fps_avg(status[9:8]),
 	.joystick_0(joystick_0[15:0]), .joystick_1(joystick_1[15:0]), .joy_l0(joy_l0), .joy_l1(joy_l1), .joy_r0(joy_r0),
 	.joy_lt0(joy_lt0), .joy_rt0(joy_rt0), .paddle0(paddle0),
 	.st_pedswap(status[28]), .st_ssens(status[30:29]), .st_ssm(status[51:50]), .st_rsteer(status[54]),
 	.st_wheel(status[71:70]), .inp_drive(inp_drive),
-	.audio_l(snd_l), .audio_r(snd_r),
+	.audio_l(snd_l), .audio_r(snd_r), .snd_vol(status[7:6]),
 	.led(run_led), .uart_tx(UART_TXD), .tb_fast(1'b0),
 	.rom_loaded(), .frame(), .tr_v(), .tr_master(), .tr_we(), .tr_addr(), .tr_be(), .tr_data(),
 	.ev_v(), .ev_kind(), .ev_data(),

@@ -390,10 +390,16 @@ module r3d_rast #(
   logic [1:0]  za_pon;
   logic [23:0] za_z0, za_z1;
   logic signed [41:0] za_v0, za_v1;
-  wire  span_ok = f_sx0 < f_sx1;
+  // A span is never empty: the edge sets s_valid only for lo < hi (its stage B, by mn < mx, mn < W and mx > 0,
+  // and its own assert), so the span test that was here (f_sx0 < f_sx1, a 9-bit compare from the edge's output
+  // registers through f_sready into its row pipeline's advance and the ~500 enables behind m_load) passed every
+  // span it saw. Without it the handshake is registers only (study R165).
   wire  tq_full;
-  assign f_sready = (za_sready && !tq_full) || (f_svalid && !span_ok);
-  wire  s_take = f_svalid && span_ok && za_sready && !tq_full;
+  assign f_sready = za_sready && !tq_full;
+  wire  s_take = f_svalid && za_sready && !tq_full;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && f_svalid && !(f_sx0 < f_sx1)) $fatal(1, "rast: an empty span from the edge");
+`endif
 
   r3d_rast_zspan u_za (
     .clk, .rst,

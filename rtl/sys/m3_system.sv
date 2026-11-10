@@ -217,6 +217,7 @@ module m3_system
   output logic [7:0]  v_r, v_g, v_b,
   input  logic        overlay_en,
   input  logic        fps_en,        // the frame counter (FPS) shown
+  input  logic  [1:0] fps_avg,       // its window: 0 5 s, 1 10 s, 2 1 s (m3_fps avg)
 
   // the cabinet's controls (hps_io, clk_sys; INPUTS)
   input  logic [15:0] joystick_0,    // player 1: 3:0 right, left, down, up; 15:4 the J1 buttons
@@ -234,8 +235,9 @@ module m3_system
   input  logic  [1:0] st_wheel,
   output logic        inp_drive,     // the driving profile is loaded (the OSD shows its lines)
 
-  output logic signed [15:0] audio_l,  // the sound link's (front + rear) / 2 a side, 44.1 kHz held (0 without SND_DSP)
+  output logic signed [15:0] audio_l,  // the sound link's (front + rear) / 2 a side with its gain, 44.1 kHz held (0 without SND_DSP)
   output logic signed [15:0] audio_r,
+  input  logic  [1:0] snd_vol,         // the OSD's Volume: 0 Normal, 1 +6 dB, 2 +12 dB (m3_sndbridge)
   output logic        led,
   output logic        uart_tx,
   input  logic        tb_fast,       // bench only (0 on the board): the timebase at the clock rate
@@ -692,7 +694,7 @@ module m3_system
   logic [7:0] snd_byte;
   generate if (SND_DSP) begin : g_snd
     m3_sndbridge #(.CLK_HZ(CLK_HZ), .D(256), .BLOCK(25'h1E4_0000)) u_snd (
-      .clk, .rst(rst_snd), .midi_we(snd_we), .midi_data(snd_data), .midi_byte(snd_byte),
+      .clk, .rst(rst_snd), .midi_we(snd_we), .midi_data(snd_data), .midi_byte(snd_byte), .vol(snd_vol),
       .d_req(d_req[7]), .d_we(d_we[7]), .d_addr(d_addr[7]), .d_blen(d_blen[7]), .d_din(d_din[7]), .d_be(d_be[7]),
       .d_wacc(d_wacc[7]), .d_rvalid(d_rvalid[7]), .d_ack(d_ack[7]), .d_dout(dm_dout),
       .audio_l, .audio_r,
@@ -700,6 +702,7 @@ module m3_system
       .dbg_epoch(), .dbg_d18());
   end else begin : g_nosnd
     assign audio_l = '0; assign audio_r = '0;
+    wire _unused_vol = &{1'b0, snd_vol};
   end endgenerate
 
   m3_ddr3p #(.PIPE(1'b1), .NP(2), .MAXQ(DDR_MAXQ)) u_ddr3 (   // R101: reads in flight capped (the probe: 16 or more raise latency)
@@ -1195,10 +1198,11 @@ module m3_system
   generate if (FPS) begin : g_fps
     logic nd0_q;
     always_ff @(posedge clk) nd0_q <= n_draw[0];
-    m3_fps #(.CLK_HZ(CLK_HZ), .EXT_SEC(BR_SEC)) u_fps (.clk, .rst, .sec_tick, .en(fps_en), .draw(n_draw[0] ^ nd0_q), .x(x_d), .y(y_d),
+    m3_fps #(.CLK_HZ(CLK_HZ), .EXT_SEC(BR_SEC)) u_fps (.clk, .rst, .sec_tick, .en(fps_en), .avg(fps_avg), .draw(n_draw[0] ^ nd0_q), .x(x_d), .y(y_d),
                                      .box(fps_box), .ink(fps_ink));
   end else begin : g_nofps
     assign fps_box = 1'b0; assign fps_ink = 1'b0;
+    wire _unused_avg = &{1'b0, fps_avg};
   end endgenerate
 
   always_ff @(posedge clk) if (ce_pix) begin
