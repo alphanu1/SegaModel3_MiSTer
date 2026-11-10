@@ -27,8 +27,9 @@
 // same datapath gives, and that is the choice taken).
 //
 // The window V[161:0] (V[i] weighs 2^(E0 + i - 1)):
-//   V[106:1]   the product. A denormal multiplicand is normalised first, so
-//              the product's leading one is at V[106] or V[105].
+//   V[106:1]   the product. A denormal multiplicand is normalised first, in
+//              groups of 16 bits, so the product's leading one is at V[75]
+//              or above (V[106] or V[105] for normal operands).
 //   V[161:109] the addend before alignment; shifted right by sh.
 //   V[0]       sticky: the OR of every addend bit shifted to or below it.
 // The addend starts two places above the product's top. When it dominates
@@ -223,21 +224,30 @@ module ppc_fpu_fma
   // no denormal test or select follows the count. Counting the fraction alone
   // and selecting by "denormal" after it missed 112 MHz by 0.26 ns once the
   // fast port shared the operand registers.
-  logic [5:0] lzfa, lzfb, lzfc;
-  ppc_fpu_lzc #(.W(53)) u_lza (.clk (clk), .x({~a_e0, a_f}), .n(lzfa));
+  logic [5:0] lzfb;
   ppc_fpu_lzc #(.W(53)) u_lzb (.clk (clk), .x({~b_e0, b_f}), .n(lzfb));
+  // The multiplicands are normalised coarsely (area pass 4): shifted left by 16 k, k the number of
+  // all-zero 16-bit groups from the top of {hidden, fraction} (bits 52:37, 36:21, 20:5; 3 for bits 4:0
+  // or zero), so a denormal keeps at most 15 leading zeros (4 in the last group). The product of the
+  // two then has its leading one at V[75] or above, not V[106] / V[105]: it is the same value, E0
+  // follows the shift, and S6's count and normalise shift take the rest. Exact, since the product
+  // lies in V[106:1] either way and the kept 56 bits and the guard sit at least 19 places above V[1]
+  // whenever the product leads; where the addend leads, as before.
+  function automatic logic [1:0] cn53(input logic [52:0] x);
+    cn53 = (x[52:37] != 16'd0) ? 2'd0 : (x[36:21] != 16'd0) ? 2'd1 : (x[20:5] != 16'd0) ? 2'd2 : 2'd3;
+  endfunction
   // (frC counted raw and 1.0's count, 0, chosen after: the op decode was in
   // front of the count, R63 batch 3)
-  logic [5:0] lzfc_r;
-  ppc_fpu_lzc #(.W(53)) u_lzc (.clk (clk), .x({c_er != 11'd0, in_c[51:0]}), .n(lzfc_r));
-  assign lzfc = has_c ? lzfc_r : 6'd0;
+  wire [1:0] cna   = cn53({~a_e0, a_f});
+  wire [1:0] cnc_r = cn53({c_er != 11'd0, in_c[51:0]});
+  wire [1:0] cnc   = has_c ? cnc_r : 2'd0;
 
   wire single_e = (in_single & ~cvt) | rsp;
   // frB only where it is normalised, see the header (a zero frB counts too:
   // its value stays 0, and its exponent is then unused)
   wire       bnrm = b_e0 & (single_e | in_ctl[5]) & ~cvt;
-  wire [5:0] na = lzfa;
-  wire [5:0] nc = lzfc;
+  wire [1:0] na = cna;          // in groups of 16
+  wire [1:0] nc = cnc;
   wire [5:0] nb = bnrm ? lzfb : 6'd0;
 
   exp_t ea0, ec0, eb0, esum, ep00, sh_cvt;
@@ -300,7 +310,8 @@ module ppc_fpu_fma
 
   typedef struct packed {
     logic [52:0] a, b, c;
-    logic [5:0]  na, nb, nc;
+    logic [1:0]  na, nc;          // the multiplicands' coarse shifts, in groups of 16
+    logic [5:0]  nb;
     exp_t        esum, ep00, eb0, sh_cvt;
     cls_t        k;
   } r1a_t;
@@ -400,13 +411,13 @@ module ppc_fpu_fma
     s1_sd.exc.vxcvi  = cvt_spc;
   end
 
-  wire [52:0] a_nrm = r1a_q.a << r1a_q.na;
-  wire [52:0] c_nrm = r1a_q.c << r1a_q.nc;
+  wire [52:0] a_nrm = r1a_q.a << {r1a_q.na, 4'b0000};
+  wire [52:0] c_nrm = r1a_q.c << {r1a_q.nc, 4'b0000};
   wire [52:0] b_nrm = r1a_q.b << r1a_q.nb;
 
   exp_t ep0, ebn, sh_raw;
   // the normalise amounts, summed on 8 bits first so only one 14-bit add follows
-  wire [7:0] sac = {2'b00, r1a_q.na} + {2'b00, r1a_q.nc};
+  wire [7:0] sac = {1'b0, {1'b0, r1a_q.na} + {1'b0, r1a_q.nc}, 4'b0000};
   wire [7:0] sbb = {2'b00, r1a_q.nb};
   assign ep0    = r1a_q.ep00 - exp_t'({6'd0, sac});
   assign ebn    = r1a_q.eb0 - exp_t'({6'd0, sbb});

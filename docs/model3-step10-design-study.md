@@ -13841,3 +13841,171 @@ What the fit shows against the blocks:
   and the geometry's registered idle tests set, and even then its geometry draws next to nothing (the area pass's
   stores changed type and are not carried). It still runs the CPU's loop and the DMA (DMA wait 0.041 vblank), so it
   compares the leaner blocks against the prototypes on a953ee0, but it is not a frame-time measurement.
+
+**R157 — Area pass 4: the double unit's multiplicands normalised by 16-bit groups instead of to the bit (−248 ALM at
+map, −293 ALUTs), and the integer divide's compare taken from its subtract (−20 ALM, −38 ALUTs); both cycle-identical
+and bit-identical. In the fit the two changed blocks are −289 ALM and −340 ALUTs; the whole build's "ALMs needed" fell 1,445, but
+placed ALMs only 136: the rest is the fitter's packing estimate. Nothing else cycle-free and Fmax-neutral of that size is in the CPU, the geometry or the
+rasteriser: the rest of what I found is 10-20 ALM an item. The pass falls short of the 500 ALM I set it.**
+
+Work in `sm3-builds/area4/`:
+- `tree`: a953ee0 by `git archive`; `work`: the kept changes; `v/k1`: the two files the fit overlays;
+- `v/edge`: the edge walker at 54 bits (priced, not built);
+- `sa`, `sa_src`: standalone maps and their wrappers; `miter/fma`: the double unit, old against new;
+- `flt`: planted faults; `logs`: every bench; `tools`: the scripts.
+
+The fit is `sm3-builds/area4_k1_s3` (120 MHz, seed 3, release, dual SDRAM off), against `area3_a_base_s3`.
+
+D-48 and D-57 apply: no cycle anywhere, the CPU above all, and no Fmax loss for any block. D-54: no sys/ edits, no
+Step split, the FPS counter stays. No storage moves and no fitter settings (R151, R153, R155 did those). M10K is not
+touched (about 30 left after the DSP's 135, D-55).
+
+*What I believed:*
+- That after R128-R155 the CPU had nothing cycle-free left above about 50 ALM (R128, R129), so the room would be in
+  logic shared between units of the geometry and the rasteriser that are never busy together.
+- That the units which looked idle were the facing unit, the reciprocals, the fog divider and the rasteriser's front
+  divider. R130 and R131 had already measured them: each is busy in the same clocks as the unit it would share with,
+  or sharing it costs cycles. I found nothing in the control logic to prove otherwise, so none of them is here.
+- That the double unit's S1 needs every operand normalised to the bit. Its header said so ("a denormal multiplicand
+  is normalised first, so the product's leading one is at V[106] or V[105]"), and R129 priced the three 53-bit
+  normalise shifts at about 350 ALUTs and their counts at 106, as part of the front that only an iterative unit would
+  remove.
+
+*What I know now:*
+
+**1. Only frB needs its leading one at a fixed bit; frA and frC do not.** The window holds the 106-bit product in
+V[106:1] whatever its leading zeros. The addend is placed against the window's top, not against the product's leading
+one, and S5's count and S6's normalise shift already cover the whole 162-bit window. So a denormal multiplicand only
+has to be close enough to normalised that the kept 56 bits and the guard bit stay inside the window.
+- frA and frC are now shifted left by 16k, k the number of all-zero 16-bit groups from the top of {hidden, fraction}
+  (bits 52:37, 36:21, 20:5; 48 for bits 4:0 or zero). Each keeps at most 15 leading zeros, so the product's leading
+  one is at V[75] or above, and the kept 56 bits end at V[20] or above, 19 places clear of V[1].
+- E0 takes the coarse shifts (in 16s) as it took the exact ones, so every value has the same weight it had.
+- Where the addend leads (sh_raw < 0) nothing changes: the product still lies in V[106:1] and still acts only as a
+  sticky. A coarse product is smaller against its top, so this happens a little less often, and the cases that move
+  from addend-anchored to product-anchored (sh_raw now in 0 ... 15) are exact in the window.
+- The denormal cap (UE = 0 doubles) is weight-based: a coarse E0 is higher, so the clamp at −1182 is taken less often,
+  and where it is taken the product still lies at or below V[106], under the guard at V[108].
+- frB is left as it was: where it leads, its leading one must be at V[161] for the stand-in argument, and UE = 1
+  doubles need that to the bit.
+- The 53-bit counts of frA and frC go (three 16-bit zero tests each), and each 6-bit, three-level shift becomes one
+  4:1 level.
+
+Standalone `quartus_map` (the core's device and settings, all stage boundaries in, as `ppc_core` builds it):
+
+| | ALM (map) | ALUTs | Registers |
+|---|---|---|---|
+| `ppc_fpu_fma`, a953ee0 | 2,743 | 4,029 | 3,194 |
+| frA, frC normalised by 16-bit groups | 2,495 (−248) | 3,736 (−293) | 3,186 (−8) |
+| `ppc_muldiv`, a953ee0 | 289 | 433 | 410 |
+| the divide's compare from its subtract | 269 (−20) | 395 (−38) | 410 |
+
+S1a loses a 53-bit count per operand and S1b two levels of each shift, so the change only takes logic out of the
+unit's front. The stages that set its Fmax (S4-S6) are untouched.
+
+**2. The integer divide's compare was a second carry chain.** `ppc_muldiv`'s step formed `d_r2 >= d_div` and
+`d_r2 - d_div` apart. Now one 34-bit subtract gives both, `d_ge` its borrow. (With the remainder below twice the
+divisor, bit 32 of that difference always equals bit 33, so even a 33-bit subtract would do.)
+
+**3. The fit** (`area4_k1_s3` against `area3_a_base_s3`, both seed 3; per block, ALMs needed):
+
+| Block | `area3_a_base_s3` | `area4_k1_s3` | Δ ALM | Δ ALUTs | Δ registers |
+|---|---|---|---|---|---|
+| `ppc_fpu_fma` (changed) | 2,789.3 | 2,524.9 | −264.4 | −309 | −67 |
+| `ppc_muldiv` (changed) | 270.4 | 245.9 | −24.5 | −31 | −6 |
+| `ppc_fpu_sfma` | 1,171.6 | 1,169.0 | −2.6 | +10 | −16 |
+| D-cache | 1,230.3 | 1,175.5 | −54.8 | −2 | −2 |
+| I-cache | 716.6 | 713.4 | −3.2 | −2 | −28 |
+| `ppc_cpu` | 13,968.8 | 13,540.9 | −427.9 | −323 | −173 |
+| `r3d_geo` | 7,153.5 | 7,067.8 | −85.7 | −57 | −26 |
+| `r3d_rast` | 7,581.8 | 7,049.2 | −532.6 | −3 | +16 |
+| framework (`sys_top` less `emu`) | 6,418.6 | 6,203.7 | −214.9 | +1 | +16 |
+| **whole build** | **40,980.5** | **39,535.5** | **−1,445.0** | **−451** | **−115** |
+
+- **The changed blocks give −289 ALM and −340 ALUTs**, close to the maps (−268 ALM, −331 ALUTs).
+- **The whole build's −1,445 is not a measurement.** Placed ALMs fell by 136 (41,060.1 → 40,924.0); the fitter's
+  recoverable estimate rose from 926.0 to 2,233.5. The rasteriser's −533 comes on −3 ALUTs and the framework's −215
+  on +1. That is R153's finding again: with a few hundred ALMs of slack the fitter packs less densely, and "ALMs
+  needed" follows the estimate. The two seeds of a953ee0 differ by up to 45 ALM a block on identical RTL.
+- **Every LAB is still in use** (4,191 of 4,191) and M10K (388) and DSP (88) are unchanged.
+
+Timing (slow corners setup, ns; hold the least over all clocks, ns):
+
+| Fit | Setup 100 °C / −40 °C | TNS 100 °C / −40 °C | Setup fast 100 °C / −40 °C | Hold s100 / sn40 / f100 / fn40 | HDMI | RBF |
+|---|---|---|---|---|---|---|
+| `area3_a_base_s3` | −2.980 / −3.094 | −5,751.3 / −4,338.3 | +1.873 / +2.870 | +0.068 / +0.071 / +0.098 / +0.055 | −0.249 | 0ef29c7f |
+| `area4_k1_s3` | −3.024 / −2.888 | −5,246.9 / −3,996.1 | +1.846 / +2.925 | +0.158 / +0.111 / +0.094 / +0.052 | −0.129 | 60e3753c |
+
+- Hold is positive at all four corners. Every SDRAM pin is packed.
+- The double unit's own failing endpoints fell from 135 to 99 (100 °C) and from 131 to 113 (−40 °C); its worst went
+  from −2.699 to −1.802 ns (100 °C). S1's endpoints went from 73 to 54. The divide's from 164 to 102.
+- The worst path is now `fpscr_q[30]` (a duplicate) into the FP scoreboard's `pend`, logic neither change touches:
+  1,020 failing endpoints start at `fpscr_q` against 57 in the base fit, whose worst there was −2.064. With one seed
+  I read the 0.044 ns lost at 100 °C (and the 0.206 ns gained at −40 °C) as placement.
+
+**4. Proof** (base = `tree`, new = `work`):
+- **The double unit, old against new** (`miter/fma`): every output every clock, the injection and other-unit ports
+  idle. A random op of the ten every clock at 90%, random FPSCR controls, frA and frC denormal 40% of the time in
+  three quarters of the runs (fractions with every leading-zero count, single bits, runs of ones), low and high
+  normals so that denormal products land in range, zeros, infinities, NaNs, near-cancelling frB. 3 seeds × 3 M clocks:
+  8,100,270 results, 0 differing.
+- **FPU unit benches** (MPFR reference), both trees, line for line the same:
+  - `test_fpu_reg`, seeds 1 and 2: 133,632 directed cases and 4,205,095 / 4,205,426 checked, 0 failures;
+  - `test_fpu_fast`, seeds 1 and 2: 152,317 directed and 4,719,074 / 4,720,235 checked, 0 failures; 692,564 /
+    694,020 fast ops with 494,841 / 496,275 twins compared against the double unit, 0 route mismatches.
+- **CPU bench** (`tc/cpu/tools/bench.sh`'s 16 runs, as `tools/cpubench.sh`, on a953ee0's own benches):
+  16 of 16 logs byte for byte the base's, instructions, cycles and every count included; 16 PASS (for example the core
+  bench's 1,000 programs, 3,267,138 instructions in 10,665,666 cycles, and the subsystem's 200, 664,869 in 10,924,536).
+- **System bench from a fresh boot** (`tb_m3_system`, Model3.sv's options, 120 MHz, 48 frames; `tools/sysfull.sh`,
+  `tools/sysrun.sh`): every line the base's but the host's speed.
+  - Daytona 2 (configuration, extra memory and fixed CROM through ioctl): 99,935,050 cycles, 21,573,048 SDRAM reads.
+    It is still in the boot ROM at frame 48 (pc FFF0332C), so it says little about FP.
+  - VF3 (`--xlin --tb-fast`): 97,848,970 cycles, 1,008,419 bus records, 8,450,440 SDRAM reads, in the game's own code
+    from about frame 20 (pc 0000251C at the end).
+- **Planted faults**, each caught:
+
+  | Fault | Caught by | Result |
+  |---|---|---|
+  | the middle 16-bit group's test one bit short (bit 21 left out) | FMA miter | 1,240 of 900,443 results differ |
+  | frC's coarse shift left out of E0 | FMA miter | 10,389 of 900,443 |
+  | frC's shift kept for fadd / fsub (1.0 is then shifted) | FMA miter | 21,477 of 900,443 |
+  | the divide's remainder with its bit 0 dropped | core bench, 300 programs | FAIL |
+
+- **Lint** (`lint_cpu`, `lint_fpu`, -Wall): clean on both, the same output.
+- **`quartus_map --analyze_file`** on both files, in a scratch copy: 0 errors, 0 warnings.
+- **Constant fold** (Quartus 17, `sa_src/cf_sac.sv`): the coarse E0 sum `{1'b0, {1'b0, na} + {1'b0, nc}, 4'b0000}`
+  for all 16 cases, and the borrow against `>=` at 16 points: every pin as intended.
+
+*Wrong turns:*
+- **The 48-frame bench (`tc/cpu/s48/one.sh`) cannot run a953ee0's CPU.** Its checkpoints are transplanted from the
+  R107-era model, and a953ee0's D-cache fails its own check on the first restored clock ("d_idle's register 1
+  against its terms 0"), on the base CPU as on mine. The transplant's derived registers (`xtool/mkextra.py`) predate
+  the D-cache changes since r19. I used the fresh-boot system bench instead, as R151 did; the 48-frame bench needs its
+  transplant brought up to date before the next CPU pass.
+- **fctiw's increment through the rounding add.** For fctiw the rounding place is bit 3, so `mt7 + 1` is
+  `ri7[34:3]`; reading it there came out +15 ALM and +30 ALUTs at map. Quartus had either shared the two adds already
+  or built the wider one worse. Not kept.
+- **My first planted fault in the divide** (`d_ge` from bit 32 instead of 33) was no fault at all: under the
+  remainder's bound the two bits are always equal.
+- **My first FPU bench script** gave Make an absolute object path, which its rules prefix with `./`; nothing built,
+  and the first logs were empty.
+
+*Priced, not built:*
+
+| # | Block | Change | Why it costs no cycle | ALM | Fmax risk |
+|---|---|---|---|---|---|
+| 1 | `r3d_rast_edge` | the walk 54 bits wide, not 56 | its header's own bound: every value of a walked row is under 2^53, so 54-bit modular arithmetic gives the same bits | −18 (map; −29 ALUTs, −20 registers) | none: three shorter adders |
+| 2 | `ppc_fpu_div` | the remainder at the divide's 55 bits and the root's states out with RSQRT = 0 | the remainder is below 2B < 2^54 | about −10 to −20 (est.; 321 ALM standalone now) | none |
+| 3 | `r3d_rast_zspan` and `r3d_rast_interp` | interp's leading-one search and 41-bit normalise of 1/w taken from the Z walk, which already makes both for the Z word | the same function of the same value | about −50 net (est.): it needs 30 bits more through the Z band and the pixel queue, and |o2| for negative 1/w | low; in the pixel queue's path, which is being reworked |
+| 4 | `m3_ddr_arb` / `m3_ddr3p` | the write data as an AND-OR of the registered owner | the owner is a register; the same word | 0 to −50 (est.) | low |
+| 5 | `ppc_fpu_fma` | frB normalised by groups for single results only | a single's round bit has 29 places of margin | 0: the exact shift stays for UE = 1 doubles | — |
+
+None of the unit-sharing candidates (the facing unit on lane 3, the reciprocals, the fog divider, the integer divide
+on the FP divider) is cycle-free: R128-R131's measurements stand, and reading the control logic again gave no proof of
+mutual exclusion for any of them.
+
+*Budget.* The kept changes free about 290 ALM of logic (−340 ALUTs) for no M10K, no DSP and no cycle. Against the
+about 1,180 coming in (the DSP and its bridge 837, the DMA bursts about 196, the pair queue 149) that leaves about
+900 to find. The priced rows add about 40-140 more. Placed ALMs in `area4_k1_s3` are 40,924 of 41,910, so there are
+about 986 placeable ALMs today, and every LAB is in use. The rest has to come from D-57's other two sources: leaner
+designs of the blocks coming in, and the second SDRAM.

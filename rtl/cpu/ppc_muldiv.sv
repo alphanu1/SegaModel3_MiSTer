@@ -97,7 +97,9 @@ module ppc_muldiv
   // the special cases are checked on the second cycle, from registered compares,
   // not on the forwarded operands of the start cycle (R23 timing)
   wire [32:0] d_r2     = {d_r[31:0], d_q[31]};
-  wire        d_ge     = d_r2 >= {1'b0, d_div};
+  // the trial subtract's borrow is the compare (area pass 4: a separate >= was a second 33-bit carry chain)
+  wire [33:0] d_sub    = {1'b0, d_r2} - {2'b00, d_div};
+  wire        d_ge     = !d_sub[33];
   wire [31:0] d_res    = d_special ? d_spec : (d_neg ? -d_q : d_q);
 
   always_ff @(posedge clk) begin
@@ -126,7 +128,7 @@ module ppc_muldiv
         d_fin   <= 1'b1;
         d_res_q <= d_res;                              // the quotient is final here
       end else begin
-        d_r   <= d_ge ? (d_r2 - {1'b0, d_div}) : d_r2;
+        d_r   <= d_ge ? d_sub[32:0] : d_r2;
         d_q   <= {d_q[30:0], d_ge};
         d_cnt <= d_cnt + 6'd1;
       end
