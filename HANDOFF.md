@@ -42,6 +42,9 @@ study's R-entries carry the findings. To pick a stream up, read its folder's not
      removed, session number in the tag), not yet board-tested or committed; the likely root cause is the sound DSP's
      failing timing at 120, which item 1's DSP pipelining addresses. The bridge side (+12 ALM) needs a decision.
    - The bridge's 93 ms watchdog reboots the sound board if a live server stalls that long: raise to 1-2 s.
+   - Sega Rally 2's arcsnd change (`sm3-builds/srally2/arcsnd_srally2.patch` against 7ccac34: the four srally2 sets
+     claimed, DSB2's spin skip extended to its program; binary 065681e3, running on the board as
+     `/media/fat/arcsnd_test/arcsnd7`) goes into the fork's `model3` branch once tested on the board.
    - The arcsnd PR to ppriest: draft `sm3-builds/arcsnd_pr_draft.md`; the README additions (why the DSP is in the FPGA,
      what a core must carry) are uncommitted in `sm3-builds/arcsnd`. Ben approves the PR text before it is opened.
 7. **Area:** the device is full (4,191 / 4,191 LABs, about 620 ALM free). The only large item left is the CPU's MLAB
