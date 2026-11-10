@@ -1,5 +1,41 @@
 # Handoff
 
+## Update (2026-11-10)
+
+`main` is ad35700, pushed: a `--no-ff` merge of `area`, which carries `timing-120` (`git revert -m 1 ad35700` undoes
+the batch). The tree is board build `next2_s3`'s RTL (RBF 4c02ce46), on the board now: **120 MHz** (PLL and SYS_HZ),
+41,286 ALM (98.5%), 4,191 / 4,191 LABs, 528 M10K, 90 DSP; setup −3.08 / −3.23 ns at slow 100 / −40 °C, hold positive
+at every corner (least +0.016 ns), HDMI −0.31 ns. The study's R138-R166 and D-50 to D-58 carry the detail.
+
+- **In since 2026-11-08:** timing rounds (R138-R140, R146-R148: geometry MAC stage); area passes (R151, R153, R155,
+  R157, R163, R164: storage into M10K, the MPC106 file in M10K with a reset sweep, the interconnect, the FPU);
+  `MISTER_DUAL_SDRAM` off while the analog board is fitted (R150); player controls with Template e901a9f and Model 2's
+  steering options (R154, R166); Scud Race's HUD (the tile generator's bus timing, R152); the Real3D DMA bursts and
+  the pair queue (R144, R149, R156, R165); sound (below); the FPS counter averaged over 5 s.
+- **Sound (D-51, D-53, D-55; R142, R145, R159, R161):** the 68000, the SCSP slots and the Digital Sound Board run on
+  the HPS in arcsnd (my fork alphanu1/MiSTer_ArcadeSoundServer, branch `model3`, 7ccac34; PR to ppriest not opened,
+  draft in `sm3-builds/arcsnd_pr_draft.md`). The SCSP DSPs and the bridge are in the core (`rtl/sound`). Output +12 dB
+  fixed, OSD Volume on top. On the board with arcsnd 35c3d966 (run by hand from `/media/fat/arcsnd_test/`): VF3 seven
+  stages clean at 57-58 fps, Scud Race and Daytona 2 (DSB music) clean, Lost World's quiet stretches are its own attract
+  (Supermodel agrees, R166 notes).
+- **Decisions:** D-57 no area change may cost the CPU a cycle; D-58 no behaviour removed because the games in hand do
+  not use it; D-54 no `sys/` edits, FPS counter kept, no per-Step cores.
+- **Open:**
+  - **Timing closure is the next priority** (ahead of speed and area): a census of `next/tree` at 110 and 120 MHz is
+    running in `sm3-builds/tclose`. The sound DSP (about 340-450 failing endpoints) can take pipeline registers at no
+    game cost; the rasteriser front's next family is `tq_full`.
+  - A 130 MHz test build is fitting (`sm3-builds/f130`), to see what the CPU's speed does to Daytona 2's frame rate.
+  - Bass Fishing hisses after a direct game change (not through the menu). A stray session of the old set is fixed in
+    arcsnd (`sm3-builds/sound/bass`, md5 40d24879, not yet tested, not committed); the likely cause is the sound DSP's
+    failing timing at 120 MHz.
+  - The bridge's 93 ms watchdog reboots the sound board if a live server stalls that long: raise it to 1-2 s.
+  - Scud Race's polygons broke under the first server's word writes; not reproduced on any bench (R162). The board test
+    that would separate VROM damage at load from DDR3 starvation is in R162.
+  - Daytona 2's 30 fps stretches are the CPU's loop just over a vblank (R160); the second SDRAM as the CPU's own memory
+    is the strongest lever. The device is full: the CPU's MLAB files into M10K (about 380 ALM) are the only large area
+    left, and need a speed proof.
+  - Daytona 2's car shadow (R137) and Lost World's fog (R134) as before.
+
 ## Update (2026-11-08, later)
 
 The study's R134-R137 and D-49 carry this. The tree is build `c7_s1`'s RTL (RBF be782d4a): 41,091 ALM (98%), 347
