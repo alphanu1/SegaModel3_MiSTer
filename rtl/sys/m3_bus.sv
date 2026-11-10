@@ -242,6 +242,9 @@ module m3_bus
   input  logic [18:0]       jt_cfg0, jt_cfg1, jt_cfg2,
 
   // bench trace: every access outside RAM and CROM reads
+  output logic              snd_we,           // a byte written to the MIDI port (F0080000 data, F0080004 control)
+  output logic              snd_data,         // 1: the data port
+  output logic [7:0]        snd_byte,
   output logic              tr_v,
   output logic              tr_master,
   output logic              tr_we,
@@ -594,6 +597,10 @@ module m3_bus
     end
   end
   always_ff @(posedge clk) if (do_w && tgt_q == X_TGREG) tg_shadow[addr[7:2]] <= bswap(wd);
+  // the sound port's writes, as the TxRDY model takes them (the byte in lane 3), for the sound bridge
+  assign snd_we   = do_w && be[3] && tgt_q == X_MIDI;
+  assign snd_data = !addr[2];
+  assign snd_byte = wd[31:24];
   // the MPC106's registers, each byte lane as written (the first write of a register keeps
   // its reset value's other lanes, as Supermodel's byte array does)
   always_ff @(posedge clk) if (STEP2 && !C106_M10K && do_w && tgt_q == X_PCID && s2 && pci_dev == 5'd0) begin

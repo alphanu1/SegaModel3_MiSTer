@@ -148,6 +148,19 @@ Supermodel (GPL-3.0-or-later) is instrumented only, through
   `CNew3D::RenderViewport` / `CalcViewport` and `Mat4::FrustumRZ`; node culling
   follows its block culling, as before.
 
+## Supermodel, the SCSP DSP and its effect return (transcribed, D-53)
+
+- Source: https://github.com/trzy/supermodel, commit `036af1c`
+- Files: `Src/Sound/SCSPDSP.cpp`, `SCSPDSP.h` (the DSP's step, after Mednafen's), `Src/Sound/SCSP.cpp`
+  (the effect return, the DAC18B clip)
+- Licence: GPL-3.0-or-later, the same as this project.
+- Taken: the DSP's pipeline (the access a step after MRD / MWT, a read before a waiting write, IWT's
+  MEMVAL from before the access, the 26-bit ACC and SHIFTED, the empty steps past LastStep, a stopped
+  DSP), PACK / UNPACK, and the effect return ((EFREG x pan) >> 12 a term) and clip, re-expressed in
+  `rtl/sound/m3_scsp_dsp.sv`; the link to the HPS is `rtl/sound/m3_sndbridge.sv`, my own. Proved
+  bit-exact against arcsnd's port of the same files (the design study, D-53 and its R-entries).
+  No Supermodel code is copied verbatim.
+
 ## Model 2 core: the SCSP (same author)
 
 - Source: https://github.com/alphanu1/sega-model2-mister, branch `model2a`, commit

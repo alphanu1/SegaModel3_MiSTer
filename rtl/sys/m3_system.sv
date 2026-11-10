@@ -118,6 +118,7 @@ module m3_system
   //   m3_xmem's reads both follow it. 0: the MRA layout, a beat a read, as before
   parameter bit          VROM_LIN = 1'b1,
   parameter int          DDR_MAXQ = 8,               // m3_ddr3p: DDR3 reads queued or in flight at most (1-32; R101)
+  parameter bit          SND_DSP  = 1'b1,            // the sound link (D-53): the SCSP DSPs and the HPS bridge on DDR3 port 7; 0 silence
   // ---- SDRAM scheduling for the CPU (study R107; all 0: m2_sdram as it was)
   //   SDR_PRI      ports granted ahead of the round-robin (m2_sdram PRI; bit 0 the bus, i.e. the CPU)
   //   SDR_PRI_CAP  PRI grants in a row while others wait, before one round-robin grant
@@ -233,6 +234,8 @@ module m3_system
   input  logic  [1:0] st_wheel,
   output logic        inp_drive,     // the driving profile is loaded (the OSD shows its lines)
 
+  output logic signed [15:0] audio_l,  // the sound link's (front + rear) / 2 a side, 44.1 kHz held (0 without SND_DSP)
+  output logic signed [15:0] audio_r,
   output logic        led,
   output logic        uart_tx,
   input  logic        tb_fast,       // bench only (0 on the board): the timebase at the clock rate
@@ -289,13 +292,16 @@ module m3_system
   (* preserve *) logic rst_geo = 1'b1, rst_rast = 1'b1;
   // and one for the CPU (rst_s[2] into the FP divider's registers, -1.11 ns in a 110 MHz merged fit)
   (* preserve *) logic rst_cpu = 1'b1;
+  // and one for the sound link (SND_DSP), which spans its own corner of the device
+  (* preserve *) logic rst_snd = 1'b1;
   always_ff @(posedge clk) begin
     rst_geo  <= rst_s[1];
     rst_rast <= rst_s[1];
     rst_cpu  <= rst_s[1];
+    rst_snd  <= rst_s[1];
   end
 `ifdef VERILATOR
-  always_ff @(posedge clk) if ({rst_geo, rst_rast, rst_cpu} != {3{rst}}) $fatal(1, "m3_system: the reset copies");
+  always_ff @(posedge clk) if ({rst_geo, rst_rast, rst_cpu, rst_snd} != {4{rst}}) $fatal(1, "m3_system: the reset copies");
 `endif
   logic por_n;                       // power-on: the EEPROM and the I/O latches
   always_ff @(posedge clk) por_n <= mem_rst_n;
@@ -595,6 +601,7 @@ module m3_system
     .pingpong_o(pingpong), .pingpong_i(r3_pingpong), .h_go, .h_rdy, .h_we, .h_addr, .h_wdata, .h_rv, .h_rdata,
     .r3d_cfg0, .r3d_cfg1, .r3d_cfg2,
     .jt_wr, .jt_wdata, .jt_busy, .jt_tdo, .jt_cfg_we, .jt_cfg0, .jt_cfg1, .jt_cfg2,
+    .snd_we, .snd_data, .snd_byte,
     .tr_v, .tr_master, .tr_we, .tr_addr, .tr_be, .tr_data);
 
   m3_sdr_port #(.AW(AW), .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .RA(SDR_RA), .RA_TOP(SDR_VRAM), .RA_CONF(SDR_RA_CONF), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ), .PW_DLY(SDR_PW_DLY)) u_sport (
@@ -657,8 +664,9 @@ module m3_system
   // ---- DDR3: m3_ddr3p (the texture cache on its pipelined port, R100's
   // extra memory reads on a second) behind m3_ddr_arb: 0 the layer's
   // scan-out, 1 the store, 2 the layer, 3 the geometry's polygon reads,
-  // 4 r3d_mem, 5 r3d_texup, 6 the loader's extra-memory writes (R100)
-  localparam int NDP = 7;
+  // 4 r3d_mem, 5 r3d_texup, 6 the loader's extra-memory writes (R100), 7 the sound
+  // link (SND_DSP)
+  localparam int NDP = SND_DSP ? 8 : 7;
   localparam logic [24:0] D_XMEM = 25'h100_0000;                   // R100: VROM, 64 MiB
   logic        xp_req, xp_ack, xp_rvalid;
   logic [7:0]  xp_blen;
@@ -678,6 +686,22 @@ module m3_system
     .wacc(d_wacc), .rvalid(d_rvalid), .ack(d_ack),
     .m_req(dm_req), .m_we(dm_we), .m_addr(dm_addr), .m_blen(dm_blen), .m_din(dm_din), .m_be(dm_be),
     .m_wacc(dm_wacc), .m_rvalid(dm_rvalid), .m_ack(dm_ack));
+  // ---- the sound link (D-53): the main CPU's sound port out to the HPS, its records and commands
+  // in to the SCSP DSPs, their channels out at 44.1 kHz (sm3-builds/sound/DESIGN.md section 16)
+  logic       snd_we, snd_data;
+  logic [7:0] snd_byte;
+  generate if (SND_DSP) begin : g_snd
+    m3_sndbridge #(.CLK_HZ(CLK_HZ), .D(256), .BLOCK(25'h1E4_0000)) u_snd (
+      .clk, .rst(rst_snd), .midi_we(snd_we), .midi_data(snd_data), .midi_byte(snd_byte),
+      .d_req(d_req[7]), .d_we(d_we[7]), .d_addr(d_addr[7]), .d_blen(d_blen[7]), .d_din(d_din[7]), .d_be(d_be[7]),
+      .d_wacc(d_wacc[7]), .d_rvalid(d_rvalid[7]), .d_ack(d_ack[7]), .d_dout(dm_dout),
+      .audio_l, .audio_r,
+      .sim_ff(1'b0), .dbg_idle(), .dbg_cyc(), .dbg_tick(), .dbg_fs(), .dbg_p(), .dbg_pop(), .dbg_ch(), .dbg_q(), .dbg_skip(),
+      .dbg_epoch(), .dbg_d18());
+  end else begin : g_nosnd
+    assign audio_l = '0; assign audio_r = '0;
+  end endgenerate
+
   m3_ddr3p #(.PIPE(1'b1), .NP(2), .MAXQ(DDR_MAXQ)) u_ddr3 (   // R101: reads in flight capped (the probe: 16 or more raise latency)
     .clk, .rst_n(mem_rst_n), .base(DDR_BASE),
     .req(dm_req && ddr_ok), .we(dm_we), .addr(dm_addr), .blen(dm_blen), .din(dm_din), .be(dm_be),

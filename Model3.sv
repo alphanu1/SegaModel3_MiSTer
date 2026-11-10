@@ -64,9 +64,11 @@ assign HDMI_FREEZE = 0;
 assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
 
-assign AUDIO_S = 0;
-assign AUDIO_L = 0;
-assign AUDIO_R = 0;
+// the sound link's two channels, signed, 44.1 kHz held (m3_system's audio_l / audio_r)
+wire signed [15:0] snd_l, snd_r;
+assign AUDIO_S = 1;
+assign AUDIO_L = snd_l;
+assign AUDIO_R = snd_r;
 assign AUDIO_MIX = 0;
 
 assign LED_DISK = 0;
@@ -245,6 +247,7 @@ m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN
 	.joy_lt0(joy_lt0), .joy_rt0(joy_rt0), .paddle0(paddle0),
 	.st_pedswap(status[28]), .st_ssens(status[30:29]), .st_ssm(status[51:50]), .st_rsteer(status[54]),
 	.st_wheel(status[71:70]), .inp_drive(inp_drive),
+	.audio_l(snd_l), .audio_r(snd_r),
 	.led(run_led), .uart_tx(UART_TXD), .tb_fast(1'b0),
 	.rom_loaded(), .frame(), .tr_v(), .tr_master(), .tr_we(), .tr_addr(), .tr_be(), .tr_data(),
 	.ev_v(), .ev_kind(), .ev_data(),

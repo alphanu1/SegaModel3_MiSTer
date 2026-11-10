@@ -798,7 +798,11 @@ module m2_sdram #(
   // 1 on are read from wb_din / wb_be into din_r / be_r while S_WR issues the
   // column before (wb_col = the column after this one; writes have no read
   // tags, so rd_issued is free to count them)
-  assign wb_col = rd_issued + 4'd1;
+  // registered (4 flip-flops): set wherever rd_issued is, to its value + 1, so it is rd_issued + 1
+  // on every clock as before, with no adder between rd_issued and the requester's word select
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (rst_n && wb_col != 4'(rd_issued + 4'd1)) $fatal(1, "m2_sdram: wb_col is not rd_issued + 1");
+`endif
 
   // ------------------------------------------- the prefetch handoff (R387)
   // One transaction deep. The front stage fills it, the back stage drains it.
@@ -1137,7 +1141,7 @@ module m2_sdram #(
       dl_lo <= 1'b0; p_lo <= '0;                  // R787
       grant <= '0; grant_is_wr <= 1'b0; rr_mask <= '1;                  // R498
       pri_run <= '0;                                                    // R574
-      rd_total <= 4'd1; rd_issued <= '0; rd_captured <= '0;
+      rd_total <= 4'd1; rd_issued <= '0; wb_col <= 4'd1; rd_captured <= '0;
       is_write <= 1'b0; xfer_addr <= '0; din_r <= '0; be_r <= '0;
       wait_cnt <= '0; dq_r <= '0;
       nxt_valid <= 1'b0; pf_sel <= 1'b0; nxt_grant <= '0; nxt_addr <= '0;
@@ -1368,7 +1372,7 @@ module m2_sdram #(
               rd_total    <= 4'd1;
               rd_wrap     <= 1'b0;
               rd_pair     <= 1'b0;
-              rd_issued   <= '0;
+              rd_issued   <= '0; wb_col <= 4'd1;
               rd_captured <= '0;
               state       <= S_SEL;
             end else if (pf_take) begin
@@ -1387,7 +1391,7 @@ module m2_sdram #(
               xfer_addr   <= nxt_addr;
               din_r       <= nxt_din;
               be_r        <= nxt_be;
-              rd_issued   <= '0;
+              rd_issued   <= '0; wb_col <= 4'd1;
               rd_captured <= '0;
               nxt_valid   <= 1'b0;
               // S_DISPATCH still sees a SETTLED xfer_addr for its row
@@ -1419,7 +1423,7 @@ module m2_sdram #(
               xfer_addr   <= pf_addr;
               din_r       <= pf_din;
               be_r        <= pf_be;
-              rd_issued   <= '0;
+              rd_issued   <= '0; wb_col <= 4'd1;
               rd_captured <= '0;
               nxt_valid   <= 1'b0;
               state       <= S_DISPATCH;
@@ -1434,7 +1438,7 @@ module m2_sdram #(
               rd_wrap     <= p_long[0] && WB[0];
               rd_pair     <= p_long[0] && WB[0] && L16[0] && PAIR[0];
               xfer_addr   <= bhash(p_addr[0]);
-              rd_issued   <= '0;
+              rd_issued   <= '0; wb_col <= 4'd1;
               rd_captured <= '0;
               if (fd_go) begin
                 inflight[0] <= 1'b1;
@@ -1506,7 +1510,7 @@ module m2_sdram #(
               tag_v[cap_depth-1]    <= 1'b1; tv_set = 1'b1;
               rd_bank_cnt[tbank]    <= cap_depth;
               rd_ok[tbank]          <= 1'b0;
-              rd_issued  <= 4'd1;
+              rd_issued  <= 4'd1; wb_col <= 4'd2;
               if (rd_total == 4'd1) state <= S_IDLE;
               else begin
                 state <= S_RD;
@@ -1612,7 +1616,7 @@ module m2_sdram #(
             end else begin
               // WB: the next column, in the open row (as S_RD walks it); its
               // word and mask come from the port into din_r / be_r
-              rd_issued <= rd_issued + 1'b1;
+              rd_issued <= rd_issued + 1'b1; wb_col <= wb_col + 1'b1;
               xfer_addr[COL_BITS:1] <= xfer_addr[COL_BITS:1] + 1'b1;
               din_r <= wb_din;
               be_r  <= wb_be;
@@ -1659,7 +1663,7 @@ module m2_sdram #(
             tag_pr[cap_depth-1]   <= rd_pair;
             rd_bank_cnt[tbank]    <= cap_depth;
             rd_ok[tbank]          <= 1'b0;   // R410
-            rd_issued  <= rd_issued + 1'b1;
+            rd_issued  <= rd_issued + 1'b1; wb_col <= wb_col + 1'b1;
             if (4'(rd_issued + 4'd1) == rd_total) begin   // (rd_total 0: sixteen, R107)
               // R387: STRAIGHT INTO THE NEXT TRANSACTION, NOT BACK TO
               // ARBITRATION. The row stays open, the data still in flight is

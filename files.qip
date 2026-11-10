@@ -84,6 +84,8 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_mem.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_texup.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_vrom_rd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m3_ddr_arb.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/m3_scsp_dsp.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/m3_sndbridge.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m3_ddr3p.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/m2_fb_read.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/m3_compose.sv
