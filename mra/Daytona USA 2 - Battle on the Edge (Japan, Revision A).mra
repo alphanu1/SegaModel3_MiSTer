@@ -3,11 +3,11 @@
       Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1
       SPDX-License-Identifier: GPL-3.0-or-later
 
-      Daytona USA 2 - Battle on the Edge (Japan, Revision A). Step 2.1 (study R100): attract mode, no sound, I/O stubbed (D-37).
+      Daytona USA 2 - Battle on the Edge (Japan, Revision A). Step 2.1 (study R100): no sound.
       From MAME 0.289 model3.cpp ROM_START(daytona2); sim/system/m3_mra.py writes it,
       and packs the same images for the system bench. One download per index
       (rtl/sys/m3_loader.sv):
-        4  the game configuration: step, flags, CROM bank map, idle inputs
+        4  the game configuration: step, flags, CROM bank map, idle inputs, input profile
         1  VROM, 64 MiB, in the extra memory (DDR3 byte 0x38000000)
         3  fixed CROM, 8 MiB, SDRAM 0x7300000 (FF800000-FFFFFFFF)
         0  banked CROM, 96 MiB in 12 slots of 8 MiB from SDRAM 0; backup RAM
@@ -37,10 +37,12 @@
         <dip name="SW7" bits="1" ids="On,Off"/>
         <dip name="SW8" bits="0" ids="On,Off"/>
     </switches>
+    <!-- the controls: input profile 01 (driving), rtl/io/m3_inputs.sv -->
+    <buttons names="Coin,Start,Test,Service,VR1 Red,VR4 Green,Accel,Brake,Gear Up,Gear Down,VR2 Blue,VR3 Yellow"/>
 
-    <!-- game configuration: step 21, flags 07 (VROM in the extra memory, fixed CROM 8 MiB, VROM 64 MiB), bank map, idle ports C and D -->
+    <!-- game configuration: step 21, flags 07 (VROM in the extra memory, fixed CROM 8 MiB, VROM 64 MiB), bank map, idle ports C and D, input profile 01 (driving) -->
     <rom index="4" md5="none">
-        <part>21 07 00 01 02 03 04 05 06 07 08 09 80 80 0A 0B 80 80 AF FF</part>
+        <part>21 07 00 01 02 03 04 05 06 07 08 09 80 80 0A 0B 80 80 AF FF 01 00</part>
     </rom>
     <rom index="1" zip="daytona2.zip" md5="none">
         <!-- 0x0000000  VROM block 0, 16 MiB -->

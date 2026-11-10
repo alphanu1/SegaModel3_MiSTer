@@ -86,7 +86,8 @@ module m3_scripts
   parameter bit LINE   = 1'b1,   // eight-word line reads and writes where the alignment allows
   parameter bit INT_OP = 1'b1,   // decode INT (not run by the captured games)
   parameter bit RD_ALL = 1'b0,   // TEMP, DBC/DCMD, DSPS readable
-  parameter bit R3DMA  = 1'b0    // the Step 2.x Real3D DMA front end (step2)
+  parameter bit R3DMA  = 1'b0,   // the Step 2.x Real3D DMA front end (step2)
+  parameter bit LDV    = 1'b0    // the bridges pass: DSPS and TEMP load one shared value (m3_scripts_core)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -126,7 +127,7 @@ module m3_scripts
 
   generate
   if (ENABLE) begin : g_on
-    m3_scripts_core #(.LINE(LINE), .INT_OP(INT_OP), .RD_ALL(RD_ALL), .R3DMA(R3DMA)) u_core (
+    m3_scripts_core #(.LINE(LINE), .INT_OP(INT_OP), .RD_ALL(RD_ALL), .R3DMA(R3DMA), .LDV(LDV)) u_core (
       .clk, .rst, .step2,
       .c_req, .c_we, .c_idx, .c_be, .c_wdata, .c_ack, .c_rdata, .win_en, .win_base,
       .s_req, .s_we, .s_addr, .s_be, .s_wdata, .s_ack, .s_rdata,
@@ -161,7 +162,8 @@ module m3_scripts_core
   parameter bit LINE   = 1'b1,
   parameter bit INT_OP = 1'b1,
   parameter bit RD_ALL = 1'b0,
-  parameter bit R3DMA  = 1'b0
+  parameter bit R3DMA  = 1'b0,
+  parameter bit LDV    = 1'b0    // the bridges pass: DSPS and TEMP load one shared value (lv, below)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -275,6 +277,9 @@ module m3_scripts_core
   wire d_wr = s_go && s_we && s2;
   wire d_rd = s_go && !s_we && s2;
   wire [31:0] d_v = bswap(s_wdata);                       // the register's little-endian value
+  // LDV: the value DSPS or TEMP loads, from the DMA device's register write (d_wr, only with the engine idle) or
+  // from the SCRIPTS fetch's last beat (only with the port busy, and only without s2): never both in one clock
+  wire [31:0] lv  = (LDV && !d_wr) ? bswap(m_rdata) : d_v;
   wire d_len  = d_wr && s_addr == 5'h02 && !busy;         // C2000008: the move starts
   wire d_cmd  = d_wr && s_addr == 5'h04 && !busy;         // C2000010
   wire [4:0] s_w = s_addr;
@@ -327,8 +332,8 @@ module m3_scripts_core
     // ---------------- the Step 2 DMA device's registers
     if (d_wr) begin
       case (s_addr)
-        5'h00: if (!busy) dsps <= d_v;
-        5'h01: if (!busy) temp <= d_v;
+        5'h00: if (!busy) dsps <= lv;
+        5'h01: if (!busy) temp <= lv;
         5'h02: if (!busy) dbc <= {d_v[21:0], 2'b00};
         5'h03: begin
           if (s_be[2] && s_wdata[16]) d2_irq <= 1'b0;                  // byte D: acknowledge
@@ -408,12 +413,12 @@ module m3_scripts_core
           case (est)
             E_F0: begin {dcmd, dbc} <= bswap(m_rdata); est <= E_F1; end
             E_F1: begin
-              dsps <= bswap(m_rdata);
+              dsps <= LDV ? lv : bswap(m_rdata);
               if (is_mmov) est <= E_F2;
               else if (e_int) est <= E_IDLE;
               else est <= E_END;                         // an INT not taken
             end
-            default: begin temp <= bswap(m_rdata); est <= E_CHK; end
+            default: begin temp <= LDV ? lv : bswap(m_rdata); est <= E_CHK; end
           endcase
         end
       end

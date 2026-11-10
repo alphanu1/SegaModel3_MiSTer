@@ -23,6 +23,10 @@
   //                           system bus trace (M3BUS_TRACE). Measurement only.
   //   sm3-builds/supermodel-sb   copy of supermodel-sys with the stage B Real3D
   //                           memory dumps and frame grabs (M3SB_DIR). Measurement only.
+  //   sm3-builds/supermodel-snd  Supermodel clone with the sound board capture
+  //                           (M3SND_DIR): MIDI writes and audio. Measurement only.
+  //   sm3-builds/arcsnd   ppriest's MiSTer Arcade Sound Server, the base for the
+  //                           Model 3 sound board on the HPS (D-51).
   //   tools/sloppc603-ref     SloPPC603, a GPL-2.0+ 603e core under review.
   //   tools/ddr3test-ref      Robert Peip's MiSTerDDR3Test, read for its DDR3 reader.
   //   tools/*-ref             read-only reference clones of other cores.
@@ -41,6 +45,8 @@
     "sm3-builds/supermodel-scripts",
     "sm3-builds/supermodel-sys",
     "sm3-builds/supermodel-sb",
+    "sm3-builds/supermodel-snd",
+    "sm3-builds/arcsnd",
     "tools/sloppc603-ref",
     "tools/ddr3test-ref"
   ],

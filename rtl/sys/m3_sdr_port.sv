@@ -175,7 +175,14 @@ module m3_sdr_port
   logic [2:0]   enext;
   // the line buffer's one read: without PW the write column's beat in T_LW, else the beat to send
   wire  [2:0]   bra   = (!PW && lw) ? {wh, wb_col[2:1]} : enext;
-  wire  [31:0]  bq    = bra[0] ? bd_o[bra[2:1]] : bd_e[bra[2:1]];
+  wire  [31:0]  pd_lo = swap ? bswap(p_dout[31:0])  : p_dout[31:0];
+  wire  [31:0]  pd_hi = swap ? bswap(p_dout[63:32]) : p_dout[63:32];
+  // LB: the line buffer is built only where something reads it. With FWD, L16 and PAIR a fill's beats go to the
+  // bus as they arrive (lr_bv is 0, so T_LR sends pd_lo only), with PW a cast-out's beats go to wbuf, and without
+  // RA there is no T_HIT or T_RA: then bq has no reader and its two MLABs, their write side and the select into
+  // s_rdata go (the bridges pass). bq is pd_lo there, the word T_LR sends, so its select folds away
+  localparam bit LB = !(FWD && L16 && PAIR && PW) || RA;
+  wire  [31:0]  bq    = !LB ? pd_lo : bra[0] ? bd_o[bra[2:1]] : bd_e[bra[2:1]];
   wire  [31:0]  lw_w0 = lwh ? lr4 : lr0;
   wire  [31:0]  lw_wk = PW ? wbuf[{pw_h, wb_col[2:1]}] : bq;
   wire          lw_sw = swap;            // (T_PW sets swap to the posted line's form as it begins)
@@ -239,9 +246,8 @@ module m3_sdr_port
     ar_nx_q <= {rl[1] == sa_nx, rl[0] == sa_nx};
   end
 
-  // the line buffer's writes: a pair (words a, a + 1, a even: one each side) or one word (the side a[0])
-  wire  [31:0]  pd_lo = swap ? bswap(p_dout[31:0])  : p_dout[31:0];
-  wire  [31:0]  pd_hi = swap ? bswap(p_dout[63:32]) : p_dout[63:32];
+  // the line buffer's writes: a pair (words a, a + 1, a even: one each side) or one word (the side a[0]);
+  // pd_lo and pd_hi, the words as they arrive, are declared with the buffer's read (above)
   wire          lw_beat = (st == T_LW) && (LW1 ? wq[1] : s_wnext);   // a cast-out beat in s_wdata
   logic         bw_pair, bw_one;
   logic [2:0]   bw_a;
@@ -261,8 +267,8 @@ module m3_sdr_port
     end
   end
   always_ff @(posedge clk) begin
-    if (bw_pair || (bw_one && !bw_a[0])) bd_e[bw_a[2:1]] <= bw_lo;
-    if (bw_pair || (bw_one &&  bw_a[0])) bd_o[bw_a[2:1]] <= bw_pair ? pd_hi : bw_lo;
+    if (LB && (bw_pair || (bw_one && !bw_a[0]))) bd_e[bw_a[2:1]] <= bw_lo;
+    if (LB && (bw_pair || (bw_one &&  bw_a[0]))) bd_o[bw_a[2:1]] <= bw_pair ? pd_hi : bw_lo;
     if (lw_beat && wbeat == 3'd0) lr0 <= s_wdata;
     if (lw_beat && wbeat == 3'd4) lr4 <= s_wdata;
     if (PW && lw_beat) wbuf[wbeat] <= s_wdata;

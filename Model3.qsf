@@ -74,10 +74,13 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_YC=1"
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 
 source sys/sys.tcl
-# Dual SDRAM (D-26): the second SDRAM takes the analog board's header, so no
-# analog video or analog audio jack; HDMI carries both. sys_dual_sdram.tcl sets
-# MISTER_DUAL_SDRAM and the SDRAM2 pins.
-source sys/sys_dual_sdram.tcl
+# Dual SDRAM (D-26) stays off until the second SDRAM is fitted: the analog I/O
+# board is on the header and gives the 15 kHz analog video and audio (R150).
+# With the second SDRAM, sys_dual_sdram.tcl sets MISTER_DUAL_SDRAM and its pins,
+# in place of sys_analog.tcl (the analog board's VGA, audio, SDIO and I/O pins,
+# as the Template's qsf sources it).
+#source sys/sys_dual_sdram.tcl
+source sys/sys_analog.tcl
 source files.qip
 set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
 set_global_assignment -name PRE_FLOW_SCRIPT_FILE "quartus_sh:sys/build_id.tcl"
@@ -319,6 +322,13 @@ set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to VGA_EN
 # Step 2 (Daytona 2) bus map and texture-upload port (study R100)
 set_global_assignment -name VERILOG_MACRO "M3_STEP2_BUS=1"
 set_global_assignment -name VERILOG_MACRO "M3_STEP2_TEX=1"
+# The Real3D DMA at the bus's rate (study R144): r3d_cmd's 32 posted writes and r3d_mem's 8E writes gathered into
+# four-word SDRAM bursts. Off together they give the one held access and 8E's single halfword writes.
+set_global_assignment -name VERILOG_MACRO "M3_DMAFAST=1"
+set_global_assignment -name VERILOG_MACRO "M3_R3B=1"
 # Release builds: every debug block off together (m3_system RELEASE: the overlay and its capture, CPI_MON, FBUSY;
 # about 2,400 ALM at 100 MHz, study R105). Test builds leave this commented out.
 #set_global_assignment -name VERILOG_MACRO "M3_RELEASE=1"
+# The cabinet's driving block without Model 2's "Steering", "Steering smoothing" and "Analog control"
+# (m3_cab_inputs). Off: the full block is built, with its OSD lines.
+#set_global_assignment -name VERILOG_MACRO "M3_INP_LEAN=1"

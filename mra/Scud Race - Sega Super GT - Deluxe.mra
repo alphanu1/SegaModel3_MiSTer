@@ -3,10 +3,10 @@
       Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1
       SPDX-License-Identifier: GPL-3.0-or-later
 
-      Scud Race - Sega Super GT - Deluxe. Step 1.5 (study D-46): attract mode, no sound, I/O stubbed
-      (D-37). From MAME 0.289 model3.cpp ROM_START(scuddxo); sim/system/m3_mra.py
+      Scud Race - Sega Super GT - Deluxe. Step 1.5 (study D-46): no sound. From MAME 0.289
+      model3.cpp ROM_START(scuddxo); sim/system/m3_mra.py
       writes it, and packs the same image for the system bench. Index 4, the
-      game configuration (rtl/sys/m3_loader.sv), gives the step; the rest of it
+      game configuration (rtl/sys/m3_loader.sv), gives the step and the input profile; the rest of it
       is the Step 1.0 default, and index 0 is laid out as VF3's.
 
       SDRAM (bytes): 0x0000000 banked CROM, 64 MiB; 0x4000000 VROM, 32 MiB;
@@ -32,10 +32,12 @@
         <dip name="SW7" bits="1" ids="On,Off"/>
         <dip name="SW8" bits="0" ids="On,Off"/>
     </switches>
+    <!-- the controls: input profile 01 (driving), rtl/io/m3_inputs.sv -->
+    <buttons names="Coin,Start,Test,Service,VR1 Red,VR4 Green,Accel,Brake,Gear Up,Gear Down,VR2 Blue,VR3 Yellow"/>
 
-    <!-- game configuration: step 15, flags 00, banks 0-7 in slots 0-7, idle ports C and D -->
+    <!-- game configuration: step 15, flags 00, banks 0-7 in slots 0-7, idle ports C and D, input profile 01 (driving) -->
     <rom index="4" md5="none">
-        <part>15 00 00 01 02 03 04 05 06 07 80 80 80 80 80 80 80 80 AF FF</part>
+        <part>15 00 00 01 02 03 04 05 06 07 80 80 80 80 80 80 80 80 AF FF 01 00</part>
     </rom>
     <rom index="0" zip="scuddxo.zip" md5="none">
         <!-- 0x0000000  CROM0, 16 MiB (banks 0-1) -->

@@ -37,9 +37,17 @@
 import argparse, hashlib, struct, sys, zipfile, zlib
 import xml.etree.ElementTree as ET
 
+# the input profiles (configuration byte 20; rtl/io/m3_inputs.sv) and each one's button order, which the MRA's
+# <buttons names> follows: 0 generic (VF3), 1 driving (m3_cab_inputs; Daytona's order on Model 2), 2 analog
+# guns, 3 fishing
+P_GEN, P_DRIVE, P_GUN, P_FISH = 0, 1, 2, 3
+BTN_DRIVE = 'Coin,Start,Test,Service,VR1 Red,VR4 Green,Accel,Brake,Gear Up,Gear Down,VR2 Blue,VR3 Yellow'
+PROF_NAME = {P_GEN: 'generic', P_DRIVE: 'driving', P_GUN: 'analog guns', P_FISH: 'fishing'}
+
 # MAME 0.289 model3.cpp ROM_START(vf3), (name, ROM_LOAD64_WORD_SWAP offset)
 VF3 = {
     'setname': 'vf3', 'name': 'Virtua Fighter 3 (Japan, Revision D)', 'year': '1996', 'zip': 'vf3.zip',
+    'buttons': 'Punch,Kick,Guard,Escape,Start,Coin,Test,Service',
     'crom': [  # four banks of 16 MiB (CROM0 .. CROM3)
         [('mpr-19193.1', 6), ('mpr-19194.2', 4), ('mpr-19195.3', 2), ('mpr-19196.4', 0)],
         [('mpr-19197.5', 6), ('mpr-19198.6', 4), ('mpr-19199.7', 2), ('mpr-19200.8', 0)],
@@ -54,7 +62,8 @@ VF3 = {
 # ROM_START(bassdx): three CROM banks; CROM3 is unpopulated (00, as MAME's region)
 BASSDX = {
     'setname': 'bassdx', 'name': 'Sega Bass Fishing Deluxe (USA)', 'year': '1997', 'zip': 'bassdx.zip',
-    'category': 'Sports',
+    'category': 'Sports', 'prof': P_FISH,
+    'buttons': 'Cast,Select,Reel,Start,Coin,Test,Service',
     'crom': [
         [('mpr-20256.1', 6), ('mpr-20257.2', 4), ('mpr-20258.3', 2), ('mpr-20259.4', 0)],
         [('mpr-20260.5', 6), ('mpr-20261.6', 4), ('mpr-20262.7', 2), ('mpr-20263.8', 0)],
@@ -69,7 +78,7 @@ BASSDX = {
 # CROM is four 2 MiB ROMs filling FF800000-FFFFFFFF; VROM sixteen 4 MiB ROMs (64 MiB).
 DAYTONA2 = {
     'setname': 'daytona2', 'name': 'Daytona USA 2 - Battle on the Edge (Japan, Revision A)', 'year': '1998',
-    'zip': 'daytona2.zip', 'category': 'Driving', 'step': 0x21,
+    'zip': 'daytona2.zip', 'category': 'Driving', 'step': 0x21, 'prof': P_DRIVE, 'buttons': BTN_DRIVE,
     'idle_in': [0xAF, 0xFF],   # ports C, D at rest: the 4-speed shifter in first gear (Supermodel's default)
     'crom': [
         [('mpr-20845.1', 6), ('mpr-20846.2', 4), ('mpr-20847.3', 2), ('mpr-20848.4', 0)],
@@ -87,7 +96,7 @@ DAYTONA2 = {
 # Daytona 2 (the 4-speed shifter in first gear; Supermodel's trace of scuddxo reads AF).
 SCUDDXO = {
     'setname': 'scuddxo', 'name': 'Scud Race - Sega Super GT - Deluxe', 'year': '1996', 'zip': 'scuddxo.zip',
-    'category': 'Driving', 'step': 0x15, 'idle_in': [0xAF, 0xFF],
+    'category': 'Driving', 'step': 0x15, 'idle_in': [0xAF, 0xFF], 'prof': P_DRIVE, 'buttons': BTN_DRIVE,
     'crom': [
         [('mpr-19592.1', 6), ('mpr-19591.2', 4), ('mpr-19590.3', 2), ('mpr-19589.4', 0)],
         [('mpr-19596.5', 6), ('mpr-19595.6', 4), ('mpr-19594.7', 2), ('mpr-19593.8', 0)],
@@ -109,7 +118,8 @@ SCUDDXO = {
 # Not loaded: the billboard's Z80 ROM (epr-18022.ic2), the 68000 program and the samples (D-8).
 LOSTWSGA = {
     'setname': 'lostwsga', 'name': 'The Lost World - Jurassic Park (Revision A)', 'year': '1997', 'zip': 'lostwsga.zip',
-    'category': 'Shooter', 'step': 0x15, 'crom_mirror': True, 'dsw': 0xFF,
+    'category': 'Shooter', 'step': 0x15, 'crom_mirror': True, 'dsw': 0xFF, 'prof': P_GUN,
+    'buttons': 'Trigger,Trigger 2,Start,Coin,Test,Service',
     'crom': [
         [('mpr-19918.1', 6), ('mpr-19919.2', 4), ('mpr-19920.3', 2), ('mpr-19921.4', 0)],
         [('mpr-19922.5', 6), ('mpr-19923.6', 4), ('mpr-19924.7', 2), ('mpr-19925.8', 0)],
@@ -161,10 +171,10 @@ def mra(args):
         w('      no 3D. From MAME 0.289 model3.cpp ROM_START(%s); sim/system/m3_mra.py' % s['setname'])
         w('      writes it, and packs the same image for the system bench.')
     else:
-        w('      %s. Step %X.%X (study D-46): attract mode, no sound, I/O stubbed' % (s['name'], step >> 4, step & 15))
-        w('      (D-37). From MAME 0.289 model3.cpp ROM_START(%s); sim/system/m3_mra.py' % s['setname'])
+        w('      %s. Step %X.%X (study D-46): no sound. From MAME 0.289' % (s['name'], step >> 4, step & 15))
+        w('      model3.cpp ROM_START(%s); sim/system/m3_mra.py' % s['setname'])
         w('      writes it, and packs the same image for the system bench. Index 4, the')
-        w('      game configuration (rtl/sys/m3_loader.sv), gives the step; the rest of it')
+        w('      game configuration (rtl/sys/m3_loader.sv), gives the step and the input profile; the rest of it')
         if s.get('crom_mirror'):
             w('      is the Step 1.0 default but for CROM banks 8-15, which mirror 0-7, and')
             w('      index 0 is laid out as VF3\'s.')
@@ -184,12 +194,14 @@ def mra(args):
     w('    <manufacturer>Sega</manufacturer>')
     w('    <category>%s</category>' % s.get('category', 'Fighter'))
     switches(w, s)
+    buttons(w, s)
     w('')
-    if step != 0x10:
+    if step != 0x10 or s.get('prof', P_GEN) != P_GEN:
         mirror = s.get('crom_mirror', False)
-        cfg = [step, 0x00] + [b & 7 if mirror else b if b < 8 else 0x80 for b in range(16)] + s.get('idle_in', [0xFF, 0xFF])
-        w('    <!-- game configuration: step %02X, flags 00, banks 0-7 %sin slots 0-7, idle ports C and D -->'
-          % (step, 'and their mirror 8-15 ' if mirror else ''))
+        cfg = [step, 0x00] + [b & 7 if mirror else b if b < 8 else 0x80 for b in range(16)] + s.get('idle_in', [0xFF, 0xFF]) \
+              + [s.get('prof', P_GEN), s.get('pflg', 0)]
+        w('    <!-- game configuration: step %02X, flags 00, banks 0-7 %sin slots 0-7, idle ports C and D, input profile %02X (%s) -->'
+          % (step, 'and their mirror 8-15 ' if mirror else '', cfg[20], PROF_NAME[cfg[20]]))
         w('    <rom index="4" md5="none">')
         w('        <part>%s</part>' % ' '.join('%02X' % b for b in cfg))
         w('    </rom>')
@@ -236,22 +248,28 @@ def switches(w, s):
         w('        <dip name="SW%d%s" bits="%d" ids="On,Off"/>' % (n, ' (debug)' if n == 1 else '', 8 - n))
     w('    </switches>')
 
+def buttons(w, s):
+    """The MiSTer buttons in the input profile's order (rtl/io/m3_inputs.sv); the joystick's directions are 3:0."""
+    if 'buttons' in s:
+        w('    <!-- the controls: input profile %02X (%s), rtl/io/m3_inputs.sv -->' % (s.get('prof', P_GEN), PROF_NAME[s.get('prof', P_GEN)]))
+        w('    <buttons names="%s"/>' % s['buttons'])
+
 def mra_step2(args, s, crc):
     L = []
     w = L.append
     nb = sum(s['crom_mib']) // 8
     bm = bank_map(s['crom_mib'])
-    cfg = [s['step'], CF_VROM_X | CF_FIXED8 | CF_VROM64] + bm + s.get('idle_in', [0xFF, 0xFF])
+    cfg = [s['step'], CF_VROM_X | CF_FIXED8 | CF_VROM64] + bm + s.get('idle_in', [0xFF, 0xFF]) + [s.get('prof', P_GEN), s.get('pflg', 0)]
     w('<misterromdescription>')
     w('    <!--')
     w('      Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1')
     w('      SPDX-License-Identifier: GPL-3.0-or-later')
     w('')
-    w('      %s. Step %X.%X (study R100): attract mode, no sound, I/O stubbed (D-37).' % (s['name'], s['step'] >> 4, s['step'] & 15))
+    w('      %s. Step %X.%X (study R100): no sound.' % (s['name'], s['step'] >> 4, s['step'] & 15))
     w('      From MAME 0.289 model3.cpp ROM_START(%s); sim/system/m3_mra.py writes it,' % s['setname'])
     w('      and packs the same images for the system bench. One download per index')
     w('      (rtl/sys/m3_loader.sv):')
-    w('        4  the game configuration: step, flags, CROM bank map, idle inputs')
+    w('        4  the game configuration: step, flags, CROM bank map, idle inputs, input profile')
     w('        1  VROM, 64 MiB, in the extra memory (DDR3 byte 0x38000000)')
     w('        3  fixed CROM, 8 MiB, SDRAM 0x7300000 (FF800000-FFFFFFFF)')
     w('        0  banked CROM, %d MiB in %d slots of 8 MiB from SDRAM 0; backup RAM' % (8 * nb, nb))
@@ -271,8 +289,9 @@ def mra_step2(args, s, crc):
     w('    <manufacturer>Sega</manufacturer>')
     w('    <category>%s</category>' % s.get('category', 'Fighter'))
     switches(w, s)
+    buttons(w, s)
     w('')
-    w('    <!-- game configuration: step %02X, flags %02X (VROM in the extra memory, fixed CROM 8 MiB, VROM 64 MiB), bank map, idle ports C and D -->' % (cfg[0], cfg[1]))
+    w('    <!-- game configuration: step %02X, flags %02X (VROM in the extra memory, fixed CROM 8 MiB, VROM 64 MiB), bank map, idle ports C and D, input profile %02X (%s) -->' % (cfg[0], cfg[1], cfg[20], PROF_NAME[cfg[20]]))
     w('    <rom index="4" md5="none">')
     w('        <part>%s</part>' % ' '.join('%02X' % b for b in cfg))
     w('    </rom>')

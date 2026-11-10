@@ -30,7 +30,9 @@
 //      bit 7 empty, bits 3:0 its 8 MiB slot in SDRAM), bytes 18-19 the idle
 //      inputs on 315-5649 ports C and D (default FF FF; Daytona 2's 4-speed
 //      shifter rests in a gear, so its port C reads AF, as in Supermodel),
-//      byte 20 not used.
+//      byte 20 the input profile (m3_inputs: 0 the generic / fighting ports,
+//      VF3's; 1 driving; 2 analog guns; 3 fishing), byte 21 its flags
+//      (default 00 00)
 // 254  the MRA's <switches> (Main's DIP Switches page): byte 0 the CPU board's
 //      DIP bank, 315-5649 port G (bit 7 SW1 ... bit 0 SW8, 0 = ON). Main sends
 //      it after the last <rom>, and again whenever a switch is changed; the
@@ -62,7 +64,12 @@ module m3_loader #(
   parameter logic [26:0] BACKUP = 27'h620_0000,
   parameter logic [26:0] FIX8   = 27'h730_0000,
   parameter bit          VROM_X  = 1'b0,           // index 0's VROM range to the extra memory
-  parameter logic [26:0] VROM_AT = 27'h400_0000    // where the MRA's index-0 image holds VROM (32 MiB)
+  parameter logic [26:0] VROM_AT = 27'h400_0000,   // where the MRA's index-0 image holds VROM (32 MiB)
+  // OWIRE (the bridges pass): the destinations' address and data wired from the drain's h_adr / h_dat, not copied
+  // into registers of their own. h_* load only on f_re, which needs !wbusy and !rd_armed, so they hold from the
+  // request until its acknowledge (SDRAM: the request's rising edge latches them; the extra memory: held to x_ack)
+  // and through the clock ee_we is out. 0: as it was
+  parameter bit          OWIRE   = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst,          // memory reset (PLL lock), not the game's
@@ -99,6 +106,7 @@ module m3_loader #(
   output logic [15:0][4:0] cfg_bank,  // {empty, slot[3:0]} by bank
   output logic [7:0]  cfg_in2, cfg_in3, // idle inputs, ports C and D
   output logic [7:0]  cfg_dsw,          // the DIP bank, port G (index 254; R133)
+  output logic [7:0]  cfg_prof, cfg_pflg, // the input profile and its flags (bytes 20, 21; m3_inputs)
 
   output logic        rom_loaded,
   output logic        busy,         // a download in progress or draining
@@ -109,22 +117,25 @@ module m3_loader #(
   wire [5:0] ix   = ioctl_index[5:0];
   wire dl_any     = ioctl_download && (ix == 6'd0 || ix == 6'd1 || ix == 6'd2 || ix == 6'd3 || ix == 6'd4);
   wire dl0        = ioctl_download && ix == 6'd0;
-  wire dl_cfg     = ioctl_download && ix == 6'd4;
+  wire dl_cfg     = ioctl_download && ix == 6'd4;   // (the configuration itself: q_dlc, below)
   wire to_fifo    = dl_any && !dl_cfg;
-  wire dl_sw      = ioctl_download && ioctl_index == 16'd254;   // <switches>
 
   // destination classes in the FIFO
   localparam logic [1:0] K_SDR = 2'd0, K_X = 2'd1, K_EE = 2'd2;
 
   localparam int FD = 512, FA = 9;
-  (* ramstyle = "M10K" *) logic [AW+1:0] f_adr [FD];    // {class, address}
-  (* ramstyle = "M10K" *) logic [15:0]   f_dat [FD];
+  // no_rw_check: an entry is read only while the FIFO is not empty, and a write goes to wp only while it is not
+  // full, so the two addresses never meet
+  (* ramstyle = "M10K, no_rw_check" *) logic [AW+1:0] f_adr [FD];    // {class, address}
+  (* ramstyle = "M10K, no_rw_check" *) logic [15:0]   f_dat [FD];
   logic [FA:0] wp, rp;
   wire  [FA:0] lvl = wp - rp;
   wire         f_empty = (wp == rp);
   assign ioctl_wait = ioctl_download && (!mem_ready || lvl >= (FA+1)'(FD - 256));
 
-  // the entry for this word: its class and address
+  // the entry for this word: its class and address. flags0 is cfg_flags[0] with the configuration's update of
+  // this cycle bypassed, so the class is the one the port's own cycle gives (as before the cycle's delay)
+  logic flags0;
   logic [1:0]  n_k;
   logic [AW-1:0] n_a;
   always_comb begin
@@ -133,7 +144,7 @@ module m3_loader #(
       // only for a set whose VROM comes in index 0: a Step 2 set (flags bit 0, VROM on index 1) has banked
       // CROM there (CROM2 and CROM3, slots 8-11), which must stay in SDRAM (R100: the merged builds sent it
       // over the VROM in DDR3)
-      6'd0: if (VROM_X && !cfg_flags[0] && ioctl_addr[26:25] == VROM_AT[26:25]) begin
+      6'd0: if (VROM_X && !flags0 && ioctl_addr[26:25] == VROM_AT[26:25]) begin
               n_k = K_X; n_a = AW'(ioctl_addr[24:1]);                // VROM_AT is 32 MiB aligned
             end
       6'd1: begin n_k = K_X; n_a = ioctl_addr[AW:1]; end
@@ -144,22 +155,97 @@ module m3_loader #(
     endcase
   end
 
-  logic        rd_armed, wbusy, ack_d, dl0_d, done, cfg_seen, any_d, dlc_d;
+  logic        rd_armed, wbusy, ack_d, dl0_d, done, any_d;
+
+  // the game configuration runs a cycle behind the download port, on registered copies of it and of its
+  // decodes, so the index compares and address decodes are not in series with the configuration's enables
+  // (c7_s1: ioctl_index -> cfg_bank -0.95 ns, 105 endpoints). Every cfg_* value and every order between them
+  // is as before, one cycle later; the FIFO, ioctl_wait, busy and rom_loaded still run on the port itself.
+  // Nothing reads the configuration in that cycle: the game is held in reset while the loader is busy.
+  logic        q_dl, q_wr, q_cfg, q_ix0, q_sw, q_a0, q_a9, q_a10, q_alo;
+  logic [3:0]  q_a41;
+  logic [15:0] q_d;
+  logic        q_cfg_d, q_dl0_d, q_cfg_seen;
+  always_ff @(posedge clk) begin
+    q_dl  <= ioctl_download;
+    q_wr  <= ioctl_wr;
+    q_cfg <= ix == 6'd4;
+    q_ix0 <= ix == 6'd0;
+    q_sw  <= ioctl_index == 16'd254;
+    q_a0  <= ioctl_addr[26:1] == 26'd0;
+    q_a9  <= ioctl_addr[26:1] == 26'd9;
+    q_a10 <= ioctl_addr[26:1] == 26'd10;
+    q_alo <= ioctl_addr[26:5] == 22'd0;
+    q_a41 <= ioctl_addr[4:1];
+    q_d   <= ioctl_dout;
+  end
+  wire q_dlc = q_dl && q_cfg;
+  wire q_dl0 = q_dl && q_ix0;
+  wire q_dsw = q_dl && q_sw;
+  always_comb begin
+    flags0 = cfg_flags[0];
+    if (q_dlc && q_wr && q_alo && q_a41 == 4'd0) flags0 = q_d[8];
+    if (q_dl0 && !q_dl0_d && !q_cfg_seen) flags0 = 1'b0;
+  end
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      q_cfg_seen <= 1'b0; q_cfg_d <= 1'b0; q_dl0_d <= 1'b0;
+      cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
+      cfg_prof <= 8'h00; cfg_pflg <= 8'h00;
+      for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
+    end else begin
+      q_cfg_d <= q_dlc;
+      q_dl0_d <= q_dl0;
+      if (q_dlc && !q_cfg_d) cfg_dsw <= 8'h7F;
+      if (q_dlc && q_wr) begin
+        q_cfg_seen <= 1'b1;
+        if (q_a9) begin cfg_in2 <= q_d[7:0]; cfg_in3 <= q_d[15:8]; end
+        if (q_a10) begin cfg_prof <= q_d[7:0]; cfg_pflg <= q_d[15:8]; end
+        if (q_alo) begin
+          if (q_a41 == 4'd0) begin cfg_step <= q_d[7:0]; cfg_flags <= q_d[15:8]; end
+          else if (q_a41 <= 4'd8) begin
+            cfg_bank[{q_a41[2:0] - 3'd1, 1'b0}] <= {q_d[7], q_d[3:0]};
+            cfg_bank[{q_a41[2:0] - 3'd1, 1'b1}] <= {q_d[15], q_d[11:8]};
+          end
+        end
+      end
+      if (q_dl0 && !q_dl0_d) begin
+        q_cfg_seen <= 1'b0;
+        if (!q_cfg_seen) begin
+          cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
+          cfg_prof <= 8'h00; cfg_pflg <= 8'h00;
+          for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
+        end
+      end
+      // the DIP bank: byte 0 of <switches>
+      if (q_dsw && q_wr && q_a0) cfg_dsw <= q_d[7:0];
+    end
+  end
   logic [1:0]  h_k;
   logic [AW-1:0] h_adr;
   logic [15:0]   h_dat;
+  logic [AW:1]   sdr_wr_addr_q;
+  logic [26:1]   x_addr_q;
+  logic [15:0]   sdr_wr_din_q, x_din_q, ee_d_q;
+  logic [5:0]    ee_a_q;
+  // the drain's read: the two RAMs into their own output registers on the drain's read condition, outside the
+  // reset's branch (area pass, Model 2 R988: read inside the reset's else, Quartus read a clock early and
+  // forwarded the writes, Warning 276020, 82 flip-flops of pass-through in merge4b_s3). h_k, h_adr and h_dat
+  // load in the same clocks as before.
+  wire f_re = !rst && !wbusy && !f_empty && mem_ready && !rd_armed;
+  always_ff @(posedge clk) if (f_re) begin
+    {h_k, h_adr} <= f_adr[rp[FA-1:0]];
+    h_dat        <= f_dat[rp[FA-1:0]];
+  end
 
   always_ff @(posedge clk) begin
     ee_we <= 1'b0;
     if (rst) begin
       wp <= '0; rp <= '0; rd_armed <= 1'b0; wbusy <= 1'b0; ack_d <= 1'b0; dl0_d <= 1'b0; done <= 1'b0;
       sdr_wr_req <= 1'b0; x_req <= 1'b0; overflow <= 1'b0; rom_loaded <= 1'b0; bytes <= '0;
-      cfg_seen <= 1'b0; any_d <= 1'b0; dlc_d <= 1'b0;
-      cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
-      for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
+      any_d <= 1'b0;
     end else begin
       ack_d <= sdr_wr_ack;
-      dlc_d <= dl_cfg;
       dl0_d <= dl0;
       any_d <= dl_any;
       if (to_fifo && ioctl_wr) begin
@@ -170,28 +256,6 @@ module m3_loader #(
         end
       end
       if (dl0 && ioctl_wr) bytes <= ioctl_addr + 27'd2;
-      // the game configuration
-      if (dl_cfg && !dlc_d) cfg_dsw <= 8'h7F;
-      if (dl_cfg && ioctl_wr) begin
-        cfg_seen <= 1'b1;
-        if (ioctl_addr[26:1] == 26'd9) begin cfg_in2 <= ioctl_dout[7:0]; cfg_in3 <= ioctl_dout[15:8]; end
-        if (ioctl_addr[26:5] == 22'd0) begin
-          if (ioctl_addr[4:1] == 4'd0) begin cfg_step <= ioctl_dout[7:0]; cfg_flags <= ioctl_dout[15:8]; end
-          else if (ioctl_addr[4:1] <= 4'd8) begin
-            cfg_bank[{ioctl_addr[3:1] - 3'd1, 1'b0}] <= {ioctl_dout[7], ioctl_dout[3:0]};
-            cfg_bank[{ioctl_addr[3:1] - 3'd1, 1'b1}] <= {ioctl_dout[15], ioctl_dout[11:8]};
-          end
-        end
-      end
-      if (dl0 && !dl0_d) begin
-        cfg_seen <= 1'b0;
-        if (!cfg_seen) begin
-          cfg_step <= 8'h10; cfg_flags <= 8'h00; cfg_in2 <= 8'hFF; cfg_in3 <= 8'hFF; cfg_dsw <= 8'h7F;
-          for (int b = 0; b < 16; b++) cfg_bank[b] <= (b < 8) ? {1'b0, 4'(b)} : 5'h10;
-        end
-      end
-      // the DIP bank: byte 0 of <switches>
-      if (dl_sw && ioctl_wr && ioctl_addr[26:1] == 26'd0) cfg_dsw <= ioctl_dout[7:0];
       if (dl0) rom_loaded <= 1'b0;
       if (dl0_d && !dl0) done <= 1'b1;
       // drain: one write per entry, to its class's destination
@@ -199,23 +263,22 @@ module m3_loader #(
         sdr_wr_req <= 1'b0;
         if (h_k == K_SDR && sdr_wr_ack && !ack_d) begin wbusy <= 1'b0; rp <= rp + 1'b1; end
         if (h_k == K_X && x_ack) begin x_req <= 1'b0; wbusy <= 1'b0; rp <= rp + 1'b1; end
-      end else if (!f_empty && mem_ready && !rd_armed) begin
-        {h_k, h_adr} <= f_adr[rp[FA-1:0]]; h_dat <= f_dat[rp[FA-1:0]];
+      end else if (f_re) begin
         rd_armed <= 1'b1;
       end else if (rd_armed) begin
         if (h_k == K_EE) begin
           rd_armed <= 1'b0;
-          ee_we <= 1'b1; ee_a <= h_adr[5:0]; ee_d <= h_dat;
+          ee_we <= 1'b1; ee_a_q <= h_adr[5:0]; ee_d_q <= h_dat;
           rp <= rp + 1'b1;
         end else if (h_k == K_X) begin
           if (x_ok) begin
             rd_armed <= 1'b0;
-            x_req <= 1'b1; x_addr <= 26'(h_adr); x_din <= h_dat;
+            x_req <= 1'b1; x_addr_q <= 26'(h_adr); x_din_q <= h_dat;
             wbusy <= 1'b1;
           end
         end else begin
           rd_armed <= 1'b0;
-          sdr_wr_req <= 1'b1; sdr_wr_addr <= h_adr; sdr_wr_din <= h_dat;
+          sdr_wr_req <= 1'b1; sdr_wr_addr_q <= h_adr; sdr_wr_din_q <= h_dat;
           wbusy <= 1'b1;
         end
       end
@@ -223,6 +286,12 @@ module m3_loader #(
     end
   end
   assign sdr_wr_be = 2'b11;
+  assign sdr_wr_addr = OWIRE ? h_adr          : sdr_wr_addr_q;
+  assign sdr_wr_din  = OWIRE ? h_dat          : sdr_wr_din_q;
+  assign x_addr      = OWIRE ? 26'(h_adr)     : x_addr_q;
+  assign x_din       = OWIRE ? h_dat          : x_din_q;
+  assign ee_a        = OWIRE ? h_adr[5:0]     : ee_a_q;
+  assign ee_d        = OWIRE ? h_dat          : ee_d_q;
   assign busy = dl_any || done || !f_empty || wbusy || rd_armed || any_d;
 
 endmodule

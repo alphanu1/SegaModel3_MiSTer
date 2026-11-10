@@ -32,7 +32,7 @@ R3D_SYS = rtl/real3d/r3d_ucode_pkg.sv rtl/real3d/r3d_fp_add.sv rtl/real3d/r3d_fp
           rtl/real3d/r3d_rast_intake.sv rtl/real3d/r3d_rast_zspan.sv rtl/real3d/r3d_rast_zband.sv rtl/real3d/r3d_rast_recip.sv \
           rtl/real3d/r3d_rast_interp.sv rtl/real3d/r3d_rast_fogp.sv rtl/real3d/r3d_rast_texel.sv rtl/real3d/r3d_rast_tcache.sv \
           rtl/real3d/r3d_rast_colour.sv rtl/real3d/r3d_rast_band.sv rtl/real3d/r3d_rast_fogvp.sv \
-          rtl/real3d/r3d_rast_store.sv rtl/real3d/r3d_rast.sv \
+          rtl/real3d/r3d_rast_store.sv rtl/real3d/r3d_rast_zq.sv rtl/real3d/r3d_rast.sv \
           rtl/real3d/r3d_cmd.sv rtl/real3d/r3d_mem.sv $(TEXUP_RTL) rtl/real3d/r3d_vrom_rd.sv \
           rtl/mem/m3_ddr_arb.sv rtl/mem/m3_ddr3p.sv rtl/video/m2_fb_read.sv rtl/video/m3_compose.sv \
           rtl/viewer/m3v_sdr_rd.sv rtl/viewer/m3v_ddr_rd.sv
@@ -40,12 +40,13 @@ R3D_SYS = rtl/real3d/r3d_ucode_pkg.sv rtl/real3d/r3d_fp_add.sv rtl/real3d/r3d_fp
 # sm3-builds/dt2/m3_bus_step2.patch) with SYS_DEFS = +define+M3_STEP2_BUS
 BUS_RTL  ?= rtl/sys/m3_bus.sv
 TEXUP_RTL ?= rtl/real3d/r3d_texup.sv    # R100: with M3_STEP2_TEX, sm3-builds/dt2/handoff2/rtl/r3d_texup.sv
-SYS_DEFS ?= +define+M3_STEP2_BUS=1 +define+M3_STEP2_TEX=1
-SYS_RTL = $(R3D_SYS) rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/sys/m3_jtag.sv rtl/io/m3_93c46.sv rtl/io/m3_io.sv rtl/sys/m3_sdr_port.sv $(BUS_RTL) \
+SYS_DEFS ?= +define+M3_STEP2_BUS=1 +define+M3_STEP2_TEX=1 +define+M3_DMAFAST=1 +define+M3_R3B=1   # (R144: as Model3.qsf)
+SYS_RTL = $(R3D_SYS) rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/sys/m3_jtag.sv rtl/io/m3_93c46.sv rtl/io/m3_io.sv rtl/io/m3_cab_inputs.sv rtl/io/m3_inputs.sv rtl/sys/m3_sdr_port.sv $(BUS_RTL) \
           rtl/io/m3_scripts.sv rtl/mem/m2_sdram.sv rtl/video/m2_video_timing.sv rtl/viewer/m3v_overlay.sv \
-          rtl/dbg/m3_frame_busy.sv rtl/dbg/m3_fps.sv rtl/sys/m3_xmem.sv rtl/sys/m3_5881.sv rtl/sys/m3_sec.sv rtl/sys/m3_loader.sv rtl/sys/m3_system.sv
+          rtl/dbg/m3_frame_busy.sv rtl/dbg/m3_fps.sv rtl/sys/m3_xmem.sv rtl/sys/m3_5881.sv rtl/sys/m3_sec.sv rtl/sys/m3_loader.sv \
+          rtl/sound/m3_scsp_dsp.sv rtl/sound/m3_sndbridge.sv rtl/sys/m3_system.sv
 
-.PHONY: test_jtag test_jtag_fault lint_sys test_io test_sdr_port test_bus system test_xmem test_sec test_texup2
+.PHONY: test_jtag test_jtag_fault lint_sys test_inputs test_io test_sdr_port test_bus test_bus_tg system test_xmem test_sec test_texup2
 
 # r3d_texup's three-word texture port (R100; Step 1.5 and later, D-46) against its FIFO
 # path, on 64 MiB of VROM (Daytona 2) and on 32 MiB (--v32: a Step 1.5 set). TEXUP2_RTL:
@@ -108,6 +109,16 @@ test_jtag: $(SYS_OBJ)/jtag/Vm3_jtag
 test_jtag_fault: $(SYS_OBJ)/jtag/Vm3_jtag
 	@echo "== m3_jtag, one TDO expectation flipped (must FAIL)"
 	! ./$(SYS_OBJ)/jtag/Vm3_jtag $(TRACE) --fault
+
+# m3_inputs and m3_cab_inputs (the cabinet's controls by input profile) against a reference written from
+# MAME's and Supermodel's ports
+$(SYS_OBJ)/inputs/Vm3_inputs: rtl/io/m3_cab_inputs.sv rtl/io/m3_inputs.sv sim/system/tb_m3_inputs.cpp
+	@$(VERILATOR) $(VFLAGS) --top-module m3_inputs -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/inputs rtl/io/m3_cab_inputs.sv rtl/io/m3_inputs.sv sim/system/tb_m3_inputs.cpp >/dev/null
+
+test_inputs: $(SYS_OBJ)/inputs/Vm3_inputs
+	@echo "== m3_inputs: the controls by profile against MAME's and Supermodel's ports"
+	./$(SYS_OBJ)/inputs/Vm3_inputs 1
+	./$(SYS_OBJ)/inputs/Vm3_inputs 2
 
 $(SYS_OBJ)/io/Vm3_io: rtl/io/m3_93c46.sv rtl/io/m3_io.sv sim/system/tb_m3_io.cpp
 	@$(VERILATOR) $(VFLAGS) --top-module m3_io -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/io rtl/io/m3_93c46.sv rtl/io/m3_io.sv sim/system/tb_m3_io.cpp >/dev/null
@@ -228,6 +239,23 @@ $(SYS_OBJ)/bus/Vm3_bus_tb: rtl/sys/m3_bus.sv rtl/sys/m3_sdr_port.sv rtl/mem/m2_s
 test_bus: $(SYS_OBJ)/bus/Vm3_bus_tb
 	@echo "== m3_bus with its SDRAM target: two masters against a reference"
 	./$(SYS_OBJ)/bus/Vm3_bus_tb 100000 1
+
+# R152: the bus with the tile generator's bus timing (TGT) and the R112 options as the core builds them;
+# m3_bus's TGT timing itself against Supermodel's model: sim/system/tb_m3_bus_tg.cpp (test_bus_tg)
+$(SYS_OBJ)/bus_tgt/Vm3_bus_tb: rtl/sys/m3_bus.sv rtl/sys/m3_sdr_port.sv rtl/mem/m2_sdram.sv sim/system/m3_bus_tb.sv sim/system/tb_m3_bus.cpp
+	@mkdir -p $(SYS_OBJ)/bus_tgt
+	@$(VERILATOR) $(VFLAGS) -GTGT=1 -GFAST=1 -GR3P=1 --top-module m3_bus_tb -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/bus_tgt \
+	  rtl/cpu/ppc_cache_pkg.sv rtl/mem/m2_sdram.sv rtl/sys/m3_sdr_port.sv rtl/sys/m3_bus.sv sim/system/m3_bus_tb.sv sim/system/tb_m3_bus.cpp >/dev/null
+$(SYS_OBJ)/bus_tg/Vm3_bus: rtl/sys/m3_bus.sv sim/system/tb_m3_bus_tg.cpp
+	@mkdir -p $(SYS_OBJ)/bus_tg
+	@$(VERILATOR) --cc --exe --build -j 6 -O2 -Wno-fatal -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-UNUSEDSIGNAL +define+M3_STEP2_BUS=1 \
+	  --public-flat-rw --top-module m3_bus -GR3P=1 -GFAST=1 -GTGT=1 -GTG_MHZ=110 -GSTEP2=1 -CFLAGS "-O2 -std=c++17" --Mdir $(SYS_OBJ)/bus_tg \
+	  rtl/cpu/ppc_cache_pkg.sv rtl/sys/m3_bus.sv sim/system/tb_m3_bus_tg.cpp >/dev/null
+test_bus_tg: $(SYS_OBJ)/bus_tgt/Vm3_bus_tb $(SYS_OBJ)/bus_tg/Vm3_bus
+	@echo "== m3_bus with TGT: two masters against a reference, then the timing against Supermodel's"
+	./$(SYS_OBJ)/bus_tgt/Vm3_bus_tb 100000 21
+	./$(SYS_OBJ)/bus_tg/Vm3_bus --cycles 4000000 --seed 1 | tail -n 3
+	./$(SYS_OBJ)/bus_tg/Vm3_bus --cycles 4000000 --seed 2 --gap 4 | tail -n 3
 
 # R107: the bus with the port's L16 / BXOR / LW1 (the SDR_VARIANTS above)
 $(SYS_OBJ)/bus_%/Vm3_bus_tb: rtl/sys/m3_bus.sv rtl/sys/m3_sdr_port.sv rtl/mem/m2_sdram.sv sim/system/m3_bus_tb.sv sim/system/tb_m3_bus.cpp

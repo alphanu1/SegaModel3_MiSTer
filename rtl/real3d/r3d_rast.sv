@@ -70,7 +70,10 @@ module r3d_rast #(
   parameter bit L8K = 1'b1,         // study R134: an L8 texel of 0xFF has alpha 0 (Supermodel); 0: MAME's decode
   // study R135: Supermodel's texture decode (format 2, contour on formats 1-4), contour's dilation and test,
   // texture alpha and translucency on textured polygons (r3d_rast_texel, r3d_rast_colour); 0: MAME's
-  parameter bit SMTX = 1'b1
+  parameter bit SMTX = 1'b1,
+  // study R149: the pairs that passed the z band queue for the pixel stage, ZQ of them (0: none, the z band's
+  // output register feeds the pixel stage as before), in an M10K from 64, else an MLAB
+  parameter int ZQ = 256
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -239,6 +242,26 @@ module r3d_rast #(
       t_full <= 1'b0; hk <= 3'd0;
     end else begin
       if (g_valid && g_ready) begin
+        if (g_tag == 5'd31) hk <= hk + 3'd1;
+        if (g_last) begin t_full <= 1'b1; hk <= 3'd0; end
+      end
+      if (t_go) t_full <= 1'b0;
+    end
+  end
+  // the record's words load outside the reset: the intake's o_valid is low through it, so its beats
+  // cannot load (rst_rast into these ~1,000 enables was a failing family in three full fits)
+`ifdef VERILATOR
+  /* verilator lint_off PROCASSINIT */
+  logic rst_q = 1'b0;
+  /* verilator lint_on PROCASSINIT */
+  always_ff @(posedge clk) begin
+    rst_q <= rst;
+    if (rst && rst_q && g_valid) $fatal(1, "rast: a record word in reset");
+  end
+`endif
+  always_ff @(posedge clk) begin
+    begin
+      if (g_valid && g_ready) begin
         if (g_tag == 5'd31) begin                     // the header's beats
           if (hk == 3'd0) th0 <= g_data[31:0];
           // an untextured triangle's u and v planes go into table 1 as zeros: cleared here, before its
@@ -251,7 +274,6 @@ module r3d_rast #(
           if (hk == 3'd2) th2 <= g_data[31:0];
           if (hk == 3'd3) th3 <= g_data[31:0];
           if (hk == 3'd4) th4 <= g_data[20:0];
-          hk <= hk + 3'd1;
         end else if (g_tag <= 5'd5) tv[g_tag[2:0]] <= g_data[31:0];
         else if (g_tag >= 5'd8) begin                 // tag 8 + 4p + k: k 0 e, 1 c, 2 dx, 3 dy
           case (g_tag[1:0])
@@ -261,9 +283,7 @@ module r3d_rast #(
             default: pdy[g_ps] <= g_data;
           endcase
         end
-        if (g_last) begin t_full <= 1'b1; hk <= 3'd0; end
       end
-      if (t_go) t_full <= 1'b0;
     end
   end
 
@@ -370,10 +390,16 @@ module r3d_rast #(
   logic [1:0]  za_pon;
   logic [23:0] za_z0, za_z1;
   logic signed [41:0] za_v0, za_v1;
-  wire  span_ok = f_sx0 < f_sx1;
+  // A span is never empty: the edge sets s_valid only for lo < hi (its stage B, by mn < mx, mn < W and mx > 0,
+  // and its own assert), so the span test that was here (f_sx0 < f_sx1, a 9-bit compare from the edge's output
+  // registers through f_sready into its row pipeline's advance and the ~500 enables behind m_load) passed every
+  // span it saw. Without it the handshake is registers only (study R165).
   wire  tq_full;
-  assign f_sready = (za_sready && !tq_full) || (f_svalid && !span_ok);
-  wire  s_take = f_svalid && span_ok && za_sready && !tq_full;
+  assign f_sready = za_sready && !tq_full;
+  wire  s_take = f_svalid && za_sready && !tq_full;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && f_svalid && !(f_sx0 < f_sx1)) $fatal(1, "rast: an empty span from the edge");
+`endif
 
   r3d_rast_zspan u_za (
     .clk, .rst,
@@ -427,11 +453,17 @@ module r3d_rast #(
     end
   end
 
-  logic        zo_valid, zo_ready, zo_ctr;
+  logic        zo_valid /* verilator public_flat_rd */;
+  logic        zo_ready, zo_ctr;
   logic [8:0]  zo_y, zo_x;
   logic [1:0]  zo_on;
   logic signed [41:0] zo_p0, zo_p1;
   logic [7:0]  zo_tag;
+  logic        zr_valid, zr_ready, zr_ctr;
+  logic [8:0]  zr_y, zr_x;
+  logic [1:0]  zr_on;
+  logic signed [41:0] zr_p0, zr_p1;
+  logic [7:0]  zr_tag;
   logic        cv_valid, cv_zw;            // contour verdicts, from the colour stage
   r3d_rast_zband #(.OOW(1'b1), .TRANS(0), .PW(42), .TW(8)) u_zband (
     .clk, .rst,
@@ -439,9 +471,21 @@ module r3d_rast #(
     .s_y(zb_y), .s_x(zb_x), .s_on(zb_on), .s_z0(zb_z0), .s_z1(zb_z1),
     .s_p0(zb_v0), .s_p1(zb_v1), .s_zk(zb_zk), .s_tag(zb_tag),
     .s_stip(1'b0), .s_trans(5'd0), .s_pinv(1'b0),
-    .o_valid(zo_valid), .o_ready(zo_ready), .o_y(zo_y), .o_x(zo_x), .o_on(zo_on),
-    .o_p0(zo_p0), .o_p1(zo_p1), .o_tag(zo_tag), .o_ctr(zo_ctr),
+    .o_valid(zr_valid), .o_ready(zr_ready), .o_y(zr_y), .o_x(zr_x), .o_on(zr_on),
+    .o_p0(zr_p0), .o_p1(zr_p1), .o_tag(zr_tag), .o_ctr(zr_ctr),
     .c_valid(cv_valid), .c_zw(cv_zw));
+
+  // the passed pairs' queue (study R149): in overdraw-heavy frames most pairs fail Z, and the pixel stage
+  // waited behind runs of rejected pairs while the z band waited on it behind runs of passing ones
+  generate if (ZQ > 0) begin : g_zq
+    r3d_rast_zq #(.D(ZQ), .W(113), .RAM(ZQ >= 64 ? "M10K" : "MLAB")) u_zq (
+      .clk, .rst,
+      .i_valid(zr_valid), .i_ready(zr_ready), .i_data({zr_y, zr_x, zr_on, zr_p0, zr_p1, zr_tag, zr_ctr}),
+      .o_valid(zo_valid), .o_ready(zo_ready), .o_data({zo_y, zo_x, zo_on, zo_p0, zo_p1, zo_tag, zo_ctr}));
+  end else begin : g_nozq
+    assign zo_valid = zr_valid; assign zr_ready = zo_ready;
+    assign {zo_y, zo_x, zo_on, zo_p0, zo_p1, zo_tag, zo_ctr} = {zr_y, zr_x, zr_on, zr_p0, zr_p1, zr_tag, zr_ctr};
+  end endgenerate
 
   // ===========================================================================
   // the front domain: pairs into pixels, the interpolants, fog's P, the texel
@@ -557,7 +601,8 @@ module r3d_rast #(
   (* ramstyle = "M10K, no_rw_check" *) logic [RCW-1:0] ring_c [128];
   logic [6:0]     ra_a, ra_b, ra_c;
   logic [RAW-1:0] rq_a, ra_wd;
-  logic [RBW-1:0] rq_b;
+  logic [RBW-1:0] rq_b, rq_bm;
+  logic [6:0]  tb_ne;                      // the filter's next tag (o_tag a cycle early)
   logic [RCW-1:0] rq_c;
   logic [7:0]  tf_bk, tf_fu, tf_fv;
   logic [2:0]  tf_fmt;
@@ -580,7 +625,11 @@ module r3d_rast #(
       ring_c[pn] <= {r_x, r_y, r_ctr && (a_kind == K_CONTOUR)};
     end
     rq_a <= ring_a[ra_a];
-    rq_b <= ring_b[ra_b];
+    // ring B is read a cycle early, at the filter's next tag, and registered again, as D1 and D2 are: the
+    // M10K's output ran through the kind's decode and the 8 x 8 product into b1 (two full fits at 110 MHz).
+    // The entry was written at R, long before, and is not rewritten until its number comes round.
+    rq_bm <= ring_b[tb_ne];
+    rq_b <= rq_bm;
     rq_c <= ring_c[ra_c];
   end
 
@@ -634,7 +683,6 @@ module r3d_rast #(
   // written long before (at the texel fetch), so the earlier read sees the same words.
   logic [37:0] rq_d1, rq_d1m;
   logic [12:0] rq_d2, rq_d2m;
-  logic [6:0]  tb_ne;
   always_ff @(posedge clk) begin
     if (f1_v) ring_d1[f1_n] <= tf_q[37:0];
     if (fd3_v) ring_d2[fd3_n] <= fp_p;
@@ -744,6 +792,13 @@ module r3d_rast #(
     if (rst) cb_v <= 1'b0; else cb_v <= tb_valid;
     cb_n <= tb_n; cb_texel <= tb_texel;
   end
+`ifdef VERILATOR
+  logic [RBW-1:0] rq_bc;
+  always_ff @(posedge clk) begin
+    rq_bc <= ring_b[ra_b];
+    if (!rst && cb_v && rq_b != rq_bc) $fatal(1, "rast: ring B read early");
+  end
+`endif
   logic        co_v, co_ok, co_zw, co_fbv;
   logic [6:0]  co_n;
   logic [7:0]  co_fb;

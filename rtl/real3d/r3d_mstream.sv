@@ -84,7 +84,14 @@ module r3d_mstream (
   assign rd = in_vrom ? vrom_rdata : pram_rdata;
 
   assign ready_start = !active && !draining && outst == 3'd0 && !pram_req && !vrom_req;
-  assign w_valid = active && count != 7'd0;
+  // w_valid as a register beside count (c7_s1: the geometry's header decode through the stall into pop and rp,
+  // -0.55 / -1.41 ns): formed from the next active and the next count's zero test, the count's own compares
+  // side by side with push and pop
+  logic wv_q;
+  assign w_valid = wv_q;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && wv_q != (active && count != 7'd0)) $fatal(1, "mstream: w_valid registered");
+`endif
   assign w_data = fifo[rp];
 
   // space for one more burst beyond those in flight
@@ -94,12 +101,12 @@ module r3d_mstream (
   always_ff @(posedge clk) begin
     c_valid <= 1'b0;
     if (rst) begin
-      active <= 1'b0; draining <= 1'b0; outst <= '0; count <= '0;
+      active <= 1'b0; draining <= 1'b0; outst <= '0; count <= '0; wv_q <= 1'b0;
       wp <= '0; rp <= '0; bw <= '0; br <= '0; beat <= '0;
       pram_req <= 1'b0; vrom_req <= 1'b0;
       creq_pending <= 1'b0; c_issued <= 1'b0;
     end else begin
-      logic push, pop;
+      logic push, pop, act_n, nz_n;
       logic [31:0] pd;
       push = 1'b0; pd = 32'd0;
       pop = w_pop && w_valid;
@@ -167,6 +174,13 @@ module r3d_mstream (
       if (pop) rp <= rp + 5'd1;
       if (!(start && ready_start)) count <= count + {6'd0, push} - {6'd0, pop};
       if (draining && outst == 3'd0) draining <= 1'b0;
+      // the next w_valid: the next active, and the next count non-zero (count + push - pop, count < FD)
+      act_n = (start && ready_start) || (active && !(stop && active));
+      if (start && ready_start) nz_n = 1'b0;
+      else if (push && !pop) nz_n = 1'b1;
+      else if (pop && !push) nz_n = count != 7'd1;
+      else nz_n = count != 7'd0;
+      wv_q <= act_n && nz_n;
     end
   end
 endmodule

@@ -188,7 +188,32 @@ module r3d_recip (
     logic [23:0] am;
   } ctl_t;
 
-  ctl_t c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10;
+  ctl_t c0, c1;
+
+  // The payload past stage 1 travels in r3d_dline delay lines (area pass), one per stage that reads it, each
+  // exactly the field the register chain c2 .. c10 held there: M at stages 3 and 8 (and 9, a register after 8),
+  // A at 7 (its low six bits on to 9 in registers), ge at 8 (and 9), and {v, s, re, special, tin} at 10, taken
+  // from c1 after its exponent correction.
+  typedef struct packed {
+    logic        v;
+    logic        s;
+    logic [9:0]  re;
+    logic [1:0]  special;
+    logic        tin;
+  } out_t;
+  out_t        c1o, c10;
+  logic [23:0] m3, m8, m9, am7;
+  logic        ge8, ge9;
+  logic [5:0]  am8lo, am9lo;
+  assign c1o = {c1.v, c1.s, c1.re, c1.special, c1.tin};
+  r3d_dline #(.W(24), .D(3))  u_m3  (.clk, .en(1'b1), .d(c0.m), .q(m3));
+  r3d_dline #(.W(25), .D(8))  u_m8  (.clk, .en(1'b1), .d({c0.m, c0.ge}), .q({m8, ge8}));
+  r3d_dline #(.W(24), .D(7))  u_am7 (.clk, .en(1'b1), .d(c0.am), .q(am7));
+  r3d_dline #(.W(15), .D(9))  u_out (.clk, .en(1'b1), .d(c1o), .q(c10));
+  always_ff @(posedge clk) begin
+    m9 <= m8; ge9 <= ge8;
+    am8lo <= am7[5:0]; am9lo <= am8lo;
+  end
 
   // stage 0: unpack, seed
   logic [11:0] t0;
@@ -231,7 +256,6 @@ module r3d_recip (
   logic [11:0] t2;
   always_ff @(posedge clk) begin
     logic [35:0] e1;
-    c2 <= c1;
     t2 <= t1;
     e1 = 36'h8_0000_0000 - p1;
     e1s <= e1[35:16];
@@ -241,7 +265,6 @@ module r3d_recip (
   logic [20:0] r1s;
   always_ff @(posedge clk) begin
     logic [31:0] r1;
-    c3 <= c2;
     r1 = t2 * e1s;
     r1s <= r1[29:9];
   end
@@ -250,9 +273,8 @@ module r3d_recip (
   logic [44:0] p2;
   logic [20:0] r1s4;
   always_ff @(posedge clk) begin
-    c4 <= c3;
     r1s4 <= r1s;
-    p2 <= c3.m * r1s;
+    p2 <= m3 * r1s;
   end
 
   // stage 5: ds = (2^43 - p2) >>> 4, signed, |ds| < 2^24
@@ -260,7 +282,6 @@ module r3d_recip (
   logic [20:0] r1s5;
   always_ff @(posedge clk) begin
     logic signed [45:0] d;
-    c5 <= c4;
     r1s5 <= r1s4;
     d = 46'sh800_0000_0000 - $signed({1'b0, p2});
     ds <= d[28:4];
@@ -270,7 +291,6 @@ module r3d_recip (
   logic signed [46:0] c6p;
   logic [20:0] r1s6;
   always_ff @(posedge clk) begin
-    c6 <= c5;
     r1s6 <= r1s5;
     c6p <= $signed({1'b0, r1s5}) * ds;
   end
@@ -280,7 +300,6 @@ module r3d_recip (
   always_ff @(posedge clk) begin
     logic signed [46:0] csh;
     logic signed [52:0] r2;
-    c7 <= c6;
     csh = c6p >>> 9;
     r2 = $signed({2'b00, r1s6, 30'd0}) + $signed({{6{csh[46]}}, csh});
     r27 <= r2[50:24];
@@ -289,8 +308,7 @@ module r3d_recip (
   // stage 8: P = A * r (~ A 2^49 / M)
   logic [50:0] pq;
   always_ff @(posedge clk) begin
-    c8 <= c7;
-    pq <= c7.am * r27;
+    pq <= am7 * r27;
   end
 
   // stage 9: Q0 = P >> 26 (A >= M) or >> 25; mq = M * Q0
@@ -298,10 +316,9 @@ module r3d_recip (
   logic [24:0] q09;
   always_ff @(posedge clk) begin
     logic [24:0] q0;
-    c9 <= c8;
-    q0 = c8.ge ? {1'b0, pq[49:26]} : pq[49:25];
+    q0 = ge8 ? {1'b0, pq[49:26]} : pq[49:25];
     q09 <= q0;
-    mq <= c8.m * q0;
+    mq <= m8 * q0;
   end
 
   // stage 10: compare M (2 Q0 +- 1) against T = A 2^(s+1), as the sign of
@@ -312,13 +329,12 @@ module r3d_recip (
   logic [24:0] q10;
   always_ff @(posedge clk) begin
     logic [29:0] two_mq, tt, d, dlo, dhi;
-    c10 <= c9;
     q10 <= q09;
     two_mq = {mq[28:0], 1'b0};
-    tt = c9.ge ? {c9.am[5:0], 24'd0} : {c9.am[4:0], 25'd0};
+    tt = ge9 ? {am9lo, 24'd0} : {am9lo[4:0], 25'd0};
     d = tt - two_mq;
-    dlo = d - {6'd0, c9.m};          // T - M (2 Q0 + 1) >= 0: round up
-    dhi = d + {6'd0, c9.m};          // T - M (2 Q0 - 1) < 0: round down
+    dlo = d - {6'd0, m9};          // T - M (2 Q0 + 1) >= 0: round up
+    dhi = d + {6'd0, m9};          // T - M (2 Q0 - 1) < 0: round down
     up10 <= !dlo[29];
     dn10 <= dhi[29];
   end

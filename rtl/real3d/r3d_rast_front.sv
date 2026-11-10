@@ -52,11 +52,20 @@ module r3d_rast_front #(
   logic     [TGW-1:0] d_tag;
 
   // the band rides beside the divider, which holds one triangle at a time
+  // (it follows the inputs while the divider takes a triangle, t_ready, so it holds the accepted one's: the edge
+  // reads it with the slopes)
   always_ff @(posedge clk)
-    if (t_valid && t_ready) begin
+    if (t_ready) begin
       d_b0 <= t_b0;
       d_b1 <= t_b1;
     end
+`ifdef VERILATOR
+  logic [8:0] c_b0, c_b1;
+  always_ff @(posedge clk) begin
+    if (t_valid && t_ready) begin c_b0 <= t_b0; c_b1 <= t_b1; end
+    if (!rst && d_valid && {d_b0, d_b1} != {c_b0, c_b1}) $fatal(1, "rast_front: the band followed the inputs");
+  end
+`endif
 
   r3d_rast_div #(.PRE(PRE_DIV), .TGW(TGW)) u_div (
     .clk, .rst,

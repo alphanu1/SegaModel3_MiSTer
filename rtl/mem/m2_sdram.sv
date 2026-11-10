@@ -182,7 +182,13 @@ module m2_sdram #(
   parameter bit            FDSP      = 1'b0,
   // READ FROM DISPATCH (Model 3, study R112): a read whose row is open issues its first READ from
   // S_DISPATCH instead of a clock later from S_RD. 0: the controller exactly as it was.
-  parameter bit            HITRD     = 1'b0
+  parameter bit            HITRD     = 1'b0,
+  // ONE READ REGISTER FOR SEVERAL PORTS (Model 3, the bridges pass). The ports set in SHD get their p_dout
+  // from one 64-bit register, loaded with every delivery, instead of one register each. Only for a port
+  // that takes p_dout in the cycles its p_lo or p_ack is high and never after (the delivery and its strobe
+  // leave the stage together, one delivery a clock), and with ACK_HOLD 1, so p_ack is one clock. Between
+  // its strobes such a port's p_dout shows other ports' words. Default none: the controller as it was.
+  parameter logic [NP-1:0] SHD       = '0
 ) (
   input  logic                 clk,
   input  logic                 rst_n,
@@ -251,6 +257,10 @@ module m2_sdram #(
   // which a one-cycle request pulse would not show.
   output logic [NP-1:0]        dbg_req,
   output logic [NP-1:0]        dbg_grant
+`ifdef M3_R3B
+  // (Model 3, study R144) the transfer's port, so the system can give each write-burst port's columns
+  , output logic [$clog2(NP+1)-1:0] wb_grant
+`endif
 );
 
   // Burst length per port, in 16-bit words. D8: p1 is tile character fetch and
@@ -464,6 +474,8 @@ module m2_sdram #(
   initial begin
     if (MASK_ON_A && COL_BITS > 10)
       $error("m2_sdram: MASK_ON_A needs COL_BITS <= 10 -- A11 carries the mask, not a column bit");
+    if (SHD != '0 && ACK_HOLD != 1)
+      $error("m2_sdram: SHD needs ACK_HOLD 1 -- a held p_ack could see the next port's word");
   end
 
   // Column value placed on the address bus, skipping A10.
@@ -786,7 +798,11 @@ module m2_sdram #(
   // 1 on are read from wb_din / wb_be into din_r / be_r while S_WR issues the
   // column before (wb_col = the column after this one; writes have no read
   // tags, so rd_issued is free to count them)
-  assign wb_col = rd_issued + 4'd1;
+  // registered (4 flip-flops): set wherever rd_issued is, to its value + 1, so it is rd_issued + 1
+  // on every clock as before, with no adder between rd_issued and the requester's word select
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (rst_n && wb_col != 4'(rd_issued + 4'd1)) $fatal(1, "m2_sdram: wb_col is not rd_issued + 1");
+`endif
 
   // ------------------------------------------- the prefetch handoff (R387)
   // One transaction deep. The front stage fills it, the back stage drains it.
@@ -942,6 +958,16 @@ module m2_sdram #(
   // stays -- it has to, p_dout really is per port -- but a decode is far
   // cheaper than a data mux. The registers go from NP*64 to 64.
   logic [3:0][15:0] cap;
+  // p_dout: a register a port, or with SHD one for those ports (pd_sh, loaded with every delivery)
+  logic [NP-1:0][63:0] pd_q;
+  logic [63:0]         pd_sh;
+  always_ff @(posedge clk) if (dl_v) pd_sh <= dl_data;
+  genvar gd;
+  generate
+    for (gd = 0; gd < NP; gd = gd + 1) begin : g_pdout
+      assign p_dout[gd] = SHD[gd] ? pd_sh : pd_q[gd];
+    end
+  endgenerate
 
   // Acks are per port now. A single shared hold counter was fine when only one
   // transfer existed at a time; with two ports in flight it would clear the
@@ -1004,8 +1030,14 @@ module m2_sdram #(
   logic [NP-1:0]            inflight;
   logic                     wr_inflight;
 
-  logic pipe_busy;
-  assign pipe_busy = |tag_v;
+  // pipe_busy is |tag_v, kept as a register beside it: formed from the tags' next state (their shift and this
+  // cycle's injection), so the six-way OR is not in front of the S_IDLE decisions that drive cmd and sd_a
+  // (c7_s1: tag_v -> sd_a / cmd, -1.65 ns)
+  logic pipe_busy, pb_r;
+  assign pipe_busy = pb_r;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (rst_n && pb_r != |tag_v) $fatal(1, "m2_sdram: pipe_busy registered");
+`endif
 
   // The dedicated write port is ready to go: it drives DQ, so it may not be
   // issued while read data is still returning on the same wires.
@@ -1061,6 +1093,9 @@ module m2_sdram #(
   // With the pipeline this is genuinely several ports at once, which is what
   // the telemetry is there to show.
   assign dbg_grant = inflight;
+`ifdef M3_R3B
+  assign wb_grant = grant;
+`endif
 
   // SYNCHRONOUS RESET, DELIBERATELY, and it is about the pins rather than style.
   //
@@ -1098,15 +1133,15 @@ module m2_sdram #(
       bank_open <= '0;
       for (int b = 0; b < NB; b++) begin bank_row[b] <= '0; ras_cnt[b] <= '0; end
       ras_ok <= '1; rd_ok <= '1;       // R410: idle out of reset
-      tag_v <= '0; tag_p <= '0; tag_w <= '0; tag_last <= '0; tag_pr <= '0; cap <= '0;
+      tag_v <= '0; tag_p <= '0; tag_w <= '0; tag_last <= '0; tag_pr <= '0; cap <= '0; pb_r <= 1'b0;
       ack_cnt <= '0; wack_cnt <= '0; inflight <= '0; wr_inflight <= 1'b0;
       for (int b = 0; b < NB; b++) rd_bank_cnt[b] <= '0;
-      p_ack <= '0; wr_ack <= 1'b0; p_dout <= '0;
+      p_ack <= '0; wr_ack <= 1'b0; pd_q <= '0;
       dl_v <= 1'b0; dl_p <= '0; dl_data <= '0;   // R557
       dl_lo <= 1'b0; p_lo <= '0;                  // R787
       grant <= '0; grant_is_wr <= 1'b0; rr_mask <= '1;                  // R498
       pri_run <= '0;                                                    // R574
-      rd_total <= 4'd1; rd_issued <= '0; rd_captured <= '0;
+      rd_total <= 4'd1; rd_issued <= '0; wb_col <= 4'd1; rd_captured <= '0;
       is_write <= 1'b0; xfer_addr <= '0; din_r <= '0; be_r <= '0;
       wait_cnt <= '0; dq_r <= '0;
       nxt_valid <= 1'b0; pf_sel <= 1'b0; nxt_grant <= '0; nxt_addr <= '0;
@@ -1168,6 +1203,8 @@ module m2_sdram #(
           default: ;
         endcase
       end else begin
+        logic tv_set;                   // a tag injected this cycle (pb_r)
+        tv_set = 1'b0;
         sd_dqm <= 2'b00;
 
         for (int b = 0; b < NB; b++)
@@ -1254,7 +1291,7 @@ module m2_sdram #(
         p_lo <= '0;                                   // R787: one cycle
         if (dl_v) begin
           dl_v            <= 1'b0;
-          p_dout[dl_p]    <= dl_data;
+          for (int k = 0; k < NP; k++) if (!SHD[k] && dl_p == PW'(k)) pd_q[k] <= dl_data;   // SHD: pd_sh, below
           if (dl_lo) p_lo[dl_p] <= 1'b1;              // R787: the first half, no ack
           else begin
             p_ack[dl_p]   <= 1'b1;
@@ -1335,7 +1372,7 @@ module m2_sdram #(
               rd_total    <= 4'd1;
               rd_wrap     <= 1'b0;
               rd_pair     <= 1'b0;
-              rd_issued   <= '0;
+              rd_issued   <= '0; wb_col <= 4'd1;
               rd_captured <= '0;
               state       <= S_SEL;
             end else if (pf_take) begin
@@ -1354,7 +1391,7 @@ module m2_sdram #(
               xfer_addr   <= nxt_addr;
               din_r       <= nxt_din;
               be_r        <= nxt_be;
-              rd_issued   <= '0;
+              rd_issued   <= '0; wb_col <= 4'd1;
               rd_captured <= '0;
               nxt_valid   <= 1'b0;
               // S_DISPATCH still sees a SETTLED xfer_addr for its row
@@ -1386,7 +1423,7 @@ module m2_sdram #(
               xfer_addr   <= pf_addr;
               din_r       <= pf_din;
               be_r        <= pf_be;
-              rd_issued   <= '0;
+              rd_issued   <= '0; wb_col <= 4'd1;
               rd_captured <= '0;
               nxt_valid   <= 1'b0;
               state       <= S_DISPATCH;
@@ -1401,7 +1438,7 @@ module m2_sdram #(
               rd_wrap     <= p_long[0] && WB[0];
               rd_pair     <= p_long[0] && WB[0] && L16[0] && PAIR[0];
               xfer_addr   <= bhash(p_addr[0]);
-              rd_issued   <= '0;
+              rd_issued   <= '0; wb_col <= 4'd1;
               rd_captured <= '0;
               if (fd_go) begin
                 inflight[0] <= 1'b1;
@@ -1470,10 +1507,10 @@ module m2_sdram #(
             if (row_hit && HITRD && !is_write) begin
               // R112: the first READ now (S_RD's first column: rd_issued is 0 here)
               cmd        <= C_READ;
-              tag_v[cap_depth-1]    <= 1'b1;
+              tag_v[cap_depth-1]    <= 1'b1; tv_set = 1'b1;
               rd_bank_cnt[tbank]    <= cap_depth;
               rd_ok[tbank]          <= 1'b0;
-              rd_issued  <= 4'd1;
+              rd_issued  <= 4'd1; wb_col <= 4'd2;
               if (rd_total == 4'd1) state <= S_IDLE;
               else begin
                 state <= S_RD;
@@ -1579,7 +1616,7 @@ module m2_sdram #(
             end else begin
               // WB: the next column, in the open row (as S_RD walks it); its
               // word and mask come from the port into din_r / be_r
-              rd_issued <= rd_issued + 1'b1;
+              rd_issued <= rd_issued + 1'b1; wb_col <= wb_col + 1'b1;
               xfer_addr[COL_BITS:1] <= xfer_addr[COL_BITS:1] + 1'b1;
               din_r <= wb_din;
               be_r  <= wb_be;
@@ -1614,7 +1651,7 @@ module m2_sdram #(
             // Injected at the selected depth, not at the top of the
             // pipeline: the tag reaches slot 0 after cap_depth cycles, which
             // is what decides which bus word is called word 0.
-            tag_v[cap_depth-1]    <= 1'b1;
+            tag_v[cap_depth-1]    <= 1'b1; tv_set = 1'b1;
             // PW BITS. This took grant[2:0] -- three bits for a ten-port
             // controller -- so ports 8 and 9 were tagged as 0 and 1 and their
             // read data was delivered to, and acknowledged on, the i960's own
@@ -1626,7 +1663,7 @@ module m2_sdram #(
             tag_pr[cap_depth-1]   <= rd_pair;
             rd_bank_cnt[tbank]    <= cap_depth;
             rd_ok[tbank]          <= 1'b0;   // R410
-            rd_issued  <= rd_issued + 1'b1;
+            rd_issued  <= rd_issued + 1'b1; wb_col <= wb_col + 1'b1;
             if (4'(rd_issued + 4'd1) == rd_total) begin   // (rd_total 0: sixteen, R107)
               // R387: STRAIGHT INTO THE NEXT TRANSACTION, NOT BACK TO
               // ARBITRATION. The row stays open, the data still in flight is
@@ -1714,6 +1751,7 @@ module m2_sdram #(
 
           default: state <= S_IDLE;
         endcase
+        pb_r <= (|tag_v[RD_LAT-1:1]) || tv_set;
       end
     end
   end

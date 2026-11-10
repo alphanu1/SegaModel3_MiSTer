@@ -27,6 +27,8 @@
 //   m3_tilegen (VRAM in SDRAM, port 1) + m3_compose (the layer from DDR3) -> video
 //   m3_loader: the MRA's downloads -> SDRAM (download port), the extra memory,
 //              the 93C46, the game configuration (study R100)
+//   m3_inputs: MiSTer's joysticks, sticks, triggers and paddle -> m3_io's ports
+//              and ADC, by the configuration's input profile (INPUTS)
 //
 // R100 (Daytona 2, Step 2.1): the game configuration (MRA index 4) picks the
 // step at run time; STEP2 builds the Step 2.x hardware (the Real3D DMA front
@@ -116,6 +118,7 @@ module m3_system
   //   m3_xmem's reads both follow it. 0: the MRA layout, a beat a read, as before
   parameter bit          VROM_LIN = 1'b1,
   parameter int          DDR_MAXQ = 8,               // m3_ddr3p: DDR3 reads queued or in flight at most (1-32; R101)
+  parameter bit          SND_DSP  = 1'b1,            // the sound link (D-53): the SCSP DSPs and the HPS bridge on DDR3 port 7; 0 silence
   // ---- SDRAM scheduling for the CPU (study R107; all 0: m2_sdram as it was)
   //   SDR_PRI      ports granted ahead of the round-robin (m2_sdram PRI; bit 0 the bus, i.e. the CPU)
   //   SDR_PRI_CAP  PRI grants in a row while others wait, before one round-robin grant
@@ -151,7 +154,30 @@ module m3_system
   //   SDR_PW_DLY   with SDR_PW: a posted line write waits this many clocks before its bursts unless needed (m3_sdr_port PW_DLY)
   parameter int          SDR_PW_DLY  = 0,
   //   BUS_R3P      m3_bus: writes to the Real3D's host port posted in an eight-word buffer, the bus freed (m3_bus R3P)
-  parameter bit          BUS_R3P     = 1'b0
+  parameter bit          BUS_R3P     = 1'b0,
+  // ---- the cabinet's controls (m3_inputs): INPUTS 0 ties m3_io's inputs idle (in0 FF, test and service high,
+  //   ports C and D the configuration's idle bytes, the ADC 00), the core before them; INP_DRIVE, INP_GUN,
+  //   INP_FISH build the driving, analog-gun and fishing profiles (off: those games read the generic ports)
+  parameter bit          INPUTS      = 1'b1,
+  parameter bit          INP_DRIVE   = 1'b1,
+  parameter bit          INP_GUN     = 1'b1,
+  parameter bit          INP_FISH    = 1'b1,
+  parameter bit          INP_LEAN    = 1'b0,       // the driving block without "Steering", "Steering smoothing", "Analog control"
+  //   TG_TIMING    m3_bus: the tile generator's bus timing, tile RAM and palette writes at the board's rate (R152)
+  parameter bit          TG_TIMING   = 1'b1,
+  // ---- the bridges pass (zero cycles, the same words at every port's strobe)
+  //   SDR_SHD      m2_sdram: the read register shared by every port but r3d_mem's (port 4, which reads its word on
+  //                through its write burst); the others take p_dout only with p_lo / p_ack (m2_sdram SHD)
+  parameter bit          SDR_SHD     = 1'b1,
+  //   BR_C106      m3_bus: the MPC106's 64 registers in one M10K, as they behaved (m3_bus C106_M10K)
+  //   BR_SEC       one second counter for the RTC and the frame counter (m3_bus, m3_fps EXT_SEC)
+  //   BR_BUS       m3_bus: the targets' fields wired, wd from the owner in B_DEC (m3_bus OWIRE, WD_DEC); m3_scripts:
+  //                DSPS and TEMP load one shared value (m3_scripts LDV)
+  parameter bit          BR_C106     = 1'b1,
+  parameter bit          BR_SEC      = 1'b1,
+  parameter bit          BR_BUS      = 1'b1,
+  //   BR_LD        m3_loader: the destinations' fields wired from the drain's registers (m3_loader OWIRE)
+  parameter bit          BR_LD       = 1'b1
 ) (
   input  logic        clk,
   input  logic        mem_rst_n,
@@ -191,7 +217,27 @@ module m3_system
   output logic [7:0]  v_r, v_g, v_b,
   input  logic        overlay_en,
   input  logic        fps_en,        // the frame counter (FPS) shown
+  input  logic  [1:0] fps_avg,       // its window: 0 5 s, 1 10 s, 2 1 s (m3_fps avg)
 
+  // the cabinet's controls (hps_io, clk_sys; INPUTS)
+  input  logic [15:0] joystick_0,    // player 1: 3:0 right, left, down, up; 15:4 the J1 buttons
+  input  logic [15:0] joystick_1,    // player 2
+  input  logic [15:0] joy_l0,        // player 1's left stick {Y, X}, signed
+  input  logic [15:0] joy_l1,        // player 2's left stick
+  input  logic [15:0] joy_r0,        // player 1's right stick
+  input  logic  [7:0] joy_lt0,       // player 1's analogue triggers (hps_io 0x46)
+  input  logic  [7:0] joy_rt0,
+  input  logic  [7:0] paddle0,
+  input  logic        st_pedswap,    // the driving OSD lines (m3_cab_inputs)
+  input  logic  [1:0] st_ssens,
+  input  logic  [1:0] st_ssm,
+  input  logic        st_rsteer,
+  input  logic  [1:0] st_wheel,
+  output logic        inp_drive,     // the driving profile is loaded (the OSD shows its lines)
+
+  output logic signed [15:0] audio_l,  // the sound link's (front + rear) / 2 a side with its gain, 44.1 kHz held (0 without SND_DSP)
+  output logic signed [15:0] audio_r,
+  input  logic  [1:0] snd_vol,         // the OSD's Volume: 0 Normal, 1 +6 dB, 2 +12 dB (m3_sndbridge)
   output logic        led,
   output logic        uart_tx,
   input  logic        tb_fast,       // bench only (0 on the board): the timebase at the clock rate
@@ -225,6 +271,13 @@ module m3_system
   localparam int EE_TWP_C   = (EE_TWP != 0)   ? EE_TWP   : CLK_HZ / 500;
   localparam int MIDI_GAP_C = (MIDI_GAP != 0) ? MIDI_GAP : CLK_HZ / 3125;
   localparam int T_REFI_C   = CLK_MHZ * 77 / 10;
+  // SDRAM row timings for a -6 part (tRC 60 ns, tRAS 42 ns), rounded up to whole clocks, never below m2_sdram's
+  // 7 / 5 (the counts proven on the board at 90-110 MHz): 7 / 5 to 116 MHz, 8 / 6 at 120. tRCD and tRP (15 ns)
+  // stay at m2_sdram's 2 clocks to 133 MHz.
+  localparam int T_RC_N     = (CLK_MHZ * 60 + 999) / 1000;
+  localparam int T_RAS_N    = (CLK_MHZ * 42 + 999) / 1000;
+  localparam int T_RC_C     = (T_RC_N  > 7) ? T_RC_N  : 7;
+  localparam int T_RAS_C    = (T_RAS_N > 5) ? T_RAS_N : 5;
   localparam logic [26:0] SDR_CROM = 27'h000_0000, SDR_FIXED = 27'h600_0000, SDR_BACKUP = 27'h620_0000,
                           SDR_RAM = 27'h640_0000, SDR_VRAM = 27'h6C0_0000, SDR_FIX8 = 27'h730_0000;
 
@@ -239,10 +292,19 @@ module m3_system
   // (preserve) so each block's reset fans out from a flip-flop of its own (rst_s[2] into the
   // rasteriser's registers was -0.52 ns at 100 MHz; study R104)
   (* preserve *) logic rst_geo = 1'b1, rst_rast = 1'b1;
+  // and one for the CPU (rst_s[2] into the FP divider's registers, -1.11 ns in a 110 MHz merged fit)
+  (* preserve *) logic rst_cpu = 1'b1;
+  // and one for the sound link (SND_DSP), which spans its own corner of the device
+  (* preserve *) logic rst_snd = 1'b1;
   always_ff @(posedge clk) begin
     rst_geo  <= rst_s[1];
     rst_rast <= rst_s[1];
+    rst_cpu  <= rst_s[1];
+    rst_snd  <= rst_s[1];
   end
+`ifdef VERILATOR
+  always_ff @(posedge clk) if ({rst_geo, rst_rast, rst_cpu, rst_snd} != {4{rst}}) $fatal(1, "m3_system: the reset copies");
+`endif
   logic por_n;                       // power-on: the EEPROM and the I/O latches
   always_ff @(posedge clk) por_n <= mem_rst_n;
 
@@ -265,14 +327,32 @@ module m3_system
   logic [3:0]  wb_col;
   logic [15:0] wb_din;
   logic [1:0]  wb_be;
-  m2_sdram #(.COL_BITS(COL_BITS), .NP(NSP), .T_REFI(T_REFI_C), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL),
+`ifdef M3_R3B
+  // (study R144) two write-burst ports, the bus and r3d_mem: the columns come from the port the controller is
+  // writing for
+  logic [2:0]  wb_grant;
+  logic [15:0] sp_wbd, r3_wbd;
+  logic [1:0]  sp_wbb, r3_wbb;
+  assign wb_din = (wb_grant == 3'd4) ? r3_wbd : sp_wbd;
+  assign wb_be  = (wb_grant == 3'd4) ? r3_wbb : sp_wbb;
+`endif
+  m2_sdram #(.COL_BITS(COL_BITS), .NP(NSP), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL),
              .PRI(SDR_PRI), .PRI_CAP(SDR_PRI_CAP), .AGE(SDR_AGE), .AGE_T(SDR_AGE_T), .BXOR(SDR_BXOR),
              .L16({{(NSP-1){1'b0}}, SDR_L16}), .PAIR({{(NSP-1){1'b0}}, SDR_PAIR}),
-             .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdram (   // port 0 (the bus) writes in bursts (R101)
+`ifdef M3_R3B
+             .WB(NSP'(6'b010001)), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD),
+             .SHD(SDR_SHD ? NSP'(6'b101111) : NSP'(0))) u_sdram (   // R101, R144: the bus (port 0) and r3d_mem (port 4) write in bursts
+`else
+             .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD),
+             .SHD(SDR_SHD ? NSP'(6'b101111) : NSP'(0))) u_sdram (   // port 0 (the bus) writes in bursts (R101)
+`endif
     .clk, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm, .sd_dq_o, .sd_dq_oe, .sd_dq_i,
     .wr_req(ld_req), .wr_addr(ld_addr), .wr_din(ld_din), .wr_be(ld_be), .wr_ack(ld_ack),
     .p_req, .p_we, .p_addr, .p_din, .p_be, .p_dout, .p_ack, .p_long, .p_lo, .wb_col, .wb_din, .wb_be,
+`ifdef M3_R3B
+    .wb_grant(wb_grant),
+`endif
     .dbg_req(), .dbg_grant());
 
   logic [26:0] ld_bytes;
@@ -286,21 +366,28 @@ module m3_system
   logic [15:0][4:0] cfg_bank /* verilator public_flat_rd */;
   logic [7:0]  cfg_in2 /* verilator public_flat_rd */, cfg_in3 /* verilator public_flat_rd */;
   logic [7:0]  cfg_dsw /* verilator public_flat_rd */;   // the DIP bank (R133)
-  m3_loader #(.AW(AW), .BACKUP(SDR_BACKUP), .FIX8(SDR_FIX8),
+  logic [7:0]  cfg_prof /* verilator public_flat_rd */, cfg_pflg;   // the input profile and its flags
+  m3_loader #(.AW(AW), .BACKUP(SDR_BACKUP), .FIX8(SDR_FIX8), .OWIRE(BR_LD),
               .VROM_X((VROM_LOC != 0) && (VROM_LOC == XMEM)), .VROM_AT(27'h400_0000)) u_ld (   // R100: VROM placement
     .clk, .rst(!mem_rst_n), .mem_ready, .x_ok(ddr_ok),
     .ioctl_download, .ioctl_index, .ioctl_wr, .ioctl_addr, .ioctl_dout, .ioctl_wait,
     .sdr_wr_req(ld_req), .sdr_wr_addr(ld_addr), .sdr_wr_din(ld_din), .sdr_wr_be(ld_be), .sdr_wr_ack(ld_ack),
     .x_req(lx_req), .x_addr(lx_addr), .x_din(lx_din), .x_ack(lx_ack),
     .ee_we(ee_ld_we), .ee_a(ee_ld_a), .ee_d(ee_ld_d),
-    .cfg_step, .cfg_flags, .cfg_bank, .cfg_in2, .cfg_in3, .cfg_dsw,
+    .cfg_step, .cfg_flags, .cfg_bank, .cfg_in2, .cfg_in3, .cfg_dsw, .cfg_prof, .cfg_pflg,
     .rom_loaded, .busy(loader_busy), .overflow(ld_ovf), .bytes(ld_bytes));
 
   // R100: the game configuration, static while the game runs (it changes only
   // during a download, with the game in reset)
-  wire        step2   = STEP2 && cfg_step >= 8'h20;           // the Step 2.x devices
-  wire        step15  = cfg_step >= 8'h15;                    // 13.11 vertices, full culling nodes
-  wire [1:0]  jstep   = {cfg_step >= 8'h20, cfg_step == 8'h15 || cfg_step == 8'h21};
+  // The step's decodes are registered (c7_s1: cfg_step into m3_bus's read data and r3d_texup's FIFO, -1.1 ns): they
+  // follow cfg_step a cycle later, while the loader is busy and the game in reset.
+  logic       step2, step15;
+  logic [1:0] jstep;
+  always_ff @(posedge clk) begin
+    step2  <= STEP2 && cfg_step >= 8'h20;                     // the Step 2.x devices
+    step15 <= cfg_step >= 8'h15;                              // 13.11 vertices, full culling nodes
+    jstep  <= {cfg_step >= 8'h20, cfg_step == 8'h15 || cfg_step == 8'h21};
+  end
   // VROM in the extra memory: by placement (VROM_LOC), or by the set (Step 2: flags bit 0)
   wire        vrom_x  = (XMEM == 1) && (((VROM_LOC != 0) && (VROM_LOC == XMEM)) || cfg_flags[0]);
   wire        fixed8  = cfg_flags[1];                         // an 8 MiB fixed CROM at SDR_FIX8
@@ -312,13 +399,13 @@ module m3_system
   // the CPU
   // ===========================================================================
   // the timebase and decrementer count at the 66 MHz bus / 4 (D-14): 16.5 MHz
-  logic [7:0] tb_acc;
+  logic [8:0] tb_acc;   // 9 bits: tb_acc + 33 reaches 2 x CLK_MHZ + 32, past 255 above 111 MHz
   logic       tb_tick;
   always_ff @(posedge clk) begin
     if (rst) begin tb_acc <= '0; tb_tick <= 1'b0; end
     else if (tb_fast) tb_tick <= 1'b1;
-    else if (tb_acc + 8'd33 >= 8'(2 * CLK_MHZ)) begin tb_acc <= tb_acc + 8'd33 - 8'(2 * CLK_MHZ); tb_tick <= 1'b1; end
-    else begin tb_acc <= tb_acc + 8'd33; tb_tick <= 1'b0; end
+    else if (tb_acc + 9'd33 >= 9'(2 * CLK_MHZ)) begin tb_acc <= tb_acc + 9'd33 - 9'(2 * CLK_MHZ); tb_tick <= 1'b1; end
+    else begin tb_acc <= tb_acc + 9'd33; tb_tick <= 1'b0; end
   end
 
   logic [1:0]       m_req, m_ack, m_wnext, m_rvalid;
@@ -345,7 +432,7 @@ module m3_system
   localparam bit XC_ON  = XCAP    && OV_ON;
 
   ppc_cpu #(.PVR(PVR), .ISB(ISB)) u_cpu (
-    .clk, .rst,
+    .clk, .rst(rst_cpu),
     .m_req(m_req[0]), .m_cmd(m_cmd[0]), .m_addr(m_addr[0]), .m_be(m_be[0]), .m_wdata(m_wdata[0]),
     .m_ack(m_ack[0]), .m_wnext(m_wnext[0]), .m_rvalid(m_rvalid[0]), .m_rdata,
     // the D-cache snoop (D-41): the 53C810's RAM accesses, from m3_bus
@@ -416,7 +503,7 @@ module m3_system
   logic [31:8] sc_win_base;
   logic [5:0]  cf_idx;
 
-  m3_scripts #(.R3DMA(STEP2)) u_scsi (
+  m3_scripts #(.R3DMA(STEP2), .LDV(BR_BUS)) u_scsi (
     .clk, .rst, .step2,     // R100: Step 2.x, the Real3D DMA device on this move engine
     .c_req(cf_req), .c_we(cf_we), .c_idx(cf_idx), .c_be(cf_be), .c_wdata(cf_wdata), .c_ack(cf_ack), .c_rdata(cf_rdata),
     .win_en(sc_win_en), .win_base(sc_win_base),
@@ -476,13 +563,29 @@ module m3_system
   assign sec_req = 1'b0; assign sec_we = 1'b0; assign sec_addr = '0; assign sec_be = '0; assign sec_wdata = '0;
 `endif
 
+  // one second of clk (the bridges pass): the RTC's (m3_bus EXT_SEC) and the frame counter's (m3_fps EXT_SEC), the
+  // count each of them kept, from the game's reset
+  localparam int SCW = $clog2(CLK_HZ);
+  logic [SCW-1:0] sec_cnt;
+  wire            sec_tick = BR_SEC && (sec_cnt == SCW'(CLK_HZ - 1));
+  always_ff @(posedge clk) if (rst || sec_tick) sec_cnt <= '0; else sec_cnt <= sec_cnt + 1'd1;
+`ifdef VERILATOR
+  // the counter m3_bus's rtc_pre and m3_fps's tcnt each were (reset with rst, CLK_HZ - 1 then 0): sec_tick is its wrap
+  logic [SCW-1:0] sec_chk;
+  always_ff @(posedge clk) begin
+    if (rst) sec_chk <= '0; else sec_chk <= (sec_chk == SCW'(CLK_HZ - 1)) ? '0 : sec_chk + 1'd1;
+    if (!rst && BR_SEC && sec_tick != (sec_chk == SCW'(CLK_HZ - 1))) $fatal(1, "m3_system: sec_tick against the old prescaler");
+  end
+`endif
+
   m3_bus #(.AW(AW), .SDR_CROM(SDR_CROM), .SDR_FIXED(SDR_FIXED), .SDR_BACKUP(SDR_BACKUP), .SDR_RAM(SDR_RAM),
-           .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P)
+           .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P), .TGT(TG_TIMING), .TG_MHZ(CLK_MHZ),
+           .C106_M10K(BR_C106), .OWIRE(BR_BUS), .WD_DEC(BR_BUS)
 `ifdef M3_STEP2_BUS
-           , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ)
+           , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ), .EXT_SEC(BR_SEC)
 `endif
            ) u_bus (
-    .clk, .rst,
+    .clk, .rst, .sec_tick,
 `ifdef M3_STEP2_BUS
     .step2, .fixed8, .crom_slot(crom_map[3:0]), .crom_zero(crom_map[4]),
     .sec_req, .sec_we, .sec_addr, .sec_be, .sec_wdata, .sec_ack, .sec_rdata,
@@ -500,17 +603,51 @@ module m3_system
     .pingpong_o(pingpong), .pingpong_i(r3_pingpong), .h_go, .h_rdy, .h_we, .h_addr, .h_wdata, .h_rv, .h_rdata,
     .r3d_cfg0, .r3d_cfg1, .r3d_cfg2,
     .jt_wr, .jt_wdata, .jt_busy, .jt_tdo, .jt_cfg_we, .jt_cfg0, .jt_cfg1, .jt_cfg2,
+    .snd_we, .snd_data, .snd_byte,
     .tr_v, .tr_master, .tr_we, .tr_addr, .tr_be, .tr_data);
 
   m3_sdr_port #(.AW(AW), .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .RA(SDR_RA), .RA_TOP(SDR_VRAM), .RA_CONF(SDR_RA_CONF), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ), .PW_DLY(SDR_PW_DLY)) u_sport (
     .clk, .rst(!mem_rst_n), .ra_clr(rst),
     .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
     .p_req(p_req[0]), .p_we(p_we[0]), .p_addr(p_addr[0]), .p_din(p_din[0]), .p_be(p_be[0]), .p_long(p_long[0]),
+`ifdef M3_R3B
+    .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]), .wb_col, .wb_din(sp_wbd), .wb_be(sp_wbb));
+`else
     .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]), .wb_col, .wb_din, .wb_be);
+`endif
+
+  // the cabinet (m3_inputs): the sticks, triggers and paddle registered once here, beside the logic they feed
+  // (Model 2 R842: hps_io's analog outputs straight into the steering block failed clk_sys there)
+  logic [7:0]      io_in0, io_in2, io_in3;
+  logic            io_test_b_n, io_service_b_n;
+  logic [7:0][7:0] io_an;
+  generate if (INPUTS) begin : g_inputs
+    logic [15:0] jl0_q, jl1_q, jr0_q;
+    logic  [7:0] lt0_q, rt0_q, pad0_q;
+    always_ff @(posedge clk) begin
+      jl0_q <= joy_l0; jl1_q <= joy_l1; jr0_q <= joy_r0;
+      lt0_q <= joy_lt0; rt0_q <= joy_rt0; pad0_q <= paddle0;
+    end
+    m3_inputs #(.SYS_MHZ(CLK_MHZ), .DRIVE(INP_DRIVE), .GUN(INP_GUN), .FISH(INP_FISH), .LEAN(INP_LEAN)) u_inputs (
+      .clk, .rst_n(!rst), .prof(cfg_prof), .pflg(cfg_pflg), .idle_c(cfg_in2), .idle_d(cfg_in3),
+      .joystick_0, .joystick_1, .joy_analog(jl0_q), .joy_ranalog(jr0_q), .joy_analog_1(jl1_q), .paddle(pad0_q),
+      .trig_rt(rt0_q), .trig_lt(lt0_q),
+      .st_pedswap, .st_ssens, .st_ssm, .st_rsteer, .st_wheel,
+      .in0(io_in0), .test_b_n(io_test_b_n), .service_b_n(io_service_b_n), .in2(io_in2), .in3(io_in3), .an(io_an),
+      .drive(inp_drive));
+  end else begin : g_noinputs
+    assign io_in0 = 8'hFF; assign io_test_b_n = 1'b1; assign io_service_b_n = 1'b1;
+    assign io_in2 = cfg_in2; assign io_in3 = cfg_in3; assign io_an = '0; assign inp_drive = 1'b0;
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire _unused_inp = &{1'b0, joystick_0, joystick_1, joy_l0, joy_l1, joy_r0, joy_lt0, joy_rt0, paddle0,
+                         st_pedswap, st_ssens, st_ssm, st_rsteer, st_wheel, cfg_prof, cfg_pflg};
+    /* verilator lint_on UNUSEDSIGNAL */
+  end endgenerate
 
   m3_io #(.EE_TWP(EE_TWP_C), .EE_LOAD(1'b1)) u_io (
     .clk, .por_n, .rst_n(!rst), .sel(io_sel), .we(io_we), .off(io_off), .wbyte(io_wbyte), .rbyte(io_rbyte),
-    .in0(8'hFF), .test_b_n(1'b1), .service_b_n(1'b1), .in2(cfg_in2), .in3(cfg_in3), .dsw(cfg_dsw), .pa_q(io_pa),
+    .in0(io_in0), .test_b_n(io_test_b_n), .service_b_n(io_service_b_n), .in2(io_in2), .in3(io_in3), .an(io_an),
+    .dsw(cfg_dsw), .pa_q(io_pa),
     .ee_ld_we, .ee_ld_a, .ee_ld_d);       // R100: the MRA's <nvram>
 
   m3_jtag u_jtag (
@@ -529,8 +666,9 @@ module m3_system
   // ---- DDR3: m3_ddr3p (the texture cache on its pipelined port, R100's
   // extra memory reads on a second) behind m3_ddr_arb: 0 the layer's
   // scan-out, 1 the store, 2 the layer, 3 the geometry's polygon reads,
-  // 4 r3d_mem, 5 r3d_texup, 6 the loader's extra-memory writes (R100)
-  localparam int NDP = 7;
+  // 4 r3d_mem, 5 r3d_texup, 6 the loader's extra-memory writes (R100), 7 the sound
+  // link (SND_DSP)
+  localparam int NDP = SND_DSP ? 8 : 7;
   localparam logic [24:0] D_XMEM = 25'h100_0000;                   // R100: VROM, 64 MiB
   logic        xp_req, xp_ack, xp_rvalid;
   logic [7:0]  xp_blen;
@@ -550,6 +688,23 @@ module m3_system
     .wacc(d_wacc), .rvalid(d_rvalid), .ack(d_ack),
     .m_req(dm_req), .m_we(dm_we), .m_addr(dm_addr), .m_blen(dm_blen), .m_din(dm_din), .m_be(dm_be),
     .m_wacc(dm_wacc), .m_rvalid(dm_rvalid), .m_ack(dm_ack));
+  // ---- the sound link (D-53): the main CPU's sound port out to the HPS, its records and commands
+  // in to the SCSP DSPs, their channels out at 44.1 kHz (sm3-builds/sound/DESIGN.md section 16)
+  logic       snd_we, snd_data;
+  logic [7:0] snd_byte;
+  generate if (SND_DSP) begin : g_snd
+    m3_sndbridge #(.CLK_HZ(CLK_HZ), .D(256), .BLOCK(25'h1E4_0000)) u_snd (
+      .clk, .rst(rst_snd), .midi_we(snd_we), .midi_data(snd_data), .midi_byte(snd_byte), .vol(snd_vol),
+      .d_req(d_req[7]), .d_we(d_we[7]), .d_addr(d_addr[7]), .d_blen(d_blen[7]), .d_din(d_din[7]), .d_be(d_be[7]),
+      .d_wacc(d_wacc[7]), .d_rvalid(d_rvalid[7]), .d_ack(d_ack[7]), .d_dout(dm_dout),
+      .audio_l, .audio_r,
+      .sim_ff(1'b0), .dbg_idle(), .dbg_cyc(), .dbg_tick(), .dbg_fs(), .dbg_p(), .dbg_pop(), .dbg_ch(), .dbg_q(), .dbg_skip(),
+      .dbg_epoch(), .dbg_d18());
+  end else begin : g_nosnd
+    assign audio_l = '0; assign audio_r = '0;
+    wire _unused_vol = &{1'b0, snd_vol};
+  end endgenerate
+
   m3_ddr3p #(.PIPE(1'b1), .NP(2), .MAXQ(DDR_MAXQ)) u_ddr3 (   // R101: reads in flight capped (the probe: 16 or more raise latency)
     .clk, .rst_n(mem_rst_n), .base(DDR_BASE),
     .req(dm_req && ddr_ok), .we(dm_we), .addr(dm_addr), .blen(dm_blen), .din(dm_din), .be(dm_be),
@@ -591,8 +746,13 @@ module m3_system
     .s_req(p_req[4]), .s_we(p_we[4]), .s_addr(p_addr[4]), .s_din(p_din[4]), .s_be(p_be[4]), .s_ack(p_ack[4]), .s_dout(p_dout[4]),
     .d_req(d_req[4]), .d_we(d_we[4]), .d_addr(d_addr[4]), .d_blen(d_blen[4]), .d_din(d_din[4]), .d_be(d_be[4]),
     .d_wacc(d_wacc[4]), .d_rvalid(d_rvalid[4]), .d_ack(d_ack[4]), .d_dout(dm_dout),
+`ifdef M3_R3B
+    .s_long(p_long[4]), .s_wbc(wb_col), .s_wbd(r3_wbd), .s_wbb(r3_wbb),
+`endif
     .n_runs, .n_copy);
+`ifndef M3_R3B
   assign p_long[4] = 1'b0;
+`endif
 
   // ---- textures
   // R100: Step 2's texture port (90) is three words, an address, a header and a word
@@ -736,11 +896,11 @@ module m3_system
   // ===========================================================================
   // video: timing, the tile generator, the overlay
   // ===========================================================================
-  logic [6:0] ce_acc;
+  logic [7:0] ce_acc;   // 8 bits: ce_acc + 16 reaches CLK_MHZ + 15, past 127 above 112 MHz
   always_ff @(posedge clk) begin
     if (!mem_rst_n) begin ce_acc <= '0; ce_pix <= 1'b0; end
-    else if (ce_acc + 7'd16 >= 7'(CLK_MHZ)) begin ce_acc <= ce_acc + 7'd16 - 7'(CLK_MHZ); ce_pix <= 1'b1; end
-    else begin ce_acc <= ce_acc + 7'd16; ce_pix <= 1'b0; end
+    else if (ce_acc + 8'd16 >= 8'(CLK_MHZ)) begin ce_acc <= ce_acc + 8'd16 - 8'(CLK_MHZ); ce_pix <= 1'b1; end
+    else begin ce_acc <= ce_acc + 8'd16; ce_pix <= 1'b0; end
   end
 
   logic [9:0] hcnt, vcnt;
@@ -1038,10 +1198,11 @@ module m3_system
   generate if (FPS) begin : g_fps
     logic nd0_q;
     always_ff @(posedge clk) nd0_q <= n_draw[0];
-    m3_fps #(.CLK_HZ(CLK_HZ)) u_fps (.clk, .rst, .en(fps_en), .draw(n_draw[0] ^ nd0_q), .x(x_d), .y(y_d),
+    m3_fps #(.CLK_HZ(CLK_HZ), .EXT_SEC(BR_SEC)) u_fps (.clk, .rst, .sec_tick, .en(fps_en), .avg(fps_avg), .draw(n_draw[0] ^ nd0_q), .x(x_d), .y(y_d),
                                      .box(fps_box), .ink(fps_ink));
   end else begin : g_nofps
     assign fps_box = 1'b0; assign fps_ink = 1'b0;
+    wire _unused_avg = &{1'b0, fps_avg};
   end endgenerate
 
   always_ff @(posedge clk) if (ce_pix) begin

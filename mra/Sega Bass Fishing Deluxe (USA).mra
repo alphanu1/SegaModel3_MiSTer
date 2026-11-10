@@ -30,7 +30,13 @@
         <dip name="SW7" bits="1" ids="On,Off"/>
         <dip name="SW8" bits="0" ids="On,Off"/>
     </switches>
+    <!-- the controls: input profile 03 (fishing), rtl/io/m3_inputs.sv -->
+    <buttons names="Cast,Select,Reel,Start,Coin,Test,Service"/>
 
+    <!-- game configuration: step 10, flags 00, banks 0-7 in slots 0-7, idle ports C and D, input profile 03 (fishing) -->
+    <rom index="4" md5="none">
+        <part>10 00 00 01 02 03 04 05 06 07 80 80 80 80 80 80 80 80 FF FF 03 00</part>
+    </rom>
     <rom index="0" zip="bassdx.zip" md5="none">
         <!-- 0x0000000  CROM0, 16 MiB (banks 0-1) -->
         <interleave output="64">

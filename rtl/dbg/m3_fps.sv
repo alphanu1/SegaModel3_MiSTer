@@ -10,21 +10,25 @@
 //
 // ---------------------------------------------------------------------------
 //
-// Frame counter: the Real3D frames begun in each second of clk (CLK_HZ
-// clocks, r3d_cmd's n_draw), shown as two decimal digits at the top right
-// on a dark box, the glyphs doubled (10 x 14). It saturates at 99 and leaves
-// a leading zero blank. Unlike the debug overlay it stays in release builds,
+// Frame counter: the Real3D frames begun a second (r3d_cmd's n_draw), the
+// mean over a window of 1, 5 or 10 seconds of clk (avg, the OSD's "FPS
+// average"), rounded to the nearest whole frame (a half up), shown as two
+// decimal digits at the top right on a dark box, the glyphs doubled (10 x 14).
+// It saturates at 99 and leaves a leading zero blank. Unlike the debug overlay it stays in release builds,
 // behind the OSD switch on en. box and ink follow x and y by two clocks;
 // x and y hold for a pixel, six clocks or more.
 
 module m3_fps #(
   parameter int CLK_HZ = 110_000_000,
   parameter int X0 = 460,             // box left: 28 wide, 8 from the 496-pixel line's end
-  parameter int Y0 = 8                // box top: 18 high
+  parameter int Y0 = 8,               // box top: 18 high
+  parameter bit EXT_SEC = 1'b0        // the second from sec_tick (m3_system's counter, the RTC's too), not tcnt
 ) (
   input  logic       clk,
   input  logic       rst,
+  input  logic       sec_tick,        // EXT_SEC: high in the clock tcnt would have read CLK_HZ - 1
   input  logic       en,
+  input  logic [1:0] avg,             // the window: 0 5 s (the OSD's default), 1 10 s, 2 1 s, 3 5 s
   input  logic       draw,            // one clock per frame begun
   input  logic [9:0] x,
   input  logic [9:0] y,
@@ -34,21 +38,46 @@ module m3_fps #(
 
   localparam int TW = $clog2(CLK_HZ);
 
-  // ---- count: BCD, one window a second, the shown pair latched at its end
+  // ---- count: frames x 10 / W over a window of W seconds, in three BCD digits (ch ct cu), so no divider: a frame
+  // adds 10 in a 1 s window, 2 in a 5 s one, 1 in a 10 s one. At the window's end the shown pair is {ch, ct},
+  // one more when cu is 5 or over (the mean rounded), 99 at most. The count holds at 999; a new setting starts a
+  // new window.
   logic [TW-1:0] tcnt;
-  logic [3:0]    c1, c0, d1, d0;
+  logic [3:0]    ch, ct, cu, d1, d0, wcnt;
+  logic [1:0]    avg_q;
+  wire wrap = EXT_SEC ? sec_tick : (tcnt == TW'(CLK_HZ - 1));
+  wire w1   = avg == 2'd2;                       // 1 s: x 10
+  wire w10  = avg == 2'd1;                       // 10 s: x 1
+  wire wend = wrap && (w1 || wcnt == (w10 ? 4'd9 : 4'd4));
+  wire [3:0] k = w10 ? 4'd1 : 4'd2;              // the units' step (5 s, 10 s)
+  wire [4:0] us = {1'b0, cu} + {1'b0, k};
+  wire       uc = us >= 5'd10;                   // the units carry
+  wire       tinc = w1 || uc;                    // the tens step
+  wire       full = ch == 4'd9 && ct == 4'd9 && tinc;
+  wire       rup  = cu >= 4'd5;                  // the shown pair one up
   always_ff @(posedge clk) begin
-    if (rst) begin
-      tcnt <= '0; c1 <= 4'd0; c0 <= 4'd0; d1 <= 4'd0; d0 <= 4'd0;
-    end else if (tcnt == TW'(CLK_HZ - 1)) begin
-      tcnt <= '0;
-      d1 <= c1; d0 <= c0;
-      c1 <= 4'd0; c0 <= {3'd0, draw};
+    avg_q <= avg;
+    if (!EXT_SEC) tcnt <= (rst || wrap) ? '0 : tcnt + 1'd1;
+    if (rst) begin d1 <= 4'd0; d0 <= 4'd0; end
+    if (rst || avg != avg_q) begin
+      ch <= 4'd0; ct <= 4'd0; cu <= 4'd0; wcnt <= 4'd0;
+    end else if (wend) begin
+      // the window's mean, rounded; this clock's frame is the next window's first
+      wcnt <= 4'd0;
+      d1 <= ch; d0 <= ct;
+      if (rup && !(ch == 4'd9 && ct == 4'd9)) begin
+        if (ct == 4'd9) begin d1 <= ch + 4'd1; d0 <= 4'd0; end else d0 <= ct + 4'd1;
+      end
+      ch <= 4'd0;
+      ct <= {3'd0, draw && w1};
+      cu <= (draw && !w1) ? k : 4'd0;
     end else begin
-      tcnt <= tcnt + 1'd1;
-      if (draw && !(c1 == 4'd9 && c0 == 4'd9)) begin
-        if (c0 == 4'd9) begin c0 <= 4'd0; c1 <= c1 + 4'd1; end
-        else c0 <= c0 + 4'd1;
+      if (wrap) wcnt <= wcnt + 4'd1;
+      if (draw && !full) begin
+        if (!w1) cu <= uc ? 4'(us - 5'd10) : us[3:0];
+        if (tinc) begin
+          if (ct == 4'd9) begin ct <= 4'd0; ch <= ch + 4'd1; end else ct <= ct + 4'd1;
+        end
       end
     end
   end

@@ -125,6 +125,8 @@ module ppc_dcache
   output logic [31:0] d_rdata,
   output logic [31:0] d_eword,      // EARLY: the predicted way's word at rd_a, in the lookup cycle (dq[pw])
   output logic        d_eok,        // EARLY: d_rdata is the d_eword of the cycle before (a register)
+  output logic [3:0][31:0] d_ew4,   // EARLY: each way's word at rd_a (d_eword is d_ew4[d_epw]; ppc_core EWL)
+  output logic [1:0]  d_epw,        // EARLY: the predicted way
 
   input  logic        hid_dce,
   input  logic        hid_dlock,
@@ -156,6 +158,12 @@ module ppc_dcache
   output logic [1:0]  t_alloc_way,
   output logic [19:0] t_alloc_tag
 );
+  // (R140) the restructurings' own checks; R140_NOCHK turns them off for the planted-fault runs
+`ifdef R140_NOCHK
+  localparam bit R1C = 1'b0;
+`else
+  localparam bit R1C = 1'b1;
+`endif
 
   localparam logic [2:0] K_LD = 3'd0, K_ST = 3'd1, K_TCH = 3'd2, K_DCBZ = 3'd3,
                          K_DCBST = 3'd4, K_DCBF = 3'd5, K_DCBI = 3'd6;
@@ -221,7 +229,9 @@ module ppc_dcache
   logic        x_rwv;                           // the hit way is known (a misprediction)
   logic [1:0]  x_rw;
   logic        l_x;                             // the last edge read X's set
-  logic        d_rdy_q;
+  // (preserve, R140: the 110 MHz full build c7_s1 retimed d_rdy_q back into its next-state logic, so rdy_c,
+  // with a fanout of 82, led into the core's hold and the FP operand registers: the build's worst path)
+  (* preserve *) logic d_rdy_q;
 
   // MQ: a miss waiting for the memory port
   logic        mq_v, mq_vdirty;
@@ -350,7 +360,17 @@ module ppc_dcache
   logic [6:0]  rd_set_q;
   wire  [8:0]  st_ram = stm[rd_set_q];
   wire  [8:0]  st     = (s_v && s_set == rd_set_q) ? s_new : st_ram;
-  wire  [1:0]  st_mru = st[4:3];
+  // The predicted way for the data output (LU2's early word is dq[pw]): the state write's bypass compare
+  // registered beside rd_set_q (sbyp_q: s_set and rd_set_q are r_set and rd_a's set at the last edge), and
+  // a written set's MRU is its hit way (s_way), so pw is one LUT after the state MLAB's read (R140; the full
+  // build c7_s1 had s_v, its compare, the bypass and pw in line in front of the early word, -1.93 ns into
+  // op_a at 110 MHz)
+  logic        sbyp_q;
+  (* keep = 1 *) wire sb_hit = s_v && sbyp_q;
+  wire  [1:0]  st_mru = sb_hit ? s_way : st_ram[4:3];
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (R1C && !rst && st_mru != st[4:3]) $fatal(1, "dcache: the MRU way by the registered bypass");
+`endif
 
   // Each way's tag is compared with both candidates, X's and R's, and a
   // copy of x_v of its own (x_vc: x_v drives some 200 loads) chooses at the
@@ -698,6 +718,8 @@ module ppc_dcache
   // the hit is not in it (the core takes d_eok with d_valid). The core takes dq[pw] in the lookup cycle as
   // its operand where a load's consumer has left ID, and confirms it with d_valid and d_eok.
   assign d_eword = EARLY ? dq[pw] : 32'd0;
+  assign d_ew4   = EARLY ? dq : '0;
+  assign d_epw   = EARLY ? pw : 2'd0;
   always_ff @(posedge clk)
     d_eok <= EARLY && !(er_ans || srd_ans || fh) && !(sb_m && |sb_be) && !(sbl_m && |sbl_be);
 `ifdef VERILATOR
@@ -748,6 +770,7 @@ module ppc_dcache
   always_ff @(posedge clk) begin
     l_x <= rd_sel == RD_X;
     rd_set_q <= rd_a[9:3];
+    sbyp_q   <= r_set == rd_a[9:3];
     if (rst) begin
       r_v <= 1'b0; r_fresh <= 1'b0; r_post <= 1'b0; x_v <= 1'b0; x_vc <= 1'b0; d_rdy_q <= 1'b0;
     end else begin
@@ -983,7 +1006,43 @@ module ppc_dcache
   assign res_kill = SNOOP && (rv_kill || (rsv_q && rv_new));
 
   assign m_wdata = (m_cmd == MC_WR) ? uq_wd : cb_zero ? 32'd0 : cbm[wb_cnt];
-  assign d_idle  = !r_v && !x_v && quiet && !wk_act && !wk_req && !fb_v;
+  // d_idle from a register (R140): its next value from the next state of each of the seventeen registers it
+  // reads. Formed in the cycle, the OR of those registers was two levels in front of the core's sync wait and
+  // from there EX's hold into every operand register's enable and the queue's pops (ppc_cpu spike: cp_act ->
+  // d_idle -> sync_wait_q -> qh_x -> f_hold -> fa_q's enable, -1.75 ns at 120 MHz, the spike's worst family).
+  // Each term below is that register's assignment above, in the same priority (a later assignment wins).
+  wire wk_go    = !wk_act && wk_req && quiet && !r_v && !x_v && !sn_np;     // the sweep starts (wk_req clears)
+  wire mp_wbend = mp == MP_WB && m_wnext && wb_cnt == 3'd7;
+  wire mp_uqend = (mp == MP_RQ && m_ack && m_cmd == MC_WR) || (mp == MP_SRD && m_rvalid);
+  wire mpn_idle = (mp == MP_IDLE) ? !((wb_pend && !cp_act) || fill_go || (uq_v && !f_act)) :
+                  (mp == MP_RQ)   ? (m_ack && m_cmd == MC_WR) :
+                  (mp == MP_WB)   ? mp_wbend :
+                  (mp == MP_FILL) ? (m_rvalid && f_cnt == 3'd7) :
+                  (mp == MP_SRD)  ? m_rvalid : 1'b1;
+  wire mq_v_n   = (d_alloc && !fill_go) || (mq_v && !(fill_go && fs_mq));
+  wire f_act_n  = fill_go || (f_act && !(!beat && f_ph == 2'd3));
+  wire cp_act_n = do_cp || (fill_go && fs_vd) || (cp_act && !(!cp_rd && cp_dv));
+  wire z_act_n  = do_z || (z_act && !(!z_wcp && z_cnt[3]));
+  wire wbp_set  = (!do_cp && !(fill_go && fs_vd) && cp_act && !cp_rd && cp_dv && cp_wb) || do_cbz ||
+                  (!fill_go && f_act && !beat && f_ph == 2'd3 && f_wb);
+  wire wb_pend_n = !mp_wbend && (wbp_set || wb_pend);
+  wire uq_v_n   = !mp_uqend && (l_uq || uq_v);
+  wire sb_v_n   = l_sb || (f_act && f_ph == 2'd1 && f_k == K_ST);
+  wire tw_n     = wk_act || do_tw || fill_go;                                // tw_en_q's next value is nonzero
+  wire wk_act_n = wk_act ? wk_cnt != 8'd127 : wk_go;
+  wire wk_req_n = !wk_go && (wk_req || (hid_dcfi && !dcfi_q && hid_dce));
+  wire fb_v_n   = !fill_go && f_act && beat;
+  // (d_req, late from EX's translation, joins at the last level: r_v_n is d_req || (r_v && !lr))
+  (* keep = 1 *) wire idl_n = !rst && !(r_v && !lr) && !x_v_c && !l_dq && !mq_v_n && !f_act_n && !cp_act_n && !z_act_n &&
+                              !wb_pend_n && !uq_v_n && mpn_idle && !sb_v_n && !tw_n && !wk_act_n && !wk_req_n && !fb_v_n;
+  (* preserve *) logic d_idle_q;
+  always_ff @(posedge clk) d_idle_q <= idl_n && !d_req;
+  assign d_idle  = d_idle_q;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && d_idle_q != (!r_v && !x_v && quiet && !wk_act && !wk_req && !fb_v))
+      $fatal(1, "dcache: d_idle's register %b against its terms %b", d_idle_q, !r_v && !x_v && quiet && !wk_act && !wk_req && !fb_v);
+`endif
 
 `ifdef PPC_CACHE_SIM
   // the protocol and the single write port, as the design relies on them

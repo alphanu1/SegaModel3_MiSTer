@@ -8,10 +8,19 @@ sources section instead.
 ## MiSTer framework (Template_MiSTer)
 
 - Source: https://github.com/MiSTer-devel/Template_MiSTer
-- Commit: `0874acdf053ff42c8dd179685d4ef95f577ce429` (2026-08-15)
+- Commit: `e901a9fa6548f4eb024619357b89d48be94fd9f8` (2026-11-03, "hps_io: support
+  for analog RT/LT input"); `sys/` was `0874acdf053ff42c8dd179685d4ef95f577ce429`
+  (2026-08-15) until the cabinet's controls went in. Between the two: `hps_io`'s
+  analogue triggers (`joystick_lt_analog_*` / `joystick_rt_analog_*`, Main's UIO
+  0x46) and its force feedback request (`FFB`, UIO 0x45, 76dd8f5; FFB 0 here),
+  the frame buffer parameters on the emu port (`LFB_*`, inputs, unused here),
+  registered analog audio pins, `ascal`'s gray-counter revert and o_state reset,
+  `yc_out`'s registered sine values
 - Licence: GPL-2.0-or-later (the template's `LICENSE`; individual `sys/` files
   carry their own headers)
-- Taken: `sys/` unchanged; `Template.sv` as `Model3.sv`, `Template.qsf`,
+- Taken: `sys/` unchanged (upstream e901a9f file for file; my Model 2 core's
+  `sys/` is the same plus its scaler line-buffer sizes, `IHRES(512)` /
+  `OHRES(2048)` in `sys_top.v`, which are not taken here); `Template.sv` as `Model3.sv`, `Template.qsf`,
   `Template.qpf`, `Template.sdc` and `Template.srf` as the `Model3.*` project
   files; `rtl/pll.v`, `rtl/pll.qip`, `rtl/pll/`; `rtl/mycore.v`, `rtl/lfsr.v` and
   `rtl/cos.sv` as `rtl/video/` (the test picture).
@@ -39,6 +48,29 @@ sources section instead.
   function is a mux.
 - Also taken earlier, unchanged: `rtl/mem/m2_sdram.sv`, `rtl/video/m2_video_timing.sv`
   (used by the stage-A system, `rtl/sys/m3_system.sv`).
+- Also taken, at `4d79cd47f9` (both files last changed in 757aa7ba, the analogue
+  triggers, Model 2 R981): `rtl/io/m2_2a_inputs.sv` as `rtl/io/m3_inputs.sv` and
+  `rtl/io/m2_cab_inputs.sv` as `rtl/io/m3_cab_inputs.sv`, the cabinet's controls,
+  with Model2.sv's hps_io hook-up (the joysticks, sticks, triggers and paddle,
+  registered once before the mapping: Model 2 R842) and its driving OSD lines
+  and status bits. Kept: the profile scheme (one fixed button order a profile,
+  which the MRA's `<buttons names>` follows), the stick-to-d-pad dead zone
+  (R879), Daytona's steering sources, sensitivity, smoothing, Wheel A / B,
+  pedals and triggers, its button order. Changed for Model 3: the ports are
+  Model 3's (MAME 0.289 model3.cpp, Supermodel 036af1c ReadInputs: port B's
+  two banks, C, D, eight ADC channels); the profile comes from the game
+  configuration's byte 20 (`m3_loader`); the ADC runs 0x00-0xFF (Model 2's
+  ports are PORT_MINMAX 0x20-0xE0), so the steering's default sensitivity is
+  Full and the smoothing's rates are scaled by 4/3; the shifter is Model 3's
+  four-speed H in Supermodel's encoding, from first gear; Desert Tank's map,
+  the Virtua Cop guns' serial driver, Over Rev / STCC's scaling, Sky Target,
+  Manx TT's motion base and Zero Gunner's map are Model 2 only and not taken;
+  the analog guns (Lost World) and the fishing controls (Bass Fishing) are
+  Model 3's profiles. The OSD bits are used as hps_io gives them (it runs on
+  clk_sys here, so Model 2's three-flop synchronisers are dropped), and
+  "Steering", "Steering smoothing" and "Analog control" are build options
+  (`m3_cab_inputs` SENS / SMOOTH / WHEEL; `Model3.sv` macro `M3_INP_LEAN` leaves
+  all three out, each reading as its default).
 
 ## Supermodel, Model 3 system behaviour (transcribed, stage A)
 
@@ -115,6 +147,19 @@ Supermodel (GPL-3.0-or-later) is instrumented only, through
   GPL-3.0-or-later): behaviour only, no code. The default frustum follows
   `CNew3D::RenderViewport` / `CalcViewport` and `Mat4::FrustumRZ`; node culling
   follows its block culling, as before.
+
+## Supermodel, the SCSP DSP and its effect return (transcribed, D-53)
+
+- Source: https://github.com/trzy/supermodel, commit `036af1c`
+- Files: `Src/Sound/SCSPDSP.cpp`, `SCSPDSP.h` (the DSP's step, after Mednafen's), `Src/Sound/SCSP.cpp`
+  (the effect return, the DAC18B clip)
+- Licence: GPL-3.0-or-later, the same as this project.
+- Taken: the DSP's pipeline (the access a step after MRD / MWT, a read before a waiting write, IWT's
+  MEMVAL from before the access, the 26-bit ACC and SHIFTED, the empty steps past LastStep, a stopped
+  DSP), PACK / UNPACK, and the effect return ((EFREG x pan) >> 12 a term) and clip, re-expressed in
+  `rtl/sound/m3_scsp_dsp.sv`; the link to the HPS is `rtl/sound/m3_sndbridge.sv`, my own. Proved
+  bit-exact against arcsnd's port of the same files (the design study, D-53 and its R-entries).
+  No Supermodel code is copied verbatim.
 
 ## Model 2 core: the SCSP (same author)
 

@@ -267,10 +267,10 @@ module r3d_rast_store #(
   // list its start S modulo 2^RB (0 when empty: the region's top). A record fits when O + beats < S (S = 0
   // read as 2^RB): the region's last beat is never used, which is what keeps O below 2^RB. The sweep
   // clears every pointer to 0.
-  (* ramstyle = "MLAB, no_rw_check" *) logic [RB-1:0] nx [8];
+  (* ramstyle = "M10K, no_rw_check" *) logic [RB-1:0] nx [8];    // M10K (area pass): read registered, as nx_q
   logic [RB-1:0] nx_q;
   // (PAIR) a copy of nx read at the pass's other list, the bound the record must not cross
-  (* ramstyle = "MLAB, no_rw_check" *) logic [RB-1:0] nxp [8];
+  (* ramstyle = "M10K, no_rw_check" *) logic [RB-1:0] nxp [8];   // M10K (area pass): read registered, as nxp_q
   logic [RB-1:0] nxp_q;
   logic          nx_we;
   logic [2:0]    nx_wa;
@@ -327,6 +327,23 @@ module r3d_rast_store #(
   wire [RB:0]   nhi  = {nhs == '0, nhs};
   wire        wfit   = (RB+1)'(nlo) + (RB+1)'(wnb) < nhi;
   wire [RB-1:0] wa_n = walpha ? nxl - RB'(wnb) : nxl;
+  // W_ADDR's fit test, start beat and the list's next pointer, formed a cycle early as registers: W_ADDR is
+  // entered only from the record's last word, where wnb is set from wk (wk >> 1), and lasts a cycle; nx is
+  // written only in W_ADDR and the sweep, so nx_q and wl are the same in both cycles (checked below). The
+  // pointer read through the add and compare into W_ADDR's ~80 enables and nx's write port was 114.8 MHz
+  // standalone (dpram -> wq_blen), and dpram_llo1 -> nx / wa in c7_s1 (-0.49 ns).
+  wire [3:0]    wnb_k  = 4'(wk >> 1);
+  logic         wfit_q;
+  logic [RB-1:0] wa_q, wnx_q;
+  always_ff @(posedge clk) begin
+    wfit_q <= (RB+1)'(nlo) + (RB+1)'(wnb_k) < nhi;
+    wa_q   <= walpha ? nxl - RB'(wnb_k) : nxl;
+    wnx_q  <= nxl + RB'(wnb_k);
+  end
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && ws == W_ADDR && {wfit_q, wa_q, wnx_q} != {wfit, wa_n, nxl + RB'(wnb)}) $fatal(1, "store: the fit a cycle early");
+`endif
   wire [8:0]  wbin   = {bc, wl};
   // the entry read for (bc, wl): extend its open run, or close it and open one
   wire [NRB-1:0] q_nr = e_nr(t_q);
@@ -365,10 +382,10 @@ module r3d_rast_store #(
   // nx's port: the sweep's first eight cycles set every list's start (odd lists, alpha, at the top);
   // W_ADDR writes the record's list
   always_comb begin
-    nx_we = 1'b0; nx_wa = wl; nx_wd = walpha ? wa_n : nxl + RB'(wnb);
+    nx_we = 1'b0; nx_wa = wl; nx_wd = walpha ? wa_q : wnx_q;
     if (ws == W_SWEEP && sw < 9'd8) begin
       nx_we = 1'b1; nx_wa = sw[2:0]; nx_wd = '0;
-    end else if (ws == W_ADDR && !nob_q && wfit) nx_we = 1'b1;
+    end else if (ws == W_ADDR && !nob_q && wfit_q) nx_we = 1'b1;
   end
   always_ff @(posedge clk) begin
     if (nx_we) begin nx[nx_wa] <= nx_wd; nxp[nx_wa] <= nx_wd; end
@@ -432,15 +449,15 @@ module r3d_rast_store #(
         end
         W_ADDR: begin
           if (nob_q) begin n_drop <= n_drop + 16'd1; ws <= W_REC; end
-          else if (!wfit) begin
+          else if (!wfit_q) begin
             n_drop <= n_drop + 16'd1; ovf[1] <= 1'b1; ws <= W_REC;
             if (ovf == 3'd0 && n_ovff != 16'hffff) n_ovff <= n_ovff + 16'd1;   // the frame's first overflow
           end
           else begin
-            wa <= wa_n;
+            wa <= wa_q;
             bc <= blo_q; bhi <= bhi_q;
             wq_req <= 1'b1; wq_we <= 1'b1; wq_be <= 8'hff;
-            wq_addr <= 25'(rec_a(wb, wl, wa_n));
+            wq_addr <= 25'(rec_a(wb, wl, wa_q));
             wq_blen <= 8'(wnb);
             wbt <= '0;
             ws <= W_WR;
@@ -472,12 +489,16 @@ module r3d_rast_store #(
           end
           bq_chk <= ne;
 `endif
+          // the old open run's write, its fields loaded whether or not it goes: the port is idle in W_BQ (W_WR
+          // and W_RUN end on their ack) and reads them only with wq_req (the close test from the table's
+          // word was in front of 30 enables: the table's M10K to wq_addr, 116.7 MHz standalone)
+          wrun <= {(25-RB)'(0), q_st, q_nb};
+          wq_we <= 1'b1; wq_be <= q_nr[0] ? 8'hf0 : 8'h0f;
+          wq_addr <= 25'(run_a(wb, wbin, q_nr[BB:1]));
+          wq_blen <= 8'd1;
           if (close && keep) begin
             // the old open run to the bin's run list, entry q_nr
-            wrun <= {(25-RB)'(0), q_st, q_nb};
-            wq_req <= 1'b1; wq_we <= 1'b1; wq_be <= q_nr[0] ? 8'hf0 : 8'h0f;
-            wq_addr <= 25'(run_a(wb, wbin, q_nr[BB:1]));
-            wq_blen <= 8'd1;
+            wq_req <= 1'b1;
             n_run <= n_run + 16'd1;
             ws <= W_RUN;
           end else if (bc == bhi) ws <= W_REC;
@@ -522,7 +543,12 @@ module r3d_rast_store #(
   logic [NRB-1:0] ck_c;                             // that chunk (pr >> 5)
   logic [RB-1:0] rst_b;                             // the run to read: start, beats
   logic [6:0]    rnb;
-  wire [EW-1:0]  ecur = pal ? ea : eo;
+  // the bin entry in hand (pal ? ea : eo) as a register, loaded wherever eo, ea or pal is (c7_s1: pal, fanout
+  // 87, through the select and the run compare into P_RE's enables, -0.81 ns)
+  logic [EW-1:0] ecur;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && ps != P_IDLE && ps != P_TO && ps != P_TA && ecur != (pal ? ea : eo)) $fatal(1, "store: ecur registered");
+`endif
   wire [8:0]     pbin = {pband, pp, pal};
   assign p_ready = (ps == P_IDLE) && bst[pbk] == B_FULL;
   assign p_bank  = pb;
@@ -535,10 +561,18 @@ module r3d_rast_store #(
   (* ramstyle = "M10K" *) logic [31:0] rro [16];
   logic [3:0]  rr_wa;
   logic [31:0] rr_q;
+  // each bank read into its own output register and the parity select after them (area pass, Model 2 R985):
+  // a select in front of the register made Quartus read a clock early and forward the writes (Warning 276020,
+  // 72 flip-flops of pass-through in merge4b_s3). rr_q is every clock the word the register held.
+  logic [31:0] rre_q, rro_q;
+  logic        rr_odd;
   always_ff @(posedge clk) begin
     if (p_rv && ps == P_CKW) begin rre[rr_wa] <= m_dout[31:0]; rro[rr_wa] <= m_dout[63:32]; end
-    rr_q <= pr[0] ? rro[pr[4:1]] : rre[pr[4:1]];
+    rre_q  <= rre[pr[4:1]];
+    rro_q  <= rro[pr[4:1]];
+    rr_odd <= pr[0];
   end
+  assign rr_q = rr_odd ? rro_q : rre_q;
 
   // the FIFO: beats, {marker, word} by word parity; markers fill both halves
   // marker word: [31] 0 NEWGEN 1 BANDEND, [5:0] band
@@ -570,13 +604,13 @@ module r3d_rast_store #(
       case (ps)
         P_IDLE: if (p_take) begin pb <= pbk; pbk <= !pbk; pband <= '0; pp <= '0; ps <= P_TO; end
         P_TO: ps <= P_TA;
-        P_TA: begin eo <= t_q; ps <= P_TB; end
-        P_TB: begin ea <= t_q; ps <= P_DEC; end
+        P_TA: begin eo <= t_q; ecur <= pal ? ea : t_q; ps <= P_TB; end
+        P_TB: begin ea <= t_q; ecur <= pal ? t_q : eo; ps <= P_DEC; end
         P_DEC: begin
           if (!e_ov(eo) && !e_ov(ea)) ps <= P_NEXT;           // no run: no record (a bin is never only closed runs)
           else if (mk_room && !mk_we) begin
             mk_we <= 1'b1; mk_wd <= {1'b1, 1'b0, 25'd0, pband};
-            pal <= !e_ov(eo);
+            pal <= !e_ov(eo); ecur <= !e_ov(eo) ? ea : eo;
             ps <= P_BIN;
           end
         end
@@ -593,7 +627,7 @@ module r3d_rast_store #(
         P_RE: begin
           // the item in hand: the open run, or DDR3 run pr (its chunk loaded first)
           if (pn == '0) begin
-            if (!pal && e_ov(ea)) begin pal <= 1'b1; ps <= P_BIN; end
+            if (!pal && e_ov(ea)) begin pal <= 1'b1; ecur <= ea; ps <= P_BIN; end
             else ps <= P_NEXT;
           end else if (pal ? popen : (pr == e_nr(ecur))) begin rst_b <= e_st(ecur); rnb <= e_nb(ecur); ps <= P_RQ; end
           else if (ck_v && ck_c == (pr >> 5)) ps <= P_CK;    // rr_q valid next cycle

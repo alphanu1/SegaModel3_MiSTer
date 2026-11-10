@@ -40,6 +40,8 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/viewer/m3v_overlay.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/io/m3_scripts.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/io/m3_93c46.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/io/m3_io.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/io/m3_cab_inputs.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/io/m3_inputs.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_jtag.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_sdr_port.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_bus.sv
@@ -75,12 +77,15 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast_colour.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast_band.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast_fogvp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast_store.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast_zq.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_cmd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_mem.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_texup.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_vrom_rd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m3_ddr_arb.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/m3_scsp_dsp.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/m3_sndbridge.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m3_ddr3p.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/m2_fb_read.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/m3_compose.sv

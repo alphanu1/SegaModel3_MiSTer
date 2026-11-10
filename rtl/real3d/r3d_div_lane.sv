@@ -52,8 +52,6 @@ module r3d_div_lane (
     if (rst) begin
       k_r <= 5'd0;
     end else if (start && !busy) begin
-      n_r <= n;
-      d_r <= d;
       r   <= r0;
       q   <= 54'd0;
       k_r <= nb2;
@@ -62,11 +60,17 @@ module r3d_div_lane (
       t1 = step(r, n_r[53], d_r);
       t2 = step(t1[31:0], n_r[52], d_r);
       r   <= t2[31:0];
-      n_r <= {n_r[51:0], 2'b00};
       q   <= {q[51:0], t1[32], t2[32]};
       k_r <= k_r - 5'd1;
     end
   end
+
+  // the dividend and the divisor follow the inputs while the lane is idle, so they hold the start's when it
+  // starts; only q, r and k_r wait on start (it fanned out to 140 enables a lane, the edge's state through the
+  // front's go: 110 MHz merged fits, w_act / m_busy -> q / n_r -0.97 ns)
+  always_ff @(posedge clk)
+    if (!busy) begin n_r <= n; d_r <= d; end
+    else n_r <= {n_r[51:0], 2'b00};
 
   // a 33-bit {r, b} is kept in 32 bits: r < d < 2^32 and the step's result is
   // either r'' < d or the shifted r, whose top bit is lost only when 2 r + b

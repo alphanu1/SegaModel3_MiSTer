@@ -142,6 +142,31 @@ module r3d_rast_div #(
   assign o_s13 = zero[1] ? 54'sd0 : neg[1] ? (54'sd0 - l_q[1]) : l_q[1];
   assign o_s23 = zero[2] ? 54'sd0 : neg[2] ? (54'sd0 - l_q[2]) : l_q[2];
 
+  // the triangle's fields follow the inputs while the divider takes one (i_ready), so they hold the accepted
+  // triangle's from go until the slopes are taken; the edge reads them only with o_valid. They were behind go,
+  // the edge's state (study R131's FOV) through t_go: 200 enables.
+  always_ff @(posedge clk)
+    if (i_ready) begin
+      o_x1 <= i_x1; o_y1 <= i_y1; o_x2 <= i_x2; o_y2 <= i_y2; o_x3 <= i_x3; o_y3 <= i_y3; o_tag <= i_tag;
+      for (int j = 0; j < 3; j++) begin
+        neg[j]  <= h_neg[j];
+        zero[j] <= h_zero[j];
+      end
+    end
+`ifdef VERILATOR
+  logic [31:0] c_x1, c_y1, c_x2, c_y2, c_x3, c_y3;
+  logic [TGW-1:0] c_tag;
+  logic [2:0] c_neg, c_zero;
+  always_ff @(posedge clk) begin
+    if (go) begin
+      c_x1 <= i_x1; c_y1 <= i_y1; c_x2 <= i_x2; c_y2 <= i_y2; c_x3 <= i_x3; c_y3 <= i_y3; c_tag <= i_tag;
+      c_neg <= h_neg; c_zero <= h_zero;
+    end
+    if (!rst && o_valid && {o_x1, o_y1, o_x2, o_y2, o_x3, o_y3, o_tag, neg, zero} != {c_x1, c_y1, c_x2, c_y2, c_x3, c_y3, c_tag, c_neg, c_zero})
+      $fatal(1, "rast_div: the fields followed the inputs");
+  end
+`endif
+
   always_ff @(posedge clk) begin
     if (rst) begin
       busy    <= 1'b0;
@@ -150,11 +175,6 @@ module r3d_rast_div #(
       if (o_valid && o_ready) o_valid <= 1'b0;
       if (go) begin
         busy    <= 1'b1;
-        o_x1 <= i_x1; o_y1 <= i_y1; o_x2 <= i_x2; o_y2 <= i_y2; o_x3 <= i_x3; o_y3 <= i_y3; o_tag <= i_tag;
-        for (int j = 0; j < 3; j++) begin
-          neg[j]  <= h_neg[j];
-          zero[j] <= h_zero[j];
-        end
       end else if (busy) begin
         if (l_busy == 3'b000) begin
           busy    <= 1'b0;

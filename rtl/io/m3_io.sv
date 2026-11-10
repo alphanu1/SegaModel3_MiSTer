@@ -27,8 +27,10 @@
 //     does not set it. Lost World reads SW1 (bit 7) at start-up and, when it
 //     is ON (0), never enables its I-cache (study R133), so its MRA's default
 //     is 0xFF;
-//   - the analog channels read 0x00, as Supermodel gives VF3 (the trace's
-//     F004003C reads); MAME has the AN ports at their defaults;
+//   - the analog channels (the ADC at 0xF) are the an[] input: the cabinet's
+//     values from m3_inputs, the game's own per profile; 0x00 where a profile
+//     drives nothing, as Supermodel gives VF3 (the trace's F004003C reads;
+//     MAME has the AN ports at their defaults);
 //   - no gun board, no lamps or billboard outputs (written, not driven).
 // Port semantics (MAME sega/315_5649.cpp): offsets 0-6 ports A-G, a read is
 // the input when the direction bit is 1, else the latch; 8 direction (0xFF
@@ -65,6 +67,7 @@ module m3_io #(
   input  logic        service_b_n,
   input  logic [7:0]  in2,          // player 1
   input  logic [7:0]  in3,          // player 2
+  input  logic [7:0][7:0] an,       // the ADC's eight channels (m3_inputs)
   input  logic [7:0]  dsw,          // the DIP bank, port G (active low: 0 is ON)
   output logic [7:0]  pa_q,         // port A's latch (the overlay)
   input  logic        ee_ld_we,     // the 93C46's load port (EE_LOAD), the game in reset
@@ -100,7 +103,7 @@ module m3_io #(
     else case (off)
       4'hb:    rbyte = 8'h00;
       4'hd:    rbyte = SER_ST;
-      4'hf:    rbyte = 8'h00;
+      4'hf:    rbyte = an[an_ch];
       default: rbyte = 8'hff;
     endcase
   end
@@ -121,9 +124,5 @@ module m3_io #(
   end
 
   assign pa_q = pv[0];
-
-  /* verilator lint_off UNUSEDSIGNAL */
-  wire _unused = &{1'b0, an_ch};
-  /* verilator lint_on UNUSEDSIGNAL */
 
 endmodule

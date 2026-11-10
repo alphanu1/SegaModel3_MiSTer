@@ -117,8 +117,12 @@ module m3_tilegen_fetch #(
   logic [8:0]  csrc;
 
   // the name row buffer: entry {layer, srcx[8:5]} holds four names (one 4-word burst's image)
-  (* ramstyle = "M10K" *) logic [63:0] nram [64];
-  logic [5:0]  nra, nra_q;      // read address, registered in the RAM
+  // read into its own output register (area pass): nbuf is used only in S_PATA, whose address edge (from
+  // S_CHUNK or S_NLK) never writes (nwe is S_NREQ's), so the word written at the read's edge, which Quartus
+  // forwarded for the asynchronous read of nra_q (Warning 276020, 77 flip-flops of pass-through in
+  // merge4b_s3), is never one nbuf gives; in S_PATA nbuf is the word it was
+  (* ramstyle = "M10K, no_rw_check" *) logic [63:0] nram [64];
+  logic [5:0]  nra;             // read address, registered in the RAM
   logic [63:0] nbuf;            // the entry read
   logic        nwe;
   logic [5:0]  nwa;
@@ -127,9 +131,8 @@ module m3_tilegen_fetch #(
   logic        nf_ok;           // no name table write since this fill was requested
   always_ff @(posedge clk) begin
     if (nwe) nram[nwa] <= p_dout;
-    nra_q <= nra;
+    nbuf <= nram[nra];
   end
-  assign nbuf = nram[nra_q];
   logic [63:0] pbuf;
   logic [16:0] ptag;
   logic        pval;

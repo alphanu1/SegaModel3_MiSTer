@@ -238,16 +238,16 @@ module r3d_rast_texel #(
     if (en) tag2 <= tag1;
     if (en) ctr2 <= ctr1;
     if (en && PART != 2) begin
-      logic [13:0] ca, cb;
-      logic [10:0] ra, rb;
-      ca = {3'd0, x01} + {1'b0, mirx(u1a, pw1)};
-      cb = {3'd0, x01} + {1'b0, mirx(u1b, pw1)};
-      ra = 11'(y01 + 11'(mirx(v1a, ph1)));
-      rb = 11'(y01 + 11'(mirx(v1b, ph1)));
-      aw[0] <= {ra, 11'd0} + 22'(ca);
-      aw[1] <= {ra, 11'd0} + 22'(cb);
-      aw[2] <= {rb, 11'd0} + 22'(ca);
-      aw[3] <= {rb, 11'd0} + 22'(cb);
+      // ((y01 + v) mod 2^11) 2^11 + x01 + u, mod 2^22, as one three-input add: x01 < 2^11, so {y01, x01} is
+      // y01 2^11 + x01 (the row's add and the column's ran into a third add in series: 113 / 107 MHz)
+      logic [12:0] mua, mub;
+      logic [10:0] mva, mvb;
+      mua = mirx(u1a, pw1); mub = mirx(u1b, pw1);
+      mva = 11'(mirx(v1a, ph1)); mvb = 11'(mirx(v1b, ph1));
+      aw[0] <= {y01, x01} + {mva, 11'd0} + 22'(mua);
+      aw[1] <= {y01, x01} + {mva, 11'd0} + 22'(mub);
+      aw[2] <= {y01, x01} + {mvb, 11'd0} + 22'(mua);
+      aw[3] <= {y01, x01} + {mvb, 11'd0} + 22'(mub);
       fu2 <= fu1; fv2 <= fv1; fmt2 <= fmt1;
     end
   end
@@ -257,6 +257,22 @@ module r3d_rast_texel #(
     if (!rst && en && v1 && PART != 2 && {mirx(u1a, pw1), mirx(u1b, pw1), mirx(v1a, ph1), mirx(v1b, ph1)} !=
                             {mir(u1a, pw1), mir(u1b, pw1), mir(v1a, ph1), mir(v1b, ph1)})
       $fatal(1, "texel: the mirror without the compare");
+`endif
+
+`ifdef VERILATOR
+  logic [21:0] aw_chk [4];
+  always_ff @(posedge clk) if (en && PART != 2) begin
+    logic [13:0] ca, cb;
+    logic [10:0] ra, rb;
+    ca = {3'd0, x01} + {1'b0, mirx(u1a, pw1)};
+    cb = {3'd0, x01} + {1'b0, mirx(u1b, pw1)};
+    ra = 11'(y01 + 11'(mirx(v1a, ph1)));
+    rb = 11'(y01 + 11'(mirx(v1b, ph1)));
+    aw_chk[0] <= {ra, 11'd0} + 22'(ca); aw_chk[1] <= {ra, 11'd0} + 22'(cb);
+    aw_chk[2] <= {rb, 11'd0} + 22'(ca); aw_chk[3] <= {rb, 11'd0} + 22'(cb);
+  end
+  always_ff @(posedge clk) if (!rst && PART != 2 && v2 && {aw[0], aw[1], aw[2], aw[3]} != {aw_chk[0], aw_chk[1], aw_chk[2], aw_chk[3]})
+    $fatal(1, "texel: the corner words in one add");
 `endif
 
   // the port: each bank's address from the first corner that lands in it
@@ -393,7 +409,6 @@ module r3d_rast_texel #(
   logic          v4;
   logic [TW-1:0] tag4;
   logic [31:0]   c4 [4];
-  logic signed [8:0] dt4 [4], db4 [4];    // the u lerp's differences, b - a and d - c
   logic [7:0]    fu4, fv4;
   logic [31:0]   d3 [4];
   // each corner's colour from its select's bank (its own unless dilated); a dilated corner keeps its own
@@ -403,17 +418,15 @@ module r3d_rast_texel #(
     w = dec(fmt3, mq[sb3[k]]);
     d3[k] = dl3 ? {tk3[k] ? 8'h00 : 8'hff, w[23:0]} : w;
   end
-  // the differences are taken here, from the decoded texels, so stage 5 is a product and
-  // an add (R87: the -40C path ran c4 -> subtract -> product -> add -> bot5)
+  // stage 4 holds the decoded texels; the u lerp's differences (b - a, d - c) are taken in stage 5a, in front
+  // of their products (the DSP's pre-adder form, (b - a) x fu): stage 3 is the selects and the decode alone
+  // (R87 had moved the differences here from stage 5; with R135's dilation selects in stage 3 the subtract
+  // behind them was the rasteriser's worst path, 110.7 MHz standalone, -1.22 ns in c7_s1)
   always_ff @(posedge clk) begin
     if (rst) v4 <= 1'b0;
     else if (en) v4 <= v3;
     if (en) begin
       for (int k = 0; k < 4; k++) c4[k] <= d3[k];
-      for (int c = 0; c < 4; c++) begin
-        dt4[c] <= $signed({1'b0, d3[1][8 * c +: 8]}) - $signed({1'b0, d3[0][8 * c +: 8]});
-        db4[c] <= $signed({1'b0, d3[3][8 * c +: 8]}) - $signed({1'b0, d3[2][8 * c +: 8]});
-      end
       fu4 <= fu3; fv4 <= fv3; tag4 <= tag3;
     end
   end
@@ -433,8 +446,11 @@ module r3d_rast_texel #(
     else if (en) begin v5a <= v4; v5 <= v5a; end
     if (en) begin
       for (int c = 0; c < 4; c++) begin
-        pt5a[c] <= dt4[c] * $signed({1'b0, fu4});
-        pb5a[c] <= db4[c] * $signed({1'b0, fu4});
+        logic signed [8:0] dt, db;     // b - a and d - c
+        dt = $signed({1'b0, c4[1][8 * c +: 8]}) - $signed({1'b0, c4[0][8 * c +: 8]});
+        db = $signed({1'b0, c4[3][8 * c +: 8]}) - $signed({1'b0, c4[2][8 * c +: 8]});
+        pt5a[c] <= dt * $signed({1'b0, fu4});
+        pb5a[c] <= db * $signed({1'b0, fu4});
         ct5a[c] <= c4[0][8 * c +: 8];
         cb5a[c] <= c4[2][8 * c +: 8];
         top5[c] <= 16'({ct5a[c], 8'd0} + 16'(pt5a[c]));

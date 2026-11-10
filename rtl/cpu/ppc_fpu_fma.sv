@@ -27,8 +27,9 @@
 // same datapath gives, and that is the choice taken).
 //
 // The window V[161:0] (V[i] weighs 2^(E0 + i - 1)):
-//   V[106:1]   the product. A denormal multiplicand is normalised first, so
-//              the product's leading one is at V[106] or V[105].
+//   V[106:1]   the product. A denormal multiplicand is normalised first, in
+//              groups of 16 bits, so the product's leading one is at V[75]
+//              or above (V[106] or V[105] for normal operands).
 //   V[161:109] the addend before alignment; shifted right by sh.
 //   V[0]       sticky: the OR of every addend bit shifted to or below it.
 // The addend starts two places above the product's top. When it dominates
@@ -150,6 +151,12 @@ module ppc_fpu_fma
   output logic [63:0]     out_res,
   output fpu_flags_t      out_flags
 );
+  // (R140) the restructurings' own checks; R140_NOCHK turns them off for the planted-fault runs
+`ifdef R140_NOCHK
+  localparam bit R1C = 1'b0;
+`else
+  localparam bit R1C = 1'b1;
+`endif
 
   localparam int EW = 14;  // signed exponents: the product of two denormals reaches -2252
   typedef logic signed [EW-1:0] exp_t;
@@ -217,21 +224,30 @@ module ppc_fpu_fma
   // no denormal test or select follows the count. Counting the fraction alone
   // and selecting by "denormal" after it missed 112 MHz by 0.26 ns once the
   // fast port shared the operand registers.
-  logic [5:0] lzfa, lzfb, lzfc;
-  ppc_fpu_lzc #(.W(53)) u_lza (.clk (clk), .x({~a_e0, a_f}), .n(lzfa));
+  logic [5:0] lzfb;
   ppc_fpu_lzc #(.W(53)) u_lzb (.clk (clk), .x({~b_e0, b_f}), .n(lzfb));
+  // The multiplicands are normalised coarsely (area pass 4): shifted left by 16 k, k the number of
+  // all-zero 16-bit groups from the top of {hidden, fraction} (bits 52:37, 36:21, 20:5; 3 for bits 4:0
+  // or zero), so a denormal keeps at most 15 leading zeros (4 in the last group). The product of the
+  // two then has its leading one at V[75] or above, not V[106] / V[105]: it is the same value, E0
+  // follows the shift, and S6's count and normalise shift take the rest. Exact, since the product
+  // lies in V[106:1] either way and the kept 56 bits and the guard sit at least 19 places above V[1]
+  // whenever the product leads; where the addend leads, as before.
+  function automatic logic [1:0] cn53(input logic [52:0] x);
+    cn53 = (x[52:37] != 16'd0) ? 2'd0 : (x[36:21] != 16'd0) ? 2'd1 : (x[20:5] != 16'd0) ? 2'd2 : 2'd3;
+  endfunction
   // (frC counted raw and 1.0's count, 0, chosen after: the op decode was in
   // front of the count, R63 batch 3)
-  logic [5:0] lzfc_r;
-  ppc_fpu_lzc #(.W(53)) u_lzc (.clk (clk), .x({c_er != 11'd0, in_c[51:0]}), .n(lzfc_r));
-  assign lzfc = has_c ? lzfc_r : 6'd0;
+  wire [1:0] cna   = cn53({~a_e0, a_f});
+  wire [1:0] cnc_r = cn53({c_er != 11'd0, in_c[51:0]});
+  wire [1:0] cnc   = has_c ? cnc_r : 2'd0;
 
   wire single_e = (in_single & ~cvt) | rsp;
   // frB only where it is normalised, see the header (a zero frB counts too:
   // its value stays 0, and its exponent is then unused)
   wire       bnrm = b_e0 & (single_e | in_ctl[5]) & ~cvt;
-  wire [5:0] na = lzfa;
-  wire [5:0] nc = lzfc;
+  wire [1:0] na = cna;          // in groups of 16
+  wire [1:0] nc = cnc;
   wire [5:0] nb = bnrm ? lzfb : 6'd0;
 
   exp_t ea0, ec0, eb0, esum, ep00, sh_cvt;
@@ -294,7 +310,8 @@ module ppc_fpu_fma
 
   typedef struct packed {
     logic [52:0] a, b, c;
-    logic [5:0]  na, nb, nc;
+    logic [1:0]  na, nc;          // the multiplicands' coarse shifts, in groups of 16
+    logic [5:0]  nb;
     exp_t        esum, ep00, eb0, sh_cvt;
     cls_t        k;
   } r1a_t;
@@ -394,13 +411,13 @@ module ppc_fpu_fma
     s1_sd.exc.vxcvi  = cvt_spc;
   end
 
-  wire [52:0] a_nrm = r1a_q.a << r1a_q.na;
-  wire [52:0] c_nrm = r1a_q.c << r1a_q.nc;
+  wire [52:0] a_nrm = r1a_q.a << {r1a_q.na, 4'b0000};
+  wire [52:0] c_nrm = r1a_q.c << {r1a_q.nc, 4'b0000};
   wire [52:0] b_nrm = r1a_q.b << r1a_q.nb;
 
   exp_t ep0, ebn, sh_raw;
   // the normalise amounts, summed on 8 bits first so only one 14-bit add follows
-  wire [7:0] sac = {2'b00, r1a_q.na} + {2'b00, r1a_q.nc};
+  wire [7:0] sac = {1'b0, {1'b0, r1a_q.na} + {1'b0, r1a_q.nc}, 4'b0000};
   wire [7:0] sbb = {2'b00, r1a_q.nb};
   assign ep0    = r1a_q.ep00 - exp_t'({6'd0, sac});
   assign ebn    = r1a_q.eb0 - exp_t'({6'd0, sbb});
@@ -1145,6 +1162,40 @@ module ppc_fpu_fma
     if (!cvt8 && flip) res8[63] = ~res8[63];
     if (sgl8) res8[28:0] = 29'd0;
   end
+  // The result as one-hot kinds ANDed with their values and ORed (R140), in place of res8's priority
+  // chain: cvt8, spc8, the zero, ovf_dis, rzero / flush, then the normal value, each in front of the next,
+  // were eight levels from r7_q into out_res (the 110 MHz full build c7_s1: r7_q.sd.cvt -> ovf -> ovf_dis
+  // -> the chain -> out_res, -1.94 ns, and the same into the single unit's operand select once out_res was
+  // retimed forward, -2.24). Every kind is formed from r7_q in two or three levels; a fraction bit is then
+  // one LUT of the kinds and its values. res8 above still gives cls8 (its value bits are not used).
+  (* keep = 1 *) wire k_b   = ~cvt8 & ~spc8 & ~r7_q.zero;                 // none of the first three
+  (* keep = 1 *) wire k_ovd = ~r7_q.tiny & ~sd8.oe & (r7_q.ovf0 | (r7_q.ovf_at & c1));   // ovf_dis but for k_b
+  (* keep = 1 *) wire k_ove = ~r7_q.tiny &  sd8.oe & (r7_q.ovf0 | (r7_q.ovf_at & c1));   // ovf & oe but for k_b
+  (* keep = 1 *) wire k_fla = sd8.ni & r7_q.tiny & ~sd8.ue;
+  (* keep = 1 *) wire k_rzf = r7_q.rzero | (k_fla & (sgl8 ? ~(r7_q.den_at & c1) : (~c1 & ~r8[55])));  // rzero | flush
+  (* keep = 1 *) wire k_ovf = k_b & k_ovd;
+  (* keep = 1 *) wire k_n   = k_b & ~k_ovd & ~k_rzf;
+  (* keep = 1 *) wire k_spc = ~cvt8 & spc8;
+  (* keep = 1 *) wire k_sn  = k_spc | k_n;                                   // the fraction is r8's
+  (* keep = 1 *) wire k_ovm = k_ovf & ~to_inf;                               // ovf_mag's fraction is all ones
+  wire [63:0] cvt_v = {cvt_hi, cvt_lo};
+  wire [10:0] bsn = k_ove ? (c1 ? r7_q.bo1.v : r7_q.bo0.v) :                // the normal value's exponent
+                    (c2 ? r7_q.bnu2.v : c1 ? r7_q.bnu1.v : r7_q.bnu0.v);
+  wire        k_ne  = k_n & ~dbl_den;
+  // ovf_mag's exponent: 7FF to infinity, else 47E (single) or 7FE
+  wire [10:0] ovf_e = to_inf ? 11'h7FF : sgl8 ? 11'h47E : 11'h7FE;
+  logic [63:0] res8f;
+  always_comb begin
+    for (int b = 0; b < 52; b++)
+      res8f[b] = ((cvt8 & cvt_v[b]) | (k_sn & r8[b + 3]) | k_ovm) & ~(sgl8 & (b < 29));
+    for (int e = 0; e < 11; e++)
+      res8f[52 + e] = (cvt8 & cvt_v[52 + e]) | k_spc | (k_ovf & ovf_e[e]) | (k_ne & bsn[e]);
+    res8f[63] = cvt8 ? cvt_v[63] : ((k_b ? r7_q.sign : (spc8 ? r7_q.sign : zsign)) ^ flip);
+  end
+  // (the zero kind is spc8 = 0, cvt8 = 0, zero = 1: its sign is zsign; every other kind's is r7_q.sign)
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (R1C && !rst && r7_v && res8f != res8) $fatal(1, "ppc_fpu_fma: S8 by kinds %016X against the chain %016X", res8f, res8);
+`endif
   // the class with the delivered sign (a NaN's sign is not part of its class)
   wire [4:0] fprf8 = (cls8 == FPRF_QNAN || !res8[63]) ? cls8 :
                      (cls8 == FPRF_PINF)  ? FPRF_NINF  :
@@ -1186,7 +1237,7 @@ module ppc_fpu_fma
     else     out_valid <= r7_v | x_valid;
     out_tag   <= x_valid ? x_tag : sd8.tag;
     out_div   <= ~x_valid & sd8.div;
-    out_res   <= x_valid ? x_res : res8;
+    out_res   <= x_valid ? x_res : res8f;
     out_flags <= x_valid ? x_flags : flags8;
   end
 

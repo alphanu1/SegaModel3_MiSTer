@@ -58,7 +58,12 @@ module r3d_walker #(
   // node[0] & 4 sets it from node words 3, 7, 8; it stays until the next such
   // node, and starts each frame at 0x400. MODEL events carry it in b
   // (CTAB = 0: always 0x400, MAME's fixed table).
-  parameter bit CTAB = 1'b1
+  parameter bit CTAB = 1'b1,
+  // VP_M10K (area pass, study R164): the viewport chain in one M10K, read registered at vp_idx's next value, in
+  // place of four MLABs read asynchronously at vp_idx. The word is the same in every clock that uses it: those
+  // are S_VP_SEL to S_VP_EMIT, all after the S_VP_NEXT that sets vp_idx, and no write comes after the chain is
+  // collected. 0 keeps the MLAB.
+  parameter bit VP_M10K = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -100,8 +105,6 @@ module r3d_walker #(
     S_RET, S_RET_POP, S_END
   } state_t;
 
-  state_t st, rd_ret;
-
   // ---- read helper -------------------------------------------------------
   logic [31:0] rd_addr;
   logic [2:0]  rd_len;          // words - 1
@@ -123,15 +126,54 @@ module r3d_walker #(
 
   // ---- walker state -------------------------------------------------------
   logic [1:0]  pass;
-  // MLAB, not M10K: M10K is the binding resource on this part. Written only
-  // while the chain is collected, read only afterwards (no_rw_check).
-  // {priority, address} in one memory
-  (* ramstyle = "MLAB, no_rw_check" *) logic [33:0] vp_mem [0:VP_N-1];
+  // Written only while the chain is collected, read only afterwards (no_rw_check).
+  // {priority, address} in one memory: VP_M10K one M10K, else MLAB (M10K was the binding resource)
   logic [31:0] vp_addr_q;
   logic [1:0]  vp_pri_q;
-  assign {vp_pri_q, vp_addr_q} = vp_mem[vp_idx[VP_LOG2-1:0]];
   logic [VP_LOG2:0] vp_cnt, vp_idx;
+  state_t st, rd_ret;
+  logic        vp_we;
+  logic [33:0] vp_wd;
+  generate if (VP_M10K) begin : g_vpm
+    (* ramstyle = "M10K, no_rw_check" *) logic [33:0] vp_mem [0:VP_N-1];
+    logic [33:0] vp_q;
+    // vp_idx's next value where S_VP_NEXT moves it to S_VP_SEL (vp_idx - 1); elsewhere vp_idx itself, which
+    // the states that read the word hold. S_VP_NEXT's wrap (vp_idx 0 to vp_cnt) is followed by S_VP_NEXT
+    // again, which reads nothing, so its address does not matter
+`ifdef WALKER_FAULT_VPRA
+    wire [VP_LOG2:0] vp_ra = vp_idx;
+`else
+    wire [VP_LOG2:0] vp_ra = (st == S_VP_NEXT) ? vp_idx - 1'b1 : vp_idx;
+`endif
+    always_ff @(posedge clk) begin
+`ifdef WALKER_FAULT_WE63
+      if (vp_we && vp_cnt[VP_LOG2-1:0] != '1) vp_mem[vp_cnt[VP_LOG2-1:0]] <= vp_wd;
+`else
+      if (vp_we) vp_mem[vp_cnt[VP_LOG2-1:0]] <= vp_wd;
+`endif
+      vp_q <= vp_mem[vp_ra[VP_LOG2-1:0]];
+    end
+    assign {vp_pri_q, vp_addr_q} = vp_q;
+`ifdef VERILATOR
+`ifndef WALKER_NOCHK
+    // the MLAB's word beside it: every state that reads the word must see the same
+    logic [33:0] vp_sh [0:VP_N-1];
+    always_ff @(posedge clk) if (vp_we) vp_sh[vp_cnt[VP_LOG2-1:0]] <= vp_wd;
+    always_ff @(posedge clk)
+      if (!rst && (st == S_VP_SEL || st == S_VP_W22 || st == S_VP_W2 || st == S_VP_EMIT) &&
+          vp_q != vp_sh[vp_idx[VP_LOG2-1:0]])
+        $fatal(1, "walker: vp_mem %09X against %09X at %0d", vp_q, vp_sh[vp_idx[VP_LOG2-1:0]], vp_idx);
+`endif
+`endif
+  end else begin : g_vpl
+    (* ramstyle = "MLAB, no_rw_check" *) logic [33:0] vp_mem [0:VP_N-1];
+    always_ff @(posedge clk) if (vp_we) vp_mem[vp_cnt[VP_LOG2-1:0]] <= vp_wd;
+    assign {vp_pri_q, vp_addr_q} = vp_mem[vp_idx[VP_LOG2-1:0]];
+  end endgenerate
   logic [31:0] vaddr;           // chain walk
+  // S_VPC_GOT's write (outside the reset, as before)
+  assign vp_we = !rst && st == S_VPC_GOT;
+  assign vp_wd = {rbuf[0][4:3], vaddr};
   logic [31:0] mbase;           // matrix base of the current viewport
   logic [31:0] link;            // link being processed
   // a node's words stay in rbuf from S_BLK_GOT to S_BLK_FRAME:
@@ -245,7 +287,6 @@ module r3d_walker #(
           rd_addr <= vaddr; rd_len <= 3'd1; rd_ret <= S_VPC_GOT; st <= S_RD;
         end
         S_VPC_GOT: begin
-          vp_mem[vp_cnt[VP_LOG2-1:0]] <= {rbuf[0][4:3], vaddr};
           vp_cnt <= vp_cnt + 1'b1;
           if (rbuf[1] != 32'h0100_0000 && rbuf[1] != 32'd0) begin
             if (vp_cnt + 1'b1 == VP_N[VP_LOG2:0]) begin   // chain longer than the buffer

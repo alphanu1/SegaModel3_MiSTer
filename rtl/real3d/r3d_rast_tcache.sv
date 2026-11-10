@@ -165,8 +165,14 @@ module r3d_rast_tcache #(
   logic [DB:0]   pix_n, rd_n;              // pixels into the FIFO, pixels read
   logic [SB:0]   sw_n;                     // tag sweep: sets left
   logic          sw_q;                     // the cycle after the sweep: C's rows were read under it
+  // the sweep as the register sw_nz (= sw_n != 0, below), and the hold as a register of its own: hold_q is
+  // sw_nz || sw_q one cycle on, which is sw_nz || inval (sweeping, or a sweep starts; sw_q is the cycle after).
+  // The sweep counter's zero test was in front of a_go, c_go and A's enables (sw_n -> a_ln / a_row, -1.34 ns in a
+  // 110 MHz merged fit).
   wire           sweeping = sw_n != '0;
-  wire           hold = sweeping || sw_q;
+  logic          sw_nz;                    // = sweeping, as a register
+  logic          hold_q;
+  wire           hold = hold_q;
 
   // ---- W: the tag write of the last allocation, and Wq the one before -------------------------
   logic          w_v, wq_v;
@@ -176,7 +182,7 @@ module r3d_rast_tcache #(
   logic [RW-1:0] w_base;                   // the set's row before W's entry
   always_comb begin
     twe = w_v; twa = w_set; twd = put(w_base, w_way, w_tg);
-    if (sweeping) begin twe = 1'b1; twa = SB'(sw_n - 1'b1); twd = '0; end
+    if (sw_nz) begin twe = 1'b1; twa = SB'(sw_n - 1'b1); twd = '0; end
   end
 
   // ---- L0 -----------------------------------------------------------------------------------
@@ -193,7 +199,6 @@ module r3d_rast_tcache #(
   logic [19:0]   sk_a [4];
   logic [3:0]    sk_use;
   logic [PW-1:0] sk_pay;
-  logic          sw_nz;                    // = sweeping, as a register
   assign i_ready = !sk_v && !sw_nz;
   wire           l0_free = !l0_v || c_go;
   logic [17:0]   l0_ln [4];
@@ -201,6 +206,7 @@ module r3d_rast_tcache #(
 
 `ifdef VERILATOR
   always_ff @(posedge clk) if (!rst && sw_nz != sweeping) $fatal(1, "tcache: sw_nz");
+  always_ff @(posedge clk) if (!rst && hold_q != (sweeping || sw_q)) $fatal(1, "tcache: hold registered");
 `endif
 
   // ---- C: compare -----------------------------------------------------------------------------
@@ -300,13 +306,21 @@ module r3d_rast_tcache #(
   // fill queue {line, slot, allocating pixel}, indexed by the counters
   localparam int QW = 18 + LB + DB + 1;
   (* ramstyle = "MLAB, no_rw_check" *) logic [QW-1:0] fq [F];
-  wire fq_full = (alloc_n - done_n) == NB'(F);
+  // the fill queue's and the pixel FIFO's full flags as registers, from their counts' next values: each count
+  // moves by one either way, so the next flag is one of three compares of the present count, chosen by the
+  // two moves (c7_s1 and standalone: rd_n through pix_n - rd_n, the compare, a_done and c_go into tra and
+  // c_mw, 113.7 MHz standalone)
+  logic fq_full, pf_full;
+  wire [NB-1:0] fq_c = alloc_n - done_n;
 
   // pixel FIFO {need, payload, j x4, slot x4}
   localparam int PFW = NB + PW + 8 + 4 * LB;
   (* ramstyle = "M10K, no_rw_check" *) logic [PFW-1:0] pf [D];
   wire  [DB:0] pf_cnt  = pix_n - rd_n;
-  wire         pf_full = pf_cnt >= (DB+1)'(D - 1);
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && (fq_full != (fq_c == NB'(F)) || pf_full != (pf_cnt >= (DB+1)'(D - 1))))
+    $fatal(1, "tcache: the full flags registered");
+`endif
 
   wire alloc  = a_v && mneed && !fq_full && !hold;
   wire a_done = a_v && !mneed && !pf_full && !hold;
@@ -351,6 +365,7 @@ module r3d_rast_tcache #(
   wire         beats4 = (bb_wp - bb_rp) >= (FB+3)'(4);
   logic        gate_ok;
   wire         wr_go = (alloc_n != done_n) && (wk != 2'd0 || (beats4 && gate_ok));
+  wire         fq_dn = wr_go && wk == 2'd3;     // a fill written: done_n moves
   wire  [63:0] bq = bb[bb_rp[FB+1:0]];
   always_comb begin
     dwe = wr_go; dwk = wk; dwa = fq_r[DB+1 +: LB];
@@ -402,7 +417,12 @@ module r3d_rast_tcache #(
     // the later reader: the nearer of the two counting back from P (a stale number may
     // alias nearer, which only waits longer)
     wire [DB:0] dx = lq_px - qx2 - (DB+1)'(1), dy = lq_px - qy2 - (DB+1)'(1);
-    wire [DB:0] gl = lq_px - (DB+1)'(1) - ((dx < dy) ? dx : dy);
+    // (P - 1 - (P - q - 1) is q, mod 2^(DB + 1): the nearer reader's own number, without the last subtract;
+    // qx2 through the two subtracts and the compare into fs was 114.2 MHz at -40C standalone)
+    wire [DB:0] gl = (dx < dy) ? qx2 : qy2;
+`ifdef VERILATOR
+    always_ff @(posedge clk) if (!rst && lq_v && gl != lq_px - (DB+1)'(1) - ((dx < dy) ? dx : dy)) $fatal(1, "tcache: the gate's reader");
+`endif
     (* ramstyle = "MLAB, no_rw_check" *) logic [DB:0] fs [F];
     logic [NB-1:0] st_n;                 // fills whose last reader is known
     always_ff @(posedge clk) if (lq_v) fs[st_n[FB-1:0]] <= gl;
@@ -453,14 +473,16 @@ module r3d_rast_tcache #(
   always_ff @(posedge clk) begin
     if (rst) begin
       l0_v <= 1'b0; c_v <= 1'b0; a_v <= 1'b0; o_valid <= 1'b0; r_v <= 1'b0; ph_v <= 1'b0; sk_v <= 1'b0;
-      sw_nz <= 1'b1;
+      sw_nz <= 1'b1; hold_q <= 1'b1;
       w_v <= 1'b0; wq_v <= 1'b0; sw_q <= 1'b0; c_mw <= '0; c_mq <= '0;
       alloc_n <= '0; iss_n <= '0; done_n <= '0; pix_n <= '0; rd_n <= '0; rd_n1 <= (DB+1)'(1);
+      fq_full <= 1'b0; pf_full <= 1'b0;
       sw_n <= (SB+1)'(SETS); rr <= '0; bb_wp <= '0; bb_rp <= '0; wk <= 2'd0;
     end else begin
-      if (inval && !sweeping) begin sw_n <= (SB+1)'(SETS); sw_nz <= 1'b1; end
-      else if (sweeping) begin sw_n <= sw_n - 1'b1; sw_nz <= sw_n != (SB+1)'(1); end
-      sw_q <= sweeping;
+      if (inval && !sw_nz) begin sw_n <= (SB+1)'(SETS); sw_nz <= 1'b1; end
+      else if (sw_nz) begin sw_n <= sw_n - 1'b1; sw_nz <= sw_n != (SB+1)'(1); end
+      sw_q <= sw_nz;
+      hold_q <= sw_nz || inval;
       // L0 and its skid
       if (l0_free) begin
         if (sk_v) begin
@@ -499,7 +521,7 @@ module r3d_rast_tcache #(
         a_hit <= c_hit; a_ok <= ~c_use; a_use <= c_use; a_pay <= c_pay;
         a_qb <= c_use & c_hit;
         for (int b = 0; b < 4; b++) a_wo[b] <= WAYS'(1) << c_hway[b];
-      end else if (sweeping) begin
+      end else if (sw_nz) begin
         for (int b = 0; b < 4; b++) a_row[b] <= '0;   // a row read before the upload is not written back
       end else begin
         for (int b = 0; b < 4; b++) a_row[b] <= a_rowe[b];
@@ -511,12 +533,15 @@ module r3d_rast_tcache #(
       // W, Wq
       w_v <= alloc; w_set <= a_set_mb; w_way <= vic; w_tg <= a_tag_mb; w_base <= a_rowe[mb];
       for (int b = 0; b < 4; b++) a_wm[b] <= a_go ? (set_of(c_ln[b]) == a_set_mb) : a_ss[b][mb];
-      wq_v <= w_v && !sweeping; wq_set <= w_set; wq_way <= w_way; wq_tg <= w_tg;
+      wq_v <= w_v && !sw_nz; wq_set <= w_set; wq_way <= w_way; wq_tg <= w_tg;
       for (int b = 0; b < 4; b++) begin    // tra is C's set next cycle
         c_mw[b] <= alloc && tra[b] == a_set_mb;
-        c_mq[b] <= w_v && !sweeping && tra[b] == w_set;
+        c_mq[b] <= w_v && !sw_nz && tra[b] == w_set;
       end
       if (alloc) begin rr <= vic + WB'(1); alloc_n <= alloc_n + 1'b1; end
+      fq_full <= (alloc && !fq_dn) ? (fq_c == NB'(F - 1)) : (!alloc && fq_dn) ? (fq_c == NB'(F + 1)) : (fq_c == NB'(F));
+      pf_full <= (a_done && !r_go) ? (pf_cnt >= (DB+1)'(D - 2)) : (!a_done && r_go) ? (pf_cnt >= (DB+1)'(D)) :
+                                     (pf_cnt >= (DB+1)'(D - 1));
       if (a_done) pix_n <= pix_n + 1'b1;
       // fills
       if (f_req && f_ack) iss_n <= iss_n + 1'b1;

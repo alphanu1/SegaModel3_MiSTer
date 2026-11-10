@@ -120,7 +120,7 @@ module m3_jtag (
   // ------------------------------------------------------------ the devices
   // {sr[56:0], len[2:0], ir[4:0], mw[31:0]}
   localparam int DW = 57 + 3 + 5 + 32;
-  (* ramstyle = "MLAB, no_rw_check" *) logic [DW-1:0] dev [0:31];
+  (* ramstyle = "M10K, no_rw_check" *) logic [DW-1:0] dev [0:31];   // study R128: M10K, the read is registered
   wire  [4:0]  nlast = jstep[1] ? 5'd16 : 5'd9;   // the chain's last device
 
   tap_t        st;

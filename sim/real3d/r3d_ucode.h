@@ -7,24 +7,24 @@
 
 #pragma once
 namespace r3d_uc {
-constexpr unsigned K_MM = 0, LEN_MM = 56;
-constexpr unsigned K_MODEL = 21, LEN_MODEL = 108;
-constexpr unsigned K_TL = 62, LEN_TL = 149;
-constexpr unsigned K_PROJ = 200, LEN_PROJ = 74;
-constexpr unsigned K_TL3 = 254, LEN_TL3 = 115;
-constexpr unsigned K_PROJ1 = 358, LEN_PROJ1 = 60;
-constexpr unsigned K_PROJ3 = 375, LEN_PROJ3 = 68;
-constexpr unsigned K_CLIP = 420, LEN_CLIP = 57;
-constexpr unsigned K_ADD = 432, LEN_ADD = 14;
-constexpr unsigned K_SUB = 435, LEN_SUB = 14;
-constexpr unsigned K_MUL = 438, LEN_MUL = 14;
-constexpr unsigned K_DIV = 441, LEN_DIV = 20;
-constexpr unsigned K_COPYB = 444, LEN_COPYB = 17;
-constexpr unsigned K_CULLU = 450, LEN_CULLU = 53;
-constexpr unsigned K_CULLT = 459, LEN_CULLT = 40;
-constexpr unsigned K_SMFR = 466, LEN_SMFR = 114;
-constexpr unsigned K_SETUP4 = 490, LEN_SETUP4 = 110;
-constexpr unsigned K_SETUP2 = 570, LEN_SETUP2 = 104;
+constexpr unsigned K_MM = 0, LEN_MM = 60;
+constexpr unsigned K_MODEL = 21, LEN_MODEL = 116;
+constexpr unsigned K_TL = 62, LEN_TL = 150;
+constexpr unsigned K_PROJ = 200, LEN_PROJ = 75;
+constexpr unsigned K_TL3 = 254, LEN_TL3 = 118;
+constexpr unsigned K_PROJ1 = 359, LEN_PROJ1 = 63;
+constexpr unsigned K_PROJ3 = 377, LEN_PROJ3 = 71;
+constexpr unsigned K_CLIP = 423, LEN_CLIP = 60;
+constexpr unsigned K_ADD = 435, LEN_ADD = 15;
+constexpr unsigned K_SUB = 438, LEN_SUB = 15;
+constexpr unsigned K_MUL = 441, LEN_MUL = 15;
+constexpr unsigned K_DIV = 444, LEN_DIV = 20;
+constexpr unsigned K_COPYB = 447, LEN_COPYB = 18;
+constexpr unsigned K_CULLU = 453, LEN_CULLU = 57;
+constexpr unsigned K_CULLT = 462, LEN_CULLT = 43;
+constexpr unsigned K_SMFR = 469, LEN_SMFR = 119;
+constexpr unsigned K_SETUP4 = 493, LEN_SETUP4 = 116;
+constexpr unsigned K_SETUP2 = 575, LEN_SETUP2 = 110;
 constexpr unsigned R_MT = 0;
 constexpr unsigned R_CO = 8;
 constexpr unsigned R_PR = 12;

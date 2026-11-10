@@ -50,3 +50,32 @@ module r3d_ram #(
     assign rq = m[ra];
   end endgenerate
 endmodule
+
+// A fixed delay of D steps (D >= 3) for a W-bit word, as a chain of D registers all enabled by en would give it
+// (q is d of D enabled clocks before), in an M10K (area pass, R151): the first D - 2 steps in the block's memory,
+// the last two in its address and output registers, so q is the block's output register and nothing of the line
+// is in ALMs. Each enabled clock writes the block at p and reads it at p - (D - 2): the word written D - 2 steps
+// before, which with 2^A >= D has not been written over, at an address that is never the one being written. q
+// then follows it by the output register's step. Nothing resets: as the chain, q is only defined D steps after the
+// clock starts, whatever value p starts at. (The first form, an MLAB with its output register, freed no ALMs: an
+// MLAB is a whole LAB, here used 4 to 10 deep of its 32.)
+module r3d_dline #(
+  parameter int W = 32,
+  parameter int D = 4
+) (
+  input  logic         clk,
+  input  logic         en,
+  input  logic [W-1:0] d,
+  output logic [W-1:0] q
+);
+  localparam int A = $clog2(D);
+  logic [A-1:0] p;                 // any start: the delay holds from D steps on whatever p starts at
+  (* ramstyle = "M10K, no_rw_check" *) logic [W-1:0] m [0:(1 << A) - 1];
+  logic [W-1:0] q1;
+  always_ff @(posedge clk) if (en) begin
+    p  <= p + 1'b1;
+    m[p] <= d;
+    q1 <= m[p - A'(D - 2)];
+    q  <= q1;
+  end
+endmodule
