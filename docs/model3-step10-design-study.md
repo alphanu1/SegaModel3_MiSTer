@@ -1114,6 +1114,7 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-55 | (2026-11-09) The FPGA SCSP DSP (D-53) keeps its two 32K-word effect rings in M10K, not DDR3: 128 of its 135 M10K, no ALM, and no dependent DDR3 traffic against the rasteriser (D-48). The area work (D-54) may use what M10K is left after that. The sound path's fixed delay starts at the design's 256 samples (5.8 ms) and is cut on the board if it is not good; the DSP itself adds one sample. |
 | D-56 | (2026-11-09) The rasteriser's pair queue (R149) is taken although it is not zero-cycle frame by frame: the mean replay falls 4-9% on every census set and Daytona 2's system frames by 13.6%, while 7-38 frames of about 400 a set (none in VF3) are up to 360 clocks slower (0.02% of a frame), contour verdicts returning later behind a fuller queue. An exception to D-48 for this change only: the frame rate it gives outweighs the rare 0.02%. |
 | D-57 | (2026-11-10) No area change may cost the CPU a cycle, D-56-style exceptions included: R129's iterative double front (−700 to −800 ALM est., 0.01-0.08% of a vblank) is rejected. Daytona 2's game loop needs the CPU at about 113-115 MHz, or fewer cycles, to make 60 Hz at 110 (R144), so CPU cycles are spoken for. Area for the SCSP DSP and bridge (837 ALM), the DMA bursts and the pixel queue comes from zero-cycle sharing, leaner designs of the blocks coming in, and later the second SDRAM. |
+| D-58 | (2026-11-10) Area work may not remove hardware behaviour because the five sets in hand do not use it: other Model 3 games may, and so may the parts of these games a trace never reached (the 3,000-frame Daytona 2 trace behind `BR_C106` covered boot and attract, not play, test menus or other modes). The MPC106 keeps its full register file (the bridges pass's `BR_C106`, which kept only the registers Daytona 2 reads back, is not taken). Behaviour stays whole; only its implementation may get smaller. |
 
 ### Open
 
@@ -14009,3 +14010,276 @@ about 1,180 coming in (the DSP and its bridge 837, the DMA bursts about 196, the
 900 to find. The priced rows add about 40-140 more. Placed ALMs in `area4_k1_s3` are 40,924 of 41,910, so there are
 about 986 placeable ALMs today, and every LAB is in use. The rest has to come from D-57's other two sources: leaner
 designs of the blocks coming in, and the second SDRAM.
+
+**R158 — Daytona 2 on the board with the DMA bursts and the pair queue at 120 MHz (`lean_m_s3`, RBF 765d4a74,
+2026-11-10): more of the attract runs at 60 fps, but much of it still drops to 30.** The bench's 15 loops of 60 Hz
+covered one early attract scene from the frame-1300 checkpoint; there the rasteriser was at 1.005 vblanks a drawn frame
+with the queue and the CPU at 0.93-0.94. Other scenes are heavier on one or the other. Which one limits each scene is
+being measured across the whole attract.
+
+**R159 — The sound link integrated (`sm3-builds/sound/integ`, on 6c11801) does not fit: 4,287 LABs needed of 4,191.**
+The SCSP DSP and its bridge fit at 637 ALM (engine 472.8, bridge 164.4; 837 at map), on m3_ddr_arb's new eighth port,
+behind `SND_DSP`. The base already used 4,189 of the 4,191 LABs, so the link needs about 98 whole LABs freed, roughly
+700-1,000 placed ALM. The sound ROMs are read by arcsnd from the set's zip (miniz), at no FPGA cost and no added load
+time, instead of through the MRA. The DSP stays in the FPGA: core 1 is too slow for it next to MiSTer Main, and the
+Digital Sound Board's MPEG decode still has to go on the ARM. The room comes from the engine and bridge made smaller (the
+engine uses at most 1,606 of about 2,721 clocks a sample at 120 MHz), the small zero-cycle rows of R157, and the
+interconnect (`m3_bus`, the SDRAM and DDR3 ports, the loader). The second SDRAM is not area relief: it frees the
+analog path's 262 ALM but brings its own controller (`m2_sdram` is 527 ALM in `area4_k1_s3`, perhaps 300-400 with fewer
+ports) and its port logic, about +100 to +350 net. Its value is the CPU's own memory (R144: an estimated 4-6% of
+Daytona 2's loop), not ALM.
+
+**R160 — Daytona 2's attract at 120 MHz, scene by scene: the CPU holds every heavy scene near its deadline, and the
+board's seconds at 30 are stretches where it is just over. The game has no governor and the core builds no backlog. The
+system bench's Daytona 2 frames since R127 draw the wrong VROM, so its Real3D figures (R142, R144, R149, R156, R158) are
+not the scene's; on the right data the rasteriser is at 0.5-0.9 vblank and rarely the limiter.**
+
+Desk and bench only, no RTL change (`sm3-builds/d2scene`). D-57's question: which of CPU, geometry or rasteriser holds
+each scene at 30, and by how much.
+
+*What I believed* (R156, R158): at 120 MHz with the DMA bursts and the pair queue, the CPU reaches 4C6FC at 0.93-0.94
+vblank and the rasteriser is at 1.005 vblanks a drawn frame, so the rasteriser was the next limiter and other scenes
+were "heavier on one or the other". The board's pattern, a few seconds at 60 then 3-10 seconds at 30, over and over,
+looked like something with memory: a frame-rate governor in the game, or a backlog in the core.
+
+*No governor.* From the game's own code (my Supermodel copy, every executed RAM word disassembled, and a watch on
+0x100000-0x1000FF and 0x712000-0x7120FF over 3,000 and 1,500 frames):
+- The pacing function at 4C6FC waits for the decrementer count at 0x100033 to change from what it was on arrival, so a
+  loop always waits for the next decrementer event; if the count reached 2, it adds one to 0x100011. Nothing else in
+  the game reads 0x100011 (its only reader is 4C770, the increment itself).
+- 0x100034 sums the DMA poll's time a loop (52F0/52FC) and is cleared at 4C7BC; nothing reads it. The loop's timebase
+  stamp at 0x712018 (4C7A8) is never read. The decrementer's reload (0x10000C) is written twice at start-up.
+- So each loop is one vblank or two on its own, and a two-vblank loop is slow motion, not a skipped step. Supermodel
+  at the core's speed confirms it: at the same loop count the two runs have executed the same instructions to within
+  1-2%, while the slower run has taken 21% more vblanks.
+
+*No backlog in the core as built.* R149's system run (`tc/r3d4/d2/runs/zqr`) does drift: the CPU's arrival grows about
+0.010 vblank a loop (0.918 → 1.003) and a loop misses every 10-11. The time is the DMA's read of the Real3D status
+block (84000008) held from the ping-pong flip until the swap, 0.000 → 0.082 vblank, the swap waiting for the posted
+writes. That tree was built with `M3_DMAFAST` alone, R144's 8,192-entry model FIFO. The built form (`M3_R3B`, 32
+entries; R144's `r120`, logs identical to R156's lean blocks) shows a swap wait of 0.000 on all 15 loops and the CPU
+steady at 0.929-0.941. When the rasteriser falls behind there, the frame is dropped (`r3d_cmd`: no store bank free),
+and the CPU does not wait.
+
+*The system bench draws the wrong models.* I dumped the system's Real3D memories at its frame 1302 (`--r3d`, the dump
+test relaxed in my copy of the testbench: after a restore the frame-end and frame-done counts are off by the frames
+in flight, so `r3_dones == r3_target` never held). The same moment is my Supermodel frame 1104 (the Phantom #41 car
+in the same pose; the bench's timeline runs about 200 frames behind mine).
+- Through the geometry model and the rasteriser bench, the system's own culling RAM, polygon RAM and texture sheets
+  give the right picture and the same work as Supermodel's dump: 484,953 pixels and 1,502,445 replay cycles against
+  480,804 and 1,496,126; geometry 1,742,999 cycles against 1,740,248.
+- The system's own layer at that frame has the car right and the stadium as large flat polygons and noise textures.
+  Its rasteriser shades 0.83-1.28 M pixels a frame there, twice the scene's, and its geometry runs 0.50 vblank
+  against 0.84.
+- The likely cause: `m3_system`'s `VROM_LIN` is 1 (R127, VROM in DDR3 in pair order), and the testbench puts the
+  `--xmem` image into DDR3 through `xl()`, which reorders only with `--xlin`. None of the d2 run scripts pass it, and
+  `dt2_sdram.i1.bin` (2 November) is in the MRA's order. The polygon-RAM car draws right; the VROM models do not.
+  Not yet confirmed by a rerun with `--xlin`.
+- So R149's "two thirds of the pairs fail Z, overdraw 15 times" and the 1.005 vblank of R156 and R158 measured that
+  picture. The CPU's figures stand: the CPU does not read VROM.
+
+*Method.*
+- **CPU.** My Supermodel copy with the census (`d2scene/sm`): each busy instruction charged α times the CPI model's
+  cycles (`16k_p40_er20_sb`), plus 0.041 vblank of DMA wait a loop, so the decrementer, interrupts and the game's own
+  pacing run at the core's speed. α = 2.29 puts the CPU's time to 4C6FC at 0.933-0.944 over the matched frames, against
+  the system bench's 0.929-0.941. My first α (2.135) was fitted to the wrong frames: frame 1300 in my timeline is not
+  the bench's frame 1300. Run to its frame 13,039 (10,595 loops, reference frames to 10,752); past that, the reference
+  run's model cycles converted the same way, which agree with the run to −0.005 ± 0.032 vblank a loop. The loop rule
+  (over 1.000 is two vblanks) predicts the run's 12,917 vblanks to within 0.3%.
+- **Geometry.** HEAD's (6c11801) geometry bench (SETUP_OUT, LOD, Supermodel's rows) on Supermodel dumps every 10
+  frames from 900 to 14,400 (1,351 frames), unscaled (R141: +4 clocks of latency costs 1.0-1.5%).
+- **Rasteriser.** HEAD's whole-rasteriser bench (ZQ 256) on the same frames, the lists from the geometry model as the
+  core sends them. Scaled by 1.086: the system's texture fills take 41.3 + 1.8 clocks to the first beat (R149) where the
+  bench draws 13-40; at 30-52 the replay is 6.5-11% longer (mean 8.6%) on the calibration frames.
+- **Frames.** `r3d_cmd`'s rules: a loop offers a frame at its flip; it is drawn if the last frame's geometry has ended
+  and the frame two back has finished its replay; geometry starts at the flip; a replay starts when its geometry has
+  ended and the previous replay is done.
+
+*The attract at 120 MHz* (Supermodel's frame axis; CPU in vblanks to 4C6FC per loop, geometry and rasteriser per frame):
+
+| Frames | Scene | CPU p50 / p90 | Loops over 1.000 | Geometry p50 / p90 / max | Rasteriser p50 / p90 | Limiter | fps | fps with the CPU on time |
+|---|---|---|---|---|---|---|---|---|
+| 1,050-1,749 | montage 1: speedway, #41 close-ups, wide shots | 0.969 / 1.025 | 18% | 0.51 / 0.80 / 0.86 | 0.60 / 0.87 | CPU; rasteriser in the white-out | 47.0 | 55.4 |
+| 1,750-2,199 | montage 1: cockpit, red canyon | 0.941 / 1.038 | 11% | 0.54 / 0.68 / 0.77 | 0.52 / 0.68 | CPU | 51.6 | 57.5 |
+| 2,200-3,049 | montage 1: city street chase | 1.002 / 1.082 | 51% | 0.53 / 0.96 / 0.98 | 0.50 / 0.64 | CPU | 38.2 | 57.5 |
+| 3,050-3,799 | montage 1: cockpit, speedway replay | 0.976 / 1.124 | 24% | 0.59 / 1.00 / 1.12 | 0.63 / 0.98 | CPU; geometry in the cockpit | 43.6 | 54.2 |
+| 4,350-7,649 | demo race 1: blue car, speedway, HUD | 0.991 / 1.060 | 38% | 0.64 / 0.92 / 1.02 | 0.74 / 0.86 | CPU | 41.3 | 56.8 |
+| 7,650-9,249 | demo race 2: Impulse car, Adventure Dome | 0.786 / 0.835 | 0% | 0.44 / 0.80 / 0.94 | 0.52 / 0.69 | none | 57.5 | 57.5 |
+| 10,200-13,299 | montage 2 | 0.986 / 1.053 | 41% | 0.52 / 0.84 / 1.12 | 0.52 / 0.82 | CPU; geometry in the cockpit; rasteriser in the white-out | 39.9 | 56.1 |
+| 13,600-14,400 | demo race 3: red car, speedway | 0.976 / 1.032 | 25% | 0.64 / 0.94 / 1.02 | 0.79 / 0.87 | CPU | 45.9 | 57.2 |
+
+The titles (3,800-4,349, 9,250-10,199, 13,300-13,599) run at 57.5. Demo race 2 is the board's one steady 60 Hz scene
+(R142); its CPU is 15-20% under the line. Seen as the FPS counter sees it (frames begun a second), the CPU alone
+gives runs of 4-11 seconds at 28-30 (mean 4.1) between runs of 3-15 seconds at 57-58 (mean 3.4), with a second or two
+between at 32-50: the board's pattern. The per-scene CPU is within 2-3% of its deadline at p50, so a few percent of
+camera-driven load decides each stretch.
+
+*What each limiter needs.*
+- **CPU**, the time to 4C6FC cut by (the loops above 1.3-1.4 are single loops at cuts and are left out):
+
+  | Scene | for p90 under 1.000 | for p95 | CPU work alone (less the 0.041 DMA wait) |
+  |---|---|---|---|
+  | montage 1 speedway | 0.7% | 5.5% | 0.7 / 5.8% |
+  | montage 1 cockpit, canyon | 3.7% | 4.3% | 3.9 / 4.5% |
+  | montage 1 city | 5.9% | 13.5% | 6.1 / 14.1% |
+  | montage 1 cockpit, replay | 9.1% | 12.3% | 9.5 / 12.8% |
+  | demo race 1 | 5.2% | 6.6% | 5.4 / 6.9% |
+  | montage 2 | 4.9% | 10.6% | 5.1 / 11.0% |
+  | demo race 3 | 3.1% | 3.5% | 3.2 / 3.6% |
+
+  About 6-7% covers the races' p95 (the CPU at about 128 MHz, or that many fewer cycles); the city and replay shots
+  need 13-14%. D-57 holds: CPU cycles are the lever, and no area change may cost one.
+- **Geometry** is over a vblank only in the cockpit shots (3,160-3,260 and 12,380-12,480, up to 1.12: −10.6% to
+  clear) and for a frame or two in the races (6,220-6,240, 7,050-7,060, 14,350: up to 1.02). With the CPU on time it
+  drops 42 of 750 frames in montage 1's cockpit and replay, 25 of 3,297 in race 1.
+- **Rasteriser** is over a vblank only in the white-outs (1,670-1,720 and 10,880-10,940, full-screen translucent
+  quads: 1.80 vblanks, 1.29 M pixels, 2,412 triangles, texture misses 2%), where it gives 30 for about a second, and
+  for single frames at 1.00-1.09 (3,160-3,260, 5,580-5,620, 6,410-6,450, 12,380), which the store's second bank
+  absorbs. On the 122 frames between 0.85 and 1.2 vblank: pixel stage busy 34.1%, texture misses 23.0%, the pixel
+  stage waiting on the z band (Z-rejected pairs and the front together; the bench does not split them) 27.0%, band
+  ends 2.1%. R149's levers, priced on the wrong frames, need pricing again here: texture misses are a quarter of
+  the replay, not 5%, so D-33's 16 fills and 64 KiB cache come before a second Z lane; the white-outs need pixel
+  rate, not cache.
+
+*VF3* (board: mostly 60 with a couple of slowdowns). The queue-on census (`zqf_vf3sm`, 400 frames) has 5 frames over a
+vblank, in two clusters (2,010-2,070 at 1.41-1.42 and 9,450-9,480 at 1.22-1.34; ×1.086 for latency, 1.33-1.54): the
+camera close against a large textured surface, 68% of the replay waiting on texture misses. Its geometry peaks at
+0.71 and its CPU bursts at 0.81 (R141), and VF3 paces on the vblank count, so these are rasteriser-bound drops of a
+frame in two or three. The texture cache is the lever there too.
+
+*Wrong turns.*
+- I calibrated α on my frames 1300-1316 against the bench's frames 1300-1316; the timelines differ by about 200
+  frames, and the scene there is 4% heavier. Redone on the matched frames (α 2.135 → 2.29).
+- I took the system bench's 2× pixels for a different scene until its own dump showed the scene was the same and the
+  models were not. R149 had read the same gap as "the census frames differ from the system frames".
+- The game's screenshots from Supermodel under xvfb come out with the backdrop only; the scene pictures here are
+  the rasteriser bench's own layers (`--out`).
+
+*Next.* Rerun the d2 system bench with `--xlin` (or a fresh image), then repeat the rasteriser and geometry
+calibration on correct system frames; price D-33 and the CPU's cycle levers on these scenes.
+
+*Correction to R149, R156 and R158.* The d2 system bench drew the wrong models: `m3_system` has `VROM_LIN` on and the d2 scripts never passed `--xlin`, so VROM sat in DDR3 in the wrong order (the stadium as huge flat polygons, noise textures, twice the pixels). R149's 1.005 vblank and its "15x overdraw, two thirds fail Z" describe that broken picture; the pair queue was chosen on it. On correct frames the queue still cuts the census replay 4-9% (R156), but texture misses are a quarter of the replay and D-33's options rank ahead of a second Z lane. The CPU figures stand: the CPU does not read VROM.
+
+**R161 — First sound on the board (2026-11-10, `sndtest4_s3` RBF 9b532170: `area` 6c11801, the interconnect savings
+and the sound link v4; arcsnd on the HPS).** With arcsnd's first live server the sound cut in and out (VF3, Scud
+Race) and Scud Race's polygons were stretched and misplaced in play on track 1. The server's DDR3 block lies above
+the kernel's RAM, so `/dev/mem` maps it uncached and strongly ordered, and the server wrote each record a word at a
+time: 74 stores a sample, 3.26 M a second, 30-40 points of core 0 the bench never paid. Written as nine 32-byte bursts
+(arcsnd 0a3cc7cb): Scud Race plays with no cut-outs and its polygons are right; VF3 has a few short cut-outs (load
+73-82%); Daytona 2, with the DSB's MPEG music, plays clean (52-63%). The record writes still take 17-18% of the core.
+The polygon fault means heavy HPS traffic on DDR3 can corrupt what the Real3D reads: a core fault, being reproduced
+on the bench. The output is too quiet; the next build adds gain and an OSD volume setting, and the steering options.
+
+*Board, 2026-11-10, later (arcsnd 35c3d966: only changed words written, count and tag in one 64-bit store, inactive
+slots' LFO deferred, DSB1's Z80 delay loop skipped exactly).* VF3 through seven stages of play: sound good, no
+dropouts, every stage at 57-58 fps. Server: 56-76% busy, records 5.3-6.7% of core 0, most behind 64-128 samples, late
+flat since load, MIDI late 0. VF3's earlier slowdowns follow the characters with a lot of floating cloth, not the sound.
+
+**R162 — Scud Race's stretched polygons with the first sound server running: not reproduced. Every block on the
+Real3D's DDR3 path, and the path itself, gives the right words under an HPS-traffic model far past the server's
+load; the frame's DMA, the 8C copy, the scan-out and the build's timing were each measured and none fits on its own.
+A board test separates what is left.**
+
+Work in `sm3-builds/ddrload/` (tree: `git archive 6c11801` plus `sm3-builds/sndtest/tree4`'s RTL, which is
+`sndtest4_s3`'s, RBF 9b532170). No RTL changed. The main tree is untouched.
+
+*What I believed* (the board, 2026-11-10, `sndtest4_s3`): with arcsnd's first server running (each record a word at a
+time: 74 uncached stores a sample, about 3.26 M single-word DDR3 writes a second at 0x3F200000), Scud Race's polygons
+were stretched and misplaced in play on track 1. Stopped, and the game reloaded, they were fine; with the second server
+(nine 32-byte bursts a record, about 486k a second) they were fine. So heavy HPS DDR3 traffic by itself was making the
+core read wrong data or mishandle a slow DDR3 answer somewhere in the Real3D's path.
+
+*The model of the HPS's traffic* (`sim/hps_ddr.h`). Beyond the benches' "BUSY a random PCT, beats LO..HI later": the
+controller is taken every PERIOD clocks for TAKE clocks (BUSY high, no beats), long stalls at random, latency spikes,
+gaps between beats, a cap on reads held, and reads that return memory as it was when the read was taken (command order
+with writes, as the controller keeps it; the old models read memory when the beat comes back). Profiles: `hps1` the
+first server (a take every 37 ± 20 clocks of 4-16, BUSY 35%, latency to 240); `hps2` heavier (BUSY 94-97%, latency to
+560); `hps3` long stalls only (1,000-8,000 clocks, BUSY 85%); `hps4` an order of magnitude past `hps1` (BUSY 99.9%).
+`base` is the old model. On the board, R69 measured 15 clocks typical and 99 worst with only the scaler running.
+
+*What I found, block by block:*
+
+| Bench | What | Result |
+|---|---|---|
+| `tb_m3_ddr3p_hps` | m3_ddr3p (NP 2, MAXQ 8), every beat checked by owner | 5 profiles × 2 seeds × 3 M clocks: 0 errors |
+| `tb_ddrpath` (new) | the path as m3_system builds it: m3_ddr3p behind m3_ddr_arb's 8 ports, m3_xmem (PIPE, XLIN, GQ 4) on P1, the texture cache's fills on P0, m3v_ddr_rd on port 3, the other 6 ports as clients with their burst shapes; every word the geometry's VROM and polygon RAM ports, the texture port and the cache get is checked, the writers' regions at the end | 5 profiles × 3 seeds × 3 M clocks, and Scud Race's traffic mix (below) at 0.5-2×: 0 errors |
+| `r3d_geo` (SETUP_OUT, LOD_WORD, as m3_system) | the geometry's 6 hostile profiles plus two HPS-like ones (latency 12-300 / 12-600, gaps 30-60%) | Scud Race (frames 10,690-10,770): 81 of 81 frames match the model on every triangle field, 275,733 triangles, on all 8; VF3, Bass Fishing, Daytona 2 (20 frames each): all match on all 8 |
+| `r3d_rast` (MIP) | p1 (BUSY 60%, latency 20-200, acknowledges up to 400) and an HPS-like profile | Scud Race's 81 frames: 0 pixels wrong, 0 port-rule violations, on both |
+| `tb_r3d_hostx` (new form) | r3d_cmd, r3d_mem, r3d_texup on m2_sdram and m3_ddr3p, driven by Scud Race's 10,770-frame Supermodel trace; built as the board is (`M3_DMAFAST`, `M3_R3B`), which `test_sb_host` never built | `base`: 141 draws checked (8E and polygon RAM at the draw and at the geometry's end), textures at upload and at replay end, 209 8C images, all identical. `hps1` (BUSY 34.8%, 125 M HPS takes, 92,286 long stalls over 4.6 G clocks): 155 draws, again at the geometry's end, 155 texture sheets twice, 209 8C images, all identical. The old form: 160 draws, all identical. Only the 585 line-of-sight status reads differ, by design |
+
+Planted: a texture read that does not wait for the geometry's beats (m3_xmem) is caught, 90 errors on the old model and
+236 under `hps1`. Two others turned out harmless, and say something about the design: removing m3_ddr3p's head forward
+changes nothing, because the head is read again every clock and no beat comes the clock after a take; dropping the
+arbiter's no-grant clock after an acknowledge changes nothing, because none of the core's masters holds its request
+past the acknowledge's clock.
+
+*The mechanisms that DDR3 timing could reach without a logic fault, each measured:*
+- **8C is one copy, read live by the geometry** (the notes' "the geometry may see them if it is still running"). Scud
+  Race writes 8C only at course loads: Supermodel's attract trace, frames 188-200, 748-749, 4,617-4,618, 8,486-8,488;
+  a play trace I made with scripted input (coin at 1,500, a race from about 4,000), 3,544-3,545. Never in a frame.
+- **The frame's DMA.** After each flip (line 239) the 53C810 writes 24,216 polygon RAM words, about 6,600 8E words and
+  the command port, chained block by block from the CPU's interrupt. In my Supermodel copy, with the CPU's RAM stores
+  logged in a window (`ddrload/sm`), the play frame's DMA copies its lists 342k-446k CPU cycles after the flip (of a
+  1,738,400-cycle frame), the CPU builds them from 69k-110k after the flip, and rewrites them from 69k-110k after the
+  next flip. 1,800-2,100 polygon RAM words and 550-780 8E words change value each frame. So a DMA would have to take
+  about 0.84 of a frame before it copied a half-built list, and, because a command-port write that lands after a flip
+  arms the next flip, about 0.75 of a frame before a part-written DMA could be drawn. With Scud Race's traffic (the
+  geometry's 2,691 polygon RAM and 5,442 VROM requests a frame, the store's record writes and run reads, the layer,
+  the scan-out, the sound bridge's 37-beat reads every 2,721 clocks, texture fills every 60 clocks), r3d_mem's one-word
+  writes drain at 7.9 clocks a word on the old model and 12.9 under `hps1` (10.3 and 19.9 at 1.5× the traffic). The
+  DMA engine itself moves a word in 14.9 clocks (R144), so a 30,800-word DMA stays near 0.22-0.3 of a frame.
+- **The scan-out**, the one DDR3 client whose failure would leave the HUD right and the 3D wrong (a line fetched late
+  shows another line's 3D). With m3_compose on arbiter port 0 of `tb_ddrpath` and Scud Race's mix at 1× and 2×: 2
+  lines late in 10 frames (the start) on `base`, `hps1` and `hps2`; 2,014 under `hps3`. It needs the FPGA port held for
+  tens of microseconds at a time, which one strongly ordered ARM store every 300 ns should not do.
+- **The build's timing.** `sndtest4_s3` runs 120 MHz at −3.117 ns worst setup (slow 100 °C), 11,115 failing endpoints.
+  76 of them end in the f2sdram port (write data and byte enables through the arbiter's and m3_ddr3p's muxes: r3d_mem's
+  copy data −2.314, its one-word data through m2_sdram's column count −1.906, the layer −1.486, the store −1.381). From
+  the port's BUSY output, paths into m3_ddr3p's `wbeats` (−0.389), the layer FIFO (−0.331) and `c_a[0]` (−0.055) fail,
+  and r3d_mem's `ci`, m3_xmem's `ni`, the texture cache's issue count sit within +0.5. A BUSY path only matters on a
+  clock where BUSY changes, which the HPS's traffic makes common. But ordinary request paths into the same registers
+  already fail by up to −1.9 ns and work on the board, and the CPU's −3.1 ns paths would fail first; the game kept
+  running. So timing is not likely alone.
+
+*What I know now:* the Real3D's DDR3 path is right under any wait-request, gap and latency I could model, by every
+block's own comparison against its reference, on Scud Race's own data; the frame's DMA and 8C are not exposed at
+these loads. I have not reproduced the symptom. What is left is outside what the benches model: the FPGA port starved
+far longer than the model's `hps1` (the scan-out), a wrong word written into VROM while the game was loading with the
+server running (a persistent fault: the board report's "stopped, and the game reloaded" fixes that and any live fault
+alike), the framework's scaler starved on HDMI (the whole picture, not only the 3D), or the die's temperature or supply
+with a busy ARM (timing).
+
+*The board test* (each a few minutes of track 1 in play, after loading the game with nothing extra running, unless
+said; a test build with the overlay, `RELEASE` off, and `SND_DSP` 0 if the overlay does not fit beside the sound link):
+1. The first server again, on `sndtest4_s3`; when the polygons go wrong, stop the server **without** reloading.
+   Still wrong: a memory's contents (go to 2). Right again within a frame: a live fault (go to 3).
+2. OSD reset (the game restarts, VROM is not reloaded). Still wrong: VROM in DDR3 is damaged; then load the game
+   with the server already running, and again with it stopped, and compare. Right: polygon RAM or 8E (the copies).
+3. `hpsload word -r 3263400` (`board/hpsload.c`, the server's stores without sound) at its default block
+   0x3E000000: wrong as with the server means DDR3 traffic alone; then `hpsload cpu`: wrong means the busy ARM (heat,
+   supply), not DDR3; then `hpsload burst -r 486000` as the control.
+4. On the test build, overlay row 1 while it is wrong: `geo_err`, and the layer lines late (`fb_late`). Late lines
+   climbing name the scan-out. Main's screenshot against the screen: right in the screenshot and wrong on HDMI is the
+   scaler, not the core.
+
+*Side findings:*
+- `m3v_ddr_rd`'s header says words past the 4 MiB window read as zeros. Only a request that starts past it does; one
+  that crosses it reads on into the next bank. Harmless: `r3d_mstream` drops the words past a region's end itself.
+- m3_ddr3p's head forward (`rd_take && rq_wp == rp_next`) is never needed, since no beat comes the clock after a take:
+  a small area candidate for the MLAB form.
+- `test_sb_host` builds the host blocks without `M3_DMAFAST` and `M3_R3B`, so the board's form of r3d_cmd and r3d_mem
+  had only been through the system bench. `ddrload/sim/r3d_host_tb.sv` wires r3d_mem's write-burst port as m3_system
+  does.
+- The Makefile's `RAST_TOP_RTL` lacks `r3d_rast_zq.sv`.
+
+*Wrong turns:*
+- My first path-bench check expected zeros past the polygon RAM window and failed 52 words; it was my reading of the
+  header, not the RTL.
+- My first drain measurements used loads far heavier than any frame (343-1,318 clocks a word) and made the DMA look
+  as if it could stretch past a frame. At Scud Race's rates it is 7.9-19.9.
+- I took the DMA's timing for a strong lead (a late command-port write arming the next flip over a part-written DMA)
+  until the trace showed 0.75-0.84 of a frame of slack.
+- The host bench's first runs stopped at time 0 on r3d_mem's copy assertion with random initial state (the assertion
+  is not held off in reset); they run with zeroed state.
+- crash15's dumps are the geometry's 9 MiB form; the rasteriser bench needs the 17 MiB form and ran 0 frames on them
+  without saying why.
