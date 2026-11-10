@@ -14283,3 +14283,247 @@ said; a test build with the overlay, `RELEASE` off, and `SND_DSP` 0 if the overl
   is not held off in reset); they run with zeroed state.
 - crash15's dumps are the geometry's 9 MiB form; the rasteriser bench needs the 17 MiB form and ran 0 frames on them
   without saying why.
+
+**R163 — The bridges pass (on 6c11801, 120 MHz): eight zero-cycle changes to the interconnect free about 410 ALM in
+the blocks they touch (fit against fit), −454 ALM at the full map, for one M10K; every bench, both system runs and
+both bus traces identical. The LAB count only falls from 4,189 to 4,183: at 94% the fitter keeps every LAB in use. The
+bus was the outlier; most of it was the MPC106's register file, now one M10K with every register as it behaved.**
+
+Work in `sm3-builds/bridges/`:
+- `tree`: 6c11801 by `git archive`; `work`: the kept changes; `flt/`: planted faults; `logs/`: every bench and
+  `pricing.txt`, every standalone map;
+- `sa`, `sa_src`: standalone maps and their wrappers (`w_bus`, `w_sdram`, `w_ddr`, with `m3_system`'s tie-offs and only
+  the outputs a release build reads); `map/`: full-design maps; `miter/bus`: `m3_bus`, old against new;
+- `trace/c106.py`: the MPC106 accesses of a bus trace; `tools/`: the scripts.
+
+The fit is `sm3-builds/br3_s3` (120 MHz, seed 3, release, dual SDRAM off; RBF be74da05). `br_s3` (2795838f) is the
+first form, with the MPC106 cut to two registers, and `br2_s3` (b95290ad) the M10K form with its first hold (§2). The comparison fits are
+`area4_k1_s3` (a953ee0 and R157, no M3_R3B / M3_DMAFAST) and `lean_m_s3` (a953ee0 and R156, with them): neither is
+6c11801, which has both, and there is no fit of 6c11801 itself. Per block I compare against the fit that builds the
+block as 6c11801 does: `lean_m_s3` for `m2_sdram` (R3B's second write-burst port), `area4_k1_s3` for the rest.
+
+D-48 and D-57 apply: no cycle anywhere, the CPU above all, no Fmax loss. D-54: no sys/ edits. One M10K (D-55's
+budget: 392 used, with the DSP's 135 that is 527 of 553). No behaviour removed, even where none of the five games uses
+it: other Model 3 games may.
+Every change sits behind a parameter whose default is the old form; `m3_system` turns them on (`SDR_SHD`, `BR_C106`,
+`BR_SEC`, `BR_BUS`, `BR_LD`), so Model 2's copy of `m2_sdram` and every unit bench build as before.
+
+*What I believed:*
+- That the bus (828 ALM against my Model 2 core's `m2_cpu_bridge` at 632) was big because of its decode and its
+  wide data selects, and that the interconnect as a whole had 700-1,000 ALM in it.
+- That the loader (186) was the other outlier. In `area4_k1_s3` it is 130; R151's area pass had already taken
+  its RAM-read registers.
+
+*What I know now:*
+
+**1. Where the bus goes** (standalone map, the release outputs only; 892 ALM, 1,211 ALUTs, 852 registers):
+
+| Taken out (pricing only, not built) | ALM | ALUTs | Registers |
+|---|---|---|---|
+| STEP2 (the whole Step 2.x map) | −308 | −432 | −204 |
+| of which the MPC106's 64 registers (read as their reset values) | −183 | −229 | −83 |
+| of which the RTC (held at zero) | −43 | −78 | −47 |
+| R3P's buffer | −74 | −115 | −73 |
+| TGT (the tile generator's timing) | +2 | −61 | −33 |
+| the trace kept for the tile generator's name-table flush | −5 | −23 | −19 |
+
+Without Step 2 the bus is 584 ALM, under Model 2's bridge. The MPC106's file is a 64 × 32 MLAB (4 LABs), 64
+written flags with their 6-bit decode and 64:1 select, the reset-value table and a byte-lane merge.
+
+**2. The MPC106's file in one M10K, every register as it behaved.** In the MLAB form a register reads as written
+since the game's reset, else its CMPC10x::Reset value: a 64 × 32 MLAB read asynchronously at `pci_reg`, 64 written flags
+cleared by reset, a 64:1 select of them, the reset-value table and a 2:1 select, all registered into `cq_q` every clock.
+`cq_q` is the only consumer, in B_INT's read and in the write's lane merge, used a clock or more after `pci_reg` settles.
+With `C106_M10K`:
+- the M10K is read registered at `pci_reg` every clock, so its output is `cq_q` itself: the same address, sampled at
+  the same edge;
+- the written flags go: from each reset's start a sweep writes the 64 reset values, one a clock (registers power up 0,
+  so it runs at power-up too), so the M10K always holds the written value or the reset value. A write merges its lanes
+  with `cq_q` as before; reset clears what the game wrote, as the flags did;
+- while the sweep runs every access waits in B_DEC. That happens only if a master asks within 64 clocks of a reset's
+  start. The core's resets are all far longer: the loader's (the whole download), RESET, the OSD's status bit (set and
+  cleared by Main over SPI, tens of microseconds) and the button, against 0.53 us. So the form is zero-cycle given a
+  reset of at least 64 clocks, and a Verilator check stops on any access the sweep holds;
+- under Verilator the MLAB form is kept beside it as a shadow, and every word used is checked against it.
+
+The first hold (`br2_s3`) waited only for configuration data accesses, `c_swp && tgt == X_PCID`. That put the target
+decode into B_DEC's choice and cost the bus's `addr` enables 0.66 ns (−1.297 → −1.960). The hold on the sweep's register
+alone, ORed into the tile generator's, adds no level.
+
+The study's earlier trace check (Supermodel's 3,000-frame Daytona 2 run reads device 0 at 00, 02 as a byte, 3C and 2A,
+`trace/smnv_c106.txt`) supported a two-register form, which I built and fitted (`br_s3`). I dropped it: other Model 3
+games may use the registers, so the file keeps its full behaviour.
+
+**3. The changes** (map: standalone, the build's parameters; fit: `br3_s3` against the base fit named above, ALMs needed):
+
+| # | Block | Change | Why it is zero-cycle | Map ALM / ALUTs / regs | Fit ALM / ALUTs / regs |
+|---|---|---|---|---|---|
+| 1 | `m3_bus` | `C106_M10K`: the MPC106's 64 registers in one M10K, the reset values swept in | §2; the same word at every use, given resets of 64 clocks or more | −131 / −160 / −94; +1 M10K, the 4-LAB MLAB gone | |
+| 2 | `m3_bus` | `WD_DEC`: `wd` loaded in B_DEC from the owner's `m_wdata[who]` (the select `s_wdata` already has), not in B_IDLE through the grant's | the master holds its word until `m_ack` | −46 / −36 / 0 | |
+| 3 | `m3_bus`, `m3_fps`, `m3_system` | `EXT_SEC`: one second counter for the RTC and the frame counter | both counted 0 to CLK_HZ − 1 from the game's reset; a Verilator check keeps the old counter beside it | −27 / −41 / −27 | `m3_fps` −20.4 / −37 / −25 |
+| 4 | `m3_bus` | `OWIRE`: the 53C810's, the security board's and the PCI configuration's fields, and the tile generator's data, wired from `cmd`, `addr`, `be`, `wd`, `pci_addr` | each target reads them only with its request up, or the clock after `do_w`, where none of them moves; `tg_*_addr` stay registered (a line write's `addr` has moved on) | −11 / −5 / −186 | |
+| | `m3_bus` | 1-4 together | | **892 → 694 (−198) / −219 / −307** | **828.1 → 641.2 (−186.9) / −146 / −307; MLAB 70 → 30; M10K 1 → 2** |
+| 5 | `m2_sdram` | `SHD`: ports 0, 1, 2, 3, 5 share one 64-bit read register; port 4 keeps its own | every one of those takes `p_dout` only in its `p_lo` / `p_ack` clock (ACK_HOLD 1). `r3d_mem` reads its word on through its write burst (S_SW2), so it cannot share | 751 → 620 (−131) / −6 / −256 | 600.9 → 522.2 (−78.7) / −23 / −136 |
+| 6 | `m3_sdr_port` | `LB`: the line buffer (`bd_e`, `bd_o`) built only where it is read: not with FWD, L16, PAIR and PW and without RA, the build's set | there `bq` has no reader: a fill's beats go out as they arrive, a cast-out's into `wbuf` | 272 → 251 (−21) / −37 / 0 | 246.0 → 171.0 (−75.0) / −72 / −14; MLAB 60 → 20 |
+| 7 | `m3_loader` | `OWIRE`: the SDRAM, extra-memory and 93C46 fields wired from `h_adr` / `h_dat` | `h_*` load only on `f_re`, which needs `!wbusy && !rd_armed`, so they hold from each request to its acknowledge and through `ee_we` | 210 → 164 (−46) / −3 / −106 | 130.3 → 100.6 (−29.7) / −4 / −121 |
+| 8 | `m3_scripts` | `LDV`: DSPS and TEMP load one shared value, the DMA device's register write or the SCRIPTS fetch's beat | the write needs `!busy`, the fetch's last beat a busy port and no Step 2: never in one clock | 388 → 374 (−14) / −30 / 0 | 341.5 → 305.1 (−36.4) / −73 / +7 |
+| | **all** | | | **full map 40,066 → 39,612 (−454) / 58,624 → 58,175 (−449) / 50,932 → 50,409 (−523); M10K +1** | **about −409 ALM in the changed blocks** |
+
+- The fit's −409: `m3_bus` −186.9, `m2_sdram` −78.7, `m3_sdr_port` −75.0, `m3_scripts` −36.4, `m3_loader` −29.7,
+  `m3_fps` −20.4, and `m3_system`'s own logic +18.5 (91.6 → 110.1: the shared second counter is there now). Of it, 8
+  LABs are MLABs gone: `c106` (4) and the line buffer (4).
+- The bus is 641 ALM against my Model 2 core's `m2_cpu_bridge` at 632, with the Step 2 map (RTC, MPC106, security board)
+  that Model 2's bridge has no counterpart for.
+- At the map the registers moved most and bought least (row 4: −186 registers, −11 ALM), as §8.4 says. In the fit
+  `m2_sdram` gives about half its map figure, and the loader about 60%: they were partly register-bound.
+- **The whole build** (`br3_s3`): 39,302.5 ALMs needed, 40,779 placed, 2,284 recoverable; **4,183 of 4,191 LABs**, M10K
+  392, DSP 88. `area4_k1_s3`: 39,535.5 / 40,924.0 / 2,233.5, 4,189 LABs, M10K 388. 6c11801 carries R156's blocks
+  (`lean_m_s3`'s rasteriser is +588 ALM on `area4_k1_s3`'s, here +162), so the whole-build difference is not the
+  pass's. As R157 found, with a few hundred ALMs of slack the fitter spreads into every LAB: the LAB count falls by 6
+  for 409 ALM of logic, and does not measure what the sound link has to find.
+
+Timing (slow corners setup, ns; hold the least over all clocks):
+
+| Fit | Setup 100 °C / −40 °C | TNS 100 °C / −40 °C | Setup fast 100 °C / −40 °C | Hold s100 / sn40 / f100 / fn40 | HDMI | RBF |
+|---|---|---|---|---|---|---|
+| `area4_k1_s3` | −3.024 / −2.888 | −5,246.9 / −3,996.1 | +1.846 / +2.925 | +0.158 / +0.111 / +0.094 / +0.052 | −0.129 | 60e3753c |
+| `br_s3` (two registers) | −2.952 / −2.852 | −4,370.4 / −3,092.1 | +1.758 / +2.824 | +0.102 / +0.075 / +0.108 / +0.067 | −0.084 | 2795838f |
+| `br2_s3` (M10K, first hold) | −3.017 / −3.014 | −6,032.2 / −4,609.1 | +1.727 / +2.952 | +0.155 / +0.092 / +0.101 / +0.081 | −0.078 | b95290ad |
+| `br3_s3` (M10K, kept) | −2.684 / −2.497 | −4,533.4 / −3,546.1 | +1.808 / +2.960 | +0.182 / +0.143 / +0.095 / +0.076 | +0.124 | be74da05 |
+
+In `br3_s3` the worst paths are the CPU's (−2.476 to −2.479 in the core, I- and D-cache), untouched. Every SDRAM pin
+is packed. One seed each.
+
+The bus's own worst path is worse, though: its B_DEC choice into the state register (`addr` → `bs.*`, 100 °C):
+
+| Fit | Into `bs.*` | Bus family worst |
+|---|---|---|
+| `area4_k1_s3` | −1.265 | −1.522 |
+| `lean_m_s3` | −1.402 | −1.565 |
+| `br_s3` | −1.641 | −1.641 |
+| `br2_s3` | −1.738 | −1.960 |
+| `br3_s3` | −2.019 | −2.019 |
+
+One seed of a full fit cannot separate placement from logic, so the bus was fitted alone (`tools/safit2.sh`: the release
+wrapper, every port a virtual pin, 8.333 ns, three seeds each; slack at the slow corners, 100 °C / −40 °C, ns):
+
+| Seed | 6c11801's bus | The kept bus |
+|---|---|---|
+| 1 | +1.254 / +1.208 | +0.617 / +0.477 |
+| 2 | +1.079 / +1.113 | +1.016 / +1.128 |
+| 3 | +1.380 / +1.224 | +1.299 / +1.217 |
+
+The worst path in all six is the tile generator's timing (`addr` → `tg_done` / `tg_free`), which no change touches.
+Two seeds agree to 0.08 ns, and seed 1 is 0.64 ns down. The design's worst slack improved by 0.34 ns and is the CPU's.
+The bus's path in the core (−2.0) is the open question. A second seed of the full fit, or the bus's B_DEC choice made
+shallower, would settle it. Not done.
+
+**4. Proof** (base = `tree`, new = `work`):
+- **The bus, old against new** (`miter/bus`, Verilator): 6c11801's `m3_bus` and the new one with the build's
+  parameters and STEP2, every output compared every clock; a target's fields while its request is up, the tile
+  generator's data with its strobe, `h_*` with `h_go`, `io_*` with `io_sel` / `io_we` (what each consumer reads). Two
+  masters on the caches' protocol over every target of the map (RAM, CROM, VRAM, palette, tile registers, the Real3D's
+  status and windows, 9C, the 53C810's window, I/O and its mirrors, MIDI, backup RAM, system registers, RTC, the
+  security board, MPC105 and MPC106 configuration, F8FFF0, anything else), lines included, the targets answering after
+  random delays; the RTC at 2,000 clocks a second; a reset of 80 clocks at the start and every 400,000.
+  - Seeds 1-5 and 7, Step 2, and 6, Step 1, 2 M clocks each, about 207,000 transactions a run: 0 clocks differ.
+    Each Step 2 run makes 1,056-1,208 device-0 reads and 1,012-1,259 writes, 661-858 of them partial-lane, every
+    read allowed. The shadow check never fires.
+  - With an 8-clock reset (seed 8) the sweep's check stops the run, as it should: that is the condition above.
+- **Unit benches**, both trees, every result line identical: `test_sdr_port`, `test_sdr_port_r107` (36 runs),
+  `test_bus`, `test_bus_tg` (3), `test_bus_r107` (29), `test_loader_sw`. The `fwd`, `n112`, `d112` and `b112` sets build
+  the port without its line buffer, `ra` and `a112` with it.
+- **With the switches on in the benches** (`m3_bus_tb` / `m3_sdr_tb` BR: `OWIRE`, `WD_DEC`, `SHD`), against the same
+  build and seed without: the bus's b112 seeds 36-39, b112 with TGT seeds 21-22, the port's b112 seeds 33-36: every
+  line identical, all PASS.
+- **The 53C810** (`test_scripts`' l1 runs on the five captures): the tree, the work with `LDV` 0 and with `LDV` 1, logs
+  byte for byte the same.
+- **System from a fresh boot** (`tb_m3_system`, Model3.sv's options, M3_DMAFAST and M3_R3B, 120 MHz; run on the first
+  form, on the M10K form with its first hold and on the kept form, each time against 6c11801), every line but
+  the host's speed identical, the bus traces byte for byte, the video at the frames dumped identical:
+  - VF3, 48 frames: 97,848,970 cycles, 1,008,419 bus records, frames 16, 24, 32, 40;
+  - Daytona 2 with its configuration, extra memory and fixed CROM through ioctl, 64 frames: 133,312,330 cycles,
+    28,496,992 SDRAM reads and 422,868 writes, frames 16, 32, 48, 60. One second passes, and the second counter's
+    check against the old prescaler holds. MCCR1's write and read-back (frame 1) are in it, and the shadow holds;
+    PICR1's (Supermodel's frame 61) is past the run's 64 frames, and the miter covers it.
+  - Neither run draws a Real3D frame in that time, so the culling reads (port 2's shared register) are checked by the
+    port bench and the miter's argument only, not by a picture.
+- **Planted faults**, each caught:
+
+  | Fault | Caught by | Result |
+  |---|---|---|
+  | `LB` without `|| RA` (the buffer gone where RA reads it) | port bench, a112 seeds 28, 29 | both FAIL, 10 data mismatches |
+  | `pd_sh` not loaded on `p_lo` deliveries | port bench, b112 with BR | FAIL, 14 data mismatches |
+  | the sweep writing zeros, not the reset values | bus miter, the shadow | stops: the M10K's word against the old file |
+  | the sweep not restarted at a reset | bus miter, the shadow | stops: the M10K's word against the old file |
+  | the RTC's second every other tick | bus miter | FAIL (read data, trace) |
+  | `sec_wdata` byte-reversed | bus miter | FAIL (the security board's fields) |
+  | `s_wdata` from the stale `wd` in B_DEC | bus miter | FAIL (`s_wdata`) |
+  | the loader's SDRAM word with bit 8 flipped | system bench, VF3 | 32,768 of 32,768 words wrong |
+  | `lv` always the register write's | 53C810 bench | FAIL: reads and writes differ |
+
+- **Lint** (`lint_sys`): the same nine warnings as the base. **`quartus_map --analyze_file`** on the seven files, in a
+  scratch copy: 0 errors, 0 warnings.
+
+**5. The bus's path into its state register, and B_DEC made shallower (`work2`, `BDEC`).** A fit of 6c11801 itself is
+now there (`base_6c_s3`); against it the changed blocks give −373 ALM in `br3_s3` and −349 in `br4_s3`. The shared read
+register is worth −15 to −23 there, not R160's −79 against `lean_m_s3`.
+
+`br3_s3`'s worst bus path was the address decode into B_DEC's choice of next state: `addr[28]` → `io_win` → the decode
+→ `tgt.X_PCID` → the internal targets' dispatch → `bs.B_BEAT`, 8 cells against the base's 7 (`tgt` one-hot instead of
+binary; the same source at that point), −2.019 ns against −0.455.
+
+`BDEC` (zero-cycle, miter 0 clocks differ on seven seeds, standalone bus 694 → 690 ALM):
+- the SDRAM, tile RAM and palette tests written flat from the address, the window's exclusion kept, checked against the
+  decode under Verilator;
+- every internal access sent from B_DEC to B_BEAT, whose first clock raises the 53C810's, the security board's or the
+  PCI configuration's request (by `tgt_q`) as those states' first clock did, the same clock.
+
+| Path, slow 100 °C, ns | `base_6c_s3` | `br3_s3` | `br4_s3` (`BDEC`) | `br4_s2` (`BDEC`) |
+|---|---|---|---|---|
+| `addr` → `bs.B_BEAT` | −0.455 (7 cells) | −2.019 (8) | −1.500 (8) | −0.431 (8) |
+| `r3d_cmd` `sw_wait` → `bs.*` (the host port's ready) | +0.864 (6) | +0.411 (5) | −1.785 (6) | −1.239 (7) |
+| worst into `bs.*` | −0.952 | −2.019 | −1.785 | −1.239 |
+| the design's worst (100 °C / −40 °C) | −2.830 / −3.220 | −2.684 / −2.497 | −2.846 / −2.848 | −2.924 / −2.931 |
+| LABs | 4,190 | 4,183 | 4,186 | 4,189 |
+
+- The address path is back to the base's on seed 2 and half-way on seed 3. The bus's worst is now the host port's ready
+  from `r3d_cmd`, at the base's depth or one more, 2.1-2.6 ns worse than the base's on both seeds: the bus is no longer
+  where it was placed. Neither seed is at −1.4 on both paths.
+- `work3`: the window compared at the grant for both masters and kept (`scwin_q`), taking three levels off the address
+  path. Miter 0 clocks differ, but 690 → 728 ALM: two 24-bit compares cost more than the one they replace. Not taken.
+- The design's worst path is the CPU's in every fit.
+
+*Wrong turns:*
+- **The DDR3 write data without the P ports' arm** (`m3_ddr3p` PWR 0: P ports never write, so `DDRAM_DIN` could be
+  `din`). Standalone with the arbiter in front: 457 → 458 ALUTs, 334 → 367 ALM. The mask folds into the arbiter's
+  select already. Reverted. (That select is the other pass's.)
+- **The VROM pair passed from `r3d_texup` to `m3_xmem` as it is** (R131's −40 to −50 ALUT). Measured −3 ALUTs: at AW 26
+  the SDRAM form's base is bit 25 and the two permutations are wiring; Quartus had folded the round trip. Reverted.
+- **`INT_OP` 0** (no game runs INT): +3 ALUTs. Not taken.
+- **The MPC106 cut to the two registers Daytona 2 reads back** (built, fitted in `br_s3`): dropped, as it removes
+  behaviour other Model 3 games may use. The M10K form keeps all of it for about 20 ALM more in the bus.
+- **The M10K form's first hold** waited on the target decode (`c_swp && tgt == X_PCID`): 0.66 ns on the bus's `addr`
+  enables in `br2_s3`. On the sweep's register alone it adds no level.
+- **R131's list** had the shared read register at −40 to −90 ALM; fitted it is −79.
+- My miter's first runs failed on its own model, not the bus: the cache package's command codes (LINE_RD is 0, WR 3),
+  a 60-clock line that never reached the tile generator's fetch slot, `h_go` read after the edge it was taken at, and
+  random addresses landing in the MPC106's windows that master 0 did not track.
+- `SYS_OBJ` given to the make targets as an absolute path (R157's mistake again: the rules prefix it with `./`). And a
+  b112 + TGT bench run without `--bxor` failed on both trees: the SDRAM model needs the flag whenever BXOR is built.
+
+*Priced, not built:*
+
+| Item | ALM | Why not |
+|---|---|---|
+| The two posting FIFOs in series (`m3_bus`'s R3P buffer, 8 × 60, into `r3d_cmd`'s `pf`, 32 × 60), as one | 3 LABs | the hop between them is a clock; one FIFO moves cycles |
+| `r3_pd` removed (the buffer written in B_BEAT, the pointer as now) | about −5 (60 registers) | registers alone |
+| The loader's bank map in an MLAB | about −20 | an asynchronous MLAB read on the bus's decode path |
+| `m2_sdram`'s request mailboxes for ports that hold their address | about −6 (104 registers) | the hash moves onto the arbitration path |
+
+The rest of the glue is function, not transport: the texture decode (`r3d_texup`, 592), the tile fetch, the JTAG
+chain, the security board, the 315-5649, the DMA device (123 of the 53C810's 309).
+
+*Budget.* About 410 ALM fitted for one M10K, no DSP and no cycle, against the sound link's 637 (R159: 98 LABs, about
+700-1,000 placed ALM). With R157's priced rows and the DDR3 select under way, the interconnect has no more of that size
+at zero cycles; the rest is the second SDRAM's 262 and the sound engine made smaller.

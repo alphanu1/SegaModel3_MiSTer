@@ -108,10 +108,26 @@ module m3_bus
   parameter bit          FAST       = 1'b0,           // the CPU's work-RAM reads to the SDRAM port from B_IDLE, past B_DEC (R112)
   parameter bit          R3P        = 1'b0,           // writes to the Real3D's host port posted in an eight-word buffer (R112)
   parameter bit          TGT        = 1'b0,           // the tile generator's bus timing (R152)
-  parameter int          TG_MHZ     = 100             // the clock, for TGT's 32 MHz VRAM clock
+  parameter int          TG_MHZ     = 100,            // the clock, for TGT's 32 MHz VRAM clock
+  // The bridges pass (all zero-cycle; 1 / 0 as before):
+  //   C106_M10K the MPC106's 64 configuration registers in one M10K, read registered at pci_reg every clock (cq_q,
+  //             as before), each holding its reset value until written: a sweep writes the reset values from each
+  //             reset's start (64 clocks; any access waits in B_DEC while it runs, which the core's resets, all far
+  //             longer than 64 clocks, never make it do), so no written flags. 0: the MLAB and flags
+  //   EXT_SEC   the RTC's second from sec_tick (m3_system's one counter, m3_fps's too), not a prescaler of its own;
+  //             sec_tick is high in the clock rtc_pre would have read RTC_HZ - 1
+  //   OWIRE     the targets' fields (sc_*, sec_*, cf_* but the requests; tg_reg_wdata, tg_pal_wdata) wired from the
+  //             transaction's registers, which hold while each is read, not copied into registers of their own
+  //   WD_DEC    wd taken in B_DEC from the owner's m_wdata (who), the select s_wdata already has, not in B_IDLE
+  //             through the grant's (the master holds its word until m_ack)
+  parameter bit          C106_M10K  = 1'b0,
+  parameter bit          EXT_SEC    = 1'b0,
+  parameter bit          OWIRE      = 1'b0,
+  parameter bit          WD_DEC     = 1'b0
 ) (
   input  logic          clk,
   input  logic          rst,
+  input  logic          sec_tick,       // EXT_SEC: one clock a second (STEP2's RTC)
 
   // Step 2.x (STEP2), run time
   input  logic              step2,
@@ -332,11 +348,13 @@ module m3_bus
   logic [2:0]  rtc_s10, rtc_m10;
   logic [1:0]  rtc_h10;
   logic [3:0]  rtc_d;
+  wire rtc_wrap = EXT_SEC ? sec_tick : (rtc_pre == 27'(RTC_HZ - 1));
   always_ff @(posedge clk) begin
     if (!STEP2 || rst) begin
       rtc_pre <= '0; rtc_s1 <= '0; rtc_s10 <= '0; rtc_m1 <= '0; rtc_m10 <= '0; rtc_h1 <= '0; rtc_h10 <= '0;
-    end else if (rtc_pre != 27'(RTC_HZ - 1)) rtc_pre <= rtc_pre + 27'd1;
-    else begin
+    end else if (!rtc_wrap) begin
+      if (!EXT_SEC) rtc_pre <= rtc_pre + 27'd1;
+    end else begin
       rtc_pre <= '0;
       if (rtc_s1 != 4'd9) rtc_s1 <= rtc_s1 + 4'd1;
       else begin
@@ -376,34 +394,41 @@ module m3_bus
   // Step 2: the MPC106's configuration registers (device 0), CPU byte order
   (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] c106 [0:63];
   logic [63:0] c106_w;               // written since reset
-  logic [31:0] c106_def;
-  always_comb begin
-    case (pci_reg)                   // CMPC10x::Reset, MPC106 (the little-endian values byte-reversed)
-      6'h01: c106_def = bswap(32'h0080_0006);
-      6'h02: c106_def = bswap(32'h0006_0000);
-      6'h03: c106_def = bswap(32'h0000_0800);
-      6'h1C: c106_def = bswap(32'h00CD_0000);
-      6'h2A: c106_def = bswap(32'h0010_FF00);
-      6'h2B: c106_def = bswap(32'h060C_000C);
-      6'h2E: c106_def = bswap(32'h0400_0000);
-      6'h30: c106_def = bswap(32'h0000_0100);
-      6'h38: c106_def = bswap(32'h0042_0FFF);
-      6'h3A: c106_def = bswap(32'h0020_0000);
-      6'h3C: c106_def = bswap(32'h0000_FF02);
-      6'h3D: c106_def = bswap(32'h0003_0000);
-      6'h3F: c106_def = bswap(32'h0000_0010);
-      default: c106_def = 32'd0;
+  function automatic logic [31:0] def106(input logic [5:0] r);
+    case (r)                         // CMPC10x::Reset, MPC106 (the little-endian values byte-reversed)
+      6'h01: def106 = bswap(32'h0080_0006);
+      6'h02: def106 = bswap(32'h0006_0000);
+      6'h03: def106 = bswap(32'h0000_0800);
+      6'h1C: def106 = bswap(32'h00CD_0000);
+      6'h2A: def106 = bswap(32'h0010_FF00);
+      6'h2B: def106 = bswap(32'h060C_000C);
+      6'h2E: def106 = bswap(32'h0400_0000);
+      6'h30: def106 = bswap(32'h0000_0100);
+      6'h38: def106 = bswap(32'h0042_0FFF);
+      6'h3A: def106 = bswap(32'h0020_0000);
+      6'h3C: def106 = bswap(32'h0000_FF02);
+      6'h3D: def106 = bswap(32'h0003_0000);
+      6'h3F: def106 = bswap(32'h0000_0010);
+      default: def106 = 32'd0;
     endcase
-  end
-  wire [31:0] cq = c106_w[pci_reg] ? c106[pci_reg] : c106_def;
+  endfunction
+  wire [31:0] c106_def = def106(pci_reg);
+  wire [31:0] cq = c106_w[pci_reg] ? c106[pci_reg] : c106_def;     // (the MLAB form)
+  // C106_M10K: the file in one M10K, always the written value or the reset value (the sweep, below)
+  (* ramstyle = "M10K, no_rw_check" *) logic [31:0] c106m [0:63];
+  logic [31:0] c106m_q;
+  always_ff @(posedge clk) c106m_q <= c106m[pci_reg];
   // The internal targets' reads (B_INT) and writes (do_w) take the target and the MPC106 register registered:
   // both are used a cycle or more after addr, pci_addr and the registers settled (B_INT and the write cycle
   // follow B_BEAT, which does not move addr; consecutive accesses are B_IDLE and B_DEC apart), so they read
   // as before, from registers (c7_s1: pci_addr -> c106 select -> rd_int -> m_rdata -0.99 ns, addr -> the
   // target decode -> pci_addr's enable -0.70 ns)
   tgt_t        tgt_q;
-  logic [31:0] cq_q;
-  always_ff @(posedge clk) begin tgt_q <= tgt; cq_q <= cq; end
+  wire  [31:0] cq_q;
+  always_ff @(posedge clk) tgt_q <= tgt;
+  assign cq_q = C106_M10K ? c106m_q : cq_r;
+  logic [31:0] cq_r;
+  always_ff @(posedge clk) cq_r <= cq;
   wire        be_byte = (be == 4'h8) || (be == 4'h4) || (be == 4'h2) || (be == 4'h1);
 
   // the internal targets' read word (CPU byte order)
@@ -445,6 +470,32 @@ module m3_bus
   wire        cur_w   = (cmd == MC_WR) || (cmd == MC_LINE_WR);
   wire        is_line = (cmd == MC_LINE_RD) || (cmd == MC_LINE_WR);
   wire [31:0] wd_le = bswap(wd);      // the word as a little-endian device sees it
+
+  // OWIRE: the targets' fields. Each target reads them only while its request is up (B_SCSI, B_SEC, B_CFG, which
+  // move none of cmd, addr, be, wd or pci_addr) or, for the tile generator's data, in the clock after do_w (wd moves
+  // in B_IDLE or B_BEAT only, never in that clock; tg_pal_addr and tg_reg_addr stay registered: a line write's addr
+  // has moved on by then). The registered copies are the old form
+  logic        sc_we_q, sec_we_q, cf_we_q;
+  logic [6:2]  sc_addr_q;
+  logic [17:2] sec_addr_q;
+  logic [5:0]  cf_idx_q;
+  logic [3:0]  sc_be_q, sec_be_q, cf_be_q;
+  logic [31:0] sc_wdata_q, sec_wdata_q, cf_wdata_q, tg_reg_wdata_q;
+  logic [15:0] tg_pal_wdata_q;
+  assign sc_we        = OWIRE ? cur_w      : sc_we_q;
+  assign sc_addr      = OWIRE ? addr[6:2]  : sc_addr_q;
+  assign sc_be        = OWIRE ? be         : sc_be_q;
+  assign sc_wdata     = OWIRE ? wd         : sc_wdata_q;
+  assign sec_we       = OWIRE ? cur_w      : sec_we_q;
+  assign sec_addr     = OWIRE ? addr[17:2] : sec_addr_q;
+  assign sec_be       = OWIRE ? be         : sec_be_q;
+  assign sec_wdata    = OWIRE ? wd         : sec_wdata_q;
+  assign cf_we        = OWIRE ? cur_w      : cf_we_q;
+  assign cf_idx       = OWIRE ? pci_reg    : cf_idx_q;
+  assign cf_be        = OWIRE ? {be[0], be[1], be[2], be[3]} : cf_be_q;
+  assign cf_wdata     = OWIRE ? bswap(wd)  : cf_wdata_q;
+  assign tg_reg_wdata = OWIRE ? wd_le      : tg_reg_wdata_q;
+  assign tg_pal_wdata = OWIRE ? {wd[23:16], wd[31:24]} : tg_pal_wdata_q;
 
   // A master sees its acknowledge a cycle after the bus gives it, and drops
   // its request only then: a request whose acknowledge is out this cycle is
@@ -530,9 +581,9 @@ module m3_bus
           end
           X_PCIA: if (be == 4'hF) pci_addr <= bswap(wd);
           X_PCID: if (s2 && pci_dev == 5'd0) c106_w[pci_reg] <= 1'b1;
-          X_PAL:  if (be[3] && be[2]) begin tg_pal_we <= 1'b1; tg_pal_addr <= addr[16:2]; tg_pal_wdata <= {wd[23:16], wd[31:24]}; end
+          X_PAL:  if (be[3] && be[2]) begin tg_pal_we <= 1'b1; tg_pal_addr <= addr[16:2]; tg_pal_wdata_q <= {wd[23:16], wd[31:24]}; end
           X_TGREG: begin
-            tg_reg_we <= 1'b1; tg_reg_addr <= addr[7:2]; tg_reg_wdata <= wd_le;
+            tg_reg_we <= 1'b1; tg_reg_addr <= addr[7:2]; tg_reg_wdata_q <= wd_le;
           end
           X_NONE: begin n_unmapped <= n_unmapped + 16'd1; last_unmapped <= addr; end
           default: ;
@@ -545,13 +596,49 @@ module m3_bus
   always_ff @(posedge clk) if (do_w && tgt_q == X_TGREG) tg_shadow[addr[7:2]] <= bswap(wd);
   // the MPC106's registers, each byte lane as written (the first write of a register keeps
   // its reset value's other lanes, as Supermodel's byte array does)
-  always_ff @(posedge clk) if (STEP2 && do_w && tgt_q == X_PCID && s2 && pci_dev == 5'd0) begin
+  always_ff @(posedge clk) if (STEP2 && !C106_M10K && do_w && tgt_q == X_PCID && s2 && pci_dev == 5'd0) begin
     c106[pci_reg] <= {be[3] ? wd[31:24] : cq_q[31:24], be[2] ? wd[23:16] : cq_q[23:16],
                       be[1] ? wd[15:8] : cq_q[15:8], be[0] ? wd[7:0] : cq_q[7:0]};
   end
+  // C106_M10K: the write port. A configuration write merges its lanes with cq_q (the register's word, read a clock
+  // or more after pci_reg settled, as in the MLAB form); from each reset's start c_sw writes the 64 reset values,
+  // one a clock. The read never meets a write in a clock whose word is used (accesses are B_IDLE and B_DEC apart,
+  // and the sweep holds them), checked below
+  logic [6:0] c_sw;                 // the sweep's register; 64: done (registers power up 0, so it runs at power-up)
+  logic       rst_q;
+  wire        c_swp = STEP2 && C106_M10K && !c_sw[6];
+  wire        c_we  = c_swp || (STEP2 && C106_M10K && do_w && tgt_q == X_PCID && s2 && pci_dev == 5'd0);
+  wire [5:0]  c_wa  = c_swp ? c_sw[5:0] : pci_reg;
+  wire [31:0] c_wd  = c_swp ? def106(c_sw[5:0]) :
+                      {be[3] ? wd[31:24] : cq_q[31:24], be[2] ? wd[23:16] : cq_q[23:16],
+                       be[1] ? wd[15:8] : cq_q[15:8], be[0] ? wd[7:0] : cq_q[7:0]};
+  always_ff @(posedge clk) if (c_we) c106m[c_wa] <= c_wd;
+  always_ff @(posedge clk) begin
+    rst_q <= rst;
+    if (rst && !rst_q) c_sw <= '0;
+    else if (c_swp) c_sw <= c_sw + 7'd1;
+  end
 `ifdef VERILATOR
-  always_ff @(posedge clk) if (!rst && (do_w || do_r) && (tgt_q != tgt || ((tgt_q == X_PCID) && cq_q != cq)))
+  always_ff @(posedge clk) if (!rst && (do_w || do_r) && (tgt_q != tgt || ((tgt_q == X_PCID) && !C106_M10K && cq_q != cq)))
     $fatal(1, "m3_bus: the target or the MPC106 register registered");
+  // C106_M10K: the MLAB form kept as a shadow (written flags, the file, the lane merge), and the M10K's word against it
+  // wherever one is used
+  logic [31:0] sh106 [0:63];
+  logic [63:0] sh106_w;
+  logic [31:0] sh106_q;
+  always_ff @(posedge clk) begin
+    sh106_q <= sh106_w[pci_reg] ? sh106[pci_reg] : c106_def;
+    if (rst) sh106_w <= '0;
+    else if (STEP2 && do_w && tgt_q == X_PCID && s2 && pci_dev == 5'd0) begin
+      sh106_w[pci_reg] <= 1'b1;
+      sh106[pci_reg] <= {be[3] ? wd[31:24] : sh106_q[31:24], be[2] ? wd[23:16] : sh106_q[23:16],
+                         be[1] ? wd[15:8] : sh106_q[15:8], be[0] ? wd[7:0] : sh106_q[7:0]};
+    end
+    if (!rst && C106_M10K && STEP2 && (do_w || do_r) && tgt_q == X_PCID && cq_q != sh106_q)
+      $fatal(1, "m3_bus: the MPC106's M10K word against the old file");
+    if (!rst && C106_M10K && STEP2 && c_swp && bs == B_DEC)
+      $fatal(1, "m3_bus: an access held by the reset values' sweep (a reset shorter than 64 clocks)");
+  end
 `endif
   // the I/O chip takes the access the cycle after (its read side effect included)
   always_ff @(posedge clk) begin
@@ -689,7 +776,8 @@ module m3_bus
           end
           if (rq != 2'b00) begin
           who <= g; last <= g;
-          cmd <= m_cmd[g]; addr <= m_addr[g]; be <= m_be[g]; wd <= m_wdata[g];
+          cmd <= m_cmd[g]; addr <= m_addr[g]; be <= m_be[g];
+          if (!WD_DEC) wd <= m_wdata[g];
           crit <= (m_cmd[g] == MC_LINE_RD) ? m_addr[g][4:2] : 3'd0;
           beat <= 3'd0;
           bs <= B_DEC;
@@ -704,10 +792,14 @@ module m3_bus
         end
 
         B_DEC: begin
-          if (tg_hold) begin
-            // TGT: the tile generator is busy, fetching, or has accesses still to land
+          if (WD_DEC) wd <= m_wdata[who];   // the owner's word, held until its m_ack
+          if (tg_hold || c_swp) begin
+            // TGT: the tile generator is busy, fetching, or has accesses still to land; C106_M10K: the reset values
+            // are still being written (the 64 clocks from a reset's start; the sweep's register alone, not the target
+            // decode, so the hold adds no level to B_DEC's choice: br2_s3 had the decode in it, addr -0.66 ns)
           end else if (tgt == X_SDR) begin
-            s_req <= 1'b1; s_cmd <= cmd; s_sa <= dsa; s_swap <= dswap; s_zero <= dzero; s_be <= be; s_wdata <= wd;
+            s_req <= 1'b1; s_cmd <= cmd; s_sa <= dsa; s_swap <= dswap; s_zero <= dzero; s_be <= be;
+            s_wdata <= WD_DEC ? m_wdata[who] : wd;
             bs <= B_SDR;
           end else if (R3P && !(tgt == X_R3DH && cur_w) && (!r3_empty || r3_push)) begin
             // R3P (R114): on the board every processor access to PCI leaves the MPC105 behind the writes it
@@ -828,7 +920,7 @@ module m3_bus
 
         B_SCSI: begin
           if (!sc_req && !r_pend) begin
-            sc_req <= 1'b1; sc_we <= cur_w; sc_addr <= addr[6:2]; sc_be <= be; sc_wdata <= wd; r_pend <= 1'b1;
+            sc_req <= 1'b1; sc_we_q <= cur_w; sc_addr_q <= addr[6:2]; sc_be_q <= be; sc_wdata_q <= wd; r_pend <= 1'b1;
           end
           if (sc_ack) begin
             r_pend <= 1'b0;
@@ -841,7 +933,7 @@ module m3_bus
         // the security board: one access (a line's beats are not split; the game uses words)
         B_SEC: begin
           if (!sec_req && !r_pend) begin
-            sec_req <= 1'b1; sec_we <= cur_w; sec_addr <= addr[17:2]; sec_be <= be; sec_wdata <= wd; r_pend <= 1'b1;
+            sec_req <= 1'b1; sec_we_q <= cur_w; sec_addr_q <= addr[17:2]; sec_be_q <= be; sec_wdata_q <= wd; r_pend <= 1'b1;
           end
           if (sec_ack) begin
             r_pend <= 1'b0;
@@ -853,8 +945,8 @@ module m3_bus
 
         B_CFG: begin
           if (!cf_req && !r_pend) begin
-            cf_req <= 1'b1; cf_we <= cur_w; cf_idx <= pci_reg;
-            cf_be <= {be[0], be[1], be[2], be[3]}; cf_wdata <= bswap(wd); r_pend <= 1'b1;
+            cf_req <= 1'b1; cf_we_q <= cur_w; cf_idx_q <= pci_reg;
+            cf_be_q <= {be[0], be[1], be[2], be[3]}; cf_wdata_q <= bswap(wd); r_pend <= 1'b1;
           end
           if (cf_ack) begin
             r_pend <= 1'b0;

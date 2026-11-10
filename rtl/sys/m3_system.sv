@@ -163,7 +163,20 @@ module m3_system
   parameter bit          INP_FISH    = 1'b1,
   parameter bit          INP_LEAN    = 1'b0,       // the driving block without "Steering", "Steering smoothing", "Analog control"
   //   TG_TIMING    m3_bus: the tile generator's bus timing, tile RAM and palette writes at the board's rate (R152)
-  parameter bit          TG_TIMING   = 1'b1
+  parameter bit          TG_TIMING   = 1'b1,
+  // ---- the bridges pass (zero cycles, the same words at every port's strobe)
+  //   SDR_SHD      m2_sdram: the read register shared by every port but r3d_mem's (port 4, which reads its word on
+  //                through its write burst); the others take p_dout only with p_lo / p_ack (m2_sdram SHD)
+  parameter bit          SDR_SHD     = 1'b1,
+  //   BR_C106      m3_bus: the MPC106's 64 registers in one M10K, as they behaved (m3_bus C106_M10K)
+  //   BR_SEC       one second counter for the RTC and the frame counter (m3_bus, m3_fps EXT_SEC)
+  //   BR_BUS       m3_bus: the targets' fields wired, wd from the owner in B_DEC (m3_bus OWIRE, WD_DEC); m3_scripts:
+  //                DSPS and TEMP load one shared value (m3_scripts LDV)
+  parameter bit          BR_C106     = 1'b1,
+  parameter bit          BR_SEC      = 1'b1,
+  parameter bit          BR_BUS      = 1'b1,
+  //   BR_LD        m3_loader: the destinations' fields wired from the drain's registers (m3_loader OWIRE)
+  parameter bit          BR_LD       = 1'b1
 ) (
   input  logic        clk,
   input  logic        mem_rst_n,
@@ -319,9 +332,11 @@ module m3_system
              .PRI(SDR_PRI), .PRI_CAP(SDR_PRI_CAP), .AGE(SDR_AGE), .AGE_T(SDR_AGE_T), .BXOR(SDR_BXOR),
              .L16({{(NSP-1){1'b0}}, SDR_L16}), .PAIR({{(NSP-1){1'b0}}, SDR_PAIR}),
 `ifdef M3_R3B
-             .WB(NSP'(6'b010001)), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdram (   // R101, R144: the bus (port 0) and r3d_mem (port 4) write in bursts
+             .WB(NSP'(6'b010001)), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD),
+             .SHD(SDR_SHD ? NSP'(6'b101111) : NSP'(0))) u_sdram (   // R101, R144: the bus (port 0) and r3d_mem (port 4) write in bursts
 `else
-             .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdram (   // port 0 (the bus) writes in bursts (R101)
+             .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD),
+             .SHD(SDR_SHD ? NSP'(6'b101111) : NSP'(0))) u_sdram (   // port 0 (the bus) writes in bursts (R101)
 `endif
     .clk, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm, .sd_dq_o, .sd_dq_oe, .sd_dq_i,
@@ -344,7 +359,7 @@ module m3_system
   logic [7:0]  cfg_in2 /* verilator public_flat_rd */, cfg_in3 /* verilator public_flat_rd */;
   logic [7:0]  cfg_dsw /* verilator public_flat_rd */;   // the DIP bank (R133)
   logic [7:0]  cfg_prof /* verilator public_flat_rd */, cfg_pflg;   // the input profile and its flags
-  m3_loader #(.AW(AW), .BACKUP(SDR_BACKUP), .FIX8(SDR_FIX8),
+  m3_loader #(.AW(AW), .BACKUP(SDR_BACKUP), .FIX8(SDR_FIX8), .OWIRE(BR_LD),
               .VROM_X((VROM_LOC != 0) && (VROM_LOC == XMEM)), .VROM_AT(27'h400_0000)) u_ld (   // R100: VROM placement
     .clk, .rst(!mem_rst_n), .mem_ready, .x_ok(ddr_ok),
     .ioctl_download, .ioctl_index, .ioctl_wr, .ioctl_addr, .ioctl_dout, .ioctl_wait,
@@ -480,7 +495,7 @@ module m3_system
   logic [31:8] sc_win_base;
   logic [5:0]  cf_idx;
 
-  m3_scripts #(.R3DMA(STEP2)) u_scsi (
+  m3_scripts #(.R3DMA(STEP2), .LDV(BR_BUS)) u_scsi (
     .clk, .rst, .step2,     // R100: Step 2.x, the Real3D DMA device on this move engine
     .c_req(cf_req), .c_we(cf_we), .c_idx(cf_idx), .c_be(cf_be), .c_wdata(cf_wdata), .c_ack(cf_ack), .c_rdata(cf_rdata),
     .win_en(sc_win_en), .win_base(sc_win_base),
@@ -540,13 +555,29 @@ module m3_system
   assign sec_req = 1'b0; assign sec_we = 1'b0; assign sec_addr = '0; assign sec_be = '0; assign sec_wdata = '0;
 `endif
 
+  // one second of clk (the bridges pass): the RTC's (m3_bus EXT_SEC) and the frame counter's (m3_fps EXT_SEC), the
+  // count each of them kept, from the game's reset
+  localparam int SCW = $clog2(CLK_HZ);
+  logic [SCW-1:0] sec_cnt;
+  wire            sec_tick = BR_SEC && (sec_cnt == SCW'(CLK_HZ - 1));
+  always_ff @(posedge clk) if (rst || sec_tick) sec_cnt <= '0; else sec_cnt <= sec_cnt + 1'd1;
+`ifdef VERILATOR
+  // the counter m3_bus's rtc_pre and m3_fps's tcnt each were (reset with rst, CLK_HZ - 1 then 0): sec_tick is its wrap
+  logic [SCW-1:0] sec_chk;
+  always_ff @(posedge clk) begin
+    if (rst) sec_chk <= '0; else sec_chk <= (sec_chk == SCW'(CLK_HZ - 1)) ? '0 : sec_chk + 1'd1;
+    if (!rst && BR_SEC && sec_tick != (sec_chk == SCW'(CLK_HZ - 1))) $fatal(1, "m3_system: sec_tick against the old prescaler");
+  end
+`endif
+
   m3_bus #(.AW(AW), .SDR_CROM(SDR_CROM), .SDR_FIXED(SDR_FIXED), .SDR_BACKUP(SDR_BACKUP), .SDR_RAM(SDR_RAM),
-           .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P), .TGT(TG_TIMING), .TG_MHZ(CLK_MHZ)
+           .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P), .TGT(TG_TIMING), .TG_MHZ(CLK_MHZ),
+           .C106_M10K(BR_C106), .OWIRE(BR_BUS), .WD_DEC(BR_BUS)
 `ifdef M3_STEP2_BUS
-           , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ)
+           , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ), .EXT_SEC(BR_SEC)
 `endif
            ) u_bus (
-    .clk, .rst,
+    .clk, .rst, .sec_tick,
 `ifdef M3_STEP2_BUS
     .step2, .fixed8, .crom_slot(crom_map[3:0]), .crom_zero(crom_map[4]),
     .sec_req, .sec_we, .sec_addr, .sec_be, .sec_wdata, .sec_ack, .sec_rdata,
@@ -1140,7 +1171,7 @@ module m3_system
   generate if (FPS) begin : g_fps
     logic nd0_q;
     always_ff @(posedge clk) nd0_q <= n_draw[0];
-    m3_fps #(.CLK_HZ(CLK_HZ)) u_fps (.clk, .rst, .en(fps_en), .draw(n_draw[0] ^ nd0_q), .x(x_d), .y(y_d),
+    m3_fps #(.CLK_HZ(CLK_HZ), .EXT_SEC(BR_SEC)) u_fps (.clk, .rst, .sec_tick, .en(fps_en), .draw(n_draw[0] ^ nd0_q), .x(x_d), .y(y_d),
                                      .box(fps_box), .ink(fps_ink));
   end else begin : g_nofps
     assign fps_box = 1'b0; assign fps_ink = 1'b0;

@@ -182,7 +182,13 @@ module m2_sdram #(
   parameter bit            FDSP      = 1'b0,
   // READ FROM DISPATCH (Model 3, study R112): a read whose row is open issues its first READ from
   // S_DISPATCH instead of a clock later from S_RD. 0: the controller exactly as it was.
-  parameter bit            HITRD     = 1'b0
+  parameter bit            HITRD     = 1'b0,
+  // ONE READ REGISTER FOR SEVERAL PORTS (Model 3, the bridges pass). The ports set in SHD get their p_dout
+  // from one 64-bit register, loaded with every delivery, instead of one register each. Only for a port
+  // that takes p_dout in the cycles its p_lo or p_ack is high and never after (the delivery and its strobe
+  // leave the stage together, one delivery a clock), and with ACK_HOLD 1, so p_ack is one clock. Between
+  // its strobes such a port's p_dout shows other ports' words. Default none: the controller as it was.
+  parameter logic [NP-1:0] SHD       = '0
 ) (
   input  logic                 clk,
   input  logic                 rst_n,
@@ -468,6 +474,8 @@ module m2_sdram #(
   initial begin
     if (MASK_ON_A && COL_BITS > 10)
       $error("m2_sdram: MASK_ON_A needs COL_BITS <= 10 -- A11 carries the mask, not a column bit");
+    if (SHD != '0 && ACK_HOLD != 1)
+      $error("m2_sdram: SHD needs ACK_HOLD 1 -- a held p_ack could see the next port's word");
   end
 
   // Column value placed on the address bus, skipping A10.
@@ -946,6 +954,16 @@ module m2_sdram #(
   // stays -- it has to, p_dout really is per port -- but a decode is far
   // cheaper than a data mux. The registers go from NP*64 to 64.
   logic [3:0][15:0] cap;
+  // p_dout: a register a port, or with SHD one for those ports (pd_sh, loaded with every delivery)
+  logic [NP-1:0][63:0] pd_q;
+  logic [63:0]         pd_sh;
+  always_ff @(posedge clk) if (dl_v) pd_sh <= dl_data;
+  genvar gd;
+  generate
+    for (gd = 0; gd < NP; gd = gd + 1) begin : g_pdout
+      assign p_dout[gd] = SHD[gd] ? pd_sh : pd_q[gd];
+    end
+  endgenerate
 
   // Acks are per port now. A single shared hold counter was fine when only one
   // transfer existed at a time; with two ports in flight it would clear the
@@ -1114,7 +1132,7 @@ module m2_sdram #(
       tag_v <= '0; tag_p <= '0; tag_w <= '0; tag_last <= '0; tag_pr <= '0; cap <= '0; pb_r <= 1'b0;
       ack_cnt <= '0; wack_cnt <= '0; inflight <= '0; wr_inflight <= 1'b0;
       for (int b = 0; b < NB; b++) rd_bank_cnt[b] <= '0;
-      p_ack <= '0; wr_ack <= 1'b0; p_dout <= '0;
+      p_ack <= '0; wr_ack <= 1'b0; pd_q <= '0;
       dl_v <= 1'b0; dl_p <= '0; dl_data <= '0;   // R557
       dl_lo <= 1'b0; p_lo <= '0;                  // R787
       grant <= '0; grant_is_wr <= 1'b0; rr_mask <= '1;                  // R498
@@ -1269,7 +1287,7 @@ module m2_sdram #(
         p_lo <= '0;                                   // R787: one cycle
         if (dl_v) begin
           dl_v            <= 1'b0;
-          p_dout[dl_p]    <= dl_data;
+          for (int k = 0; k < NP; k++) if (!SHD[k] && dl_p == PW'(k)) pd_q[k] <= dl_data;   // SHD: pd_sh, below
           if (dl_lo) p_lo[dl_p] <= 1'b1;              // R787: the first half, no ack
           else begin
             p_ack[dl_p]   <= 1'b1;

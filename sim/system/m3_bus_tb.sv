@@ -9,7 +9,8 @@
 module m3_bus_tb
   import ppc_cache_pkg::*;
 #(parameter bit L16 = 1'b0, parameter bit BXOR = 1'b0, parameter bit LW1 = 1'b0, parameter bit PAIR = 1'b0, parameter bit RA = 1'b0, parameter bit PW = 1'b0, parameter bit RA_CONF = 1'b0,
-  parameter bit FWD = 1'b0, parameter bit FREQ = 1'b0, parameter bit FDSP = 1'b0, parameter bit HITRD = 1'b0, parameter bit FAST = 1'b0, parameter int PW_DLY = 0, parameter bit R3P = 1'b0, parameter bit TGT = 1'b0)   // m3_sdr_port / m2_sdram (study R107)
+  parameter bit FWD = 1'b0, parameter bit FREQ = 1'b0, parameter bit FDSP = 1'b0, parameter bit HITRD = 1'b0, parameter bit FAST = 1'b0, parameter int PW_DLY = 0, parameter bit R3P = 1'b0, parameter bit TGT = 1'b0,   // m3_sdr_port / m2_sdram (study R107)
+  parameter bit BR = 1'b0)   // the bridges pass: m3_bus OWIRE and WD_DEC, m2_sdram SHD
 (
   input  logic        clk,
   input  logic        rst_n,
@@ -92,8 +93,8 @@ module m3_bus_tb
   logic [1:0]  wb_be;
   logic [63:0] p_dout;
 
-  m3_bus #(.AW(26), .MIDI_GAP(500), .FAST(FAST), .R3P(R3P), .TGT(TGT)) u_bus (
-    .clk, .rst,
+  m3_bus #(.AW(26), .MIDI_GAP(500), .FAST(FAST), .R3P(R3P), .TGT(TGT), .OWIRE(BR), .WD_DEC(BR)) u_bus (
+    .clk, .rst, .sec_tick(1'b0),
     .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
     .sn_req, .sn_addr, .sn_inv, .sn_ack,
     .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata,
@@ -117,7 +118,7 @@ module m3_bus_tb
   logic [1:0] pk, pl;
   logic [1:0][63:0] pd;
   assign p_ack = pk[0]; assign p_lo = pl[0]; assign p_dout = pd[0];
-  m2_sdram #(.COL_BITS(10), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(1'b1), .MASK_ON_A(1'b1), .INIT_NOP(200), .WB(2'b01), .L16({1'b0, L16}), .BXOR(BXOR), .PAIR({1'b0, PAIR}), .FDSP(FDSP), .HITRD(HITRD)) u_sdram (
+  m2_sdram #(.COL_BITS(10), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(1'b1), .MASK_ON_A(1'b1), .INIT_NOP(200), .WB(2'b01), .L16({1'b0, L16}), .BXOR(BXOR), .PAIR({1'b0, PAIR}), .FDSP(FDSP), .HITRD(HITRD), .SHD(BR ? 2'b11 : 2'b00)) u_sdram (
     .clk, .rst_n, .ready, .rd_lat_sel(3'd2),
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm(), .sd_dq_o, .sd_dq_oe(), .sd_dq_i,
     .wr_req(1'b0), .wr_addr('0), .wr_din('0), .wr_be('0), .wr_ack(),

@@ -20,10 +20,12 @@
 module m3_fps #(
   parameter int CLK_HZ = 110_000_000,
   parameter int X0 = 460,             // box left: 28 wide, 8 from the 496-pixel line's end
-  parameter int Y0 = 8                // box top: 18 high
+  parameter int Y0 = 8,               // box top: 18 high
+  parameter bit EXT_SEC = 1'b0        // the second from sec_tick (m3_system's counter, the RTC's too), not tcnt
 ) (
   input  logic       clk,
   input  logic       rst,
+  input  logic       sec_tick,        // EXT_SEC: high in the clock tcnt would have read CLK_HZ - 1
   input  logic       en,
   input  logic       draw,            // one clock per frame begun
   input  logic [9:0] x,
@@ -37,15 +39,16 @@ module m3_fps #(
   // ---- count: BCD, one window a second, the shown pair latched at its end
   logic [TW-1:0] tcnt;
   logic [3:0]    c1, c0, d1, d0;
+  wire wrap = EXT_SEC ? sec_tick : (tcnt == TW'(CLK_HZ - 1));
   always_ff @(posedge clk) begin
     if (rst) begin
       tcnt <= '0; c1 <= 4'd0; c0 <= 4'd0; d1 <= 4'd0; d0 <= 4'd0;
-    end else if (tcnt == TW'(CLK_HZ - 1)) begin
+    end else if (wrap) begin
       tcnt <= '0;
       d1 <= c1; d0 <= c0;
       c1 <= 4'd0; c0 <= {3'd0, draw};
     end else begin
-      tcnt <= tcnt + 1'd1;
+      if (!EXT_SEC) tcnt <= tcnt + 1'd1;
       if (draw && !(c1 == 4'd9 && c0 == 4'd9)) begin
         if (c0 == 4'd9) begin c0 <= 4'd0; c1 <= c1 + 4'd1; end
         else c0 <= c0 + 4'd1;

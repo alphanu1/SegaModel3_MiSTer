@@ -64,7 +64,12 @@ module m3_loader #(
   parameter logic [26:0] BACKUP = 27'h620_0000,
   parameter logic [26:0] FIX8   = 27'h730_0000,
   parameter bit          VROM_X  = 1'b0,           // index 0's VROM range to the extra memory
-  parameter logic [26:0] VROM_AT = 27'h400_0000    // where the MRA's index-0 image holds VROM (32 MiB)
+  parameter logic [26:0] VROM_AT = 27'h400_0000,   // where the MRA's index-0 image holds VROM (32 MiB)
+  // OWIRE (the bridges pass): the destinations' address and data wired from the drain's h_adr / h_dat, not copied
+  // into registers of their own. h_* load only on f_re, which needs !wbusy and !rd_armed, so they hold from the
+  // request until its acknowledge (SDRAM: the request's rising edge latches them; the extra memory: held to x_ack)
+  // and through the clock ee_we is out. 0: as it was
+  parameter bit          OWIRE   = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst,          // memory reset (PLL lock), not the game's
@@ -219,6 +224,10 @@ module m3_loader #(
   logic [1:0]  h_k;
   logic [AW-1:0] h_adr;
   logic [15:0]   h_dat;
+  logic [AW:1]   sdr_wr_addr_q;
+  logic [26:1]   x_addr_q;
+  logic [15:0]   sdr_wr_din_q, x_din_q, ee_d_q;
+  logic [5:0]    ee_a_q;
   // the drain's read: the two RAMs into their own output registers on the drain's read condition, outside the
   // reset's branch (area pass, Model 2 R988: read inside the reset's else, Quartus read a clock early and
   // forwarded the writes, Warning 276020, 82 flip-flops of pass-through in merge4b_s3). h_k, h_adr and h_dat
@@ -259,17 +268,17 @@ module m3_loader #(
       end else if (rd_armed) begin
         if (h_k == K_EE) begin
           rd_armed <= 1'b0;
-          ee_we <= 1'b1; ee_a <= h_adr[5:0]; ee_d <= h_dat;
+          ee_we <= 1'b1; ee_a_q <= h_adr[5:0]; ee_d_q <= h_dat;
           rp <= rp + 1'b1;
         end else if (h_k == K_X) begin
           if (x_ok) begin
             rd_armed <= 1'b0;
-            x_req <= 1'b1; x_addr <= 26'(h_adr); x_din <= h_dat;
+            x_req <= 1'b1; x_addr_q <= 26'(h_adr); x_din_q <= h_dat;
             wbusy <= 1'b1;
           end
         end else begin
           rd_armed <= 1'b0;
-          sdr_wr_req <= 1'b1; sdr_wr_addr <= h_adr; sdr_wr_din <= h_dat;
+          sdr_wr_req <= 1'b1; sdr_wr_addr_q <= h_adr; sdr_wr_din_q <= h_dat;
           wbusy <= 1'b1;
         end
       end
@@ -277,6 +286,12 @@ module m3_loader #(
     end
   end
   assign sdr_wr_be = 2'b11;
+  assign sdr_wr_addr = OWIRE ? h_adr          : sdr_wr_addr_q;
+  assign sdr_wr_din  = OWIRE ? h_dat          : sdr_wr_din_q;
+  assign x_addr      = OWIRE ? 26'(h_adr)     : x_addr_q;
+  assign x_din       = OWIRE ? h_dat          : x_din_q;
+  assign ee_a        = OWIRE ? h_adr[5:0]     : ee_a_q;
+  assign ee_d        = OWIRE ? h_dat          : ee_d_q;
   assign busy = dl_any || done || !f_empty || wbusy || rd_armed || any_d;
 
 endmodule
