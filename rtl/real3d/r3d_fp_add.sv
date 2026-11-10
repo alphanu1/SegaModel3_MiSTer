@@ -62,7 +62,7 @@ module r3d_fp_add #(
   // shifts by those. Same results, same latency; C was the leading-zero count and a 28-bit shift by a
   // 5-bit amount in one stage.
   parameter bit NORM_B = 1'b0,
-  // PIPE_B2 (Model 3 study R1xx, D-50): a register between stage B's add and its byte normalise -- LATENCY one
+  // PIPE_B2 (Model 3 study R148, D-50): a register between stage B's add and its byte normalise -- LATENCY one
   // more. B's add (28 bits, with the sticky borrow) and the byte shift's zero tests behind it were the adder's
   // slowest stage at 120 MHz (sA_sticky -> s1_sum). Same results.
   parameter bit PIPE_B2 = 1'b0

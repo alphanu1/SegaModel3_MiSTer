@@ -92,10 +92,10 @@ module r3d_geo
   // (study D-32), BC_M10K off
   parameter bit SIDE_M10K  = 1'b1,
   // CB_M10K: the clip pool (32 x 263, both halves written together) in M10K, read at its next address (area
-  // pass, R1xx: 7 M10K for 14 MLABs); 0 leaves it in two MLABs, read asynchronously
+  // pass, R153: 7 M10K for 14 MLABs); 0 leaves it in two MLABs, read asynchronously
   parameter bit CB_M10K    = 1'b1,
   // VS_M10K: the vertex store (12 x 32 x 32) in M10K, read at the polygon machine's next address, with the
-  // engine's word of that clock forwarded (area pass, R1xx: 12 M10K for its 12 MLABs); 0 leaves it in MLAB
+  // engine's word of that clock forwarded (area pass, R153: 12 M10K for its 12 MLABs); 0 leaves it in MLAB
   parameter bit VS_M10K    = 1'b1,
   parameter bit BC_M10K    = 1'b1,   // on since study R98 (-140 ALM, +8 M10K)
   // FP_DSP: the pool's and the facing test's FP adders shift in DSP blocks

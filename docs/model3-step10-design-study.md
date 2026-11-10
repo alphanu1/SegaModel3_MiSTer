@@ -1113,6 +1113,7 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-54 | (2026-11-09) What the area work (D-53) may not take: no split into Step 1.x and Step 2.x cores (D-42 stands, one core; −724 ALM at map, R128); the FPS counter stays until the core is tested at full speed (−168 at map); and no edits to the framework's `sys/`, which stays stock (hps_io's video_calc, the OSD, the audio filter and pll_hdmi_adj are left alone). The rest is the zero-cycle list: storage out of flip-flops into MLAB or M10K, RAMs without bypass logic, §8.4's techniques. |
 | D-55 | (2026-11-09) The FPGA SCSP DSP (D-53) keeps its two 32K-word effect rings in M10K, not DDR3: 128 of its 135 M10K, no ALM, and no dependent DDR3 traffic against the rasteriser (D-48). The area work (D-54) may use what M10K is left after that. The sound path's fixed delay starts at the design's 256 samples (5.8 ms) and is cut on the board if it is not good; the DSP itself adds one sample. |
 | D-56 | (2026-11-09) The rasteriser's pair queue (R149) is taken although it is not zero-cycle frame by frame: the mean replay falls 4-9% on every census set and Daytona 2's system frames by 13.6%, while 7-38 frames of about 400 a set (none in VF3) are up to 360 clocks slower (0.02% of a frame), contour verdicts returning later behind a fuller queue. An exception to D-48 for this change only: the frame rate it gives outweighs the rare 0.02%. |
+| D-57 | (2026-11-10) No area change may cost the CPU a cycle, D-56-style exceptions included: R129's iterative double front (−700 to −800 ALM est., 0.01-0.08% of a vblank) is rejected. Daytona 2's game loop needs the CPU at about 113-115 MHz, or fewer cycles, to make 60 Hz at 110 (R144), so CPU cycles are spoken for. Area for the SCSP DSP and bridge (837 ALM), the DMA bursts and the pixel queue comes from zero-cycle sharing, leaner designs of the blocks coming in, and later the second SDRAM. |
 
 ### Open
 
@@ -13552,3 +13553,291 @@ download path's new negative slack.
 - Quartus 17 called Model 2's `pedal_ax == -8'sd128` a constant overflow; it is now `joy_ranalog[15:8] == 8'h80`,
   the same comparison, and the steering, pedal and dead-zone arithmetic was constant-folded in Quartus (40 values,
   0 differ).
+
+**R155 — Area pass 3. None of the fitter's cycle-free settings frees an ALM, there is no logic arithmetic left for the
+DSP blocks, and the two new blocks are close to their smallest form. Nothing cycle-free here comes near the 600 ALM.**
+- ALM_REGISTER_PACKING_EFFORT HIGH and PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION OFF give the base's RBF byte for byte.
+- The router's logic duplication off removes its 3,266 duplicate registers and not one ALM.
+- AGGRESSIVE AREA frees 728 ALM by map, but fitted it comes out 353 ALM larger and 2.3 ns slower (§1).
+
+Work in `sm3-builds/area3/`:
+- `tree`: 7165eea; `tree2`: a953ee0, from which the fits run;
+- `v/packhi`, `v/dupoff`, `v/rldoff`, `v/aarea`, `v/tdsoff`: the qsf changes as sed scripts;
+- `sa`: standalone maps; `cen`: the cell census of `area2_vs2_s3`; `r3b`, `zq`: the new blocks priced.
+
+D-48 applies (no cycle, no Fmax), and no sys/ edits.
+
+*1. The fitter settings* (each against the base fit of its own seed: 120 MHz, release, one seed each).
+
+On 7165eea (both fits were already running when the base moved to a953ee0):
+
+| Fit | Setting | ALM | Setup slow 100 °C / −40 °C | Hold, least | HDMI | RBF |
+|---|---|---|---|---|---|---|
+| `area3_base_s2` | (as committed) | 39,487 | −2.952 / −2.853 | +0.081 | +0.400 | 9cc63f6f |
+| `area3_packhi_s2` | packing HIGH | 39,487 | −2.952 / −2.853 | +0.081 | +0.400 | 9cc63f6f (the same) |
+
+On a953ee0 (the controls and the tile generator's bus timing in):
+
+| Fit | Setting | ALM | Registers | Setup slow 100 °C / −40 °C | Hold, least | HDMI | RBF |
+|---|---|---|---|---|---|---|---|
+| `area3_a_base_s3` | (as committed) | 40,981 | 51,309 | −2.980 / −3.094 | +0.055 | −0.249 | 0ef29c7f |
+| `area3_a_packhi_s3` | packing HIGH | 40,981 | 51,309 | the same | the same | the same | 0ef29c7f (the same) |
+| `area3_a_dupoff_s3` | register duplication OFF | 40,981 | 51,309 | the same | the same | the same | 0ef29c7f (the same) |
+| `area3_a_base_s2` | (as committed) | 40,936 | 51,239 | −2.535 / −2.491 | +0.078 | −0.299 | 3199934b |
+| `area3_a_dupoff_s2` | register duplication OFF | 40,936 | 51,239 | the same | the same | the same | 3199934b (the same) |
+| `area3_a_rldoff_s3` | router logic duplication OFF | 40,981 | 48,043 | −3.116 / −3.065 | +0.059 | −0.159 | dccb4623 |
+| `area3_a_aarea_s3` | AGGRESSIVE AREA, technique AREA | 41,334 | | −5.298 / −4.983 (fast 100 °C +0.107) | +0.113 | −0.268 | 57fcafff |
+
+- **Packing HIGH and register duplication OFF are read and recorded**, and then nothing changes.
+  - The settings table shows "Perform Register Duplication for Performance: Off". The fitter still writes
+    "Created 644 register duplicates" and its netlist-optimisation table is the base's, line for line.
+  - ALM_REGISTER_PACKING_EFFORT is not in the settings table at all.
+  - Both give the base's RBF on both seeds: two seeds for packing (one on each base), two for duplication.
+- **The router's logic duplication** (3,194-3,266 "Duplicated / Routability optimization" cells a fit) works after
+  placement, in register slots of ALMs already placed.
+  - Off, the registers fall by 3,266 and ALMs needed, placed, recoverable and unavailable are all the base's to the
+    tenth (40,980.5 / 41,060.1 / 926.0 / 846.5).
+  - It costs no ALM, and turning it off saves none. Setup moved −0.136 / +0.029 ns and HDMI +0.090.
+- **What the fitter reports doing** (a953ee0, seed 3):
+
+  | Action | Cells |
+  |---|---|
+  | packed registers (timing) | 3,834 |
+  | duplicated for routability | 3,266 |
+  | retimed registers | 1,650 |
+  | modified (timing) | 849 |
+  | deleted (timing) | 719 |
+  | duplicated for timing | 607 |
+  | "Created 644 register duplicates" | 644 |
+
+  Every fit uses all 4,191 LABs.
+- **The base's two seeds:** 40,981 and 40,936 ALM. On a953ee0 the recoverable estimate is 926 / 882 (on 7165eea it
+  was 2,169 / 2,208), so the seeds sit closer than before.
+- **Synthesis-only maps** (a953ee0, release; base 40,108 ALM by map, 58,740 ALUTs):
+
+  | Setting | ALM by map | ALUTs | Registers |
+  |---|---|---|---|
+  | SYNTH_TIMING_DRIVEN_SYNTHESIS OFF | −60 | −48 | −109 |
+  | MUX_RESTRUCTURE ON | 0 (already set) | | |
+  | AGGRESSIVE AREA with technique AREA | −728 | −895 (the CPU core −307) | −297 |
+
+  The first is not worth a speed risk. My Model 1 core measured the last at −595 ALM fitted for +11 M10K and recorded
+  "do not". R97 measured it at −10 MHz on the rasteriser alone. My Model 2 core's notes have it crashing this fitter
+  under some settings. Fitted (`area3_a_aarea_s3`), it is worse on both counts:
+  - 353 ALM *more* (41,334), with ALUTs +139 against the base fit's. The fitter's physical synthesis, still on, takes
+    back the map's −895 and more.
+  - Setup −5.298 / −4.983 ns, and only +0.107 at the fast corner.
+  - It saves nothing without the physical-synthesis passes off, and those crash my Model 2 core's fitter.
+- **My Model 2 core's qsf** records that turning all four physical-synthesis options off crashed its fitter four times
+  in four. Its working configuration ended as AGGRESSIVE AREA / AREA with register and router duplication off. None of
+  this pass's fits crashed.
+
+*2. DSP blocks for logic arithmetic: nothing to move.* There are no `lpm_mult` or other multipliers left in logic: every
+`*` Quartus inferred went to DSP blocks (88). In `area2_vs2_s3`'s netlist, the cells named for multiplies are:
+
+| Cells | Where | What they are |
+|---|---|---|
+| 166 | the framework's audio filter | sys/ |
+| 46 | `ppc_muldiv` | the cross-term adders of 32 × 32 products wider than one DSP |
+| 42 | `r3d_rast_zspan` | as above |
+| 39 + 39 | the interpolator | as above |
+
+The largest arithmetic in LUTs is the double FMA's partial-product sum and T1 / T2. These are adders of 80 LUTs each,
+106 to 163 bits wide. The 27 × 27 DSP's 64-bit adder cannot take them, and the middle products already use the
+chain-out adder. Moving the cross terms into chained 18 × 18 modes would be about 20 ALM a site, against the CPU's
+and the rasteriser's DSP placement. Not done.
+
+*3. The new blocks* (standalone `quartus_map`, the same device and settings):
+- **The pixel queue (`r3d_rast_zq`, D 256, W 113): 149 ALM, 178 ALUTs, 263 registers.** Fitted, it was also 149.
+  - Of the registers, 226 are the head and the next word, which first-word fall-through needs: a pair pushed into an
+    empty queue is the head the next clock, and the M10K's read takes a clock.
+  - The muxes are already one ALUT a bit for each register. What would be smaller:
+    - the head and next word in an MLAB read asynchronously (est. −40 to −60): its read would come straight into the
+      pixel stage;
+    - a head made from the block's output register: that adds a clock behind a push into an empty queue.
+
+    Neither is done.
+- **The Real3D DMA's 8E group (`r3d_mem` under M3_R3B, tc/cpu/d2): 463 against 310 ALM without it (+153), +165 ALUTs, +156 registers.**
+  - Most of it is the group's 4 × 32 words and the 8:1 select into the burst's column (`s_wbd` by `s_wbc`).
+  - An MLAB for the words did not infer. `s_din` reads word 0 by a constant index beside the column-indexed read, so
+    Quartus keeps registers; the map came out identical, 463.
+  - Taking the burst's first column through the same column-indexed read would let the MLAB form infer (est. −60
+    to −90 in the block). It is the CPU's prototype, so I priced it and did not change it.
+
+*4. The small geometry stores* (`vpw`, `sl`, `fb`, `rasm`, face A; about 16 ALM each for an M10K):
+- Each is read asynchronously at an address its state machine forms in the same clock, with consumers that use the
+  word combinationally.
+- `rasm`'s word feeds the vertex store's next read address, now an M10K; `u_remi`'s feeds the projection output's
+  M10K address. Either move puts two block RAMs in series in one clock.
+- At about 16 ALM an M10K, each with its own next-address logic and forwarding to prove, not done.
+
+*Wrong turns:*
+- **The first timing-driven-synthesis map named the setting TIMING_DRIVEN_SYNTHESIS.** Quartus refused the qsf. It is
+  SYNTH_TIMING_DRIVEN_SYNTHESIS.
+- **My first standalone-map script looked for the reports in `output_files`.** A project without that setting writes
+  them beside the qsf.
+- **The two 7165eea fits (base, packing HIGH, seed 2) were running when the base moved to a953ee0.** I let them
+  finish; with the RBFs identical, that pair still answers the packing question.
+
+*Ranked* (ALM freed, measured by block or by fit; zero cycles unless marked):
+
+| # | Item | ALM | M10K | Cycles | Timing | Status |
+|---|---|---|---|---|---|---|
+| 1 | AGGRESSIVE AREA / AREA | −728 by map, but +353 fitted | −1 | 0 | −2.3 ns setup | measured: worse on both counts |
+| 2 | DMA 8E group: first column through the column-indexed read, words in an MLAB | −60 to −90 (est.) | 0 | 0 | the MLAB's read into the SDRAM's write data | the CPU agent's block |
+| 3 | timing-driven synthesis off | −60 by map | 0 | 0 | unknown | not worth it |
+| 4 | pixel queue, head in an MLAB | −40 to −60 (est.) | 0 | 0 | an MLAB read into the pixel stage | not built |
+| 5 | the small geometry stores | about 16 each | 1 each | 0 | two block RAMs in series for rasm and remi | not worth it |
+| 6 | DSP for the cross-term adders | about 20 a site | 1-2 a site | 0 | DSP placement | not worth it |
+| — | packing HIGH; register duplication OFF; router duplication OFF | 0 (fitted) | 0 | 0 | | no effect |
+
+**R156 — The two new blocks made leaner at the same clocks: the DMA's 8E group in an MLAB, the pair queue with one
+register word. Every bench gives the prototypes' logs exactly. Fitted on a953ee0, both together cost 56 ALM and 3 M10K, against about 345 ALM priced for the prototypes.**
+
+Work in `sm3-builds/lean/`:
+- `d2/tree`: `tc/cpu/d2/tree` (c3a4f62's system bench, R144) with the leaner `r3d_mem` and `r3d_cmd`;
+- `rz/tree`: `tc/r3d4/zq/tree` (R149) with the leaner `r3d_rast_zq`; `zs/tree_zl`: `tc/r3d4/d2/tree_zqr` with it;
+- `merge/tree`: a953ee0 by `git archive` with both, M3_DMAFAST and M3_R3B set in `Model3.qsf` and `system.mk`, ZQ = 256;
+  `merge/bl`, `merge/bp`: that tree with the event log, the leaner blocks and the prototypes' (`md2/` runs both);
+- `sa/`, `sf/`: standalone maps and fits; `flt/`: the queue's faults; `an/`: `--analyze_file`; `logs/`.
+
+D-48 and D-57 apply: no cycle, no Fmax. Nothing here changes what either block does; the benches compare against the
+prototypes' own logs, not against the base.
+
+*1. The 8E group (`r3d_mem` under M3_R3B).* R144's prototype kept the group's four words in flip-flops (128) and read
+them through an 8:1 select into the burst's column. Area pass 3 found an MLAB form did not infer, because the request
+read word 0 by a constant index beside the column read.
+- **The words in an MLAB with one read.** The read address is the column the controller asks for while a request is
+  out, and word 0 while it is formed (`g_ra = s_req ? s_wbc[2:1] : 0`), so column 0 (`s_din`, latched with the
+  request) comes through the same read. One 4 × 32 MLAB, two LABs.
+- **The single write's word in word 0 too.** An 8C or polygon RAM word is only taken with no group open, and none
+  opens before it is written, so `cd` (32 registers) goes; `d_din` reads word 0 (no SDRAM request is out in `S_DW`).
+- **The copy's pair is `s_dout` itself.** `m2_sdram` holds a port's `p_dout` until that port's next read, and the
+  copy only writes between its read and the pair's two bursts, so `sq` (64 registers) goes. A Verilator check holds
+  `s_dout` against a copy through `S_SW2`; it never fires.
+- **One form for the two run updates.** `S_RUN` (a word) and `S_GRUN` (a group's four) extend or close the open
+  run with one sum, one comparison and one adder.
+- **8C's single words only.** With the group every 8E word goes into it, so `S_SW` sees 8C alone: one copy, a
+  constant base, and `sh`, `sbase` and the second pass go.
+- `r3d_cmd`: the posted FIFO's three arrays (8, 20, 32 bits) were four MLABs; one 60-bit array is three.
+
+| `r3d_mem`, standalone (8E group on) | Map ALM est. | ALUT | Registers | Fit: ALMs placed | MLAB LABs | Fmax slow 100 / −40 °C |
+|---|---|---|---|---|---|---|
+| no group (R144's base) | 310 | 504 | 331 | 350 | 0 | 148.9 / 145.4 |
+| prototype | 463 | 669 | 487 | 523 | 0 | 127.2 / 127.9 |
+| leaner | 384 | 582 | 260 | 409 | 2 | 152.3 / 149.4 |
+
+The group's own cost falls from +173 ALM placed to +59; `r3d_cmd` from 155 to 146 (MLAB LABs 4 → 3). The standalone
+fits carry about 200 ALM of virtual I/O each, so the placed figure is the one to compare; the fitted per-block
+figures are below.
+
+*2. The pair queue (`r3d_rast_zq`, D 256, W 113).* The prototype held the head and the next word in registers (226)
+and read the M10K a clock ahead into them. The leaner form puts every word into the M10K and makes the M10K's read
+the head: it reads the next clock's head every clock (`ra = rp + pop`), so its registered address is always a clock
+ahead. The only word it cannot give is one written in the clock before it is the head, a push with nothing left
+after the pop; that word is the head for one clock from `bd`, a register that takes every word pushed. So one
+register word replaces two, and the queue is still an ideal one: a pushed word is the head the next clock, D words
+in all, `i_ready` and `o_valid` from the count.
+
+| `r3d_rast_zq`, standalone | Map ALM est. | ALUT | Registers | Fit: ALMs placed | Fmax slow 100 / −40 °C |
+|---|---|---|---|---|---|
+| prototype | 149 | 178 | 263 | 151 | 184.3 / 185.0 |
+| leaner | 98 | 156 | 140 | 80 | 277.1 / 258.6 |
+
+Both use the same 3 M10K. Area pass 3 priced an MLAB head (needs two write ports and an MLAB read in the pixel
+stage) and a head from the block's output register (a clock behind a push into an empty queue); this is neither.
+The cost moves to timing: H now loads from the M10K's read through a 2:1 select, where it loaded from a register
+(below, from the fit).
+
+*Proof.*
+- **Daytona 2, the d2 system bench, 110 and 120 MHz** (frames 1300-1316 from R144's checkpoint, the transplant as
+  R144's, the same DDR3 model): the event log (every retire at the pacing PCs, every DMA transaction, snoop and
+  host write, the busy edges, with their cycles), the Real3D write log, the per-frame profile and the CPU's cause
+  profile are byte for byte the prototype's (`r110`, `r120`), so the per-loop table is too:
+
+  | Per loop | 110 MHz | 120 MHz |
+  |---|---|---|
+  | CPU reaches 4C6FC | 1.019-1.024 vblanks | 0.929-0.941 |
+  | DMA wait (52A0) | 0.046 | 0.041 |
+  | Loop | 2.000 | 1.000, 15 of 15 |
+
+- **VF3, 48 frames** (frames 1300-1348 at 120 MHz, R144's run): the event log, all 1,285,103 Real3D writes, the CPU's cause profile and the composites at frames 1310 and 1330 are byte for byte the prototype's (`vf_r120`).
+- **Planted faults** (110 MHz, frames 1300-1311), each against the good run:
+
+  | Fault | Event log | Write log | Profile rows changed |
+  |---|---|---|---|
+  | a FIFO word's low bit (R144's) | from line 6,694 | from word 32 | 11 of 11 |
+  | the group's columns 2-7 a word late (R144's) | from line 6,685 (R144's run: the same line) | a prefix | 11 of 11 (the geometry stops drawing, as in R144's) |
+  | column 0 read at the column address (new: the read's word-0 select gone) | from line 6,694 | a prefix | 11 of 11 |
+  | a single 8C / 98 word kept in word 1 (new: the shared word 0) | from line 26,359 | a prefix | 8 of 11 |
+
+- **The rasteriser census**, sh1's nine sets, 400 frames a set (378-393 for Scud Race, Lost World, the second
+  Daytona 2): 0 pixels wrong, 0 port-rule violations, and every FRAME and STALL line identical to the prototype's
+  (`tc/r3d4/logs/rr/zqf`).
+- **The system run** (`tc/r3d4/d2`'s, Daytona 2 frames 1300-1340, 120 MHz): the event log, write log, profiles and
+  every RSYS / RPROF line identical to the prototype's: busy 2,095,946 cycles a drawn frame (1.005 vblanks), 31
+  drawn frames.
+- **The queue's faults**: a push into the RAM not written, pairs swapped by twos, and the bypass gone each stop the
+  first frame (no frame in 900 s on Daytona 2 or VF3); the full flag gone trips the count's assert at once.
+- **The merged tree.** On a953ee0 (`merge/tree`): the census as above, every FRAME and STALL line again the prototype's,
+  so a953ee0's own rasteriser changes and the queue give the same clocks together. The d2 bench of a953ee0 with
+  the leaner blocks (`ml120`) and with the prototypes' (`mp120`), 120 MHz, frames 1300-1316: event log, write log
+  and both profiles identical to each other, and the write log identical to R144's prototype run as well (the
+  geometry draws little there: the transplant, below). Its per-loop table: the CPU reaches 4C6FC at 0.927-0.933
+  vblank, the DMA wait 0.041, every loop one vblank. A final rerun of the d2 bench at 120 MHz with the files as
+  ported (the reset term out of the MLAB's write enable, a lint change) gives the prototype's logs again.
+- Verilator lint unchanged against a953ee0 (the system's nine warnings, the rasteriser's 23); `--analyze_file` of the
+  six changed files, 0 errors, 0 warnings.
+
+*Overlap with a953ee0.* None in the blocks: `r3d_mem`, `r3d_cmd` and `m2_sdram` are c3a4f62's in a953ee0, and
+`r3d_rast` 40bd38c's, so the prototypes' files go in as they are. `m3_system`'s write-burst wiring was placed by
+hand (a953ee0 moved it), and R144's `M3_DMAFAST` / `M3_R3B` are now set in `Model3.qsf` (beside `M3_STEP2_*`) and
+in `system.mk`'s `SYS_DEFS`; the other benches that build `r3d_mem` (`r3d_host_tb`) keep the single writes.
+
+*The fit* (`lean_m_s3`: a953ee0 with both, 120 MHz, seed 3, release, dual SDRAM off; against `area3_a_base_s3`):
+
+| | `area3_a_base_s3` (a953ee0) | `lean_m_s3` (both) | Change |
+|---|---|---|---|
+| ALM | 40,981 | 41,037 | +56 |
+| M10K | 388 | 391 | +3 (the queue) |
+| DSP | 88 | 88 | |
+| `r3d_mem` | 251.5 | 271.2 (20 of it the MLAB) | +19.7 (the 8E group) |
+| `r3d_cmd` | 77.5 | 86.4 (30 of it MLAB) | +8.9 (the 32 posted writes) |
+| `m2_sdram` | 616.8 | 600.9 | −15.9 (placement; +4 by map) |
+| `r3d_rast` | 7,581.8 | 7,636.8 | +55.0, the queue 52.1 |
+| Setup, slow 100 °C / −40 °C | −2.980 / −3.094 ns | −2.765 / −2.708 ns | |
+| TNS, slow 100 °C / −40 °C | −5,751 / −4,338 ns | −7,166 / −5,411 ns | |
+| Failing endpoints, slow 100 °C / −40 °C | 8,644 / 7,136 | 9,982 / 8,750 | |
+| Hold, slow 100 / slow −40 / fast 100 / fast −40 °C | +0.068 / +0.071 / +0.098 / +0.055 | +0.182 / +0.164 / +0.100 / +0.081 | |
+| HDMI setup, worst corner | −0.249 | −0.190 | |
+
+The queue fitted in R149's `zq_s3` at 148.5 ALM with 12 failing endpoints (−0.74 ns); here it is 52.1 with none,
+and nothing into H fails, so the M10K read into the pixel stage is not a path. The worst of the worst five is the
+CPU's (`op_y` → `m_lsp_q`, −2.765), as before.
+
+What the fit shows against the blocks:
+- **The 8E group's column read.** `m2_sdram`'s `rd_issued` → `wb_col` → `g_ra` → the MLAB's read is `r3d_mem`'s worst
+  path, −1.688 / −1.600 ns (the base's worst there was `S_DST` into the HPS bridge, −1.571 / −1.336), and the same
+  read into `s_din` is −1.080. The prototype's 8:1 select had the same source (`wb_col`) but was never fitted. Two
+  cycle-free ways to take it, not built: `wb_col` as a register in `m2_sdram` (four flip-flops beside `rd_issued`,
+  the adder out of the path, the bus's port gains too), or word 0 back in a 32-bit register for `s_din` and `d_din`
+  so `g_ra` is the column alone (about +10 ALM).
+- **The merged run update.** `o_n` → `o_n` / `o_st` is −0.85 to −0.91 ns (the base's run family, `o_st` → `rf_wp`,
+  was −0.22). One comparison behind a select is deeper than two in parallel.
+- **The rest is outside these blocks.** The rasteriser's edge (`u_edge|s_x0` into the front) has 1,038 failing
+  endpoints at slow 100 °C against 9 in the base and 4 in `zq_s3`, in logic neither change touches; the CPU +645.
+  One seed does not rank it: the setup worst is better, the TNS worse.
+
+*Wrong turns:*
+- **One adder for every request's address.** The four SDRAM address adds have constant bases; one shared adder after
+  a mux came out 20 ALUT larger by map. Not kept.
+- **The standalone map's ALM estimate.** For the first leaner `r3d_mem` (MLAB, `cd` and `sq` gone) it said −34
+  ALM for −224 registers; the map's estimate follows the LUTs, and the fit placed −75. The ALUT changes (the run
+  updates, `S_SW`) were what the estimate saw.
+- **My first transplants** took the D-cache's `d_idle_q` from the current `mkextra.py` default; c3a4f62's D-cache
+  needs `XP_DIDLE_RX=1`. Daytona 2's checkpoints came out the same either way; VF3's did not, and its first run
+  stopped at the D-cache's assert. Redone with it.
+- **a953ee0's system bench from R144's checkpoint.** The transplant from tree107o needs a953ee0's CPU reset copy
+  and the geometry's registered idle tests set, and even then its geometry draws next to nothing (the area pass's
+  stores changed type and are not carried). It still runs the CPU's loop and the DMA (DMA wait 0.041 vblank), so it
+  compares the leaner blocks against the prototypes on a953ee0, but it is not a frame-time measurement.

@@ -306,14 +306,30 @@ module m3_system
   logic [3:0]  wb_col;
   logic [15:0] wb_din;
   logic [1:0]  wb_be;
+`ifdef M3_R3B
+  // (study R144) two write-burst ports, the bus and r3d_mem: the columns come from the port the controller is
+  // writing for
+  logic [2:0]  wb_grant;
+  logic [15:0] sp_wbd, r3_wbd;
+  logic [1:0]  sp_wbb, r3_wbb;
+  assign wb_din = (wb_grant == 3'd4) ? r3_wbd : sp_wbd;
+  assign wb_be  = (wb_grant == 3'd4) ? r3_wbb : sp_wbb;
+`endif
   m2_sdram #(.COL_BITS(COL_BITS), .NP(NSP), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL),
              .PRI(SDR_PRI), .PRI_CAP(SDR_PRI_CAP), .AGE(SDR_AGE), .AGE_T(SDR_AGE_T), .BXOR(SDR_BXOR),
              .L16({{(NSP-1){1'b0}}, SDR_L16}), .PAIR({{(NSP-1){1'b0}}, SDR_PAIR}),
+`ifdef M3_R3B
+             .WB(NSP'(6'b010001)), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdram (   // R101, R144: the bus (port 0) and r3d_mem (port 4) write in bursts
+`else
              .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdram (   // port 0 (the bus) writes in bursts (R101)
+`endif
     .clk, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm, .sd_dq_o, .sd_dq_oe, .sd_dq_i,
     .wr_req(ld_req), .wr_addr(ld_addr), .wr_din(ld_din), .wr_be(ld_be), .wr_ack(ld_ack),
     .p_req, .p_we, .p_addr, .p_din, .p_be, .p_dout, .p_ack, .p_long, .p_lo, .wb_col, .wb_din, .wb_be,
+`ifdef M3_R3B
+    .wb_grant(wb_grant),
+`endif
     .dbg_req(), .dbg_grant());
 
   logic [26:0] ld_bytes;
@@ -554,7 +570,11 @@ module m3_system
     .clk, .rst(!mem_rst_n), .ra_clr(rst),
     .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
     .p_req(p_req[0]), .p_we(p_we[0]), .p_addr(p_addr[0]), .p_din(p_din[0]), .p_be(p_be[0]), .p_long(p_long[0]),
+`ifdef M3_R3B
+    .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]), .wb_col, .wb_din(sp_wbd), .wb_be(sp_wbb));
+`else
     .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]), .wb_col, .wb_din, .wb_be);
+`endif
 
   // the cabinet (m3_inputs): the sticks, triggers and paddle registered once here, beside the logic they feed
   // (Model 2 R842: hps_io's analog outputs straight into the steering block failed clk_sys there)
@@ -668,8 +688,13 @@ module m3_system
     .s_req(p_req[4]), .s_we(p_we[4]), .s_addr(p_addr[4]), .s_din(p_din[4]), .s_be(p_be[4]), .s_ack(p_ack[4]), .s_dout(p_dout[4]),
     .d_req(d_req[4]), .d_we(d_we[4]), .d_addr(d_addr[4]), .d_blen(d_blen[4]), .d_din(d_din[4]), .d_be(d_be[4]),
     .d_wacc(d_wacc[4]), .d_rvalid(d_rvalid[4]), .d_ack(d_ack[4]), .d_dout(dm_dout),
+`ifdef M3_R3B
+    .s_long(p_long[4]), .s_wbc(wb_col), .s_wbd(r3_wbd), .s_wbb(r3_wbb),
+`endif
     .n_runs, .n_copy);
+`ifndef M3_R3B
   assign p_long[4] = 1'b0;
+`endif
 
   // ---- textures
   // R100: Step 2's texture port (90) is three words, an address, a header and a word

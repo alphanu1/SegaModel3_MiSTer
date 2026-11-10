@@ -251,6 +251,10 @@ module m2_sdram #(
   // which a one-cycle request pulse would not show.
   output logic [NP-1:0]        dbg_req,
   output logic [NP-1:0]        dbg_grant
+`ifdef M3_R3B
+  // (Model 3, study R144) the transfer's port, so the system can give each write-burst port's columns
+  , output logic [$clog2(NP+1)-1:0] wb_grant
+`endif
 );
 
   // Burst length per port, in 16-bit words. D8: p1 is tile character fetch and
@@ -1067,6 +1071,9 @@ module m2_sdram #(
   // With the pipeline this is genuinely several ports at once, which is what
   // the telemetry is there to show.
   assign dbg_grant = inflight;
+`ifdef M3_R3B
+  assign wb_grant = grant;
+`endif
 
   // SYNCHRONOUS RESET, DELIBERATELY, and it is about the pins rather than style.
   //

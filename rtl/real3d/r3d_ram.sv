@@ -52,7 +52,7 @@ module r3d_ram #(
 endmodule
 
 // A fixed delay of D steps (D >= 3) for a W-bit word, as a chain of D registers all enabled by en would give it
-// (q is d of D enabled clocks before), in an M10K (area pass, R1xx): the first D - 2 steps in the block's memory,
+// (q is d of D enabled clocks before), in an M10K (area pass, R151): the first D - 2 steps in the block's memory,
 // the last two in its address and output registers, so q is the block's output register and nothing of the line
 // is in ALMs. Each enabled clock writes the block at p and reads it at p - (D - 2): the word written D - 2 steps
 // before, which with 2^A >= D has not been written over, at an address that is never the one being written. q

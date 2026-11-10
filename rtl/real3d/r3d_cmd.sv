@@ -135,7 +135,36 @@ module r3d_cmd #(
   logic [21:2] b_a;
   logic [31:0] b_d;
   logic        sw_wait;                   // a draw waits for the writes before the flip
+`ifdef M3_DMAFAST
+  // (study R144; on in Model3.qsf and the system bench) the held access as a FIFO of PFN posted writes: a write is
+  // taken whenever there is room, so the bus and the DMA move on while the windows drain; a read does not wait for
+  // them (below), the swap waits for them all, as with the one held access
+`ifdef M3_R3B
+  // (with r3d_mem's 8E bursts the windows drain near the bus's rate: 32 posted writes, in MLAB; without them the
+  // windows drain at about a third of it and 8,192 are a bench model, not buildable)
+  localparam int PFN = 32;
+`else
+  localparam int PFN = 8192;
+`endif
+  localparam int PFW = $clog2(PFN);
+  // {address bits 31:24, 21:2, data}: one 60-bit word, three MLABs (three arrays took four: 8 bits used one)
+  (* ramstyle = "MLAB, no_rw_check" *) logic [59:0] pf [0:PFN-1];
+  logic [PFW-1:0] pf_w, pf_r;
+  logic [PFW:0]   pf_n, pf_max /* verilator public_flat_rd */;
+  wire         pf_pop;
+  assign b_v = pf_n != '0;
+  assign {b_hi, b_a, b_d} = pf[pf_r];
+`ifdef M3_DMAFAST_RW
+  assign h_rdy = !sw_wait && (h_we ? pf_n < (PFW+1)'(PFN) : pf_n == '0);
+`else
+  // (a read is the status word or FFFFFFFF, which no posted write changes: it does not wait for the drain; with
+  // the wait, the DMA device's register read held the bus for the whole drain, and the CPU's fills behind it)
+  // (h_rdy does not look at h_we: m3_bus forms its strobe from h_rdy, so that was a loop)
+  assign h_rdy = !sw_wait && pf_n < (PFW+1)'(PFN);
+`endif
+`else
   assign h_rdy = !b_v && !sw_wait;
+`endif
 
   wire  b_mem = (b_hi == 8'h8C) || (b_hi == 8'h8E) || (b_hi == 8'h98);
   wire  b_tex = (b_hi == 8'h90) || (b_hi == 8'h94);
@@ -196,10 +225,31 @@ module r3d_cmd #(
   wire         can_start = !g_run && !e_wait && f_ready;
   wire         end_now = e_wait && g_seen && !g_busy && !x_need && !x_run && !(&used);
 
+`ifdef M3_DMAFAST
+  // the FIFO: a write pushed as the host's strobe is taken; the head popped as its target takes it
+  wire pf_push = h_go && h_rdy && h_we;
+  assign pf_pop = b_v && (b_mem ? m_ready : (b_tex || b_cmd) ? t_ready : 1'b1);
+  always_ff @(posedge clk)
+    if (rst) begin pf_w <= '0; pf_r <= '0; pf_n <= '0; pf_max <= '0; end
+    else begin
+`ifdef M3_DMAFAST_FAULT
+      // (a planted fault: one word in 8,192 through the FIFO has its low bit flipped; the comparison must catch it)
+      if (pf_push) begin pf[pf_w] <= {h_addr[31:24], h_addr[21:2], h_wdata ^ {31'd0, pf_w == PFW'(PFN - 1)}}; pf_w <= pf_w + 1'b1; end
+`else
+      if (pf_push) begin pf[pf_w] <= {h_addr[31:24], h_addr[21:2], h_wdata}; pf_w <= pf_w + 1'b1; end
+`endif
+      if (pf_pop) pf_r <= pf_r + 1'b1;
+      pf_n <= pf_n + (PFW+1)'(pf_push) - (PFW+1)'(pf_pop);
+      if (pf_n > pf_max) pf_max <= pf_n;
+    end
+`endif
   always_ff @(posedge clk) begin
     h_rv <= 1'b0; m_swap <= 1'b0; g_start <= 1'b0; f_begin <= 1'b0; f_end <= 1'b0; t_go <= 1'b0; t_mark <= 1'b0;
     if (rst) begin
-      b_v <= 1'b0; pingpong <= 1'b0; cmd_seen <= 1'b0; tg_seen <= 1'b0;
+`ifndef M3_DMAFAST
+      b_v <= 1'b0;
+`endif
+      pingpong <= 1'b0; cmd_seen <= 1'b0; tg_seen <= 1'b0;
       g_run <= 1'b0; g_seen <= 1'b0; m_rbusy <= 1'b0; sw_wait <= 1'b0; x_need <= 1'b0; x_run <= 1'b0; e_wait <= 1'b0;
       inf_n <= '0; pend_v <= 1'b0; show_v <= 1'b0; show_buf <= 2'd0; hide <= '0;
       n_draw <= '0; n_drop <= '0; tot <= '0; tot_l <= 23'h7F_FFFF; t3 <= '0;
@@ -207,7 +257,9 @@ module r3d_cmd #(
       // ---- the host
       if (h_go && h_rdy) begin
         if (h_we) begin
+`ifndef M3_DMAFAST
           b_v <= 1'b1; b_hi <= h_addr[31:24]; b_a <= h_addr[21:2]; b_d <= h_wdata;
+`endif
         end else begin
           h_rv <= 1'b1;
           if (h_addr[5:2] == 4'd0) h_rdata <= bswap(st0);
@@ -215,12 +267,16 @@ module r3d_cmd #(
           else h_rdata <= 32'hFFFF_FFFF;
         end
       end
+`ifdef M3_DMAFAST
+      if (b_v && b_cmd && t_ready) cmd_seen <= 1'b1;
+`else
       if (b_v) begin
         if (b_mem) begin if (m_ready) b_v <= 1'b0; end
         else if (b_tex) begin if (t_ready) b_v <= 1'b0; end
         else if (b_cmd) begin if (t_ready) begin b_v <= 1'b0; cmd_seen <= 1'b1; end end
         else b_v <= 1'b0;
       end
+`endif
       if (tg_reg_we && tg_reg_addr == 6'h03) tg_seen <= 1'b1;
 
       // ---- the flip: a draw begins, or the frame is dropped

@@ -77,6 +77,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast_colour.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast_band.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast_fogvp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast_store.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast_zq.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_rast.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_cmd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_mem.sv

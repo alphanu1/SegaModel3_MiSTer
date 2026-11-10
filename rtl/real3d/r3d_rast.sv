@@ -70,7 +70,10 @@ module r3d_rast #(
   parameter bit L8K = 1'b1,         // study R134: an L8 texel of 0xFF has alpha 0 (Supermodel); 0: MAME's decode
   // study R135: Supermodel's texture decode (format 2, contour on formats 1-4), contour's dilation and test,
   // texture alpha and translucency on textured polygons (r3d_rast_texel, r3d_rast_colour); 0: MAME's
-  parameter bit SMTX = 1'b1
+  parameter bit SMTX = 1'b1,
+  // study R149: the pairs that passed the z band queue for the pixel stage, ZQ of them (0: none, the z band's
+  // output register feeds the pixel stage as before), in an M10K from 64, else an MLAB
+  parameter int ZQ = 256
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -444,11 +447,17 @@ module r3d_rast #(
     end
   end
 
-  logic        zo_valid, zo_ready, zo_ctr;
+  logic        zo_valid /* verilator public_flat_rd */;
+  logic        zo_ready, zo_ctr;
   logic [8:0]  zo_y, zo_x;
   logic [1:0]  zo_on;
   logic signed [41:0] zo_p0, zo_p1;
   logic [7:0]  zo_tag;
+  logic        zr_valid, zr_ready, zr_ctr;
+  logic [8:0]  zr_y, zr_x;
+  logic [1:0]  zr_on;
+  logic signed [41:0] zr_p0, zr_p1;
+  logic [7:0]  zr_tag;
   logic        cv_valid, cv_zw;            // contour verdicts, from the colour stage
   r3d_rast_zband #(.OOW(1'b1), .TRANS(0), .PW(42), .TW(8)) u_zband (
     .clk, .rst,
@@ -456,9 +465,21 @@ module r3d_rast #(
     .s_y(zb_y), .s_x(zb_x), .s_on(zb_on), .s_z0(zb_z0), .s_z1(zb_z1),
     .s_p0(zb_v0), .s_p1(zb_v1), .s_zk(zb_zk), .s_tag(zb_tag),
     .s_stip(1'b0), .s_trans(5'd0), .s_pinv(1'b0),
-    .o_valid(zo_valid), .o_ready(zo_ready), .o_y(zo_y), .o_x(zo_x), .o_on(zo_on),
-    .o_p0(zo_p0), .o_p1(zo_p1), .o_tag(zo_tag), .o_ctr(zo_ctr),
+    .o_valid(zr_valid), .o_ready(zr_ready), .o_y(zr_y), .o_x(zr_x), .o_on(zr_on),
+    .o_p0(zr_p0), .o_p1(zr_p1), .o_tag(zr_tag), .o_ctr(zr_ctr),
     .c_valid(cv_valid), .c_zw(cv_zw));
+
+  // the passed pairs' queue (study R149): in overdraw-heavy frames most pairs fail Z, and the pixel stage
+  // waited behind runs of rejected pairs while the z band waited on it behind runs of passing ones
+  generate if (ZQ > 0) begin : g_zq
+    r3d_rast_zq #(.D(ZQ), .W(113), .RAM(ZQ >= 64 ? "M10K" : "MLAB")) u_zq (
+      .clk, .rst,
+      .i_valid(zr_valid), .i_ready(zr_ready), .i_data({zr_y, zr_x, zr_on, zr_p0, zr_p1, zr_tag, zr_ctr}),
+      .o_valid(zo_valid), .o_ready(zo_ready), .o_data({zo_y, zo_x, zo_on, zo_p0, zo_p1, zo_tag, zo_ctr}));
+  end else begin : g_nozq
+    assign zo_valid = zr_valid; assign zr_ready = zo_ready;
+    assign {zo_y, zo_x, zo_on, zo_p0, zo_p1, zo_tag, zo_ctr} = {zr_y, zr_x, zr_on, zr_p0, zr_p1, zr_tag, zr_ctr};
+  end endgenerate
 
   // ===========================================================================
   // the front domain: pairs into pixels, the interpolants, fog's P, the texel
