@@ -2,17 +2,20 @@
 
 ## Paused work and queue (2026-11-10, night)
 
-Everything is paused except Sega Rally 2. Each workstream's notes live in its `sm3-builds/` folder (git-ignored); the
+Everything is paused; Sega Rally 2 is done (below). Each workstream's notes live in its `sm3-builds/` folder (git-ignored); the
 study's R-entries carry the findings. To pick a stream up, read its folder's notes first.
 
-**Running: Sega Rally 2** (`sm3-builds/srally2`; notes and draft R-entry in `srally2/R-entry.md`).
-- Goal: Sega Rally 2 (`srally2`, zip in `~/roms/Model3/`, not yet on the board) with controls and sound, for the next
-  video. MRA from `sim/system/m3_mra.py`; srally2 added to arcsnd's claims and `roms_table.h` (patch against arcsnd
-  7ccac34, branch `model3`, my fork).
-- The board build is **130 MHz** (PLL outputs 1/2 at 130 MHz, phase_shift2 3846 ps, SYS_HZ 130_000_000, as
-  `sm3-builds/f130/tree`), from main plus the Sega Rally 2 fixes plus **FPS average defaulting to 1 s** (the OSD order
-  "1 s, 5 s, 10 s"; done and benched in `srally2/tree`). Keep only an RBF with hold positive at all four corners:
-  `f130_s3` (dcfab7f8) had hold −0.020 / −0.037 ns at the slow corners; `f130_s2` was fitting.
+**Done 2026-11-11: Sega Rally 2** (study R168; notes in `sm3-builds/srally2/`). It halted at boot (black screen) on
+the PVR: it needs version 7, so Step 2.x now reads 0x00071202 and Step 1.x keeps 0x00060103 (D-41 amended). On the
+board at 130 MHz (`sm3-builds/sr2_130p_s2_adbc4c0e.rbf`, hold positive at all corners) with arcsnd ad1a76a0: boots,
+attract, race, music, controls and the FPS counter's 1 s default all fine. `main` (merge 4834f66 of `srally2`,
+c684fb5) takes the change at **120 MHz**; the 130 MHz PLL/SYS_HZ hunks stay out (−3.7 ns setup, a test clock). No
+120 MHz build with the PVR change has been fitted yet. The fork's `model3` has 479da3e (README: the DSP in the FPGA
+and what a core needs) and 625699c (all 63 Games.xml sets claimed; DSB2's wait loops found by pattern, Sega Rally 2's
+DSB2 time 1.40 s -> 0.33 s for a 121.7 s race, output unchanged).
+- Wrong turns: my first board build (`sr2_130_s2`, 26e6cafb) lacked the PVR fix and gave the black screen; I first
+  suspected the MRA and the banking, but the bench showed the LED-code halt at frame 75. The C1 53C810 probe and the
+  93C46 DO difference (R168 §3, §3a) show nothing on the board.
 
 **Paused, in order of priority:**
 1. **Timing closure** (the top priority; ahead of speed and area). Census done: `sm3-builds/tclose/CENSUS.md` and
@@ -42,11 +45,8 @@ study's R-entries carry the findings. To pick a stream up, read its folder's not
      removed, session number in the tag), not yet board-tested or committed; the likely root cause is the sound DSP's
      failing timing at 120, which item 1's DSP pipelining addresses. The bridge side (+12 ALM) needs a decision.
    - The bridge's 93 ms watchdog reboots the sound board if a live server stalls that long: raise to 1-2 s.
-   - Sega Rally 2's arcsnd change (`sm3-builds/srally2/arcsnd_srally2.patch` against 7ccac34: the four srally2 sets
-     claimed, DSB2's spin skip extended to its program; binary 065681e3, running on the board as
-     `/media/fat/arcsnd_test/arcsnd7`) goes into the fork's `model3` branch once tested on the board.
-   - The arcsnd PR to ppriest: draft `sm3-builds/arcsnd_pr_draft.md`; the README additions (why the DSP is in the FPGA,
-     what a core must carry) are uncommitted in `sm3-builds/arcsnd`. Ben approves the PR text before it is opened.
+   - The arcsnd PR to ppriest: draft `sm3-builds/arcsnd_pr_draft.md`; the README additions are now committed on the fork
+     (479da3e), and the PR should also say every set is claimed (625699c). Ben approves the PR text before it is opened.
 7. **Area:** the device is full (4,191 / 4,191 LABs, about 620 ALM free). The only large item left is the CPU's MLAB
    files into M10K (about 380 ALM, 7 M10K), which needs a speed proof first.
 
