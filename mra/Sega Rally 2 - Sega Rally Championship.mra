@@ -1,0 +1,116 @@
+<misterromdescription>
+    <!--
+      Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1
+      SPDX-License-Identifier: GPL-3.0-or-later
+
+      Sega Rally 2 - Sega Rally Championship. Step 2.0 (study R100): no sound.
+      From MAME 0.289 model3.cpp ROM_START(srally2); sim/system/m3_mra.py writes it,
+      and packs the same images for the system bench. One download per index
+      (rtl/sys/m3_loader.sv):
+        4  the game configuration: step, flags, CROM bank map, idle inputs, input profile
+        1  VROM, 64 MiB, in the extra memory (DDR3 byte 0x38000000)
+        3  fixed CROM, 8 MiB, SDRAM 0x7300000 (FF800000-FFFFFFFF)
+        0  banked CROM, 48 MiB in 6 slots of 8 MiB from SDRAM 0; backup RAM
+           at 0x6200000, 128 KiB of 00; last, so its end releases the reset
+        2  <nvram>: config/nvram/<this file>.nvm, if present: backup RAM, then
+           the 93C46. Supermodel reaches the attract from a fresh NVRAM;
+           the file keeps the settings and records. m3_mra.py nvram converts a
+           Supermodel NVRAM file. No NVRAM data is in this repository.
+      Word form: the PowerPC's 32-bit word at A is the little-endian word at
+      the memory's A. The sound ROMs are not loaded (D-8).
+    -->
+    <name>Sega Rally 2 - Sega Rally Championship</name>
+    <setname>srally2</setname>
+    <rbf>Model3</rbf>
+    <mameversion>0289</mameversion>
+    <year>1998</year>
+    <manufacturer>Sega</manufacturer>
+    <category>Driving</category>
+    <!-- the CPU board's DIP bank, 315-5649 port G (index 254); Reset & apply after a change -->
+    <switches default="7F">
+        <dip name="SW1 (debug)" bits="7" ids="On,Off"/>
+        <dip name="SW2" bits="6" ids="On,Off"/>
+        <dip name="SW3" bits="5" ids="On,Off"/>
+        <dip name="SW4" bits="4" ids="On,Off"/>
+        <dip name="SW5" bits="3" ids="On,Off"/>
+        <dip name="SW6" bits="2" ids="On,Off"/>
+        <dip name="SW7" bits="1" ids="On,Off"/>
+        <dip name="SW8" bits="0" ids="On,Off"/>
+    </switches>
+    <!-- the controls: input profile 01 (driving), rtl/io/m3_inputs.sv -->
+    <buttons names="Coin,Start,Test,Service,View,-,Accel,Brake,Gear Up,Gear Down,Hand Brake"/>
+
+    <!-- game configuration: step 20, flags 07 (VROM in the extra memory, fixed CROM 8 MiB, VROM 64 MiB), bank map, idle ports C and D, input profile 01 (driving) -->
+    <rom index="4" md5="none">
+        <part>20 07 00 01 02 03 04 05 80 80 80 80 80 80 80 80 80 80 AF FF 01 00</part>
+    </rom>
+    <rom index="1" zip="srally2.zip" md5="none">
+        <!-- 0x0000000  VROM block 0, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-20616.26" crc="e11dcf8b" map="00000021"/>
+            <part name="mpr-20617.27" crc="96acef3f" map="00002100"/>
+            <part name="mpr-20618.28" crc="6c281281" map="00210000"/>
+            <part name="mpr-20619.29" crc="0fa65819" map="21000000"/>
+        </interleave>
+        <!-- 0x1000000  VROM block 1, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-20620.30" crc="ee79585f" map="00000021"/>
+            <part name="mpr-20621.31" crc="3a99148f" map="00002100"/>
+            <part name="mpr-20622.32" crc="0618f056" map="00210000"/>
+            <part name="mpr-20623.33" crc="ccf31b85" map="21000000"/>
+        </interleave>
+        <!-- 0x2000000  VROM block 2, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-20624.34" crc="90f30936" map="00000021"/>
+            <part name="mpr-20625.35" crc="04f804fa" map="00002100"/>
+            <part name="mpr-20626.36" crc="2d6c97d6" map="00210000"/>
+            <part name="mpr-20627.37" crc="a14ee871" map="21000000"/>
+        </interleave>
+        <!-- 0x3000000  VROM block 3, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-20628.38" crc="bba829a3" map="00000021"/>
+            <part name="mpr-20629.39" crc="ead2eb31" map="00002100"/>
+            <part name="mpr-20630.40" crc="cc5881b8" map="00210000"/>
+            <part name="mpr-20631.41" crc="5cb69ffd" map="21000000"/>
+        </interleave>
+    </rom>
+    <rom index="3" zip="srally2.zip" md5="none">
+        <!-- fixed CROM, 8 MiB (FF800000-FFFFFFFF) -->
+        <interleave output="64">
+            <part name="epr-20633.18" crc="f5a24f24" map="21000000"/>
+            <part name="epr-20632.17" crc="6829a801" map="00210000"/>
+            <part name="epr-20635.20" crc="7937473f" map="00002100"/>
+            <part name="epr-20634.19" crc="45a09245" map="00000021"/>
+        </interleave>
+    </rom>
+    <rom index="0" zip="srally2.zip" md5="none">
+        <!-- 0x0000000  CROM0, 16 MiB (banks 0, 1) -->
+        <interleave output="64">
+            <part name="mpr-20603.2" crc="ad0d8eb8" map="21000000"/>
+            <part name="mpr-20602.1" crc="60cfa72a" map="00210000"/>
+            <part name="mpr-20605.4" crc="00513401" map="00002100"/>
+            <part name="mpr-20604.3" crc="99c5f396" map="00000021"/>
+        </interleave>
+        <!-- 0x1000000  CROM1, 16 MiB (banks 2, 3) -->
+        <interleave output="64">
+            <part name="mpr-20607.6" crc="6da85aa3" map="21000000"/>
+            <part name="mpr-20606.5" crc="072498fd" map="00210000"/>
+            <part name="mpr-20609.8" crc="c03cc0e5" map="00002100"/>
+            <part name="mpr-20608.7" crc="0c9b0571" map="00000021"/>
+        </interleave>
+        <!-- 0x2000000  CROM2, 16 MiB (banks 4, 5) -->
+        <interleave output="64">
+            <part name="mpr-20611.10" crc="5d9f8ba2" map="21000000"/>
+            <part name="mpr-20610.9" crc="b6e0ff4e" map="00210000"/>
+            <part name="mpr-20613.12" crc="2938c0d9" map="00002100"/>
+            <part name="mpr-20612.11" crc="721a44b6" map="00000021"/>
+        </interleave>
+        <!-- 0x3000000  slots 6-11 unused, 48 MiB of 00, so the backup RAM lands at 0x6200000 -->
+        <part repeat="0x3000000">00</part>
+        <!-- 0x6000000  (the Step 1.0 fixed CROM's place, unused here), 2 MiB of 00 -->
+        <part repeat="0x200000">00</part>
+        <!-- 0x6200000  backup RAM, 128 KiB of 00 (Supermodel's fresh state); the NVRAM file overwrites it -->
+        <part repeat="0x20000">00</part>
+    </rom>
+    <nvram index="2" size="131200"/>
+</misterromdescription>

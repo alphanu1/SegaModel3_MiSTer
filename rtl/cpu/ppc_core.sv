@@ -100,6 +100,8 @@ module ppc_core
 #(
   parameter logic [31:0] RESET_PC = 32'hFFF0_0100,
   parameter logic [31:0] PVR      = 32'h0006_0101,
+  // PVR2: the PVR read while pvr_alt is high (the system's choice by step, D-41: Step 2.x 0x00071202)
+  parameter logic [31:0] PVR2     = PVR,
   // the multiply-add unit's optional stage boundaries (ppc_fpu_fma.sv); all
   // in, L = 12, is what 120 MHz needs
   parameter bit P1A = 1'b1, P2 = 1'b1, P3 = 1'b1, P4A = 1'b1, P5A = 1'b1,
@@ -175,6 +177,7 @@ module ppc_core
 )(
   input  logic        clk,
   input  logic        rst,
+  input  logic        pvr_alt,       // run time, steady while the CPU runs: mfpvr gives PVR2, not PVR
 
   output logic        i_req,
   output logic [31:0] i_addr,
@@ -2008,11 +2011,12 @@ module ppc_core
   // files'): Quartus otherwise copies the queue head into the array's
   // address register, and the pop's next state then reaches it (a round-2
   // cached full build, wk_act into spr_mem's rdaddr_reg)
+  wire [31:0] pvr_v = pvr_alt ? PVR2 : PVR;
   (* keep = 1 *) wire [5:0] spr_ra = id_spr_idx;
   wire        k_arr = ksp && !(ix == 6'd0 || ix == 6'd1 || ix == 6'd6 || ix == 6'd7 || (ix >= 6'd13 && ix <= 6'd18));
   wire [31:0] id_mfb = ({32{q_pd.mfcr && !q_pd.mfmsr}} & (m.valid ? m_cr : cr_q)) | ({32{q_pd.mfmsr}} & msr_q) |
                        ({32{mk0 && id_mf_sel == 3'd1}} & xer_nx) | ({32{mk0 && id_mf_sel == 3'd2}} & lr_nx) |
-                       ({32{mk0 && id_mf_sel == 3'd3}} & ctr_nx) | ({32{mk0 && id_mf_sel == 3'd7}} & PVR) |
+                       ({32{mk0 && id_mf_sel == 3'd3}} & ctr_nx) | ({32{mk0 && id_mf_sel == 3'd7}} & pvr_v) |
                        ({32{ksp && ix == 6'd0}} & srr0_q) | ({32{ksp && ix == 6'd1}} & srr1_q) |
                        ({32{ksp && ix == 6'd6}} & dsisr_q) | ({32{ksp && ix == 6'd7}} & dar_q) |
                        ({32{ksp && ix == 6'd13}} & dmiss_q) | ({32{ksp && ix == 6'd14}} & dcmp_q) |
@@ -2031,7 +2035,7 @@ module ppc_core
       3'd1:    id_mfv_c = xer_nx;
       3'd2:    id_mfv_c = lr_nx;
       3'd3:    id_mfv_c = ctr_nx;
-      3'd7:    id_mfv_c = PVR;
+      3'd7:    id_mfv_c = pvr_v;
       3'd0:    id_mfv_c = id_spr_hit ? id_spr_v : 32'd0;
       default: id_mfv_c = 32'd0;                         // DEC, TBL, TBU: read in EX
     endcase

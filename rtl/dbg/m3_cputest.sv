@@ -89,7 +89,7 @@ module m3_cputest
 
   generate if (!CACHED) begin : g_core
   ppc_core u_cpu (
-    .clk (clk), .rst (cpu_rst),
+    .clk (clk), .rst (cpu_rst), .pvr_alt (1'b0),
     .i_req (i_req), .i_addr (i_addr), .i_wimg (), .i_seq (), .i_valid (i_valid), .i_data (i_data),
     .i_way (2'd0), .i_arr (1'b0), .i_pa (20'd0), .i_pv (), .i_pidx (), .i_pway (), .i_ppa (), .i_pre (), .ev_btb (),
     .i_two (1'b0), .i_w2 (), .i_data2 (32'd0),
@@ -173,7 +173,7 @@ module m3_cputest
   logic [3:0]  m_be;
 
   ppc_cpu #(.SNOOP (1'b0)) u_cpu (
-    .clk (clk), .rst (cpu_rst),
+    .clk (clk), .rst (cpu_rst), .pvr_alt (1'b0),
     .m_req (m_req), .m_cmd (m_cmd), .m_addr (m_addr), .m_be (m_be), .m_wdata (m_wdata),
     .m_ack (m_ack), .m_wnext (m_wnext), .m_rvalid (m_rvalid), .m_rdata (m_rdata),
     .sn_req (1'b0), .sn_addr (27'd0), .sn_inv (1'b0), .sn_ack (),   // no DMA here

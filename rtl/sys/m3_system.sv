@@ -102,6 +102,9 @@ module m3_system
   // boot code and TLB-miss handler set W in every BAT and RPA on revisions below
   // 1.3; at 1.3 RAM is copy-back (D-14: per step)
   parameter logic [31:0] PVR      = 32'h0006_0103,  // 603e rev 1.3: RAM copy-back, the D-cache snoops the 53C810 (D-41, R101)
+  // Step 2.x (step2): the 603ev's 0x00071202, both emulators' value; Sega Rally 2 halts (LED code 16, RAM 0x784FC) on
+  // a PVR below 0x00070000 (D-41's per-step PVR; study R168)
+  parameter logic [31:0] PVR2     = 32'h0007_1202,
   parameter logic [28:0] DDR_BASE = 29'h0600_0000,  // byte 0x30000000, the cores' DDR3 (Model 2 R654)
   // R100 (Daytona 2): Step 2.x, and where the MRA's index 1 (VROM) lives
   parameter bit          STEP2    = 1'b1,         // the Step 2.x hardware, chosen at run time by the step
@@ -217,7 +220,7 @@ module m3_system
   output logic [7:0]  v_r, v_g, v_b,
   input  logic        overlay_en,
   input  logic        fps_en,        // the frame counter (FPS) shown
-  input  logic  [1:0] fps_avg,       // its window: 0 5 s, 1 10 s, 2 1 s (m3_fps avg)
+  input  logic  [1:0] fps_avg,       // its window: 0 1 s, 1 5 s, 2 10 s (m3_fps avg)
 
   // the cabinet's controls (hps_io, clk_sys; INPUTS)
   input  logic [15:0] joystick_0,    // player 1: 3:0 right, left, down, up; 15:4 the J1 buttons
@@ -431,8 +434,8 @@ module m3_system
   localparam bit FB_ON  = FBUSY   && !RELEASE;
   localparam bit XC_ON  = XCAP    && OV_ON;
 
-  ppc_cpu #(.PVR(PVR), .ISB(ISB)) u_cpu (
-    .clk, .rst(rst_cpu),
+  ppc_cpu #(.PVR(PVR), .PVR2(PVR2), .ISB(ISB)) u_cpu (
+    .clk, .rst(rst_cpu), .pvr_alt(step2),
     .m_req(m_req[0]), .m_cmd(m_cmd[0]), .m_addr(m_addr[0]), .m_be(m_be[0]), .m_wdata(m_wdata[0]),
     .m_ack(m_ack[0]), .m_wnext(m_wnext[0]), .m_rvalid(m_rvalid[0]), .m_rdata,
     // the D-cache snoop (D-41): the 53C810's RAM accesses, from m3_bus

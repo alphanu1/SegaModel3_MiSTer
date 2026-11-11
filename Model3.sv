@@ -95,7 +95,7 @@ localparam CONF_STR = {
 	"-;",
 	"O[4],Debug overlay,On,Off;",
 	"O[5],FPS counter,Off,On;",
-	"O[9:8],FPS average,5 s,10 s,1 s;",      // the OSD's default is the first entry (m3_fps avg)
+	"O[9:8],FPS average,1 s,5 s,10 s;",      // the OSD's default is the first entry (m3_fps avg)
 	"O[7:6],Volume,Normal,+6 dB,+12 dB;",    // on the sound link's fixed gain (m3_sndbridge GAIN), saturating
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 `ifndef M3_NO_INPUTS

@@ -129,7 +129,33 @@ LOSTWSGA = {
     'fixed': [('epr-19939a.17', 6), ('epr-19938a.18', 4), ('epr-19937a.19', 2), ('epr-19936a.20', 0)],
     'vrom': ['mpr-%d.%d' % (19902 + k, 26 + k) for k in range(16)],
 }
-SETS = {'vf3': VF3, 'bassdx': BASSDX, 'daytona2': DAYTONA2, 'scuddxo': SCUDDXO, 'lostwsga': LOSTWSGA}
+# ROM_START(srally2) (Step 2.0): Daytona 2's form (8 MiB fixed CROM of four 2 MiB ROMs, VROM sixteen 4 MiB ROMs,
+# 64 MiB) but the banked CROM is three CROMs of four 4 MiB ROMs, 16 MiB each, with no CROM3: 48 MiB. Both emulators
+# lay them out back to back (MAME's 0x800000 + bank x 8 MiB from CROM0 at 0x800000, CROM1 at 0x1800000; Supermodel's
+# banked_crom offsets 0, 0x1000000, 0x2000000), so bank b is 8 MiB slot b, banks 0-5; Supermodel's trace selects
+# banks 0, 1, 2, 4 and 5 (F0100008 written FF, FE, FD, FB, FA). No security board (no 315-5881 access in the trace).
+# Port C: bit 0 the view button, bit 1 the hand brake (Supermodel's INPUT_VIEWCHANGE and INPUT_HANDBRAKE), 7:4 the
+# 4-speed H; it rests at AF in Supermodel's trace, port D at FF. In the driving profile those are VR1 and VR2.
+# Supermodel reaches the attract from a fresh NVRAM, so the <nvram> keeps settings and records only.
+# Not loaded: the 68000 program and samples, the DSB2's 68000 program and MPEG ROMs (arcsnd reads them), the drive board.
+SRALLY2 = {
+    'setname': 'srally2', 'name': 'Sega Rally 2 - Sega Rally Championship', 'year': '1998', 'zip': 'srally2.zip',
+    'category': 'Driving', 'step': 0x20, 'prof': P_DRIVE,
+    'buttons': 'Coin,Start,Test,Service,View,-,Accel,Brake,Gear Up,Gear Down,Hand Brake',
+    'idle_in': [0xAF, 0xFF],
+    'crom': [
+        [('mpr-20602.1', 6), ('mpr-20603.2', 4), ('mpr-20604.3', 2), ('mpr-20605.4', 0)],
+        [('mpr-20606.5', 6), ('mpr-20607.6', 4), ('mpr-20608.7', 2), ('mpr-20609.8', 0)],
+        [('mpr-20610.9', 6), ('mpr-20611.10', 4), ('mpr-20612.11', 2), ('mpr-20613.12', 0)],
+    ],
+    'crom_mib': [16, 16, 16],
+    'crom_win': 16,             # MiB of bank space a CROM takes: two banks (Daytona 2's 32: four)
+    'fixed': [('epr-20632.17', 6), ('epr-20633.18', 4), ('epr-20634.19', 2), ('epr-20635.20', 0)],
+    'vrom': ['mpr-%d.%d' % (20616 + k, 26 + k) for k in range(16)],
+    'nvnote': ['the 93C46. Supermodel reaches the attract from a fresh NVRAM;',
+               'the file keeps the settings and records. m3_mra.py nvram converts a'],
+}
+SETS = {'vf3': VF3, 'bassdx': BASSDX, 'daytona2': DAYTONA2, 'scuddxo': SCUDDXO, 'lostwsga': LOSTWSGA, 'srally2': SRALLY2}
 
 # game configuration (index 4) flags, m3_loader.sv
 CF_VROM_X, CF_FIXED8, CF_VROM64 = 1, 2, 4
@@ -137,15 +163,18 @@ SDR_FIX8 = 0x7300000
 XMEM_DDR3_BYTE = 0x38000000    # the DDR3 region for <rom address=...> (not used: the stream is the default)
 
 
-def bank_map(crom_mib):
-    """CROM bank b (0-15; CROMn is banks 4n..4n+3) -> SDRAM slot, packed in order; 0x80 empty."""
+def bank_map(crom_mib, win=32):
+    """CROM bank b (0-15; CROMn is banks wn..wn+w-1, w = win / 8: four for Daytona 2's 32 MiB CROM windows, two
+    for Sega Rally 2's 16 MiB) -> SDRAM slot, packed in order; 0x80 empty."""
     m, slot = [], 0
     for n, mib in enumerate(crom_mib):
-        for k in range(4):
+        for k in range(win // 8):
             if k * 8 < mib:
                 m.append(slot); slot += 1
             else:
                 m.append(0x80)
+    m += [0x80] * (16 - len(m))
+    assert len(m) == 16
     return m
 # ROM_LOAD64_WORD_SWAP offset -> the output bytes of its pair in word form
 OFF_MAP = {2: '00000021', 0: '00002100', 6: '00210000', 4: '21000000'}
@@ -258,7 +287,7 @@ def mra_step2(args, s, crc):
     L = []
     w = L.append
     nb = sum(s['crom_mib']) // 8
-    bm = bank_map(s['crom_mib'])
+    bm = bank_map(s['crom_mib'], s.get('crom_win', 32))
     cfg = [s['step'], CF_VROM_X | CF_FIXED8 | CF_VROM64] + bm + s.get('idle_in', [0xFF, 0xFF]) + [s.get('prof', P_GEN), s.get('pflg', 0)]
     w('<misterromdescription>')
     w('    <!--')
@@ -275,8 +304,9 @@ def mra_step2(args, s, crc):
     w('        0  banked CROM, %d MiB in %d slots of 8 MiB from SDRAM 0; backup RAM' % (8 * nb, nb))
     w('           at 0x6200000, 128 KiB of 00; last, so its end releases the reset')
     w('        2  <nvram>: config/nvram/<this file>.nvm, if present: backup RAM, then')
-    w('           the 93C46. The game needs its link setting at Single, or it stops')
-    w('           at "NETWORK BOARD NOT PRESENT"; m3_mra.py nvram converts a')
+    for t in s.get('nvnote', ['the 93C46. The game needs its link setting at Single, or it stops',
+                              'at "NETWORK BOARD NOT PRESENT"; m3_mra.py nvram converts a']):
+        w('           ' + t)
     w('           Supermodel NVRAM file. No NVRAM data is in this repository.')
     w('      Word form: the PowerPC\'s 32-bit word at A is the little-endian word at')
     w('      the memory\'s A. The sound ROMs are not loaded (D-8).')
@@ -313,14 +343,19 @@ def mra_step2(args, s, crc):
     w('    </rom>')
     w('    <rom index="0" zip="%s" md5="none">' % s['zip'])
     a = 0
+    bw = s.get('crom_win', 32) // 8
     for n, bank in enumerate(s['crom']):
         mib = s['crom_mib'][n]
-        w('        <!-- 0x%07x  CROM%d, %d MiB (banks %s) -->' % (a, n, mib, ', '.join(str(b) for b in range(4 * n, 4 * n + mib // 8))))
+        w('        <!-- 0x%07x  CROM%d, %d MiB (banks %s) -->' % (a, n, mib, ', '.join(str(b) for b in range(bw * n, bw * n + mib // 8))))
         w('        <interleave output="64">')
         for name, off in sorted(bank, key=lambda p: OFF_MAP[p[1]][::-1]):
             w('            <part name="%s" crc="%s" map="%s"/>' % (name, crc[name], OFF_MAP[off]))
         w('        </interleave>')
         a += mib << 20
+    if a < 0x6000000:
+        w('        <!-- 0x%07x  slots %d-11 unused, %d MiB of 00, so the backup RAM lands at 0x6200000 -->' % (a, a >> 23, (0x6000000 - a) >> 20))
+        w('        <part repeat="0x%x">00</part>' % (0x6000000 - a))
+        a = 0x6000000
     assert a == 0x6000000
     w('        <!-- 0x6000000  (the Step 1.0 fixed CROM\'s place, unused here), 2 MiB of 00 -->')
     w('        <part repeat="0x200000">00</part>')
