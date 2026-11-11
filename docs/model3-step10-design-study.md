@@ -1097,7 +1097,7 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-38 | The CPU's long-term target is 110 MHz, closing at every corner, rather than buying back frames with area. At 110 MHz the CPI model loses 0 frames at singles-at-4 and 3 at the built fast path (R83). That is what two-word fetch (about 520 ALM) would buy at 100 MHz, so it stays off (D-36). The release keeps 100 MHz until 110 closes. Every CPU timing fix now aims for margin toward 9.09 ns, not just closure at 10 ns. This revises R58's 110 MHz from an aim to the target, after D-30. |
 | D-39 | A misaligned integer access that crosses a 4 KB page is split in hardware inside a BAT block. It takes the alignment exception only when page-translated (MSR[DR]=1, no BAT hit) or when the crossing leaves the BAT block. The 603e manual's §4.5.6.1.1 is ambiguous for BAT regions; MAME splits and never traps; Supermodel has no MMU. Model 3's boot ROM treats every alignment exception as fatal, so no game relies on the trap: if the chip traps, games never do this, and if it splits, games that do it keep working. Misaligned accesses within a page are split in hardware as the manual says (R85). *Amended by R124 (2026-11-07): Scud Race and Bass Fishing both make this access under page translation, so the 603e splits it in every mode; the trap is kept only for 4.5.6's list and an FP double crossing a page outside a BAT.* |
 | D-40 | Test builds may run up to about 41,500 ALM with loose slack; a release must close every corner and come in under budget, which may need optimisation. The attract proof of concept (D-37) has no sound (about 4,360 ALM, R81) and no real I/O, so it projects at about 22K (stage A, R85) + geometry 7.9K + rasteriser about 8K + stage B about 1K, about 39K: well under. |
-| D-41 | The CPU reports PVR 0x00060103 (603e rev 1.3, "Stretch") on Step 1.0, as MAME does; Supermodel uses 0x00071202 (603r). VF3's boot code and miss handler test the PVR. With version 6 and revision below 0x0103 they set W in every BAT and in the RPA, working round an early 603e bug, so the core's former 0x00060101 ran RAM write-through on a path neither emulator takes. At 1.3, RAM is copy-back. The board's real revision is unknown. The value is a parameter of `ppc_cpu`, set per step in the system (D-14). The CPU test harness keeps its own default, so its signatures do not move. Revised the same day: VF3 never flushes the D-cache before the 53C810 reads RAM. Its SCRIPTS lists and DMA sources can sit dirty, and the real board stays coherent only because the MPC105 snoops PCI master cycles and the 603e casts out the dirty line. Our D-cache has no snoop port. So board builds stay on 0x00060101 (write-through, DMA correct) until a snoop port is built and proven: DMA reads cast out dirty lines first, DMA writes invalidate. Then the system moves to 0x00060103. Done in R101: the snoop is wired in `m3_bus` and `m3_system`'s default is 0x00060103. |
+| D-41 | The CPU reports PVR 0x00060103 (603e rev 1.3, "Stretch") on Step 1.0, as MAME does; Supermodel uses 0x00071202 (603r). VF3's boot code and miss handler test the PVR. With version 6 and revision below 0x0103 they set W in every BAT and in the RPA, working round an early 603e bug, so the core's former 0x00060101 ran RAM write-through on a path neither emulator takes. At 1.3, RAM is copy-back. The board's real revision is unknown. The value is a parameter of `ppc_cpu`, set per step in the system (D-14). The CPU test harness keeps its own default, so its signatures do not move. Revised the same day: VF3 never flushes the D-cache before the 53C810 reads RAM. Its SCRIPTS lists and DMA sources can sit dirty, and the real board stays coherent only because the MPC105 snoops PCI master cycles and the 603e casts out the dirty line. Our D-cache has no snoop port. So board builds stay on 0x00060101 (write-through, DMA correct) until a snoop port is built and proven: DMA reads cast out dirty lines first, DMA writes invalidate. Then the system moves to 0x00060103. Done in R101: the snoop is wired in `m3_bus` and `m3_system`'s default is 0x00060103. Amended in R168: the PVR is now per step as this row always said. Step 1.x reads 0x00060103, Step 2.x 0x00071202 (603ev / 603r, both emulators' value), because Sega Rally 2 halts at boot on a version below 7. |
 | D-42 | Daytona 2's proof of concept accepts its geometry at about 118% of a frame (R76). Heavy frames then take two frames to draw, about 30 fps there, which is fine for a proof of concept. Its ROM beyond the 128 MiB SDRAM (about 200 MiB in all) goes to DDR3 while the second SDRAM is awaited: video ROM first, since it is read model by model and prefetchable (R82's numbers leave room). I want one core for every step, as D-14 says, not separate RBFs as on Model 2. Per-step hardware is selected at run time from the game ID wherever area allows. |
 | D-43 | (2026-11-02) The clock target is 120 MHz across the board, superseding D-38's 110. Throughput may be traded for area: a change may cost cycles (iterative units, fewer lanes, time-multiplexing, narrower datapaths run more often) as long as each frame's budget holds at 120 MHz, but it must not lower a block's standalone Fmax, and changes that raise it come first. The target is about 8,000 ALM freed against `sysb90_s1`, for sound (about 4,500), I/O (about 1,000) and the DSB's MPEG decoder (about 2,000); my Model 1 and Model 2 cores freed over 14,000 and about 10,000 from full. `FP_DSP` (R98) goes off by default under this rule: it cut the geometry to 103.5 MHz. |
 | D-44 | (2026-11-06) The clock is 110 MHz across the board, superseding D-43's 120. R113 priced 120 MHz for the CPU: at best 3-4% more instructions a second than 110, and 1-4% fewer if the load request needs its own stage, with nothing shown to close; load-use 2 and single latency 4 at 110 (up to 8.5% / 5.5%) collide with it on the same paths. So the CPU's speed comes from cycles at 110: the core's latencies toward the 603e manual and the miss path (R112). The rest of D-43 stands with 110 in place of 120: a throughput trade must hold each frame's budget at 110 MHz, no block's standalone Fmax may drop, and the area target is unchanged. At 110 the Daytona 2 rasteriser's p99 is about 94% of a frame and its worst about 104% (R109's 86.4% / 95.2% at 120), so the Real3D has no cycles left to trade there. |
@@ -15020,3 +15020,278 @@ going ahead of its posted writes (−1.6%), and timing closure.
 *Board, the same 130 MHz build, later.* VF3 runs at 60 fps in attract and in play, where at 120 MHz it dropped to
 29-34 fps on the characters with much floating cloth. The census (R160's VF3 note) put VF3's slow frames on the rasteriser's texture misses, not the CPU, so this gain may be the rasteriser's. Daytona 2's attract is at 60 with a couple of small drops, but
 its race stays at 30; the race is being mapped like R160's attract.
+
+**R168 — Sega Rally 2 (`srally2`, Step 2.0): Daytona 2's form with a 48 MiB banked CROM of 16 MiB CROMs
+and no security board. Supermodel runs it from a fresh NVRAM to the attract and through a race. The MRA comes from
+`m3_mra.py` with one new option (the bank space a CROM takes), and every CROM word Supermodel's DMA read matches
+the packed image. **On the core it halts at boot: the game requires a 603ev's PVR (version 7) and the core gave every
+step the 603e's 0x00060103; D-41's per-step PVR is now built, 0x00071202 on Step 2.x.** In arcsnd: every Games.xml set
+claimed, and DSB2's spin skip finds its loops by pattern, so Rally 2's program takes it, its 68000 cost cut about 4x
+with the output unchanged. A 130 MHz board build from 8ea120d with the FPS default of 1 s; on the board it boots, plays and sounds right. Main takes the change at 120 MHz.** Work in `sm3-builds/srally2/` (tree: `git archive 8ea120d`; the main tree
+untouched). Rests on R100 (Daytona 2's game configuration, indexes 1, 3 and 4, the MPC106), R127 (`VROM_LIN`),
+R154 (the driving profile) and D-46.
+
+*What I believed* (R100, R119, §3):
+- Sega Rally 2 would be Daytona 2's case: Step 2.x, 8 MiB fixed CROM, 64 MiB VROM, the Real3D DMA device, the
+  MPC106, possibly the 315-5881 and a link setting in the EEPROM.
+- The bank map's rule (CROMn is banks 4n..4n+3) would hold for every Step 2 set.
+- The PVR did not matter on Step 2: R100 found Daytona 2 only storing it and comparing it with itself, so the
+  core kept 0x00060103 everywhere, though D-41 says the value is "set per step in the system".
+
+*What I know now:*
+
+**1. The set** (MAME 0.289 `ROM_START(srally2)`, its machine config `srally2` = `model3_20` + `dsb2_config`;
+Supermodel 036af1c `Games.xml`; they agree on every ROM):
+- Step 2.0, PowerPC 603e at 166 MHz in MAME's `add_cpu_166mhz` (the core runs its own clock; R119 §3: the game does
+  not read HID1).
+- Fixed CROM 8 MiB (four 2 MiB ROMs, `epr-20632`..`20635`), FF800000-FFFFFFFF.
+- Banked CROM 48 MiB: CROM0-2, each four 4 MiB ROMs (16 MiB), **no CROM3**. Both emulators put them back to back
+  (MAME: `0x800000 + bank x 8 MiB` with CROM0 at 0x800000, CROM1 at 0x1800000; Supermodel's `banked_crom` offsets
+  0, 0x1000000, 0x2000000), so bank b is slot b, banks 0-5. Daytona 2's CROMs are 32 MiB (8 MiB ROMs) and take four
+  banks each; these take two. Supermodel's trace writes F0100008 = FF, FE, FD, FB, FA: banks 0, 1, 2, 4, 5.
+- VROM 64 MiB, sixteen 4 MiB ROMs `mpr-20616`..`20631` in IC order .26-.41 (MAME's `ROM_LOAD_VROM` offsets 2, 0, 6,
+  4, ... as VF3's).
+- Sound: 68000 `epr-20636`, SCSP samples 8 MiB; **DSB2** (a 68000, `epr-20641.2`, MPEG 16 MiB `mpr-20637`..`20640`);
+  drive board `epr-20512` (not modelled). Supermodel's `<audio>QuadMix</audio>` only matters for a four-channel
+  host; in stereo it is left = front L + rear L, right likewise, the same as every other type.
+- No protection: no 315-5881 access in the trace, and MAME's `srally2` machine has no crypt device.
+- MAME's `init_srally2` NOPs three instructions at 0x7C0C4 (a JTAG check: "expects result 0x0040000000"); the core
+  has the Step 2.0 JTAG chain (`m3_jtag` `jstep` 2, R100) and Supermodel runs it unpatched. MAME marks the clones
+  as needing other JTAG patches.
+  `tb_m3_jtag` on Rally 2's trace (`obj/jtag`): with `jstep` 2, all 16,052 TDO reads as Supermodel's (48,157
+  TCK/TMS/TDI writes); with Step 2.1's ID codes 4 differ (the first at frame 11, PC 0x8CD4C), with Step 1.0's chain
+  3,816; `--fault` fails. So the check MAME patches out is met as built.
+- Controls (Supermodel `common`, `vehicle`, `shift4`, `handbrake`, `viewchange`; MAME's `scud` ports): port C bit 0
+  the view button, bit 1 the hand brake, 7:4 the 4-speed H; ADC 0 steering (80 at centre), 1 accelerator, 2 brake.
+  Port C rests at AF and D at FF in the trace (the shifter in first gear), as Daytona 2's. In the driving profile
+  (R154) VR1 is port C bit 0 and VR2 bit 1, so no RTL change: the MRA names button 5 View and button 11 Hand Brake.
+- Clones in MAME: `srally2p` (prototype, 29 Dec 1997), `srally2pa` (8 Dec 1997), `srally2dx` (Deluxe). The zip is
+  a merged set holding all four.
+
+**2. Supermodel's reference** (`sm/`; the bus-trace build `dt2/supermodel` and `supermodel-sb`, 3,000 frames from a
+fresh NVRAM). **Wrong turn:** with the merged zip Supermodel loaded `srally2dx` ("Multiple games found"); each run
+folder now has its own `Config/Games.xml` with the three clones taken out. Two `xvfb-run -a` at once collided on
+display :99 and cut the first trace short; the trace was run again alone.
+- Screens (`sm/sheet.png`): black to 450, the SEGA logo 500-900, "INSERT COIN(S)" from 1,000, attract races from
+  1,100, rankings at 2,000-2,500, races again. **No link or network message from a fresh NVRAM**, unlike Daytona 2.
+- The trace (`sm/trace/bus.bin`, 52.1 M records, `sm/trace/bsum.txt`):
+  - the boot ROM is not Daytona 2's: CONFIG_ADDR at FEC00000 and CONFIG_DATA at FEE00000 (both inside the core's
+    Step 2 decode), PC FFF016xx;
+  - PCI: device 11 written at frame 3; device 14 (the 53C810) read 0x00011000 and BAR1 = C1000000; device 13 (the
+    Real3D) 0x178611DB, BAR C2000000; device 12 BAR F1000000;
+  - the Real3D only through the DMA device at C2000000 (1.1 M reads, 1.5 M writes), from banked CROM (FF65-FF70) and
+    fixed CROM (FFA0); texture port (90) writes from frame 103;
+  - backup RAM FE0C/FE0D, the RTC at FE14 (13 M reads), JTAG at FE10, MIDI at FE08;
+  - **C1000038 written C0 and C1000014 read twice at frame 6** (below); C0020000 written AAAA0000 and read
+    FFFFFFFF at frame 100 (a comm board probe, absent).
+
+**3. A difference not resolved: the 53C810 probe at C1.** The game (RAM 0x7B1E4, copied from the fixed CROM) writes
+DMODE = C0 at C1000038, reads ISTAT at C1000014, clears ISTAT bit 2 if set, reads it again, and if bit 0 (DIP) is
+set reads DSTAT and stores 1 at RAM 0x224438, else 0. Supermodel keeps a 53C810 at C1 on every step and reads ISTAT
+00; MAME maps nothing at C1 on Step 2.0 (unmapped, 0). The core under `step2` puts the DMA device's window at C2 and
+nothing at C1, so ISTAT reads FF and the flag would be 1. Nothing in the 2 MiB program loads 0x224438 by that
+displacement (only the store), so it may be unread; the bench has not reached frame 6's code yet to show it. If
+the board shows anything wrong early in the boot, this is the first place to look: `m3_bus` reading 0 for C1 under
+`s2` is a one-line change, not made because nothing reproduces a symptom (rule 13).
+
+**3a. The PVR: the halt, and the fix (D-41 amended).** On the first bench run (no change but the FPS remap and the
+clock) the game copies itself to RAM, clears its BSS, and at bench frame 75 writes FE10001C = EF and loops for ever:
+a routine at 0x7A4EC that writes an error code to the board's LED register and blinks it every 5,000,000 timebase
+ticks. EF is code 16, from 0x784FC: after a 10,000-tick wait the game reads the PVR, stores 2 at 0x4B9614 if it is
+above 0x00070000 and 0 otherwise, and halts unless it is 2. So Sega Rally 2 refuses a 603e (version 6) and wants a
+603ev / 603r (version 7), the Step 2.0 CPU; Supermodel and MAME both give Step 2.x 0x00071202. (Two other halts call
+the same routine: code 19 if the Real3D's PCI ID is not 0x178611DB, 0x6F598, and code 18 at 0x7BB80.) Daytona 2 was
+never exposed: its program tests only for version 6 or more (FFE01984, reading HID1 either way) and stores and
+compares the value with itself.
+- The change (`tree`): `ppc_core` takes `PVR2` and a run-time `pvr_alt` (mfpvr's two paths read
+  `pvr_alt ? PVR2 : PVR`); `ppc_cpu` passes them; `m3_system` sets `PVR2` = 0x00071202 and drives `pvr_alt` from
+  `step2` (the registered `cfg_step >= 0x20`, steady while the CPU runs); `m3_cputest` ties it low. Step 1.x sets read
+  0x00060103 as before, by the same constant. Two 32-bit constants under one select, no cycle (D-57).
+- `quartus_map --analyze_file`: `ppc_core`, `ppc_cpu`, `m3_system`, `m3_cputest` 0 errors.
+- `make test_cpu_sub` (the CPU with its caches against the reference model, `pvr_alt` low): PASS, 200 seeds,
+  664,869 instructions.
+- Bench (`obj/run_pv`, the same MRA images from a fresh boot): without the change the game halts at bench frame 75
+  (FE10001C = EF, then the blink loop at 0x7A50C-0x7A54C for ever, 2 bus records after the boot's 68). With it, at
+  the same frame it writes the LED register FF (all off) and goes on to Supermodel's frame-3 sequence: device 11's
+  six configuration writes in Supermodel's order and values (BAR0 1, BAR1 C0000000, 04, 40, 44, 50), then the
+  315-5649 and system registers' set-up and the bank register. (The bench's PCs read 4 above Supermodel's, as
+  before.)
+- **Board (2026-11-10, `sr2_130_s2`, RBF 26e6cafb, without this fix): a black screen, and the server attached
+  ("srally2 started, epoch 2, DSB2") but applied 0 MIDI bytes in over a minute.** That is this halt: the game stops
+  before its first MIDI byte and before the PCI set-up, and the LED it blinks is on the CPU board, not the screen.
+  The loader and the MRA are not the cause: the bank map is configuration bytes only (index 4; `m3_loader` already
+  takes a 16-entry slot map, and `crom_win` changes only what `m3_mra.py` writes), the bench's loader checks put
+  every window in its place with 0 words wrong, and every CROM word Supermodel's DMA read matches the image.
+- After the check (bench frames 75-100, `tools/seqcmp.py` against Supermodel's trace, per region in order): the PCI
+  set-up, tile RAM (4,096 + 9,728 writes), palette, backup RAM (968 + 968), MIDI, the RTC and the DMA device's first
+  accesses all agree. They part where R100 found Daytona 2 parting: the interrupt status (42 against 0D) and its
+  acknowledges, the I/O ports' order, and the JTAG writes interleaved differently with the interrupt-enable writes;
+  and at the C1 probe (ISTAT FF against 00, section 3). Port B bank 1 bit 5, the 93C46's DO, reads 1 on the core at
+  the first read and 0 in Supermodel, whose DO is never reset (0 from construction); a real 93C46 floats DO while CS
+  is low. Neither is shown to matter; both are the first places to look if the board stops after the logo.
+- **If this is picked up from here:** the fixed tree is `sm3-builds/srally2/tree` (`tree_8ea120d.patch`, 9 files);
+  the bench run proving it is `obj/run_pv` (`tools/sysrun.sh pv`, `logs/chain_pv.log`): it must pass bench frame 75
+  without FE10001C = EF and reach the PCI writes of Supermodel's frame 3 (CONFIG_ADDR 0x80005810 ...) and the
+  C1000038 probe. Then `tools/fit.sh sr2_130p_s2 2` (seed 2, then 1, 4 if hold is not positive at all four corners).
+- **Wrong turn:** R100 recorded "whether the game reads the PVR is checked on the bench" for Step 2 and closed it on
+  Daytona 2 alone; D-41's per-step PVR was never built. My first 130 MHz build (`sr2_130_s2`, below) has this fault
+  and would halt Sega Rally 2 at boot on the board; it is superseded.
+
+**4. The MRA** (`tree/mra/Sega Rally 2 - Sega Rally Championship.mra`, `sim/system/m3_mra.py mra srally2`):
+- `m3_mra.py`: `SRALLY2`, and `bank_map` takes the bank space a CROM takes (`crom_win`, MiB: 32 by default, 16 for
+  Rally 2), filling the map to 16 entries; the index-0 stream pads the unused slots with 00 so the backup RAM still
+  lands at 0x6200000 (48 MiB of fill); the Step 2 header's NVRAM note per set. The other five MRAs regenerate byte
+  for byte.
+- Configuration (index 4): `20 07 00 01 02 03 04 05 80 x10 AF FF 01 00`: step 2.0, flags VROM in the extra memory +
+  fixed CROM 8 MiB + VROM 64 MiB, banks 0-5 in slots 0-5, idle C AF / D FF, profile 1 (driving).
+- `<buttons names="Coin,Start,Test,Service,View,-,Accel,Brake,Gear Up,Gear Down,Hand Brake"/>`.
+- `<nvram index="2">` as Daytona 2's (backup RAM then the 93C46); not needed to boot, it keeps settings and records.
+- Checked: the 32 parts' CRCs equal MAME's and the zip's (`pack` checks each); the 9 left out are the sound, DSB2
+  and drive-board ROMs. `tools/cromchk.py`: every CROM read in Supermodel's trace (365,536, the bank register
+  followed) against the packed index 0 and index 3 images: 0 differ. Planted: banks laid out at Daytona 2's 32 MiB
+  stride: 339,162 differ.
+
+**5. The system bench** (`obj/sys_sr`, `tools/sysfull.sh`, the board's `m3_system` options at the tree's clock;
+`tools/sysrun.sh`, 100-frame segments, `--xlin`, no NVRAM file; `obj/run_sr`):
+- The loader: configuration, step 20 flags 07, banks 00-05 and 10 (empty) for the rest; the extra memory, the fixed
+  CROM and index 0's windows through ioctl with 0 words wrong; no VROM beat overwritten.
+- The boot ROM's MPC106 set-up is Supermodel's, write for write (the bench's PCs read 4 higher, as before).
+- Then the boot ROM copies the fixed CROM's first 2 MiB to RAM 0 a word at a time from uncached ROM
+  (FFF018E8-FFF018FC). Supermodel is through it by frame 3; the bench was still in it at frame 30 after 24 minutes
+  (55 kHz with three fits on the machine). So within the hour the bench stays in the boot ROM; it is the same slow
+  copy R100 found for Daytona 2, not a fault.
+- Bench wrinkle: segment 1 stopped at frame 1 on the bench's fatal-exception check, which fires at FFF00000. This
+  boot ROM's reset vector (FFF00100) branches to FFF00000. Run with `EXTRA=--no-fatal-stop` next time.
+- Not reached in the hour: the game's own code and the 3D. The geometry and the rasteriser were run instead on
+  Supermodel's Real3D state of 57 attract race frames (below).
+
+**5a. The Real3D benches on Rally 2's frames.** `sm/run_dump.sh` (`supermodel-sb`, the same Config): memory dumps
+and grabs at frames 1,150-1,199 and 2,600-2,900 every 50 (attract races). `tools/vromlin.py` writes the linear VROM
+the benches read from Games.xml (it reproduces `r3d/vrom_daytona2.bin` byte for byte); `dumps/` the geometry's
+9 MiB form, `dumps17/` the 17 MiB form.
+- The model (`sh1/tools/r3d_ref`, Supermodel's rows, step 20): 32 viewports, 1,303 nodes, 197 models, 6,152
+  polygons, 7,433 triangles a frame; 0 bad addresses; 103,492 VROM words a frame.
+- `r3d_geo` as `m3_system` builds it (`tools/geobench.sh`, `obj/geo`): **57 of 57 frames match the model on every
+  triangle field, 217,679 triangles**; under the two hostile memory profiles (latency 1-200 with BUSY 60%, and 1-2
+  with stalls 90%), 20 of 20 frames each, 75,003 triangles. (My first hostile runs gave `--first 1150`, a frame
+  number; it is an index into the dumps, so they ran nothing.)
+- `r3d_rast` (MIP, `tools/rbuild.sh`, `area107/tools/rrun.sh ... --mip --step 20`): **57 frames, 0 pixels wrong**
+  against the model, no store overflow; the store's traffic 72-144 MB/s.
+
+**6. Sound (arcsnd, patch `arcsnd_srally2.patch` on `model3` 7ccac34, made in `arcsnd_copy` from `git archive`;
+commit message draft `arcsnd_commit2_msg.txt`):**
+- **Every set:** `scripts/m3snd_table.py` writes the table for every Games.xml set with a sound program (63 of 64;
+  `pro1000` has none and is named in the header), clones through their parents, and the session claims every set in
+  the table (`model3_rom_sets` in `roms.cpp`), so a new Model 3 game needs no server change. `snd/romtest2.cpp` with
+  the new reader: VF3, Scud Race, Daytona 2, Lost World, Bass Fishing and Sega Rally 2 extract byte for byte as
+  the independent extractions (program, samples, and both DSB boards' program and MPEG); `spikeout` and `vs2` (no
+  zip, no parent zip) fail with "no X.zip". My first missing-zip choice, `getbass`, loaded from its parent's
+  `bassdx.zip`, which is the intended fallback. Supermodel gives `srally2dx` the parent's DSB2 ROMs (MAME fills its
+  DSB2 with 0, "missing dump?").
+- **DSB2's spin skip by pattern.** Rally 2's DSB2 program (`epr-20641`) holds Daytona 2's two wait loops every
+  address 0x28 lower (0x712, its call to 0xDDA, its compare at 0xBC8; the pause at 0xD56), the same words; with the
+  fixed table it ran no skip (0 turns). I first added a second table at 0x28; then, for any program, `spin_check`
+  scans for the loops' instructions with their branches agreeing (the pause: `cmpi.w #$28,$F0100E; bcs.s` back; the
+  work loop: `bsr C; beq K` with C the ring-pointer compare and K `cmpi.w #$50,$F0100E; bcs` back to the bsr). It
+  finds exactly the table's loops (the same turn counts). DSB1's Z80 delay loop was already found by its bytes
+  (`E3 E3 10 FC`). With the skip, without it (`ARCSND_NO_DSB_SPIN`) and with the address table, DSB alone over the
+  races, `M3DSB_STATE` (the CPU's state hashed after every frame): Daytona 2 output 55b6c723 / state 2bedc209,
+  13,893,973 turns; Rally 2 372dfff4 / b3a34ed8, 9,690,307; Scud Race (DSB1) 16328a70 / 6cc2e3fe, 8,583,144;
+  each the same in all three builds. Planted false match (exit constants one off, 0x29 / 0x51): Rally 2 26a0604c /
+  32dda664, Daytona 2 9ba92052 / b7c2091c, both caught. My first scan had two branch targets 2 bytes off (a 68000
+  branch lands at its opcode + 2 + displacement); fixed before the first build.
+- Bench (`snd/`, x86, captures from `supermodel-snd`: attract 3,000 frames `snd/cap`, a scripted race 7,000 frames
+  `snd/play` with coin at 1,500, the race from about 5,750, `snd/play_sheet.png`):
+
+| Check | Result |
+|---|---|
+| SCSPs on Supermodel's Musashi, Supermodel's timers, the race (35,583 MIDI bytes) | 21,465,820 channel samples, **0 differ** |
+| DSB2 against Supermodel's mix (`-mixref`), the race | 21,465,820, **0 differ** (with the new skip, and without) |
+| Daytona 2's race (`sound/play_d2`) on Supermodel's Musashi | 28,518,876, 0 differ |
+| the five earlier sets' references (`sound/tools/check.sh`) | 0 differ on all six runs |
+| DSB2 alone, Rally 2's race, 121.7 s: 7ccac34 / patched / skip compiled out | 1.396 / **0.332** / 1.420 s; output hash 372dfff4 in all three; turns skipped 0 / 9,690,307 / 0 |
+| DSB2 alone, Daytona 2's race, 161.7 s: 7ccac34 / patched | hash 55b6c723 both, 13,893,973 turns both |
+| planted: the pause loop given the work loop's condition (< 0x50) | hash 26a0604c (Rally 2), 346ba8c4 (Daytona 2): caught |
+
+  Supermodel's attract plays the DSB2 only (25 MIDI bytes; the SCSPs silent), so the race capture is the SCSP
+  check. With arcsnd's own Musashi every race capture parts from Supermodel at its first sound (Daytona 2's, VF3's,
+  Scud Race's and Bass Fishing's too): the known 68000 timing difference (sound DESIGN.md §18.2, §20.2), not this
+  change.
+- On the ARM (DESIGN.md §18.3): Daytona 2's DSB2 was 2.0% of core 0 with the skip and 15.6% without; Rally 2's now
+  takes the skip, so its share should be Daytona 2's. Not measured on the board.
+- ARM build (`tools/xbuild.sh server`, ARM GNU 10.2, static): `arm/arcsnd` md5 ad1a76a04e0e2dc5a1a183622c7d4515;
+  `arm/model3_bench` 7eb204466c7cfd9c2f28d2267de506fb. Patch md5 c6d50bf2aa94faa26f4803a845508640 (366 lines; README, the generator, `dsb.cpp`, `roms.cpp`, `roms.h`, `roms_table.h`, `session.cpp`).
+
+**7. The FPS counter's default: 1 s (my rule, 2026-11-10).** The OSD line is now "FPS average,1 s,5 s,10 s"; `m3_fps`
+reads `avg` 0 as 1 s, 1 as 5 s, 2 as 10 s (3 stays 5 s); the window and step logic as before. The bench
+(`fps/tb_fps.cpp`, now with a third argument that pins the setting): EXT_SEC 1 and 0, random settings and each of
+0-3 pinned, two seeds, 20,000 s each: 0 fail on every run (for example 20,000 1 s windows, 4,000 5 s, 2,000 10 s).
+The 8ea120d module against the new bench fails every run (the planted fault). `quartus_map --analyze_file`: 0
+errors.
+
+**8. The 130 MHz board build** (my rule, 2026-11-10: the board test is at 130 MHz): `tree` = 8ea120d + the FPS default + `pll_0002.v` at 130.000000 MHz
+with phase_shift2 3846 ps and `SYS_HZ = 130_000_000`, as `f130/tree` (whose other differences from 8ea120d are
+comments). Fit first without the PVR change, `sm3-builds/sr2_130_s2` (seed 2, `tools/fit.sh`, from
+`f130/fit.sh`; release, 22:27-22:53): **RBF `sm3-builds/sr2_130_s2_26e6cafb.rbf`
+(26e6cafb8c854af58d3eb0bc590567bd)**, the PLL's outputs at 7.692 ns / 130.0 MHz in the timing report.
+
+| | `sr2_130_s2` | `f130_s2` (the same logic but the FPS remap) |
+|---|---|---|
+| Setup, core clock, slow 100 / slow -40 / fast 100 / fast -40 °C | -3.404 / -3.340 / +0.983 / +2.209 ns | -3.688 / -3.877 / +0.439 / +1.811 |
+| Hold, least over the clocks, same corners | **+0.227 / +0.109 / +0.135 / +0.094 ns** | +0.164 / +0.169 / +0.132 / +0.115 |
+| HDMI setup, worst corner | -0.012 ns | -0.061 |
+| ALM / M10K / DSP | 41,343 / 528 / 90 | 41,132 / 528 / 90 |
+| Failing core endpoints, slow 100 °C | 18,109 | 18,455 |
+
+`tree_8ea120d.patch` (303 lines) is the whole change against 8ea120d: the FPS remap, the 130 MHz clock (the
+board build's; leave those two hunks out to stay at 120), `m3_mra.py` and the new MRA. `git apply --check` passes on
+the main tree.
+
+**`sr2_130_s2` is superseded: it halts Sega Rally 2 at boot (3a; the board's black screen).** The board build is
+**`sm3-builds/sr2_130p_s2_adbc4c0e.rbf` (adbc4c0ea57c4d7ad124a5525329fc5e)**: the same tree with the per-step PVR,
+seed 2, release, fitted 23:29-23:52 after the bench showed the halt gone; 130.0 MHz in the timing report.
+
+| | `sr2_130p_s2` (board build) |
+|---|---|
+| Setup, core clock, slow 100 / slow -40 / fast 100 / fast -40 °C | -3.708 / -3.625 / +0.872 / +1.981 ns |
+| Hold, least over the clocks, same corners | **+0.246 / +0.181 / +0.096 / +0.079 ns** |
+| HDMI setup, worst corner | -0.018 ns |
+| ALM / M10K / DSP | 41,293 / 528 / 90 |
+| Failing core endpoints, slow 100 °C | 17,705 |
+
+Hold is positive at all four corners on seed 2 in both fits, so seeds 1 and 4 were not needed. Setup is about -3.4 ns at the slow
+corners, as the 130 MHz test build is: a board test, not a release.
+
+*Board plan* (done 2026-11-10/11; every step waited for my go; the board at 192.168.1.62, root; copy with a plain
+`ssh ... 'cat > FILE' < LOCAL` or `scp -O`, never through a helper that redirects stdin; check the full md5 at both
+ends before the next step; never chain copy, install and load):
+1. (Done on 2026-11-10, keep.) The zip: `/home/ben/roms/Model3/srally2.zip` (md5 1f528b73a3bfd0efc72c97b928b885f8) to
+   `/media/fat/games/mame/srally2.zip`. It is a merged set; no parent zip. arcsnd reads the sound ROMs from it too.
+2. (Done, unchanged, keep.) The MRA: `sm3-builds/srally2/tree/mra/Sega Rally 2 - Sega Rally Championship.mra`
+   (md5 62a7cdb9865a8423cf71aa79e65ccc92) to `/media/fat/_Arcade/_Model3/`.
+3. The RBF: `sm3-builds/sr2_130p_s2_adbc4c0e.rbf` (md5 adbc4c0ea57c4d7ad124a5525329fc5e) to `/media/fat/_Arcade/cores/`, md5 both ends; then, as its own step, keep the board's current
+   `Model3.rbf` beside it (`cp Model3.rbf Model3_sr2_130_s2.rbf`, the build on it now) and copy the new one over `Model3.rbf`, md5 again.
+4. arcsnd: `sm3-builds/srally2/arm/arcsnd` (md5 ad1a76a04e0e2dc5a1a183622c7d4515) to
+   `/media/fat/arcsnd_test/arcsnd.new`, md5 both ends; stop the running server, keep 35c3d966 as `arcsnd.35c3d966`,
+   move `arcsnd.new` to `arcsnd`, start it by hand as now. (The board's 065681e3 also plays Sega Rally 2, without the
+   DSB2 skip: about 14 points more of core 0 for the DSB, DESIGN.md §18.3.)
+5. Load: `echo "load_core /media/fat/_Arcade/_Model3/Sega Rally 2 - Sega Rally Championship.mra" > /dev/MiSTer_cmd`.
+   Look for: the SEGA logo, the attract races with the DSB2's music, coin and start, a race; the View and Hand
+   Brake buttons, the 4-speed shifter (Gear Up / Down), the wheel and pedals; the FPS counter (OSD) averaging 1 s by
+   default; the other five games unchanged at 130 MHz.
+6. After the test: `echo "load_core /media/fat/menu.rbf" > /dev/MiSTer_cmd`; never reset the board.
+
+*Wrong turns:* Supermodel loading `srally2dx` from the merged zip; two `xvfb-run -a` on one display; my first FPS
+bench pinned setting 3 with no directed case for it and looped forever (stopped, fixed); `llvm-objdump` takes no raw
+binary here, so the boot ROM was read through `llvm-mc` a word at a time; a stale `dis.py` in my scratch folder
+shadowed Python's own `dis` module until the scripts ran with `-I`.
+
+**9. Board (2026-11-11, `sr2_130p_s2`, RBF adbc4c0e, arcsnd ad1a76a0 by hand with `-v`).** Sega Rally 2 boots past the
+black screen to the SEGA logo and the attract, and plays; the music, the controls and the FPS counter's 1 s default
+all worked. The server: "srally2 started (D 256 samples, epoch 1, DSB2)", MIDI bytes applied from the first status
+line (0 on the build without the PVR fix), busy 35% of core 0 once running, 92 late records all at the start and
+none after. So the halt in 3a was the whole black screen; the C1 probe (3) and the 93C46's DO show nothing on the
+board and stay as they are.
+- **Into main:** the per-step PVR, the FPS default, `m3_mra.py` and the MRA, at 120 MHz: the 130 MHz PLL and
+  `SYS_HZ` hunks of `tree_8ea120d.patch` are left out, since 130 MHz has -3.7 ns setup and is a test clock (R167).
+

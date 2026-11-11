@@ -28,7 +28,7 @@ module m3_fps #(
   input  logic       rst,
   input  logic       sec_tick,        // EXT_SEC: high in the clock tcnt would have read CLK_HZ - 1
   input  logic       en,
-  input  logic [1:0] avg,             // the window: 0 5 s (the OSD's default), 1 10 s, 2 1 s, 3 5 s
+  input  logic [1:0] avg,             // the window: 0 1 s (the OSD's default), 1 5 s, 2 10 s, 3 5 s
   input  logic       draw,            // one clock per frame begun
   input  logic [9:0] x,
   input  logic [9:0] y,
@@ -46,8 +46,8 @@ module m3_fps #(
   logic [3:0]    ch, ct, cu, d1, d0, wcnt;
   logic [1:0]    avg_q;
   wire wrap = EXT_SEC ? sec_tick : (tcnt == TW'(CLK_HZ - 1));
-  wire w1   = avg == 2'd2;                       // 1 s: x 10
-  wire w10  = avg == 2'd1;                       // 10 s: x 1
+  wire w1   = avg == 2'd0;                       // 1 s: x 10
+  wire w10  = avg == 2'd2;                       // 10 s: x 1
   wire wend = wrap && (w1 || wcnt == (w10 ? 4'd9 : 4'd4));
   wire [3:0] k = w10 ? 4'd1 : 4'd2;              // the units' step (5 s, 10 s)
   wire [4:0] us = {1'b0, cu} + {1'b0, k};

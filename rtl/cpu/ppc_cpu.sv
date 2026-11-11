@@ -40,6 +40,7 @@ module ppc_cpu
 #(
   parameter logic [31:0] RESET_PC = 32'hFFF0_0100,
   parameter logic [31:0] PVR      = 32'h0006_0101,
+  parameter logic [31:0] PVR2     = PVR,              // read while pvr_alt is high (ppc_core)
   parameter bit          BTB      = 1'b1,             // the core's BTB and the I-cache's pre-read port (D-30)
   parameter bit          FETCH2   = 1'b0,             // two-word fetch (D-30; off by default, D-36)
   parameter bit          LA       = 1'b1,             // the 603e's CR look-ahead (D-30)
@@ -51,6 +52,7 @@ module ppc_cpu
 )(
   input  logic        clk,
   input  logic        rst,
+  input  logic        pvr_alt,       // mfpvr gives PVR2 (ppc_core)
 
   // memory port (ppc_cache_pkg)
   output logic        m_req,
@@ -134,8 +136,8 @@ module ppc_cpu
   logic [6:0]  icbi_set;
   logic        d_resv, d_cond, res_kill;
 
-  ppc_core #(.RESET_PC (RESET_PC), .PVR (PVR), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA), .LU2 (LU2), .FAST (FAST), .EWL (EWL)) u_core (
-    .clk (clk), .rst (rst),
+  ppc_core #(.RESET_PC (RESET_PC), .PVR (PVR), .PVR2 (PVR2), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA), .LU2 (LU2), .FAST (FAST), .EWL (EWL)) u_core (
+    .clk (clk), .rst (rst), .pvr_alt (pvr_alt),
     .i_req (i_req), .i_addr (i_addr), .i_wimg (i_wimg), .i_seq (i_seq), .i_valid (i_valid), .i_data (i_data),
     .i_way (i_way), .i_arr (i_arr), .i_pa (i_pa), .i_pv (i_pv), .i_pidx (i_pidx), .i_pway (i_pway), .i_ppa (i_ppa),
     .i_pre (i_pre), .i_eix (i_eix), .i_two (i_two), .i_w2 (i_w2), .i_data2 (i_data2),
