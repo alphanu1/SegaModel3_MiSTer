@@ -45,7 +45,9 @@
 // texture ring at 0x200000, the rasteriser's store's records at 0x400000 (two
 // 32 MiB banks to 0xBFFFFF) and its run lists at 0x1800000 (32 MiB, in the
 // top 64 MiB above the extra memory; study R136), the texture
-// sheets at 0xC00000, the extra memory (VROM, R100) at 0x1000000 (64 MiB). Nothing touches DDR3 before ddr_ok (R71: hps_io's first
+// sheets at 0xC00000, the extra memory (VROM, R100) at 0x1000000 (64 MiB), banked CROM in the extra memory
+// (R170, m3_xcrom; MRA index 1 from 64 MiB) at 0x1C00000 (16 MiB, byte 0x3E000000, below the sound bridge's
+// block at 0x1E40000). Nothing touches DDR3 before ddr_ok (R71: hps_io's first
 // command and RESET low for 100 ms): the arbiter's request is gated on it.
 //
 // SDRAM layout (bytes; study 7.3, sim/system/notes.md, the MRA):
@@ -366,7 +368,8 @@ module m3_system
   logic [15:0] lx_din, ee_ld_d;
   logic [5:0]  ee_ld_a;
   logic [7:0]  cfg_step /* verilator public_flat_rd */, cfg_flags /* verilator public_flat_rw */;   // (the bench may set bit 0: --vrom-x)
-  logic [15:0][4:0] cfg_bank /* verilator public_flat_rd */;
+  logic [15:0][5:0] cfg_bank /* verilator public_flat_rd */;
+  logic [29:0] cfg_key /* verilator public_flat_rd */;        // the 315-5881's key (configuration bytes 22-25; R170)
   logic [7:0]  cfg_in2 /* verilator public_flat_rd */, cfg_in3 /* verilator public_flat_rd */;
   logic [7:0]  cfg_dsw /* verilator public_flat_rd */;   // the DIP bank (R133)
   logic [7:0]  cfg_prof /* verilator public_flat_rd */, cfg_pflg;   // the input profile and its flags
@@ -377,7 +380,7 @@ module m3_system
     .sdr_wr_req(ld_req), .sdr_wr_addr(ld_addr), .sdr_wr_din(ld_din), .sdr_wr_be(ld_be), .sdr_wr_ack(ld_ack),
     .x_req(lx_req), .x_addr(lx_addr), .x_din(lx_din), .x_ack(lx_ack),
     .ee_we(ee_ld_we), .ee_a(ee_ld_a), .ee_d(ee_ld_d),
-    .cfg_step, .cfg_flags, .cfg_bank, .cfg_in2, .cfg_in3, .cfg_dsw, .cfg_prof, .cfg_pflg,
+    .cfg_step, .cfg_flags, .cfg_bank, .cfg_key, .cfg_in2, .cfg_in3, .cfg_dsw, .cfg_prof, .cfg_pflg,
     .rom_loaded, .busy(loader_busy), .overflow(ld_ovf), .bytes(ld_bytes));
 
   // R100: the game configuration, static while the game runs (it changes only
@@ -395,8 +398,8 @@ module m3_system
   wire        vrom_x  = (XMEM == 1) && (((VROM_LOC != 0) && (VROM_LOC == XMEM)) || cfg_flags[0]);
   wire        fixed8  = cfg_flags[1];                         // an 8 MiB fixed CROM at SDR_FIX8
   wire        vrom64  = cfg_flags[2];
-  logic [29:0] sec_key;                                       // the 315-5881 key: configuration bytes 18-21
-  assign sec_key = 30'h2925_0E16;                             // (daytona2; MAME ROM_PARAMETER ":315_5881:key")
+  logic [29:0] sec_key;                                       // the 315-5881 key: configuration bytes 22-25 (R170), Daytona 2's
+  assign sec_key = cfg_key;                                   // 29250E16 when not given (MAME ROM_PARAMETER ":315_5881:key")
 
   // ===========================================================================
   // the CPU
@@ -519,6 +522,8 @@ module m3_system
   // the bus and its devices
   // ===========================================================================
   logic        s_req, s_swap, s_zero, s_ack, s_wnext, s_rvalid, s_idle;
+  logic        s_x, sp_ack, sp_rvalid, xc_ack, xc_rvalid;     // R170: a read of a bank in the extra memory, to m3_xcrom
+  logic [31:0] sp_rdata, xc_rdata;
   logic [1:0]  s_cmd;
   logic [AW:0] s_sa;
   logic [3:0]  s_be;
@@ -552,7 +557,7 @@ module m3_system
   logic [17:2] sec_addr;
   logic [3:0]  sec_be;
   logic [31:0] sec_wdata, sec_rdata;
-  wire  [4:0]  crom_map = cfg_bank[~crom_bank[3:0]];
+  wire  [5:0]  crom_map = cfg_bank[~crom_bank[3:0]];
   generate if (STEP2 && SEC5881) begin : g_sec
     m3_sec u_sec (
       .clk, .rst, .game_key(sec_key),
@@ -563,6 +568,7 @@ module m3_system
     assign sec_rdata = 32'hFFFF_FFFF; assign sec_cmp = 1'b0;
   end endgenerate
 `ifndef M3_STEP2_BUS
+  assign s_x = 1'b0;
   assign sec_req = 1'b0; assign sec_we = 1'b0; assign sec_addr = '0; assign sec_be = '0; assign sec_wdata = '0;
 `endif
 
@@ -590,7 +596,7 @@ module m3_system
            ) u_bus (
     .clk, .rst, .sec_tick,
 `ifdef M3_STEP2_BUS
-    .step2, .fixed8, .crom_slot(crom_map[3:0]), .crom_zero(crom_map[4]),
+    .step2, .fixed8, .crom_slot(crom_map[3:0]), .crom_zero(crom_map[5]), .crom_x(crom_map[4]), .s_x,
     .sec_req, .sec_we, .sec_addr, .sec_be, .sec_wdata, .sec_ack, .sec_rdata,
 `endif
     .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
@@ -611,13 +617,20 @@ module m3_system
 
   m3_sdr_port #(.AW(AW), .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .RA(SDR_RA), .RA_TOP(SDR_VRAM), .RA_CONF(SDR_RA_CONF), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ), .PW_DLY(SDR_PW_DLY)) u_sport (
     .clk, .rst(!mem_rst_n), .ra_clr(rst),
-    .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
+    .s_req(s_req && !s_x), .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack(sp_ack), .s_wnext, .s_rvalid(sp_rvalid),
+    .s_rdata(sp_rdata), .s_idle,
     .p_req(p_req[0]), .p_we(p_we[0]), .p_addr(p_addr[0]), .p_din(p_din[0]), .p_be(p_be[0]), .p_long(p_long[0]),
 `ifdef M3_R3B
     .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]), .wb_col, .wb_din(sp_wbd), .wb_be(sp_wbb));
 `else
     .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]), .wb_col, .wb_din, .wb_be);
 `endif
+
+  // R170: the bus's SDRAM port answers from m3_sdr_port, or from m3_xcrom for a bank in the extra memory (s_x,
+  // registered in the bus with the transaction; m3_xcrom's word is zero outside its s_rvalid)
+  assign s_ack    = sp_ack | xc_ack;
+  assign s_rvalid = sp_rvalid | xc_rvalid;
+  assign s_rdata  = s_x ? xc_rdata : sp_rdata;
 
   // the cabinet (m3_inputs): the sticks, triggers and paddle registered once here, beside the logic they feed
   // (Model 2 R842: hps_io's analog outputs straight into the steering block failed clk_sys there)
@@ -673,6 +686,7 @@ module m3_system
   // link (SND_DSP)
   localparam int NDP = SND_DSP ? 8 : 7;
   localparam logic [24:0] D_XMEM = 25'h100_0000;                   // R100: VROM, 64 MiB
+  localparam logic [24:0] D_XCROM = 25'h1C0_0000;                  // R170: banked CROM in the extra memory, 16 MiB
   logic        xp_req, xp_ack, xp_rvalid;
   logic [7:0]  xp_blen;
   logic [24:0] xp_addr;
@@ -859,11 +873,24 @@ module m3_system
       .b_req(xp_req), .b_addr(xb_addr), .b_blen(xp_blen), .b_ack(xp_ack), .b_rvalid(xp_rvalid), .b_dout(dm_dout));
     assign xp_addr = D_XMEM + 25'(xb_addr);
     // the loader's writes: one 16-bit word a beat, its lanes enabled; VROM_LIN: the MRA layout's byte
-    // {b, g, h, 2'b00} (b at 25:24 for a 64 MiB VROM, 24:23 for 32 MiB) to beat {g, b}
+    // {b, g, h, 2'b00} (b at 25:24 for a 64 MiB VROM, 24:23 for 32 MiB) to beat {g, b}. R170: index 1 from
+    // 64 MiB (lx_addr[26]) is banked CROM in the extra memory, its 16 MiB at D_XCROM in the image's order
+    // (bits 25:24 wrap there, so nothing past the region is written)
     wire [22:0] lx_lin = vrom64 ? {lx_addr[23:3], lx_addr[25:24]} : {1'b0, lx_addr[22:3], lx_addr[24:23]};
-    assign d_req[6] = lx_req; assign d_we[6] = 1'b1; assign d_addr[6] = D_XMEM + (VROM_LIN ? 25'(lx_lin) : 25'(lx_addr[26:3]));
-    assign d_blen[6] = 8'd1; assign d_din[6] = {4{lx_din}}; assign d_be[6] = 8'b11 << {lx_addr[2:1], 1'b0};
-    assign lx_ack = d_ack[6];
+    wire [24:0] lx_da  = lx_addr[26] ? D_XCROM + 25'(lx_addr[23:3])
+                                     : D_XMEM + (VROM_LIN ? 25'(lx_lin) : 25'(lx_addr[25:3]));
+    // R170: m3_xcrom shares the loader's port. The two never ask together: the loader writes only during a
+    // download, which holds the game (the bus, m3_xcrom) in reset
+    logic        xc_req;
+    logic [24:0] xc_addr;
+    logic [7:0]  xc_blen;
+    m3_xcrom #(.BASE(D_XCROM)) u_xcrom (
+      .clk, .rst,
+      .s_req(s_req && s_x), .s_cmd, .s_sa(s_sa[23:2]), .s_ack(xc_ack), .s_rvalid(xc_rvalid), .s_rdata(xc_rdata),
+      .m_req(xc_req), .m_addr(xc_addr), .m_blen(xc_blen), .m_rvalid(d_rvalid[6]), .m_ack(d_ack[6]), .m_dout(dm_dout));
+    assign d_req[6] = lx_req || xc_req; assign d_we[6] = !xc_req; assign d_addr[6] = xc_req ? xc_addr : lx_da;
+    assign d_blen[6] = xc_req ? xc_blen : 8'd1; assign d_din[6] = {4{lx_din}}; assign d_be[6] = 8'b11 << {lx_addr[2:1], 1'b0};
+    assign lx_ack = d_ack[6] && !xc_req;
   end else begin : g_noxmem
     // XMEM 2, the second SDRAM: its m2_sdram instance (the SDRAM2 pins), a read
     // port for m3_xmem's b_* (a beat a read) and a write port for lx_*, go here.
@@ -872,6 +899,7 @@ module m3_system
     assign d_req[6] = 1'b0; assign d_we[6] = 1'b0; assign d_addr[6] = '0; assign d_blen[6] = 8'd1;
     assign d_din[6] = '0; assign d_be[6] = '0;
     assign lx_ack = lx_req;
+    assign xc_ack = 1'b0; assign xc_rvalid = 1'b0; assign xc_rdata = '0;   // (no extra memory: no bank can be there)
   end endgenerate
   m3v_ddr_rd u_prd (
     .clk, .rst, .base(m3_bank ? D_POLY1 : D_POLY0),

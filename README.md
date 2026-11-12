@@ -10,7 +10,7 @@ An FPGA recreation of Sega's Model 3 arcade board for
 [Model 2](https://github.com/alphanu1/sega-model2-mister) cores on the same
 chip.
 
-**One core runs six games, on Step 1.0, 1.5 and 2.x boards:**
+**One core runs seven games, on Step 1.0, 1.5 and 2.x boards:**
 
 - **Virtua Fighter 3** (Japan, Revision D)
 - **Sega Bass Fishing Deluxe** (USA)
@@ -19,8 +19,10 @@ chip.
   analog stick or a mouse
 - **Daytona USA 2: Battle on the Edge** (Japan, Revision A)
 - **Sega Rally 2**
+- **Spikeout Final Edition**
 
-All six boot, play and have sound on my MiSTer. It is work in progress, not
+The first six boot, play and have sound on my MiSTer; Spikeout is newer and
+so far boots to its attract. It is work in progress, not
 a release: timing does not close yet, so a build can misbehave on another
 board, and the list of what's left is below. There is no `releases/` folder
 yet; every release `.rbf` will be tested on the board before it goes in.
@@ -68,6 +70,7 @@ program every sample, playing or not. In the FPGA they cost about 570 ALM.
   A 130 MHz test build reached 60 in attract and in VF3, but not in a Daytona
   2 race.
 - **Sega Rally 2:** tested at 130 MHz so far.
+- **Spikeout Final Edition:** 58 in attract, at 130 MHz.
 
 ### What's left
 
@@ -76,7 +79,7 @@ program every sample, playing or not. In the FPGA they cost about 570 ALM.
   as its own memory, are the next things to try.
 - **Pictures:** Daytona 2's car shadow, Lost World's fog in the T-rex scene,
   Bass Fishing's water shadows and underwater tint, Scud Race's luminous
-  polygons.
+  polygons, a black shape under the fighter in Spikeout's attract.
 - **Sound:** Bass Fishing can hiss after loading it straight from another
   game.
 - **The other Model 3 games**, which have not been tried.
@@ -89,7 +92,7 @@ program every sample, playing or not. In the FPGA they cost about 570 ALM.
    `/media/fat/_Arcade/cores/Model3.rbf`.
 2. Put the MRAs from `mra/` in `/media/fat/_Arcade/` (or a folder inside it).
 3. Put the MAME sets the MRAs name (`vf3.zip`, `bassdx.zip`, `scuddxo.zip`,
-   `lostwsga.zip`, `daytona2.zip`, `srally2.zip`) in `/media/fat/games/mame/`.
+   `lostwsga.zip`, `daytona2.zip`, `srally2.zip`, `spikeofe.zip`) in `/media/fat/games/mame/`.
    The sound server also looks in a set's parent zip.
 4. For sound, install the Arcade Sound Server from my fork's `model3` branch
    and start it. It reads the sound ROMs from the same zips.

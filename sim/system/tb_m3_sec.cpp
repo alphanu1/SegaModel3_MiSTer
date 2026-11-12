@@ -5,7 +5,9 @@
 //
 // m3_sec (the 315-5881 and its RAM, study R100) against a Supermodel bus
 // trace: every security-board access of the trace in order (RAM writes, the
-// stream resets, the subkeys), and every data and status read compared.
+// stream resets, the subkeys), and every data and status read compared. The I/O space
+// only (F0, F2 ... FE, as m3_bus decodes it): a DMA read of banked CROM at FF18xxxx is not
+// the security board (Spikeout's trace has them).
 //   Vm3_sec TRACE KEY [--fault]
 #include "Vm3_sec.h"
 #include "verilated.h"
@@ -26,7 +28,7 @@ int main(int argc, char **argv) {
   if (!f) { std::perror(argv[1]); return 2; }
   std::vector<Rec> tr;
   Rec r;
-  while (std::fread(&r, sizeof r, 1, f) == 1) if (r.kind != 2 && (r.addr >> 28) == 0xF && (r.addr & 0xFFFFFF) >= 0x180000 && (r.addr & 0xFFFFFF) < 0x1A0040) tr.push_back(r);
+  while (std::fread(&r, sizeof r, 1, f) == 1) if (r.kind != 2 && (r.addr >> 28) == 0xF && !((r.addr >> 24) & 1) && (r.addr & 0xFFFFFF) >= 0x180000 && (r.addr & 0xFFFFFF) < 0x1A0040) tr.push_back(r);
   std::fclose(f);
   Vm3_sec *t = new Vm3_sec;
   t->game_key = uint32_t(std::strtoul(argv[2], nullptr, 16)) & 0x3FFFFFFF;

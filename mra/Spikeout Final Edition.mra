@@ -1,0 +1,123 @@
+<misterromdescription>
+    <!--
+      Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1
+      SPDX-License-Identifier: GPL-3.0-or-later
+
+      Spikeout Final Edition. Step 2.1 (study R100): no sound.
+      From MAME 0.289 model3.cpp ROM_START(spikeofe); sim/system/m3_mra.py writes it,
+      and packs the same images for the system bench. One download per index
+      (rtl/sys/m3_loader.sv):
+        4  the game configuration: step, flags, CROM bank map, idle inputs, input profile, 315-5881 key
+        1  VROM, 64 MiB, in the extra memory (DDR3 byte 0x38000000)
+           and from 64 MiB banked CROM, 16 MiB in 2 slots there (DDR3 byte 0x3E000000;
+           bank map bit 6: rtl/sys/m3_xcrom.sv, study R170)
+        3  fixed CROM, 8 MiB, SDRAM 0x7300000 (FF800000-FFFFFFFF)
+        0  banked CROM, 96 MiB in 12 slots of 8 MiB from SDRAM 0; backup RAM
+           at 0x6200000, 128 KiB of 00; last, so its end releases the reset
+        2  <nvram>: config/nvram/<this file>.nvm, if present: backup RAM, then
+           the 93C46. Supermodel reaches the attract from a fresh NVRAM;
+           the file keeps the settings and records. m3_mra.py nvram converts a
+           Supermodel NVRAM file. No NVRAM data is in this repository.
+      Word form: the PowerPC's 32-bit word at A is the little-endian word at
+      the memory's A. The sound ROMs are not loaded (D-8).
+    -->
+    <name>Spikeout Final Edition</name>
+    <setname>spikeofe</setname>
+    <rbf>Model3</rbf>
+    <mameversion>0289</mameversion>
+    <year>1999</year>
+    <manufacturer>Sega</manufacturer>
+    <category>Fighter</category>
+    <!-- the CPU board's DIP bank, 315-5649 port G (index 254); Reset & apply after a change -->
+    <switches default="7F">
+        <dip name="SW1 (debug)" bits="7" ids="On,Off"/>
+        <dip name="SW2" bits="6" ids="On,Off"/>
+        <dip name="SW3" bits="5" ids="On,Off"/>
+        <dip name="SW4" bits="4" ids="On,Off"/>
+        <dip name="SW5" bits="3" ids="On,Off"/>
+        <dip name="SW6" bits="2" ids="On,Off"/>
+        <dip name="SW7" bits="1" ids="On,Off"/>
+        <dip name="SW8" bits="0" ids="On,Off"/>
+    </switches>
+    <!-- the controls: input profile 00 (generic), rtl/io/m3_inputs.sv -->
+    <buttons names="Beat,Charge,Shift,Jump,Start,Coin,Test,Service"/>
+
+    <!-- game configuration: step 21, flags 07 (VROM in the extra memory, fixed CROM 8 MiB, VROM 64 MiB), bank map, idle ports C and D, input profile 00 (generic), the 315-5881 key 29236FC8 -->
+    <rom index="4" md5="none">
+        <part>21 07 00 01 02 03 04 05 06 07 08 09 0A 0B 40 41 80 80 FF FF 00 00 C8 6F 23 29</part>
+    </rom>
+    <rom index="1" zip="spikeofe.zip" md5="none">
+        <!-- 0x0000000  VROM block 0, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-21633.26" crc="735fb67d" map="00000021"/>
+            <part name="mpr-21634.27" crc="876e6788" map="00002100"/>
+            <part name="mpr-21635.28" crc="093534a8" map="00210000"/>
+            <part name="mpr-21636.29" crc="2433f21c" map="21000000"/>
+        </interleave>
+        <!-- 0x1000000  VROM block 1, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-21637.30" crc="edb8f2b8" map="00000021"/>
+            <part name="mpr-21638.31" crc="3773a215" map="00002100"/>
+            <part name="mpr-21639.32" crc="313d1872" map="00210000"/>
+            <part name="mpr-21640.33" crc="271366be" map="21000000"/>
+        </interleave>
+        <!-- 0x2000000  VROM block 2, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-21641.34" crc="782147e4" map="00000021"/>
+            <part name="mpr-21642.35" crc="844732c9" map="00002100"/>
+            <part name="mpr-21643.36" crc="9e922e9d" map="00210000"/>
+            <part name="mpr-21644.37" crc="617aa65a" map="21000000"/>
+        </interleave>
+        <!-- 0x3000000  VROM block 3, 16 MiB -->
+        <interleave output="64">
+            <part name="mpr-21645.38" crc="71396f52" map="00000021"/>
+            <part name="mpr-21646.39" crc="90fd9c87" map="00002100"/>
+            <part name="mpr-21647.40" crc="cf87991f" map="00210000"/>
+            <part name="mpr-21648.41" crc="30f974a1" map="21000000"/>
+        </interleave>
+        <!-- 0x4000000  CROM3, 16 MiB (banks 12, 13), in the extra memory -->
+        <interleave output="64">
+            <part name="mpr-21626.14" crc="1861652e" map="21000000"/>
+            <part name="mpr-21625.13" crc="72a34707" map="00210000"/>
+            <part name="mpr-21628.16" crc="de3866ea" map="00002100"/>
+            <part name="mpr-21627.15" crc="efe94608" map="00000021"/>
+        </interleave>
+    </rom>
+    <rom index="3" zip="spikeofe.zip" md5="none">
+        <!-- fixed CROM, 8 MiB (FF800000-FFFFFFFF) -->
+        <interleave output="64">
+            <part name="epr-21654.18" crc="5be245a3" map="21000000"/>
+            <part name="epr-21653.17" crc="f4bd9c3c" map="00210000"/>
+            <part name="epr-21656.20" crc="bd2aaf64" map="00002100"/>
+            <part name="epr-21655.19" crc="68a9e417" map="00000021"/>
+        </interleave>
+    </rom>
+    <rom index="0" zip="spikeofe.zip" md5="none">
+        <!-- 0x0000000  CROM0, 32 MiB (banks 0, 1, 2, 3) -->
+        <interleave output="64">
+            <part name="mpr-21614.2" crc="e21d619b" map="21000000"/>
+            <part name="mpr-21613.1" crc="d039e608" map="00210000"/>
+            <part name="mpr-21616.4" crc="2900bdd8" map="00002100"/>
+            <part name="mpr-21615.3" crc="7727a6fc" map="00000021"/>
+        </interleave>
+        <!-- 0x2000000  CROM1, 32 MiB (banks 4, 5, 6, 7) -->
+        <interleave output="64">
+            <part name="mpr-21618.6" crc="633530fa" map="21000000"/>
+            <part name="mpr-21617.5" crc="a08c6790" map="00210000"/>
+            <part name="mpr-21620.8" crc="476f027f" map="00002100"/>
+            <part name="mpr-21619.7" crc="e1076f47" map="00000021"/>
+        </interleave>
+        <!-- 0x4000000  CROM2, 32 MiB (banks 8, 9, 10, 11) -->
+        <interleave output="64">
+            <part name="mpr-21622.10" crc="5f5a1563" map="21000000"/>
+            <part name="mpr-21621.9" crc="551a444d" map="00210000"/>
+            <part name="mpr-21624.12" crc="a158b7da" map="00002100"/>
+            <part name="mpr-21623.11" crc="d9301674" map="00000021"/>
+        </interleave>
+        <!-- 0x6000000  (the Step 1.0 fixed CROM's place, unused here), 2 MiB of 00 -->
+        <part repeat="0x200000">00</part>
+        <!-- 0x6200000  backup RAM, 128 KiB of 00 (Supermodel's fresh state); the NVRAM file overwrites it -->
+        <part repeat="0x20000">00</part>
+    </rom>
+    <nvram index="2" size="131200"/>
+</misterromdescription>

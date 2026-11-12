@@ -42,7 +42,10 @@
 //                      0x00021057 (MPC106), device 13 (the Real3D) 0x178611DB
 //   F0180000-F01BFFFF  the security board (315-5881): RAM 18-19, registers 1A (sec_*)
 //   FF000000-FF7FFFFF  banked CROM: the slot crom_slot (from the game's bank map; the
-//                      caller decodes crom_bank_o), empty banks (crom_zero) read zero
+//                      caller decodes crom_bank_o), empty banks (crom_zero) read zero;
+//                      a bank in the extra memory (crom_x, study R170: Spikeout's 112 MiB
+//                      do not fit the SDRAM) goes out on the same s_* port with s_x set,
+//                      its slot in the extra memory's CROM region, and the caller routes it
 //   FF800000-FFFFFFFF  with fixed8, all 8 MiB fixed CROM at SDR_FIX8
 //   C2000000-C20000FF  the Real3D DMA device: m3_scripts' window (win_base C20000)
 //   The MPC106's own configuration registers (device 0) are kept: the boot ROM reads
@@ -134,6 +137,7 @@ module m3_bus
   input  logic              fixed8,
   input  logic [3:0]        crom_slot,      // the bank register's slot (combinational from crom_bank_o)
   input  logic              crom_zero,
+  input  logic              crom_x,         // the bank is in the extra memory (R170)
   output logic              sec_req,        // the security board: one access per request, to sec_ack
   output logic              sec_we,
   output logic [17:2]       sec_addr,
@@ -165,6 +169,7 @@ module m3_bus
   output logic [AW:0]       s_sa,
   output logic              s_swap,
   output logic              s_zero,
+  output logic              s_x,            // STEP2: a banked CROM read of a bank in the extra memory (R170)
   output logic [3:0]        s_be,
   output logic [31:0]       s_wdata,
   input  logic              s_ack,
@@ -280,7 +285,7 @@ module m3_bus
   } tgt_t;
   tgt_t        tgt;
   logic [AW:0] dsa;
-  logic        dswap, dzero;
+  logic        dswap, dzero, dx;
 
   // ---- the decode ----
   logic [7:0]  crom_bank;         // F0100008 as written (the bank number is its low nibble, inverted)
@@ -290,7 +295,7 @@ module m3_bus
   wire         io_win = (a_hi[7:4] == 4'hF) && !a_hi[0];       // F0, F2 ... FE (MPC105's F8FFF0xx decoded first)
   wire s2 = STEP2 && step2;
   always_comb begin
-    tgt = X_NONE; dsa = '0; dswap = 1'b0; dzero = 1'b0;
+    tgt = X_NONE; dsa = '0; dswap = 1'b0; dzero = 1'b0; dx = 1'b0;
     if (addr[31:23] == 9'd0) begin
       tgt = X_SDR; dsa = SDR_RAM + {4'd0, addr[22:0]};
     end else if (a_hi == 8'hFF) begin
@@ -299,6 +304,7 @@ module m3_bus
         if (STEP2) begin
           dsa = SDR_CROM + {crom_slot, addr[22:0]};
           dzero = crom_zero;
+          dx = crom_x && !crom_zero;
         end else begin
           dsa = SDR_CROM + {bank_n[2:0], addr[22:0]};
           dzero = ({1'b0, bank_n} >= CROM_BANKS);
@@ -769,6 +775,7 @@ module m3_bus
     tr_v <= 1'b0;
     if (rst) begin
       bs <= B_IDLE; last <= 1'b1; s_req <= 1'b0; sc_req <= 1'b0; cf_req <= 1'b0; r_pend <= 1'b0; sec_req <= 1'b0;
+      s_x <= 1'b0;
     end else begin
       case (bs)
         B_IDLE: begin
@@ -780,6 +787,7 @@ module m3_bus
           // only s_req and the state wait on the grant and the decode below
           if (FAST) begin
             s_cmd <= m_cmd[0]; s_sa <= SDR_RAM + {4'd0, m_addr[0][22:0]}; s_swap <= 1'b0; s_zero <= 1'b0; s_be <= m_be[0];
+            s_x <= 1'b0;
           end
           if (rq != 2'b00) begin
           who <= g; last <= g;
@@ -805,7 +813,7 @@ module m3_bus
             // are still being written (the 64 clocks from a reset's start; the sweep's register alone, not the target
             // decode, so the hold adds no level to B_DEC's choice: br2_s3 had the decode in it, addr -0.66 ns)
           end else if (tgt == X_SDR) begin
-            s_req <= 1'b1; s_cmd <= cmd; s_sa <= dsa; s_swap <= dswap; s_zero <= dzero; s_be <= be;
+            s_req <= 1'b1; s_cmd <= cmd; s_sa <= dsa; s_swap <= dswap; s_zero <= dzero; s_be <= be; s_x <= STEP2 && dx;
             s_wdata <= WD_DEC ? m_wdata[who] : wd;
             bs <= B_SDR;
           end else if (R3P && !(tgt == X_R3DH && cur_w) && (!r3_empty || r3_push)) begin
