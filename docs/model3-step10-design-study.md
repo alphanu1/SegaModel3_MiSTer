@@ -1098,7 +1098,7 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-39 | A misaligned integer access that crosses a 4 KB page is split in hardware inside a BAT block. It takes the alignment exception only when page-translated (MSR[DR]=1, no BAT hit) or when the crossing leaves the BAT block. The 603e manual's §4.5.6.1.1 is ambiguous for BAT regions; MAME splits and never traps; Supermodel has no MMU. Model 3's boot ROM treats every alignment exception as fatal, so no game relies on the trap: if the chip traps, games never do this, and if it splits, games that do it keep working. Misaligned accesses within a page are split in hardware as the manual says (R85). *Amended by R124 (2026-11-07): Scud Race and Bass Fishing both make this access under page translation, so the 603e splits it in every mode; the trap is kept only for 4.5.6's list and an FP double crossing a page outside a BAT.* |
 | D-40 | Test builds may run up to about 41,500 ALM with loose slack; a release must close every corner and come in under budget, which may need optimisation. The attract proof of concept (D-37) has no sound (about 4,360 ALM, R81) and no real I/O, so it projects at about 22K (stage A, R85) + geometry 7.9K + rasteriser about 8K + stage B about 1K, about 39K: well under. |
 | D-41 | The CPU reports PVR 0x00060103 (603e rev 1.3, "Stretch") on Step 1.0, as MAME does; Supermodel uses 0x00071202 (603r). VF3's boot code and miss handler test the PVR. With version 6 and revision below 0x0103 they set W in every BAT and in the RPA, working round an early 603e bug, so the core's former 0x00060101 ran RAM write-through on a path neither emulator takes. At 1.3, RAM is copy-back. The board's real revision is unknown. The value is a parameter of `ppc_cpu`, set per step in the system (D-14). The CPU test harness keeps its own default, so its signatures do not move. Revised the same day: VF3 never flushes the D-cache before the 53C810 reads RAM. Its SCRIPTS lists and DMA sources can sit dirty, and the real board stays coherent only because the MPC105 snoops PCI master cycles and the 603e casts out the dirty line. Our D-cache has no snoop port. So board builds stay on 0x00060101 (write-through, DMA correct) until a snoop port is built and proven: DMA reads cast out dirty lines first, DMA writes invalidate. Then the system moves to 0x00060103. Done in R101: the snoop is wired in `m3_bus` and `m3_system`'s default is 0x00060103. Amended in R168: the PVR is now per step as this row always said. Step 1.x reads 0x00060103, Step 2.x 0x00071202 (603ev / 603r, both emulators' value), because Sega Rally 2 halts at boot on a version below 7. |
-| D-42 | Daytona 2's proof of concept accepts its geometry at about 118% of a frame (R76). Heavy frames then take two frames to draw, about 30 fps there, which is fine for a proof of concept. Its ROM beyond the 128 MiB SDRAM (about 200 MiB in all) goes to DDR3 while the second SDRAM is awaited: video ROM first, since it is read model by model and prefetchable (R82's numbers leave room). I want one core for every step, as D-14 says, not separate RBFs as on Model 2. Per-step hardware is selected at run time from the game ID wherever area allows. |
+| D-42 | Daytona 2's proof of concept accepts its geometry at about 118% of a frame (R76). Heavy frames then take two frames to draw, about 30 fps there, which is fine for a proof of concept. Its ROM beyond the 128 MiB SDRAM (about 200 MiB in all) goes to DDR3 while the second SDRAM is awaited: video ROM first, since it is read model by model and prefetchable (R82's numbers leave room). I want one core for every step, as D-14 says, not separate RBFs as on Model 2. Per-step hardware is selected at run time from the game ID wherever area allows. Amended in R170: a bank-map entry may name a slot in the extra memory, so Spikeout's CROM3 (16 MiB of a 112 MiB banked CROM that does not fit the SDRAM) is read from DDR3 at 0x3E000000 until the second SDRAM. |
 | D-43 | (2026-11-02) The clock target is 120 MHz across the board, superseding D-38's 110. Throughput may be traded for area: a change may cost cycles (iterative units, fewer lanes, time-multiplexing, narrower datapaths run more often) as long as each frame's budget holds at 120 MHz, but it must not lower a block's standalone Fmax, and changes that raise it come first. The target is about 8,000 ALM freed against `sysb90_s1`, for sound (about 4,500), I/O (about 1,000) and the DSB's MPEG decoder (about 2,000); my Model 1 and Model 2 cores freed over 14,000 and about 10,000 from full. `FP_DSP` (R98) goes off by default under this rule: it cut the geometry to 103.5 MHz. |
 | D-44 | (2026-11-06) The clock is 110 MHz across the board, superseding D-43's 120. R113 priced 120 MHz for the CPU: at best 3-4% more instructions a second than 110, and 1-4% fewer if the load request needs its own stage, with nothing shown to close; load-use 2 and single latency 4 at 110 (up to 8.5% / 5.5%) collide with it on the same paths. So the CPU's speed comes from cycles at 110: the core's latencies toward the 603e manual and the miss path (R112). The rest of D-43 stands with 110 in place of 120: a throughput trade must hold each frame's budget at 110 MHz, no block's standalone Fmax may drop, and the area target is unchanged. At 110 the Daytona 2 rasteriser's p99 is about 94% of a frame and its worst about 104% (R109's 86.4% / 95.2% at 120), so the Real3D has no cycles left to trade there. |
 | D-45 | (2026-11-06) Sound stays in the FPGA if it fits; that is the plan and what I would rather do. The fallback, if the area runs out, is sound on the HPS's ARM: the 68000 and the two SCSPs emulated there, with the samples streamed to the FPGA's audio out. The area plan (R105, R110: about 4,500 ALM for sound, 1,000 for I/O) keeps aiming at the FPGA. The ARM route is only a backstop, and it would have to meet the zero-added-latency rule and leave MiSTer Main its share of the CPU. |
@@ -15295,3 +15295,261 @@ board and stay as they are.
 - **Into main:** the per-step PVR, the FPS default, `m3_mra.py` and the MRA, at 120 MHz: the 130 MHz PLL and
   `SYS_HZ` hunks of `tree_8ea120d.patch` are left out, since 130 MHz has -3.7 ns setup and is a test clock (R167).
 
+**R170 — Spikeout Final Edition (`spikeofe`, Step 2.1): Daytona 2's form with a 112 MiB banked CROM, which
+does not fit the SDRAM, and its own 315-5881 key. Supermodel runs it from a fresh NVRAM to the attract and into a
+fight with no network board. Two things the core lacked: the security board's key was a constant (Daytona 2's),
+and with every ROM region where R100 put it the set needs 135 MiB of a 128 MiB SDRAM. The key is now configuration
+bytes 22-25, and a bank map entry can name a slot in the extra memory: CROM3 (banks 12-13, 16 MiB) is read from
+DDR3 at 0x3E000000 by a new `m3_xcrom` on the loader's DDR3 port. The 315-5881's compressed mode is not needed:
+in 8,000 frames of attract and play the game reads no compressed word. arcsnd needs no change. A 130 MHz board
+build from 18026dd boots to the attract on the board at 58 fps (9).** Work in `sm3-builds/spikeout/` (tree: `git archive 18026dd`; the
+main tree untouched). Rests on R100 (Daytona 2: the security board, the JTAG chain, the bank map, the extra
+memory), R154 (the generic profile), R168 (the method, the per-step PVR) and D-42.
+
+*What I believed* (R100, R168, THIRD_PARTY.md):
+- Spikeout would be Daytona 2's case with another key: Step 2.1, the 315-5881, an 8 MiB fixed CROM, 64 MiB of VROM,
+  the DSB2, and a link setting to clear from the NVRAM.
+- The key was already per set: `m3_system`'s comment says "the 315-5881 key: configuration bytes 18-21".
+- Every Model 3 set's banked CROM fits the SDRAM beside the fixed CROM and the state (R100: 8.9 MiB spare with
+  Daytona 2's 96 MiB).
+- The compressed stream mode (not built, THIRD_PARTY.md) might be what a later security game needs.
+- `tb_m3_sec` saw only the security board's accesses.
+
+*What I know now:*
+
+**1. The set** (MAME 0.289 `ROM_START(spikeofe)`, machine `spikeout` = `model3_21_5881` + `dsb2_config`;
+Supermodel 036af1c `Games.xml`; they agree on every ROM; the zip is a full set of 47 files, md5
+d7f3989bc9d2dd89dc4bb538aabc9648):
+- Step 2.1. Fixed CROM 8 MiB (`epr-21653`..`21656`, 2 MiB each), FF800000-FFFFFFFF.
+- Banked CROM **112 MiB**: CROM0, CROM1 and CROM2 four 8 MiB ROMs each (32 MiB, banks 4n..4n+3), CROM3 four 4 MiB
+  ROMs (16 MiB, banks 12-13). Both emulators put CROMn at n x 32 MiB (MAME 0x800000 + n x 0x2000000, Supermodel's
+  `banked_crom` offsets 0, 0x2000000, 0x4000000, 0x6000000), Daytona 2's 32 MiB bank space (`crom_win` 32).
+- VROM 64 MiB, sixteen 4 MiB ROMs `mpr-21633`..`21648` in IC order .26-.41.
+- Sound: 68000 `epr-21657`, samples 16 MiB (`mpr-21629`..`21632`); DSB2 `epr-21658`, MPEG 16 MiB
+  (`mpr-21649`..`21652`). The zip also carries `epr-18022.ic2` (the billboard's Z80, in no Spikeout ROM list).
+- The 315-5881's key **29236FC8** (MAME `ROM_PARAMETER`, 317-0247-COM; Supermodel `encryption_key`); Daytona 2's
+  is 29250E16.
+- MAME's `init_spikeofe` NOPs the instructions at 0x6059CC and 0x6059EC of the fixed CROM ("sound dies often
+  without these patches, investigate"); Supermodel runs the set unpatched and so does the core. MAME marks it not
+  working.
+- Supermodel gives it a network board (`netboard` true); with `Network = false`, its default, the board is absent:
+  C0000000 reads FFFFFFFF after the game writes 55555555 (frame 63), as on the core, where C0 is unmapped on Step 2.
+- Controls (Supermodel `common`, `joystick1`, `spikeout`): port C bit 0 Beat, 1 Charge, 2 Shift, 3 Jump, 7:4 the
+  stick (left, right, up, down). Those are VF3's fighting bits, so the generic profile (R154) fits as built and the
+  MRA only names the buttons: `Beat,Charge,Shift,Jump,Start,Coin,Test,Service`. Ports C and D rest at FF FF, the
+  DIP bank reads 7F, the ADC 0 (Supermodel's trace).
+- JTAG (`tb_m3_jtag` on the 8,000-frame trace below: 5,923,907 TCK/TMS/TDI writes, 2,961,953 TDO reads): with
+  Step 2.1's chain (`jstep` 3) 0 mismatches; Step 2.0's 23; Step 1.0's 852,852.
+- The PVR: Step 2.x reads 0x00071202 since R168; no change.
+
+**2. Supermodel's reference** (`sm/`): the bus-trace build with the play hook (`smtrace`, `dt2/supermodel` + the
+`spike` kind of `M3SND_PLAY`: the stick, Beat and Charge most of the time, Shift and Jump now and then) and
+`supermodel-sb` with the same hook (`smplay`), each run in its own folder with its own `Config`, one
+`xvfb-run -n 171` at a time.
+- Screens (`sm/sheet.png`, `sm/play_sheet.png`): black to 250, red to white with "TEAM SPIKEOUT PRESENTS" 300-650,
+  the attract's fights from 750 with "INSERT COIN(S)"; with a coin at 1,500 the character select at 1,800, the
+  title, "STAGE 1" at 2,400 and a fight from 2,500 to the end at 8,000. **No network message from a fresh NVRAM:**
+  unlike Daytona 2 it needs no link setting.
+- The trace (`sm/trace/bus.bin`, 3,000 frames, 32.0 M records; `sm/playt/bus_play8000.bin`, 8,000 frames with
+  play, 96.6 M; `sm/playt/bus.bin`, 3,000 frames with the CPU's CROM reads, `M3BUS_CROM`):
+  - the boot ROM is Daytona 2's form (MPC106 at FEC0 / FEE0, PCs FFF030C0-FFF03154); RAM code from frame 63;
+  - the security board from frame 260: 46 words written to its RAM a frame, the stream reset, a subkey, 44 words
+    read;
+  - the Real3D only through the DMA device at C2000000; its DMA reads banked CROM bank 1 only (220,328 words in
+    3,000 frames);
+  - bank selects (F0100008, 8,000 frames, PC 0x26D4): bank 0 205 times, 1 94, 2 8, 4 2, 5 16, 6 24, 7 50, **12 484,
+    13 124**; banks 13 and 0 first at frame 63, 12 at 160. Banks 3 and 8-11 are not selected in the 8,000 frames
+    (stage 1).
+  - the CPU's CROM reads in 3,000 frames: fixed 7,941,731; banked: bank 0 2,196,260, 1 12,662, 2 87,424, 4 327,800,
+    5 147,510, 6 262,272, 7 546,400, **12 677,043, 13 658,075**.
+
+**3. Where the ROM goes (D-42 revisited).** R100's layout puts banked CROM in 8 MiB SDRAM slots from 0 up to the
+state at 0x6000000: 12 slots, 96 MiB. Spikeout's 112 MiB, its 8 MiB fixed CROM, the backup RAM and the state are
+135.1 MiB; the SDRAM is 128 MiB, and its free pieces (0x6000000-0x61FFFFF, 0x6220000-0x63FFFFF, 0x7B00000-0x7FFFFFF)
+are 8.9 MiB and none of them 8 MiB in one piece. So 16 MiB of banked CROM has to live elsewhere until the second
+SDRAM (R150). DDR3 has room: 0x3E000000-0x3F1FFFFF (18 MiB) below the sound bridge's block, which sound
+DESIGN.md 16.3 kept for the sound ROMs and which nothing uses (the server reads them from the zip).
+- **Built:** a bank map entry's bit 6 says "in the extra memory", its slot then counted in the extra memory's CROM
+  region (`m3_loader` keeps six bits a bank). `m3_bus` decodes such a bank as before, but its SDRAM transaction
+  goes out with `s_x` set, and `m3_system` gives it to **`m3_xcrom`** instead of `m3_sdr_port`: the bus's
+  SDRAM-target contract, reads only (a CROM write never reaches the port), one DDR3 burst a transaction (a line's
+  four beats from word 0, critical word first out of two 4 x 32 MLABs; one beat for a single read), on DDR3 arbiter
+  port 6, the loader's, which is idle while the game runs (a download holds the game in reset). The region is 16 MiB
+  at beat 0x1C00000 (byte 0x3E000000); higher slot bits wrap, so nothing reaches the sound block. The loader's
+  index 1 from 64 MiB writes there in the image's order. The SDRAM answers as before for every other bank and every
+  other set: with no bit 6 in a map, nothing changes (`test_bus`, `test_bus_tg`: the same transactions and counts as
+  18026dd).
+- **Which banks:** CROM3, banks 12-13: whole 16 MiB, and read from frame 63, so a fault in the path shows at boot on
+  the bench and the board, not at a later stage. Their cost is the CPU's: about 450 of Supermodel's reads a frame
+  each pay DDR3's latency for SDRAM's (R100: 12-40 clocks against about 28), some 9,000 clocks of a 130 MHz frame's
+  2.26 M (0.4%), if every read were a miss. Banks 3 and 11 (no read in 8,000 frames) would cost nothing in stage 1,
+  but nothing would show the path working until a later stage; not taken.
+- D-48 / D-57: no other set's cycles change (the path is never taken without bit 6). The cost above is Spikeout's
+  only, against not running at all.
+
+**4. The 315-5881's key.** `m3_system` drove `m3_sec` from a constant, 29250E16, under a comment naming
+configuration bytes 18-21 (since R154 the idle inputs and the input profile). Now `m3_loader` takes bytes 22-25 as
+the key, little-endian (bits 29:0), and goes back to Daytona 2's 29250E16 at the start of every configuration
+download and at an index-0 download with none, so Daytona 2's 22-byte configuration loads its key as before
+(bench: banks and key printed after Daytona 2's and Sega Rally 2's configurations: 29250E16).
+- **Spikeout's stream** (`tools/sec_model.py`: Supermodel's `CCrypto`, uncompressed and compressed, line for line,
+  replayed on the traces): attract 116,955 data reads, play 335,745, **0 differ**. Every block is uncompressed, 11
+  lines of 8 bytes (44 words; 2,599 and 7,461 blocks). After each, the stream reads the next header at once (as
+  `m3_sec` does), from the words past the block, and that header has the compressed bit; the game resets the stream
+  before reading from it, every time: **0 compressed words read** in 8,000 frames. `m3_sec` sets `cmp_seen` on it,
+  harmlessly. RAM words used: 0-0x2F (512 kept).
+- `m3_sec` against the traces (`tb_m3_sec`): attract 231,311 reads, play 664,029, **0 differ** with 29236FC8;
+  114,356 / 320,823 differ with Daytona 2's key; `--fault` 111,757. Daytona 2's trace: 253,386, 0 differ, as before.
+  `make -f sim/system/system.mk test_sec` now runs Spikeout's trace too when it is there.
+- **Wrong turn (the bench):** `tb_m3_sec` took every F-region record at offset 18xxxx-1Axxxx, so the Real3D DMA's
+  reads of banked CROM at FF18xxxx went into the security board: 22,932 "differ" on the first run. It now takes the
+  I/O space only (F0, F2 ... FE, as `m3_bus` decodes it).
+- Area (map, against `sr2_130p_s2`): `m3_5881` 154 to 225 LUTs and 100 to 160 registers (the key's bits no longer
+  constants), `m3_loader` 160 to 179 and 186 to 234 (the key, a bit a bank), `m3_xcrom` 61 and 68, `m3_bus` 1,014 to
+  1,032.
+
+**5. The MRA** (`tree/mra/Spikeout Final Edition.mra`, md5 9254a022acd46902c83965fcabe24d04;
+`sim/system/m3_mra.py mra spikeofe`):
+- `m3_mra.py`: `SPIKEOFE`; `crom_x` (the CROMs in the extra memory: index 1 from 64 MiB, at most 16 MiB) and `key`
+  (configuration bytes 22-25). The other six MRAs regenerate byte for byte.
+- Configuration: `21 07 00 01 02 03 04 05 06 07 08 09 0A 0B 40 41 80 80 FF FF 00 00 C8 6F 23 29`: step 2.1,
+  flags 07, banks 0-11 in SDRAM slots 0-11, 12-13 in the extra memory's slots 0-1, idle C / D FF FF, profile 0, the
+  key.
+- Index 1: VROM 64 MiB, then CROM3 16 MiB (80 MiB, Main buffers it whole as it does Daytona 2's 64). Index 3: the
+  fixed CROM. Index 0: CROM0-2 (96 MiB), 2 MiB of 00, the backup RAM (98.1 MiB, Daytona 2's length). `<nvram>` as
+  Daytona 2's; a fresh NVRAM boots.
+- Checked: the 36 parts' CRCs (`pack`). `tools/cromchk.py` follows the bank map as the RTL does: every CROM read of
+  the 3,000-frame trace with the CPU's reads, **13,077,505 (1,335,118 from CROM3 in the extra memory), 0 differ**;
+  the attract trace's 186,384 DMA reads, 0 differ. Planted: banks at Rally 2's 16 MiB stride, 2,645,988 differ;
+  CROM3 read from SDRAM slots 12-13, 1,314,743.
+- **Wrong turn:** my first `cromchk` read a misaligned word from its aligned word and blamed 3,764 of the game's
+  unaligned fixed-CROM reads on the image; it now takes each byte at A ^ 3.
+
+**6. The benches.**
+- `m3_xcrom` (`make test_xcrom`, `tb_m3_xcrom`): random single reads and line fills against a model of the bus and a
+  DDR3 port with random latency (2-61), gaps and late acknowledges: 2 seeds x 200,000 transactions (about 1.13 M
+  words each), 0 fail. Planted: the odd and even words swapped, and the line's burst from the critical beat instead
+  of word 0, both fail; the model's own order planted (no critical word) fails.
+- **In the system** (`xtest/`): a PowerPC program in place of the boot ROM at FFF00100 (`xtest.s`, llvm-mc) selects
+  banks 12 and 13 and reads 64 words of each uncached, then with the D-cache on (real mode, WIMG 0011) fills 32 lines
+  of each with the critical word at every position, and 16 lines of bank 4 (SDRAM) as the control; each word goes to
+  backup RAM, which the bench traces. `tools/xcheck.py`: **849 writes, 0 differ** at the bench's DDR3 (12-40 clocks,
+  busy 10%), at 1-2 with none busy, and at 40-136 with 60% busy (6 frames). Planted: banks 12 and 13 swapped in the
+  map, 702 differ.
+- The loader through ioctl (`tb_m3_system`, windows at 0, 40 MiB, 64 MiB and the end of index 1): 0 beats wrong; the
+  64 MiB window lands at 0x1C00000, the VROM windows where they did.
+- `quartus_map --analyze_file`: `m3_xcrom`, `m3_loader`, `m3_bus`, `m3_system`: 0 errors. `lint_sys`: the same ten
+  warnings as 18026dd. `test_loader_sw`, `test_bus`, `test_bus_tg`: PASS, the same counts as 18026dd. The CPU is not
+  touched (`test_cpu_sub` not run).
+- **The system bench from reset** (`obj/run_so`, `tools/sysrun.sh`, 130 MHz, the board's options, no NVRAM file;
+  `logs/chain_so.log`; two 100-frame segments, 3,524 s and 3,038 s, the second from the first's checkpoint at frame
+  100; 56-75 kHz with three fits on the machine):
+  - the loader as above; the boot ROM's MPC106 set-up as Supermodel's, write for write (FEC0 45, FEE0 40 writes and
+    5 reads); then the boot ROM clears RAM a word at a time (FFF03420-FFF0342C, bench frames 9-80) and copies the
+    program (FFF033FC-FFF03418, to frame 88): the slow part R100 and R168 met.
+  - **The game's own code from bench frame 140** (Supermodel 63): the system registers' set-up, then bank 13 (in the
+    extra memory) selected and read at PC 0x26D4 (the same writes as Supermodel's), the LED count 1-A, the backup
+    RAM's test (49,156 reads and 65,542 writes agree with Supermodel's), the tile RAM, the 315-5649, the comm board
+    probe at C0 (FFFFFFFF, as Supermodel's), the RTC; by frame 190 the Real3D DMA's first writes (8E, 94), which
+    Supermodel makes from frame 100. The security board starts at Supermodel's frame 260, not reached.
+  - Where they part, it is timing: the bench takes 140 frames to Supermodel's 63 to reach the game, and then about
+    14 frames more at PC 0x5538, where the game polls the 93C46's DO for the end of a write (831,637 reads of port B
+    = DF against Supermodel's 320): `m3_93c46` keeps the chip's write time (`EE_TWP`, 2 ms) and Supermodel's EEPROM
+    finishes at once. After it the bench's frames 160-200 follow Supermodel's 73-113 region for region (system
+    register writes 647 / 1,015, 43,362 / 43,015, 653 / 694 a ten frames). Two routines' order differs by a frame
+    (the name-table fills at 0x8134 and 0x82C0; the backup RAM loop at 0x38918 runs once more), the interrupt
+    acknowledges and the DMA device's status reads are timing, as in R100 and R168. Port B bit 5 reads 1 at its first
+    read where Supermodel reads 0 (R168's 93C46 DO note): no symptom here either.
+  - Not reached in the two hours: the security board, the logo and the 3D. The directed test above is what runs
+    `m3_xcrom` in the system with known answers; the bench shows the game selecting bank 13 and going on as
+    Supermodel does.
+
+**6a. The Real3D on Spikeout's frames** (`sm/run_dump.sh`, `smplay`: dumps at attract frames 1,000-1,049 and play
+frames 3,000-7,000 every 200; `dumps/`, `dumps17/`, `img/vrom_spikeofe.bin` from `srally2/tools/vromlin.py`):
+- The model (`sh1/tools/r3d_ref`, Supermodel's rows, step 21): 71 frames; a frame 9.4 viewports, 948 nodes, 258
+  models, 4,682 polygons, 5,464 triangles; 0 bad addresses; 77,854 VROM words.
+- `r3d_geo` as `m3_system` builds it (`tools/geobench.sh`): **71 of 71 frames match the model on every triangle
+  field, 254,177 triangles**; the two hostile memory profiles 20 of 20 each (56,209). Its busiest frame 1.73 M
+  clocks, p99 1.71 M: 76% of a 130 MHz frame.
+- `r3d_rast` (MIP, `tools/rbuild.sh`, `area107/tools/rrun.sh ... --mip --step 21`): **71 frames, 0 pixels wrong, 0
+  port-rule violations**.
+
+**7. Sound (arcsnd model3 85ce77d, unchanged).** `roms_table.h` has `spikeofe` (program, four sample ROMs at 0, 4, 8,
+12 MiB as MAME's; DSB2 `epr-21658` and four MPEG ROMs). The bench (`snd/`, `tools/sbuild.sh`: `git archive 85ce77d`;
+the capture `snd/play` from `smsnd`, supermodel-snd with the `spike` kind: 7,000 frames, coin at 1,500, 5,139 MIDI
+bytes, a fight from about 2,500):
+
+| Check | Result |
+|---|---|
+| SCSPs on Supermodel's Musashi, Supermodel's timers (`-t 0`), against `sm_pcm` | 21,465,820 channel samples, **0 differ** |
+| the same on arcsnd's Musashi | 8,217,180 differ from 15.98 s: the known 68000 timing difference (R168, DESIGN.md 18.2) |
+| DSB2 against Supermodel's mix (`-mixref`), with the skip / without (`ARCSND_NO_DSB_SPIN`) | 21,465,820, **0 differ** both |
+| DSB2 alone (`-dsbonly`, `M3DSB_STATE`), with the skip / without | output e1898f9c both, state 2045d8ab both; **9,756,428 wait-loop turns skipped** / 0; 1.72 / 2.55 s |
+
+So Spikeout's DSB2 program has Daytona 2's wait loops and R168's pattern finds them; no server change.
+**Wrong turn:** my first SCSP comparison ran the arcade's timers (`-t 1`, the bench's default) and gave 9,105,584
+"differ"; Supermodel's are `-t 0`.
+
+**8. The 130 MHz board build** (`tree130` = `tree` + `pll_0002.v` at 130.000000 MHz, phase_shift2 3846 ps, and
+`SYS_HZ = 130_000_000`, as R168's; `tools/fit.sh so130_s2 2`, release, `MISTER_DUAL_SDRAM` off):
+**RBF `sm3-builds/so130_s2_6bbed34b.rbf` (6bbed34bfaf1d5121f7ce978646be303)**, fitted 13:02-13:38, the PLL's outputs at
+7.692 ns / 130.0 MHz in the timing report.
+
+| | `so130_s2` (board build) | `sr2_130p_s2` (R168, Rally 2's) |
+|---|---|---|
+| Setup, core clock, slow 100 / slow -40 / fast 100 / fast -40 °C | -3.557 / -3.394 / +0.956 / +2.034 ns | -3.708 / -3.625 / +0.872 / +1.981 |
+| Hold, least over the clocks, same corners | **+0.196 / +0.171 / +0.131 / +0.103 ns** | +0.246 / +0.181 / +0.096 / +0.079 |
+| HDMI setup, worst corner | +0.060 ns | -0.018 |
+| ALM / M10K / DSP | 41,291 / 528 / 90 | 41,293 / 528 / 90 |
+| Failing core endpoints, slow 100 °C | 17,453 | 17,705 |
+
+Hold is positive at all four corners on seed 2, so seeds 1 and 4 were not needed. The worst paths are the CPU's, as
+before. The new logic's worst: `m3_xcrom`'s `m_req` through port 6's address and length select into the arbiter and
+`m3_ddr3p`'s `DDRAM_DIN` registers, -2.20 ns at slow 100 °C and -2.37 at slow -40 °C (120 and 118 failing paths
+touch `m3_xcrom`, the key or the loader). For 120 MHz in main it wants a look: the select could come from a
+register of its own (the port is idle for a clock between the two users anyway). A board test, not a release.
+
+*Board plan* (done 2026-11-12; every step waited for my go; the board at 192.168.1.105 that day (DHCP moved it), root; copy with a plain
+`ssh ... 'cat > FILE' < LOCAL` or `scp -O`, never through a helper that redirects stdin; the full md5 at both ends
+before the next step; never chain copy, install and load):
+1. The zip: `/home/ben/roms/Model3/spikeofe.zip` (md5 d7f3989bc9d2dd89dc4bb538aabc9648) to
+   `/media/fat/games/mame/spikeofe.zip`. A full set; no parent. arcsnd reads the sound and DSB2 ROMs from it.
+2. The MRA: `sm3-builds/spikeout/tree/mra/Spikeout Final Edition.mra` (md5 9254a022acd46902c83965fcabe24d04) to
+   `/media/fat/_Arcade/_Model3/`.
+3. The RBF: `sm3-builds/so130_s2_6bbed34b.rbf` (md5 6bbed34bfaf1d5121f7ce978646be303) to `/media/fat/_Arcade/cores/`, md5 both ends; then, as its own step, keep the board's
+   `Model3.rbf` beside it (`cp Model3.rbf Model3_sr2_130p_s2.rbf`, if Rally 2's adbc4c0e is what is there) and copy
+   the new one over `Model3.rbf`, md5 again.
+4. arcsnd: no change; the board's release 20261112 (748320bb, the same source as ad1a76a0, R168) claims `spikeofe`
+   and runs its DSB2 with the skip.
+5. Load: `echo "load_core /media/fat/_Arcade/_Model3/Spikeout Final Edition.mra" > /dev/MiSTer_cmd`. The download is
+   about 186 MiB (index 1 80 MiB, index 0 98 MiB), longer than Daytona 2's. Look for: the red-to-white "TEAM
+   SPIKEOUT PRESENTS" logo, then the attract's fights with "INSERT COIN(S)" and the DSB2's music; coin and start,
+   the character select, "STAGE 1", a fight; the stick and Beat, Charge, Shift, Jump; the server's status line
+   naming `spikeofe` with DSB2 and MIDI bytes applied. **If it stops early:** a black screen or a hang after the
+   logo with the server attached but no MIDI is the boot (compare R168 3a); "ILLEGAL ROM" (Supermodel's note on
+   PC 0x6FAC8) or a hang at the first fight is the security board's key; garbage or a hang where CROM3 is read
+   (from frame 63) is the extra-memory path. Then the other games once each at 130 MHz, Daytona 2 first (its key
+   is now the configuration's default).
+6. After the test: `echo "load_core /media/fat/menu.rbf" > /dev/MiSTer_cmd`; never reset the board.
+
+*Wrong turns:* my first trace run was started in the background with `&` inside a background job: the job ended,
+the run did not, and the rerun (`xvfb-run -n 171`) found the first run's X server, so two Supermodels wrote into one
+folder and the second died at frame 2,237 when the first closed the display; now one run at a time, in the
+foreground of its job. Supermodel 036af1c aborts at its exit with `-no-sound` ("SoundVolume does not exist"), so a
+trace's last partial record is lost (8 bytes; truncated to whole records). `smplay` (supermodel-sb) does not log the
+Real3D DMA as master 2, so my first bank count showed no DMA reads; the bank counts come from `smtrace`
+(dt2/supermodel). My first `qa.sh` call gave it relative paths after its `cd`. My first high-latency `xtest` run
+stopped at 2 frames with 569 of 849 writes done (the rest ran in 6).
+
+**9. Board (2026-11-12, `so130_s2`, RBF 6bbed34b, arcsnd release 20261112).** The download (186 MiB) and the boot
+go through, the security board's key and CROM3 in the extra memory with them: the attract's fights with "INSERT
+COIN(S)", textured, at 58 fps on the FPS counter. Open: a solid black, floor-shaped quad under the fighter in the
+attract's tatami-room scene, most likely the fighter's shadow drawn opaque (the same family as Daytona 2's car
+shadow); no Supermodel frame of that scene has been compared yet. Play, the controls and the sound were not yet
+reported.
+- **Wrong turn (the photo):** a horizontal split across the middle of the picture in my first photo was the capture
+  card, which records at 60 fps, not the core.
+- **Into main:** `tree_main.patch` at 120 MHz; the 130 MHz PLL and `SYS_HZ` (`clock_130.patch`) stay out, as in
+  R168. D-42 gains a bank in the extra memory, and THIRD_PARTY.md's note on the compressed mode gains Spikeout's
+  count. `m3_xcrom`'s select path (-2.37 ns at 130 MHz) is inside the CPU's slack and is to be registered when
+  timing closure reaches it.

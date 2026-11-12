@@ -291,4 +291,5 @@ Supermodel (GPL-3.0-or-later) is instrumented only, through
   the word history, the block length) is written for this core from Supermodel's
   `ReadSecurity` / `WriteSecurity` and `CCrypto::Decrypt`; checked against Supermodel's
   bus trace of Daytona 2 (253,386 reads, `make -f sim/system/system.mk test_sec`).
-- Changed: logic instead of loops; the compressed-stream mode is not built.
+- Changed: logic instead of loops; the compressed-stream mode is not built (Daytona 2 and
+  Spikeout read no compressed word, R170).

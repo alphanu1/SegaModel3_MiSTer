@@ -94,6 +94,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/viewer/m3v_ddr_rd.sv
 # the geometry's delay pipes stay in registers (R64: shift taps in RAM otherwise)
 set_global_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_xmem.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_xcrom.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_5881.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_sec.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_system.sv

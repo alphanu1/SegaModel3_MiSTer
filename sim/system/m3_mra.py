@@ -155,7 +155,38 @@ SRALLY2 = {
     'nvnote': ['the 93C46. Supermodel reaches the attract from a fresh NVRAM;',
                'the file keeps the settings and records. m3_mra.py nvram converts a'],
 }
-SETS = {'vf3': VF3, 'bassdx': BASSDX, 'daytona2': DAYTONA2, 'scuddxo': SCUDDXO, 'lostwsga': LOSTWSGA, 'srally2': SRALLY2}
+# ROM_START(spikeofe) (Step 2.1, study R170): Daytona 2's form (8 MiB fixed CROM, sixteen 4 MiB VROMs) with a
+# banked CROM of 112 MiB: CROM0-2 four 8 MiB ROMs each (32 MiB, four banks), CROM3 four 4 MiB ROMs (16 MiB, banks
+# 12-13; both emulators: CROMn at n x 32 MiB). With the fixed CROM, the backup RAM and the state that is 135 MiB,
+# past the 128 MiB SDRAM, so CROM3 goes in the extra memory (index 1 from 64 MiB, m3_xcrom; bank map bit 6): the
+# two banks the program reads from its first frames (Supermodel: banks 12 and 13 selected at frames 160 and 63),
+# so the path is in use from the boot. The 315-5881's key 29236FC8 (MAME ROM_PARAMETER, Supermodel Games.xml) goes
+# in configuration bytes 22-25. The controls are VF3's port C bits (Supermodel's INPUT_SPIKEOUT: beat 0, charge
+# 1, shift 2, jump 3; the stick 7:4), so the generic profile with its buttons named. Ports C and D rest at FF.
+# Supermodel reaches the attract from a fresh NVRAM with no network board. MAME's init_spikeofe NOPs two
+# instructions at 0x6059CC and 0x6059EC ("sound dies often without these patches"); Supermodel runs it unpatched,
+# and so does the core. Not loaded: the 68000 program and samples, the DSB2 (arcsnd reads them), the billboard's
+# Z80 ROM epr-18022.ic2 that the zip carries.
+SPIKEOFE = {
+    'setname': 'spikeofe', 'name': 'Spikeout Final Edition', 'year': '1999', 'zip': 'spikeofe.zip',
+    'category': 'Fighter', 'step': 0x21, 'prof': P_GEN,
+    'buttons': 'Beat,Charge,Shift,Jump,Start,Coin,Test,Service',
+    'crom': [
+        [('mpr-21613.1', 6), ('mpr-21614.2', 4), ('mpr-21615.3', 2), ('mpr-21616.4', 0)],
+        [('mpr-21617.5', 6), ('mpr-21618.6', 4), ('mpr-21619.7', 2), ('mpr-21620.8', 0)],
+        [('mpr-21621.9', 6), ('mpr-21622.10', 4), ('mpr-21623.11', 2), ('mpr-21624.12', 0)],
+        [('mpr-21625.13', 6), ('mpr-21626.14', 4), ('mpr-21627.15', 2), ('mpr-21628.16', 0)],
+    ],
+    'crom_mib': [32, 32, 32, 16],
+    'crom_x': [3],              # CROMs in the extra memory (index 1 from 64 MiB, 16 MiB at most)
+    'key': 0x29236FC8,          # the 315-5881's (configuration bytes 22-25)
+    'fixed': [('epr-21653.17', 6), ('epr-21654.18', 4), ('epr-21655.19', 2), ('epr-21656.20', 0)],
+    'vrom': ['mpr-%d.%d' % (21633 + k, 26 + k) for k in range(16)],
+    'nvnote': ['the 93C46. Supermodel reaches the attract from a fresh NVRAM;',
+               'the file keeps the settings and records. m3_mra.py nvram converts a'],
+}
+SETS = {'vf3': VF3, 'bassdx': BASSDX, 'daytona2': DAYTONA2, 'scuddxo': SCUDDXO, 'lostwsga': LOSTWSGA, 'srally2': SRALLY2,
+        'spikeofe': SPIKEOFE}
 
 # game configuration (index 4) flags, m3_loader.sv
 CF_VROM_X, CF_FIXED8, CF_VROM64 = 1, 2, 4
@@ -163,16 +194,19 @@ SDR_FIX8 = 0x7300000
 XMEM_DDR3_BYTE = 0x38000000    # the DDR3 region for <rom address=...> (not used: the stream is the default)
 
 
-def bank_map(crom_mib, win=32):
+def bank_map(crom_mib, win=32, xcrom=()):
     """CROM bank b (0-15; CROMn is banks wn..wn+w-1, w = win / 8: four for Daytona 2's 32 MiB CROM windows, two
-    for Sega Rally 2's 16 MiB) -> SDRAM slot, packed in order; 0x80 empty."""
-    m, slot = [], 0
+    for Sega Rally 2's 16 MiB) -> SDRAM slot, packed in order; 0x80 empty. A CROM in xcrom (R170) takes slots
+    in the extra memory's CROM region instead, packed in order there, 0x40 | slot."""
+    m, slot, xslot = [], 0, 0
     for n, mib in enumerate(crom_mib):
         for k in range(win // 8):
-            if k * 8 < mib:
-                m.append(slot); slot += 1
-            else:
+            if k * 8 >= mib:
                 m.append(0x80)
+            elif n in xcrom:
+                m.append(0x40 | xslot); xslot += 1
+            else:
+                m.append(slot); slot += 1
     m += [0x80] * (16 - len(m))
     assert len(m) == 16
     return m
@@ -286,9 +320,14 @@ def buttons(w, s):
 def mra_step2(args, s, crc):
     L = []
     w = L.append
-    nb = sum(s['crom_mib']) // 8
-    bm = bank_map(s['crom_mib'], s.get('crom_win', 32))
+    xc = s.get('crom_x', [])
+    nb = sum(m for n, m in enumerate(s['crom_mib']) if n not in xc) // 8
+    nx = sum(m for n, m in enumerate(s['crom_mib']) if n in xc) // 8
+    assert nx <= 2, 'the extra memory holds 16 MiB of CROM (m3_xcrom)'
+    bm = bank_map(s['crom_mib'], s.get('crom_win', 32), xc)
     cfg = [s['step'], CF_VROM_X | CF_FIXED8 | CF_VROM64] + bm + s.get('idle_in', [0xFF, 0xFF]) + [s.get('prof', P_GEN), s.get('pflg', 0)]
+    if 'key' in s:
+        cfg += list(struct.pack('<I', s['key']))
     w('<misterromdescription>')
     w('    <!--')
     w('      Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1')
@@ -298,8 +337,11 @@ def mra_step2(args, s, crc):
     w('      From MAME 0.289 model3.cpp ROM_START(%s); sim/system/m3_mra.py writes it,' % s['setname'])
     w('      and packs the same images for the system bench. One download per index')
     w('      (rtl/sys/m3_loader.sv):')
-    w('        4  the game configuration: step, flags, CROM bank map, idle inputs, input profile')
+    w('        4  the game configuration: step, flags, CROM bank map, idle inputs, input profile%s' % (', 315-5881 key' if 'key' in s else ''))
     w('        1  VROM, 64 MiB, in the extra memory (DDR3 byte 0x38000000)')
+    if nx:
+        w('           and from 64 MiB banked CROM, %d MiB in %d slots there (DDR3 byte 0x3E000000;' % (8 * nx, nx))
+        w('           bank map bit 6: rtl/sys/m3_xcrom.sv, study R170)')
     w('        3  fixed CROM, 8 MiB, SDRAM 0x7300000 (FF800000-FFFFFFFF)')
     w('        0  banked CROM, %d MiB in %d slots of 8 MiB from SDRAM 0; backup RAM' % (8 * nb, nb))
     w('           at 0x6200000, 128 KiB of 00; last, so its end releases the reset')
@@ -321,7 +363,8 @@ def mra_step2(args, s, crc):
     switches(w, s)
     buttons(w, s)
     w('')
-    w('    <!-- game configuration: step %02X, flags %02X (VROM in the extra memory, fixed CROM 8 MiB, VROM 64 MiB), bank map, idle ports C and D, input profile %02X (%s) -->' % (cfg[0], cfg[1], cfg[20], PROF_NAME[cfg[20]]))
+    w('    <!-- game configuration: step %02X, flags %02X (VROM in the extra memory, fixed CROM 8 MiB, VROM 64 MiB), bank map, idle ports C and D, input profile %02X (%s)%s -->'
+      % (cfg[0], cfg[1], cfg[20], PROF_NAME[cfg[20]], ', the 315-5881 key %08X' % s['key'] if 'key' in s else ''))
     w('    <rom index="4" md5="none">')
     w('        <part>%s</part>' % ' '.join('%02X' % b for b in cfg))
     w('    </rom>')
@@ -333,6 +376,17 @@ def mra_step2(args, s, crc):
             name = s['vrom'][4 * blk + k]
             w('            <part name="%s" crc="%s" map="%s"/>' % (name, crc[name], SEQ_MAP[k]))
         w('        </interleave>')
+    a = 0x4000000
+    for n, bank in enumerate(s['crom']):
+        if n not in xc:
+            continue
+        mib = s['crom_mib'][n]
+        w('        <!-- 0x%07x  CROM%d, %d MiB (banks %s), in the extra memory -->' % (a, n, mib, ', '.join(str(b) for b in range(s.get('crom_win', 32) // 8 * n, s.get('crom_win', 32) // 8 * n + mib // 8))))
+        w('        <interleave output="64">')
+        for name, off in sorted(bank, key=lambda p: OFF_MAP[p[1]][::-1]):
+            w('            <part name="%s" crc="%s" map="%s"/>' % (name, crc[name], OFF_MAP[off]))
+        w('        </interleave>')
+        a += mib << 20
     w('    </rom>')
     w('    <rom index="3" zip="%s" md5="none">' % s['zip'])
     w('        <!-- fixed CROM, 8 MiB (FF800000-FFFFFFFF) -->')
@@ -345,6 +399,8 @@ def mra_step2(args, s, crc):
     a = 0
     bw = s.get('crom_win', 32) // 8
     for n, bank in enumerate(s['crom']):
+        if n in xc:
+            continue
         mib = s['crom_mib'][n]
         w('        <!-- 0x%07x  CROM%d, %d MiB (banks %s) -->' % (a, n, mib, ', '.join(str(b) for b in range(bw * n, bw * n + mib // 8))))
         w('        <interleave output="64">')

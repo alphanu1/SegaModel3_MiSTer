@@ -109,6 +109,9 @@ static ddr_dev dd;
 // R127 VROM_LIN: the MRA layout's region beat {blk, g} (g 21 bits for 64 MiB, 20 for 32 MiB) is at {g, blk}
 static bool xlin = false;
 static size_t xl(size_t b, bool v64) { if (!xlin) return b; unsigned const gb = v64 ? 21 : 20; return ((b & ((size_t(1) << gb) - 1)) << 2) | (b >> gb); }
+// the DDR3 beat of index 1's image beat b: VROM (above) from 0x1000000, and from 64 MiB banked CROM in the extra
+// memory (R170, m3_xcrom) from 0x1C00000 in the image's order, 16 MiB, wrapping as m3_system's loader path does
+static size_t xbeat(size_t b, bool v64) { return b >= 0x800000 ? 0x1C00000 + (b & 0x1FFFFF) : 0x1000000 + xl(b, v64); }
 static Prof2 p2;
 // --check-lw (study R107): every work-RAM line write (cast-out, a push, a 53C810 line write) is
 // recorded beat by beat as its master hands each beat over on m_wnext, by line, and checked against
@@ -344,10 +347,10 @@ int main(int argc, char **argv) {
                 t->rootp->m3_system__DOT__cfg_flags, t->rootp->m3_system__DOT__cfg_in2, t->rootp->m3_system__DOT__cfg_in3);
     for (int b = 0; b < 16; b++) {
       auto const &cb = t->rootp->m3_system__DOT__cfg_bank;
-      uint64_t const v = (uint64_t(cb[(5 * b) / 32 + 1 < 3 ? (5 * b) / 32 + 1 : 2]) << 32) | cb[(5 * b) / 32];
-      std::printf(" %02X", unsigned((v >> ((5 * b) % 32)) & 31));
+      uint64_t const v = (uint64_t(cb[(6 * b) / 32 + 1 < 3 ? (6 * b) / 32 + 1 : 2]) << 32) | cb[(6 * b) / 32];
+      std::printf(" %02X", unsigned((v >> ((6 * b) % 32)) & 63));
     }
-    std::printf("\n");
+    std::printf(", 315-5881 key %08X\n", unsigned(t->rootp->m3_system__DOT__cfg_key));
   }
   if (!xmem_img.empty()) {
     size_t const n = std::min(size_t(window), xmem_img.size());
@@ -355,7 +358,8 @@ int main(int argc, char **argv) {
     // windows at the start, the middle and the end of the region (R100: the second 32 MiB too)
     std::vector<size_t> at = {0};
     if (xmem_img.size() >= 2 * n) { at.push_back(xmem_img.size() / 2); at.push_back(xmem_img.size() - n); }
-    for (size_t o : at) for (size_t b = 0; b < n / 8; b++) dd.m[0x1000000 + xl(o / 8 + b, x64)] = 0xA55AA55AA55AA55Aull;
+    if (xmem_img.size() > 0x4000000) at.push_back(0x4000000);   // R170: the first window of banked CROM in the extra memory
+    for (size_t o : at) for (size_t b = 0; b < n / 8; b++) dd.m[xbeat(o / 8 + b, x64)] = 0xA55AA55AA55AA55Aull;
     t->ioctl_index = 1; t->ioctl_download = 1;
     for (size_t o : at)
       for (size_t a = o; a < o + n; a += 2) {
@@ -370,10 +374,10 @@ int main(int argc, char **argv) {
     t->ioctl_index = 0;
     long bad = 0;
     for (size_t o : at)
-      for (size_t b = 0; b < n / 8; b++) { uint64_t v; std::memcpy(&v, &xmem_img[o + 8 * b], 8); if (dd.m[0x1000000 + xl(o / 8 + b, x64)] != v) bad++; }
+      for (size_t b = 0; b < n / 8; b++) { uint64_t v; std::memcpy(&v, &xmem_img[o + 8 * b], 8); if (dd.m[xbeat(o / 8 + b, x64)] != v) bad++; }
     std::printf("loader: extra memory, %zu windows of %zu bytes through ioctl, %ld beats wrong\n", at.size(), n, bad);
     if (bad) { std::printf("FAIL\n"); return 1; }
-    for (size_t b = 0; b < xmem_img.size() / 8; b++) std::memcpy(&dd.m[0x1000000 + xl(b, x64)], &xmem_img[8 * b], 8);
+    for (size_t b = 0; b < xmem_img.size() / 8; b++) std::memcpy(&dd.m[xbeat(b, x64)], &xmem_img[8 * b], 8);
   }
   if (!fix8_img.empty()) {
     size_t const n = std::min(size_t(window), fix8_img.size());

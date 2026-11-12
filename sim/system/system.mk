@@ -43,10 +43,10 @@ TEXUP_RTL ?= rtl/real3d/r3d_texup.sv    # R100: with M3_STEP2_TEX, sm3-builds/dt
 SYS_DEFS ?= +define+M3_STEP2_BUS=1 +define+M3_STEP2_TEX=1 +define+M3_DMAFAST=1 +define+M3_R3B=1   # (R144: as Model3.qsf)
 SYS_RTL = $(R3D_SYS) rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/sys/m3_jtag.sv rtl/io/m3_93c46.sv rtl/io/m3_io.sv rtl/io/m3_cab_inputs.sv rtl/io/m3_inputs.sv rtl/sys/m3_sdr_port.sv $(BUS_RTL) \
           rtl/io/m3_scripts.sv rtl/mem/m2_sdram.sv rtl/video/m2_video_timing.sv rtl/viewer/m3v_overlay.sv \
-          rtl/dbg/m3_frame_busy.sv rtl/dbg/m3_fps.sv rtl/sys/m3_xmem.sv rtl/sys/m3_5881.sv rtl/sys/m3_sec.sv rtl/sys/m3_loader.sv \
+          rtl/dbg/m3_frame_busy.sv rtl/dbg/m3_fps.sv rtl/sys/m3_xmem.sv rtl/sys/m3_xcrom.sv rtl/sys/m3_5881.sv rtl/sys/m3_sec.sv rtl/sys/m3_loader.sv \
           rtl/sound/m3_scsp_dsp.sv rtl/sound/m3_sndbridge.sv rtl/sys/m3_system.sv
 
-.PHONY: test_jtag test_jtag_fault lint_sys test_inputs test_io test_sdr_port test_bus test_bus_tg system test_xmem test_sec test_texup2
+.PHONY: test_jtag test_jtag_fault lint_sys test_inputs test_io test_sdr_port test_bus test_bus_tg system test_xmem test_sec test_texup2 test_xcrom
 
 # r3d_texup's three-word texture port (R100; Step 1.5 and later, D-46) against its FIFO
 # path, on 64 MiB of VROM (Daytona 2) and on 32 MiB (--v32: a Step 1.5 set). TEXUP2_RTL:
@@ -65,6 +65,8 @@ test_texup2: $(SYS_OBJ)/texup2/Vr3d_texup
 
 # m3_sec (the 315-5881, study R100) against Daytona 2's Supermodel trace
 SEC_TRACE ?= sm3-builds/dt2/sec_dt2.bin
+# R170: Supermodel's spikeofe trace, 3,000 frames (optional)
+SEC_TRACE_SO ?= sm3-builds/spikeout/sm/trace/bus.bin
 $(SYS_OBJ)/sec/Vm3_sec: rtl/sys/m3_sec.sv rtl/sys/m3_5881.sv sim/system/tb_m3_sec.cpp
 	@$(VERILATOR) $(VFLAGS) --top-module m3_sec -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/sec rtl/sys/m3_sec.sv rtl/sys/m3_5881.sv sim/system/tb_m3_sec.cpp >/dev/null
 
@@ -72,6 +74,8 @@ test_sec: $(SYS_OBJ)/sec/Vm3_sec
 	@echo "== m3_sec: the security board against Daytona 2's trace"
 	./$(SYS_OBJ)/sec/Vm3_sec $(SEC_TRACE) 29250e16
 	! ./$(SYS_OBJ)/sec/Vm3_sec $(SEC_TRACE) 29250e16 --fault > /dev/null
+	@if [ -f $(SEC_TRACE_SO) ]; then echo "== m3_sec against Spikeout Final Edition's trace (R170: its key, no compressed stream read)"; \
+	  ./$(SYS_OBJ)/sec/Vm3_sec $(SEC_TRACE_SO) 29236fc8 && ! ./$(SYS_OBJ)/sec/Vm3_sec $(SEC_TRACE_SO) 29250e16 > /dev/null; fi
 
 # m3_xmem (study R100): VROM in the extra memory, against a reference. R100's bench (one request at a time)
 # runs on the MRA layout (XLIN 0), both forms; R127's (tb_m3_xmem2: requests overlapped as r3d_mstream asks
@@ -294,3 +298,12 @@ test_bus_r107: $(foreach v,$(SDR_VARIANTS),$(SYS_OBJ)/bus_$(v)/Vm3_bus_tb)
 	./$(SYS_OBJ)/bus_b112/Vm3_bus_tb 100000 37 --bxor --r3stall
 	./$(SYS_OBJ)/bus_b112/Vm3_bus_tb 100000 38 --bxor --r3slow
 	./$(SYS_OBJ)/bus_b112/Vm3_bus_tb 100000 39 --bxor
+
+# m3_xcrom (banked CROM in the extra memory, study R170) against a model of the bus and a DDR3 port
+$(SYS_OBJ)/xcrom/Vm3_xcrom: rtl/cpu/ppc_cache_pkg.sv rtl/sys/m3_xcrom.sv sim/system/tb_m3_xcrom.cpp
+	@$(VERILATOR) $(VFLAGS) --top-module m3_xcrom -CFLAGS "$(CFLAGS_SYS)" --Mdir $(SYS_OBJ)/xcrom rtl/cpu/ppc_cache_pkg.sv rtl/sys/m3_xcrom.sv sim/system/tb_m3_xcrom.cpp >/dev/null
+test_xcrom: $(SYS_OBJ)/xcrom/Vm3_xcrom
+	@echo "== m3_xcrom: random reads and line fills against a model"
+	./$(SYS_OBJ)/xcrom/Vm3_xcrom --seed 1
+	./$(SYS_OBJ)/xcrom/Vm3_xcrom --seed 2
+	! ./$(SYS_OBJ)/xcrom/Vm3_xcrom --seed 1 --n 2000 --fault > /dev/null
