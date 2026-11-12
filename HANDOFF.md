@@ -1,5 +1,45 @@
 # Handoff
 
+## Update (2026-11-12)
+
+`main` is e8a06ac, pushed: a `--no-ff` merge of `spikeout` (87e7f16), on top of 18026dd (README and LICENSE).
+
+**Done:**
+- **Spikeout Final Edition** (study R170; notes and tools in `sm3-builds/spikeout/`). Its banked CROM is 112 MiB, so
+  the set needs 135 MiB of the 128 MiB SDRAM: CROM3 (banks 12-13, 16 MiB) now lives in DDR3 at 0x3E000000, read by the
+  new `m3_xcrom` on the loader's DDR3 port (D-42 amended). The 315-5881 key comes from configuration bytes 22-25
+  (Daytona 2's 29250E16 when a set gives none); Spikeout's is 29236FC8. The compressed mode is still not needed (0
+  compressed words in 8,000 frames). arcsnd needed no change. Board, 130 MHz build `so130_s2` (RBF 6bbed34b, hold
+  positive at all corners): boots to the attract at 58 fps. `main` takes it at 120 MHz; no 120 MHz fit of it yet.
+  - Open: a solid black floor-shaped quad under the fighter in the attract's tatami-room scene, probably the shadow
+    drawn opaque; not yet compared with Supermodel on that scene. Play, controls and sound not yet reported.
+  - `m3_xcrom`'s select path is -2.37 ns at 130 MHz (inside the CPU's slack); register it when closure reaches it.
+  - Wrong turns: a split across the picture in the first photo was the capture card (60 fps), not the core; the
+    `tb_m3_sec` bench took the Real3D DMA's CROM reads as security-board accesses (22,932 false differ), fixed.
+- **Sega Rally 2's board test** at 130 MHz passed in full, and the arcsnd fork's `model3` branch is one squashed
+  commit, 85ce77d, with `releases/arcsnd_20261112.zip` (binary 748320bb); tested on the board from the zip. The
+  release's version stamp (007847a) names the pre-squash commit; the source is identical.
+- **Clock-split test** (draft R169 in `sm3-builds/csplit/`, not in the study; RBFs `cs110_s2_14b58fc0`,
+  `cs120_s2_55bbd389`): the CPU at 110 or 120 MHz with the rest at 130 did not give VF3's attract a full 60; the full
+  130 build does. So the CPU's own speed matters, which led to D-59.
+- **D-59 and D-60** are in the study's working tree, **not committed**: D-59, close timing at 130 or better the CPU's
+  CPI, and the CPI is to be bettered regardless; D-60, start with CPI items 1 and 2, the area from the core's own
+  modules at zero cycle cost (D-57 stands). They go in with R169 and R171.
+- **CPI study** (draft R171, `sm3-builds/cpi/NOTES.md`): CPI 2.92 on Daytona 2's attract, 2.69 on VF3. 60 fps at 120
+  MHz needs about 8% (race median) to 14% (race p90, city/replay shots) fewer CPU cycles; VF3 has a few percent margin.
+  Ranked plan: store misses allocating without a fill (VF3 -5.3% est.), MMU replay without refetch (Daytona 2 -2.5%),
+  dynamic branch direction (reopens D-30), one-cycle stfs/fcmpu. A second posted line write in the SDRAM port gained
+  nothing and corrupted data (`tree_pw2`, not kept): the data wait is the port busy, not a shallow buffer.
+
+**Running:** CPI items 1 and 2 (`sm3-builds/cpi2/`): build, benches, the area account, one 120 MHz fit, draft R172.
+
+**Board** (192.168.1.105 on 2026-11-12; DHCP moved it): `Model3.rbf` is Spikeout's `so130_s2` (6bbed34b), which runs
+every game at 130 MHz. The full 130 build adbc4c0e is at `/media/fat/model3_backup/` and
+`_Arcade/cores/Model3.rbf.f130sr2`. arcsnd release 20261112 runs by hand.
+
+**Still queued:** the black quad in Spikeout, timing closure, Daytona 2's race, the Bass Fishing hiss, the 93 ms
+watchdog, the arcsnd PR to ppriest (waiting on longer testing; the draft needs Sega Rally 2, Spikeout and the release).
+
 ## Paused work and queue (2026-11-10, night)
 
 Everything is paused; Sega Rally 2 is done (below). Each workstream's notes live in its `sm3-builds/` folder (git-ignored); the
