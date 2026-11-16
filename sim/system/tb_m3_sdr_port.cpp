@@ -12,6 +12,11 @@
 // eight beats a line in critical-word-first order.
 //
 //   Vm3_sdr_tb TRANSACTIONS SEED [--fault]
+//
+// Built with -DSDR2 on m3_sdr2_tb (--prefix Vm3_sdr_tb): the second SDRAM's module whole (D-66), its port 0 alone
+// (--noq), ready the start-up probe's ok. --ff fills the device with FFFF first (unwritten memory), --nomod
+// answers every read FFFF (no module, the pull-ups), --float answers the last value driven (a floating bus),
+// --en0 holds SDRAM2_EN low: the last three must find the module missing (the run then FAILs, as a planted fault).
 #include "Vm3_sdr_tb.h"
 #include "verilated.h"
 #include "sdram_dev.h"
@@ -19,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <algorithm>
 
 static Vm3_sdr_tb *t;
 static sdram_dev sd;
@@ -27,10 +33,15 @@ static std::mt19937 rng;
 static bool q_on = true;
 static uint32_t q_n = 0;
 
+static int nomod = 0;          // SDR2: 1 no module (reads FFFF), 2 a floating bus (the last value driven)
+static uint16_t dq_last = 0;
 static void tick() {
-  t->sd_dq_i = sd.dq(cyc);
+  t->sd_dq_i = nomod == 1 ? 0xFFFF : nomod == 2 ? dq_last : sd.dq(cyc);
   t->clk = 0; t->eval();
-  sd.cmd(cyc, t->sd_cke, t->sd_cs_n, t->sd_ras_n, t->sd_cas_n, t->sd_we_n, t->sd_ba, t->sd_a, t->sd_dq_o);
+  if (nomod == 0) sd.cmd(cyc, t->sd_cke, t->sd_cs_n, t->sd_ras_n, t->sd_cas_n, t->sd_we_n, t->sd_ba, t->sd_a, t->sd_dq_o);
+#ifdef SDR2
+  if (t->sd_dq_oe) dq_last = t->sd_dq_o;
+#endif
   t->clk = 1; t->eval();
   cyc++;
   // the contention port: a request every so often, dropped at its acknowledge
@@ -64,17 +75,26 @@ static uint32_t ref_word(uint32_t a, bool swap) {
               : (uint32_t(ref[b + 3]) << 24) | (uint32_t(ref[b + 2]) << 16) | (uint32_t(ref[b + 1]) << 8) | ref[b];
 }
 
+static bool lw_fault = false;
 int main(int argc, char **argv) {
   long n = argc > 1 ? std::atol(argv[1]) : 20000;
   rng.seed(argc > 2 ? unsigned(std::atoi(argv[2])) : 1);
   bool fault = argc > 3 && !std::strcmp(argv[3], "--fault");
-  bool lw1 = false, seq = false, nowait = false; int idle_max = 3;   // --seq: half the line reads are of the line after the last (the read-ahead, R107)
+  bool lw1 = false, seq = false, nowait = false, en0 = false; int idle_max = 3;   // --seq: half the line reads are of the line after the last (the read-ahead, R107)
   for (int k = 3; k < argc; k++) {
+    if (!std::strcmp(argv[k], "--lat") && k + 1 < argc) sd.lat = std::atoi(argv[k + 1]);   // the device's CAS latency (the build's CL)
     if (!std::strcmp(argv[k], "--bxor")) sd.bxor = true;   // the build's BXOR (R107)
     if (!std::strcmp(argv[k], "--lw1")) lw1 = true;        // the build's LW1 (R107)
     if (!std::strcmp(argv[k], "--seq")) seq = true;
     if (!std::strcmp(argv[k], "--nowait")) nowait = true;
+    if (!std::strcmp(argv[k], "--lw-fault")) lw_fault = true;   // a planted fault: beat 3 of partial line writes checked as whole
     if (!std::strcmp(argv[k], "--idle") && k + 1 < argc) idle_max = std::atoi(argv[k + 1]);   // longer gaps: a read-ahead completes
+    if (!std::strcmp(argv[k], "--fault")) fault = true;   // (anywhere among the options)
+    if (!std::strcmp(argv[k], "--noq")) q_on = false;      // no second reader (SDR2: port 1 is tied off)
+    if (!std::strcmp(argv[k], "--ff")) std::fill(sd.m.begin(), sd.m.end(), uint16_t(0xFFFF));   // unwritten memory reads FFFF
+    if (!std::strcmp(argv[k], "--nomod")) nomod = 1;
+    if (!std::strcmp(argv[k], "--float")) nomod = 2;
+    if (!std::strcmp(argv[k], "--en0")) en0 = true;
   }
   t = new Vm3_sdr_tb;
   // a small working set (so reads hit earlier writes) spread over both chips
@@ -88,11 +108,35 @@ int main(int argc, char **argv) {
       ref[win[w] + a] = uint8_t(v); ref[win[w] + a + 1] = uint8_t(v >> 8);
     }
   t->rst_n = 0; t->s_req = 0; t->q_req = 0;
+#ifdef SDR2
+  t->en = !en0;
+#else
+  (void)en0;
+#endif
   for (int i = 0; i < 4; i++) tick();
   t->rst_n = 1;
+#ifdef SDR2
+  {
+    // the start-up probe: ok (ready) or missing, within the bring-up and eight accesses
+    long g = 0;
+    while (!t->ready && !t->missing) { tick(); if (++g > 200000) { std::printf("the probe never finished\nFAIL\n"); return 1; } }
+    std::printf("m3_sdr2's probe: %s after %llu clocks\n", t->ready ? "the module is there" : "MISSING", (unsigned long long)cyc);
+    if (!t->ready) {
+      // missing is sticky, ok stays low, and the OSD's message rises
+      long ir = 0;
+      for (int i = 0; i < 6000; i++) { tick(); ir += t->info_req; if (t->ready || !t->missing) { std::printf("ok rose or missing fell\nFAIL\n"); return 1; } }
+      std::printf("  missing held 6,000 clocks; info_req high %ld clocks of them\nFAIL (no module)\n", ir);
+      return 1;
+    }
+    // the probe's four words are at the work RAM's base, outside the bench's windows: they must be its patterns
+    // inverted (its second pass), in the device
+    static const uint16_t pat[4] = {0x5AA5, 0x3CC3, 0x0FF0, 0x9669};
+    for (int k = 0; k < 4; k++) if (sd.m[(0x6400000 >> 1) + k] != uint16_t(~pat[k])) { std::printf("probe word %d: %04X\nFAIL\n", k, sd.m[(0x6400000 >> 1) + k]); return 1; }
+  }
+#endif
   while (!t->ready) tick();
 
-  long bad = 0, proto = 0, nrd = 0, nwr = 0, nlr = 0, nlw = 0, nz = 0;
+  long bad = 0, proto = 0, nrd = 0, nwr = 0, nlr = 0, nlw = 0, nz = 0, nlwp = 0;
   uint64_t lat_sum = 0, lat_lr_first = 0, lat_lr_last = 0, n_fast = 0;   // n_fast: fills whose first beat came in 8 clocks (a read-ahead's)
   for (long i = 0; i < n && bad < 10 && proto < 10; i++) {
     int const kind = int(rng() % 4);
@@ -124,8 +168,12 @@ int main(int argc, char **argv) {
       ref_write(a, swap, wv, be);
       nwr++;
     } else if (kind == 3) {               // cast-out: beat k is word k
-      uint32_t beats[8];
+      uint32_t beats[8], lanes[8];
       for (int k = 0; k < 8; k++) beats[k] = rng();
+      // half the line writes in part (the D-cache's write-validate): random lanes a beat, none sometimes
+      bool const part = rng() & 1;
+      for (int k = 0; k < 8; k++) lanes[k] = !part ? 15 : (rng() % 4 == 0) ? 0 : (rng() & 15);
+      if (part) nlwp++;
       // the bus as m3_bus has it (study R107): s_wnext goes on to the master a clock later as
       // m_wnext, the master shows its next beat in the clock after that, and the bus registers it
       // into s_wdata, so the beat shown follows each s_wnext by two clocks. A beat is taken when
@@ -142,12 +190,13 @@ int main(int argc, char **argv) {
         if (wn) {
           if (k >= 8) { proto++; std::printf("a ninth s_wnext\n"); }
           if (!lw1 && sh != k) { proto++; if (proto < 10) std::printf("cast-out beat %d taken while beat %d is shown\n", k, sh); }
-          ref_write(a + 4 * (k & 7), swap, beats[k & 7], 15); k++;
+          ref_write(a + 4 * (k & 7), swap, beats[k & 7], (lw_fault && part && k == 3) ? 15 : lanes[k & 7]); k++;
         }
         tick();
         sh = n2 < 8 ? n2 : 7; n2 = n1; n1 += wn;
         if (k == 8) post++;
         t->s_wdata = (lw1 && post >= 2) ? uint32_t(rng()) : beats[sh];
+        t->s_wbe   = (lw1 && post >= 2) ? uint32_t(rng() & 15) : lanes[sh];
         if (++guard > 100000) { std::printf("cast-out stalls\n"); return 1; }
       }
       nlw++;
@@ -161,7 +210,7 @@ int main(int argc, char **argv) {
         if (k == 7) lat_lr_last += cyc - t0;
         uint32_t const wa = kind == 0 ? a : (a & ~31u) + 4 * ((crit + k) & 7);
         uint32_t exp = zero ? 0 : ref_word(wa, swap);
-        if (fault && i == n / 2) exp ^= 1;
+        if (fault && i >= n / 2) { exp ^= 1; fault = false; }   // the first read word from the half-way point (the planted fault)
         if (t->s_rdata != exp) {
           if (bad < 10) std::printf("txn %ld %s %s at %07X beat %d: %08X, expected %08X\n", i, kind == 0 ? "RD" : "LINE_RD",
                                     swap ? "byte" : "word", wa, k, t->s_rdata, exp);

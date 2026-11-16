@@ -73,6 +73,11 @@ set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_YC=1"
 # Disable ALSA audio output to save some resources
 set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_ALSA=1"
 
+# D-62: the framework's audio IIR filter switched off for the FPGA sound board's room.
+# sys/audio_out.sv carries Model 2's docs/framework-patches/audio-filter-disable.patch;
+# the MiSTer menu's audio filter presets have no effect on this core.
+set_global_assignment -name VERILOG_MACRO "MISTER_DISABLE_AUDIO_FILTER=1"
+
 source sys/sys.tcl
 # Dual SDRAM (D-26) stays off until the second SDRAM is fitted: the analog I/O
 # board is on the header and gives the 15 kHz analog video and audio (R150).
@@ -82,6 +87,29 @@ source sys/sys.tcl
 #source sys/sys_dual_sdram.tcl
 source sys/sys_analog.tcl
 source files.qip
+
+# The HPS command strobe (sys_top's gp_outr, the second stage of its GPO synchroniser, and rack): one register
+# each feeds every HPS-command register on the die (sys_top's video and audio settings, hps_io, both OSDs), from
+# one corner. Copies of no more than 16 loads each can sit beside their group; sys/ is unchanged. gp_outd, the
+# first stage, is not copied, so every copy samples one settled register.
+set_instance_assignment -name MAX_FANOUT 16 -to "gp_outr[*]"
+set_instance_assignment -name MAX_FANOUT 16 -to rack
+
+# The geometry's and the rasteriser's resets (m3_system's preserved copies of rst_s[2]; rst_geo alone fans out to
+# about 3,000 registers): copied at the same stage, at most 200 loads each, so every copy deasserts in the same
+# clock as the one it replaces (a reset tree, no stage added)
+set_instance_assignment -name MAX_FANOUT 200 -to "emu:emu|m3_system:sys3|rst_geo"
+set_instance_assignment -name MAX_FANOUT 200 -to "emu:emu|m3_system:sys3|rst_rast"
+set_instance_assignment -name MAX_FANOUT 200 -to "emu:emu|m3_system:sys3|rst_s[2]"
+# m3_system's step decodes, static while a game runs (registered from cfg_step, which changes only during a
+# download with the game in reset): copies at the same stage beside their users (step15 into r3d_texup's port
+# was 150 endpoints at 120 MHz in tz_base_s3)
+set_instance_assignment -name MAX_FANOUT 24 -to "emu:emu|m3_system:sys3|step15"
+set_instance_assignment -name MAX_FANOUT 24 -to "emu:emu|m3_system:sys3|step2"
+# The memory reset (Model3.sv's mem_rst_s[2], the third stage of the PLL-lock synchroniser): copies at the same
+# stage beside their loads, each sampling the settled second stage (tz3_base_s3: 3.5 ns of route into the SDRAM
+# port's read data enables; tclose3)
+set_instance_assignment -name MAX_FANOUT 48 -to "emu:emu|mem_rst_s[2]"
 set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
 set_global_assignment -name PRE_FLOW_SCRIPT_FILE "quartus_sh:sys/build_id.tcl"
 set_location_assignment PIN_U9 -to ADC_CONVST
@@ -274,6 +302,9 @@ set_instance_assignment -name ALLOW_SYNCH_CTRL_USAGE OFF -to *|SDRAM_*
 # synchronous clear and load, SDRAM_A[0-4] and [6-9] cannot pack into the I/O cells, and the board corrupts SDRAM
 # (study R101). Only sd_a: on the whole controller it unpacks the DQ input registers instead.
 set_instance_assignment -name ALLOW_SYNCH_CTRL_USAGE OFF -to "*|m3_system:sys3|m2_sdram:u_sdram|sd_a[*]"
+# The same for the second SDRAM's controller (the dual build's m3_sdr2, D-66): without it c125d_s1 left SDRAM2_A[*]
+# out of the I/O cells (18 x Warning 176279, as snd2's fits). Matches nothing in a single-SDRAM build.
+set_instance_assignment -name ALLOW_SYNCH_CTRL_USAGE OFF -to "*|m3_system:sys3|m3_sdr2:g_w2.u_sdr2|m2_sdram:u_sdram|sd_a[*]"
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to ADC_CONVST
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to ADC_SCK
 set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to ADC_SDI

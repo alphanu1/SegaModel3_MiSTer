@@ -292,7 +292,13 @@ module r3d_rast_store #(
 
   // the word as stored: word 3 becomes {0, word 1 [30:20], 0, word 3 [7], viewport, 0, word 3 [6:0]}
   wire [31:0] w3p = {1'b0, w1q, 5'd0, w_data[7], w_vp, 1'b0, w_data[6:5], w_vpv ? w_data[4:0] : 5'd0};
-  wire [31:0] wsd = (wk == 5'd3) ? w3p : w_data;
+  // (wk3 = wk == 3, a register kept with wk: the compare fanned out to 27 loads and on into the band RAMs' write
+  // data, R5's worst path in tz3_base_s3; tclose3. Asserted in W_REC, where it is read.)
+  logic       wk3;
+  wire [31:0] wsd = wk3 ? w3p : w_data;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && ws == W_REC && wk3 != (wk == 5'd3)) $fatal(1, "rast_store: wk3");
+`endif
   wire        wkeep = (wk != 5'd1) && (wk != 5'(H + 6));
   wire [11:0] frq = frow(w_data);
   // index stored: 0, -, 2, 1, [3], k - 1 for the vertices, -, k - 2 for the planes
@@ -423,7 +429,7 @@ module r3d_rast_store #(
         W_SWEEP: begin
           t_we <= 1'b1; t_wa <= tidx(wb, sw); t_wd <= '0;
           sw <= sw + 9'd1;
-          if (sw == 9'd383) begin wk <= '0; wbad <= 1'b0; ws <= W_REC; end
+          if (sw == 9'd383) begin wk <= '0; wk3 <= 1'b0; wbad <= 1'b0; ws <= W_REC; end
         end
         W_REC: begin
           if (w_valid) begin
@@ -435,9 +441,9 @@ module r3d_rast_store #(
             if (wk == 5'd3 && w_data[6]) wbad <= 1'b1;            // faces away (FACE_DROP = 0)
             if (wk == 5'(H + 1)) fy0 <= frq;
             if (wk == 5'(H + 5)) fy2 <= frq;
-            wk <= wk + 5'd1;
+            wk <= wk + 5'd1; wk3 <= wk == 5'd2;
             if (w_last) begin
-              wk <= '0; wbad <= 1'b0;
+              wk <= '0; wk3 <= 1'b0; wbad <= 1'b0;
               // stored words wk - 1 (wk the last word's index), beats half that, rounded up
               wnb <= 4'(wk >> 1);
               if (wbad || (w_data[6] && wk == 5'd3) || wk < 5'(H + 6)) n_drop <= n_drop + 16'd1;

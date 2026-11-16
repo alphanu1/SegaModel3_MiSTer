@@ -211,12 +211,19 @@ module ppc_icache
   logic [3:0][19:0] tg;
   assign tg = {tq1[19:0], tq1[39:20], tq0[19:0], tq0[39:20]};
 
-  // {mru[1:0], plru[2:0]} per set, read at the set whose tags are out
-  (* ramstyle = "MLAB, no_rw_check" *) logic [4:0] stm [0:NS-1];
+  // {mru[1:0], plru[2:0]} per set, read at the set whose tags are out: an M10K read at the tags' own read
+  // address (ta_rd, whose register is ta_idx), so its word is the set ta_idx names. The MLAB it replaces was
+  // read asynchronously at ta_idx and saw a write made on the edge that loaded ta_idx; the M10K gives the old
+  // word then, so that write is forwarded from registers (st_fwd below)
   logic        st_we;
   logic [IW-1:0] st_wa;
   logic [4:0]  st_wd;
-  always_ff @(posedge clk) if (st_we) stm[st_wa] <= st_wd;
+  logic [4:0]  st_q;
+  ppc_cache_ram #(.W(5), .D(NS)) u_st (.clk (clk), .we (st_we), .wa (st_wa), .wd (st_wd), .ra (ta_rd), .q (st_q));
+  logic        st_wv;
+  logic [IW-1:0] st_wq;
+  logic [4:0]  st_fd;
+  always_ff @(posedge clk) begin st_wv <= st_we; st_wq <= st_wa; st_fd <= st_wd; end
 
   // ================================================================ state
   logic        pend, p_unc;
@@ -268,7 +275,8 @@ module ppc_icache
   logic        fw_pend, fw2;                    // the fill's tag write: partner tag taken, then written
   logic [19:0] fw_otag;
   wire  [4:0]  stp_new = {stp_way, plru_touch(stp_st[2:0], stp_way)};
-  wire  [4:0]  st     = stm[ta_idx];
+  wire         st_fwd = st_wv && st_wq == ta_idx;     // the set was written on the edge that read it
+  wire  [4:0]  st     = st_fwd ? st_fd : st_q;
   logic [3:0]  hv, inv;
   wire  [19:0] cmp_tag = ta_look ? ta_exp : pa[31:12];
   always_comb
@@ -309,13 +317,16 @@ module ppc_icache
   always_ff @(posedge clk) if (!rst && pend && pa != pa_chk) $fatal(1, "icache pa against its start-only load");
 `endif
   wire         p_ui     = p_unc || (pend_new && (wi_q || pa[31:12] == RSV_TAG));
-  wire         chk      = pend && !p_ui && !p_line && ta_v && !ta_look && ta_idx == six(pa_e, pa[11:5]) && !t_haz && !wk_act;
+  // (while a request is pending the tags out are always pa's set, valid and not a lookahead: ta_rd reads pa's
+  // set in every pending cycle and the request's own set in the cycle it starts, asserted below; so chk does not
+  // compare ta_idx with pa, which was on the data RAMs' address and the state write: timing, tclose3)
+  wire         chk      = pend && !p_ui && !p_line && !t_haz && !wk_act;
   // p_ui without pa's reserved-page compare, for the data read address only (timing, study R104: pa ->
   // the 16 data RAMs' address was the system's worst I-cache path). The two differ only in a request's
   // first pending cycle for the reserved page, which is a single read: it never uses the data RAMs, and
   // p_unc holds it from the next cycle, so a read of pa + 1 there is never answered.
   wire         p_ui_a   = p_unc || (pend_new && wi_q);
-  wire         chk_a    = pend && !p_ui_a && !p_line && ta_v && !ta_look && ta_idx == six(pa_e, pa[11:5]) && !t_haz && !wk_act;
+  wire         chk_a    = pend && !p_ui_a && !p_line && !t_haz && !wk_act;
   wire         look     = !pend && ta_v && ta_look && kl_v && ta_idx == six(kl_e, kl[11:5] + 7'd1) && ta_exp == kl[31:12] &&
                           !t_haz && !wk_act;
   wire         fast     = i_req && i_seq && fs_q && !pend;
@@ -330,7 +341,8 @@ module ppc_icache
   logic [1:0]  pw_q;
   logic [19:0] ppa_q;
   wire         pre_take = PRE && i_pv && fast && !wk_act && !f_act && hid_ice;
-  wire         pfast    = PRE && i_req && i_pre && pre_q && !pend && ta_v && !ta_look && !t_haz && !wk_act && !f_act;
+  // (pre_q: the last edge read the tags at T's set, so they are valid and not a lookahead; asserted below)
+  wire         pfast    = PRE && i_req && i_pre && pre_q && !pend && !t_haz && !wk_act && !f_act;
   // each way's tag against the page, the stored way choosing last: the way
   // mux was in front of the compare, from the tag M10K into pend and nx (a
   // D-36 cached full build)
@@ -346,6 +358,11 @@ module ppc_icache
   // The read address and the data select depend on registers only; the
   // compare decides i_valid and the bookkeeping.
   logic        serve;                           // answer pa this cycle
+  // da_pq: da == dix(pa_e, pa[11:2]), while pending, as a register. While pending the data RAMs read pa, or pa + 1
+  // when sel_p (below); a request's first pending cycle follows rd_a = pa, or T + 1 after a pre-read that missed
+  // (pfast). So the compare's value is known an edge ahead from the selects (asserted below; timing, tclose3:
+  // da into serve_r, the kl touch and the data RAMs' address)
+  logic        da_pq;
   logic        serve_r;                         // ... decided from registers (no compare)
   logic [1:0]  src;                             // 0 kl_way, 1 mru, 2 m_rdata, 3 fb_d
   logic        start_fill, to_unc, chk_hit;
@@ -368,7 +385,7 @@ module ppc_icache
       if (p_ui_a) serve_r = (mp == MP_SRD) && m_rvalid;
       else if (p_line) begin
         if (pfw_q) serve_r = m_rvalid ? (beat && bw == pa[4:2]) : (fb_v && fb_w == pa[4:2]);
-        else serve_r = da == dix(pa_e, pa[11:2]) && da_av;
+        else serve_r = da_pq && da_av;
       end
     end
   end
@@ -382,7 +399,7 @@ module ppc_icache
     if (chk) begin
       if (any) begin
         chk_hit = 1'b1;
-        if (WAYPRED && hv[st[4:3]] && da == dix(pa_e, pa[11:2]) && da_av) serve = 1'b1;
+        if (WAYPRED && hv[st[4:3]] && da_pq && da_av) serve = 1'b1;
       end else if (hid_ilock) to_unc = 1'b1;
       else if (fill_ok) start_fill = 1'b1;
     end
@@ -407,27 +424,47 @@ module ppc_icache
   wire [8:0]  nx1_e = {nx1[11:5], nx1[4:3] + {1'b0, nx1[2]}};   // even-bank indices of nx + 1, nx + 2
   wire [8:0]  nx2_e = {nx2[11:5], nx2[4:3] + {1'b0, nx2[2]}};
   wire [31:2] pa1 = pa + 30'd1;
+  // (pend first: pre_take, pfast and fast all need !pend, and a request never comes while one is pending.
+  // In pfast i_addr is T, which the last edge read (da = dix(i_eix, i_addr[11:2]), asserted), so T + 1 is taken
+  // from da, a register, not from the core's i_addr through an adder: timing, tclose3)
+  wire          sel_p = serve_r || (chk_a && WAYPRED);
+  // (rd_x: the read address of a request, i_req and !pend taken as given, so the core's i_req is the last select
+  // and not inside fast's net (fo 69), which came after the core's fetch issue in tz3_b8_s3's C2 path; tclose3)
+  (* keep = 1 *) wire sq_a  = i_seq && fs_q;                                         // fast, given i_req && !pend
+  (* keep = 1 *) wire prt_a = PRE && i_pv && sq_a && !wk_act && !f_act && hid_ice;  // pre_take, given the same
+  (* keep = 1 *) wire pfs_a = PRE && i_pre && pre_q && !t_haz && !wk_act && !f_act; // pfast, given the same
+  logic [DW-1:0] rd_x;
+  logic          da_av_x;
+  wire [DW-1:0] da1   = dix(da[DW-1], da[9:0] + 10'd1);
   always_comb begin
-    if (pre_take)            rd_a = dix(i_pidx[12], i_pidx[11:2]);
-    else if (pfast)          rd_a = dix(i_eix, i_addr[11:2] + 10'd1);   // a miss is then served a cycle later
-    else if (fast)           rd_a = dix(nx_e, nxn[11:2]);
-    else if (i_req && !pend) rd_a = dix(i_eix, i_addr[11:2]);
-    else if (pend)           rd_a = (serve_r || (chk_a && WAYPRED)) ? dix(pa_e, pa1[11:2]) : dix(pa_e, pa[11:2]);
-    else                     rd_a = dix(nx_e, nx[11:2]);
+    if (prt_a)               rd_x = dix(i_pidx[12], i_pidx[11:2]);
+    else if (pfs_a)          rd_x = da1;                               // a miss is then served a cycle later
+    else if (sq_a)           rd_x = dix(nx_e, nxn[11:2]);
+    else                     rd_x = dix(i_eix, i_addr[11:2]);
+  end
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && i_req && !pend && (prt_a != pre_take || pfs_a != pfast || sq_a != fast)) $fatal(1, "ppc_icache: rd_x's selects");
+`endif
+  always_comb begin
+    if (pend)                rd_a = sel_p ? dix(pa_e, pa1[11:2]) : dix(pa_e, pa[11:2]);
+    else if (!i_req)         rd_a = dix(nx_e, nx[11:2]);
+    else                     rd_a = rd_x;
   end
   // da_av's next value for each candidate read address, chosen as rd_a is: through rd_a the
   // select (pfast from ta_idx's hazard compares) was in front of the fill-line compare and the
   // word's availability (the 110 MHz build's ta_idx into da_av, eight levels)
   // (the candidates; av() takes every input as an argument: Quartus 17 does not read a module's
   // signals inside a function)
-  wire [9:0] ip1_a = i_addr[11:2] + 10'd1;
   wire [9:0] pidx_a = i_pidx[11:2];
   wire [9:0] nxn_a = nxn[11:2], ia_a = i_addr[11:2], pa1_a = pa1[11:2], pa_a = pa[11:2], nx_a = nx[11:2];
   // (ISB: the set's EA[19] beside each; fe_c is f_e, or 0)
   wire       fe_c = ISB && f_e;
   wire       pe_c = ISB && i_pidx[12], ie_c = ISB && i_eix, nxe_c = ISB && nx_e, pae_c = ISB && pa_e;
   (* keep = 1 *) wire av_pidx = ave({f_line[31:12], pidx_a[9:3]}, pe_c,  pidx_a[2:0], f_act, f_line, fe_c, avail);
-  (* keep = 1 *) wire av_ip1  = ave({f_line[31:12], ip1_a[9:3]},  ie_c,  ip1_a[2:0],  f_act, f_line, fe_c, avail);
+  wire [9:0] da1_a = da1[9:0];
+  wire       de_c  = ISB && da1[DW-1];
+  (* keep = 1 *) wire av_ip1  = ave({f_line[31:12], da1_a[9:3]},  de_c,  da1_a[2:0],  f_act, f_line, fe_c, avail);
   (* keep = 1 *) wire av_nxn  = ave({f_line[31:12], nxn_a[9:3]},  nxe_c, nxn_a[2:0],  f_act, f_line, fe_c, avail);
   (* keep = 1 *) wire av_ia   = ave({f_line[31:12], ia_a[9:3]},   ie_c,  ia_a[2:0],   f_act, f_line, fe_c, avail);
   (* keep = 1 *) wire av_pa1  = ave({f_line[31:12], pa1_a[9:3]},  pae_c, pa1_a[2:0],  f_act, f_line, fe_c, avail);
@@ -435,12 +472,15 @@ module ppc_icache
   (* keep = 1 *) wire av_nx   = ave({f_line[31:12], nx_a[9:3]},   nxe_c, nx_a[2:0],   f_act, f_line, fe_c, avail);
   logic da_av_n;
   always_comb begin
-    if (pre_take)            da_av_n = av_pidx;
-    else if (pfast)          da_av_n = av_ip1;
-    else if (fast)           da_av_n = av_nxn;
-    else if (i_req && !pend) da_av_n = av_ia;
-    else if (pend)           da_av_n = (serve_r || (chk_a && WAYPRED)) ? av_pa1 : av_pa;
-    else                     da_av_n = av_nx;
+    if (prt_a)               da_av_x = av_pidx;
+    else if (pfs_a)          da_av_x = av_ip1;
+    else if (sq_a)           da_av_x = av_nxn;
+    else                     da_av_x = av_ia;
+  end
+  always_comb begin
+    if (pend)                da_av_n = sel_p ? av_pa1 : av_pa;
+    else if (!i_req)         da_av_n = av_nx;
+    else                     da_av_n = da_av_x;
   end
 `ifdef VERILATOR
   always_ff @(posedge clk)
@@ -451,10 +491,11 @@ module ppc_icache
   logic ta_k_look, ta_k_v;
   always_comb begin
     ta_k_look = 1'b0; ta_k_v = 1'b1;
-    if (pre_take)                 ta_rd = six(i_pidx[12], i_pidx[11:5]);
-    else if (pfast)               ta_rd = six(i_eix, i_addr[11:5]);  // (no lookahead this cycle)
-    else if (i_req && !fast && !pend)  ta_rd = six(i_eix, i_addr[11:5]);
-    else if (pend)                ta_rd = six(pa_e, pa[11:5]);
+    // (pend first, as rd_a; in pfast T's set is the one out, ta_idx, asserted)
+    if (pend)                     ta_rd = six(pa_e, pa[11:5]);
+    else if (pre_take)            ta_rd = six(i_pidx[12], i_pidx[11:5]);
+    else if (pfast)               ta_rd = ta_idx;                   // (no lookahead this cycle)
+    else if (i_req && !fast)      ta_rd = six(i_eix, i_addr[11:5]);
     else begin
       ta_rd = six(kl_e, kl[11:5] + 7'd1); ta_k_look = 1'b1; ta_k_v = kl_v && kl[11:5] != 7'd127;
     end
@@ -489,6 +530,7 @@ module ppc_icache
     if (!pend) begin pa <= i_addr[31:2]; pa_e <= ISB && i_eix; end
     da       <= rd_a;
     da_av    <= da_av_n;
+    da_pq    <= pend ? !sel_p : !pfast;
     ta_idx   <= ta_rd;
     ta_look  <= ta_k_look;
     ta_v     <= ta_k_v;
@@ -654,6 +696,15 @@ module ppc_icache
 
   assign i_idle = !pend && !f_act && mp_idle && !wk_act && !wk_req && tw_en_q == 2'd0;
 
+`ifdef VERILATOR
+  // the invariants the tclose3 forms rest on (chk, pfast, da_pq, rd_a / ta_rd in pfast)
+  always_ff @(posedge clk) if (!rst) begin
+    if (pend && (!ta_v || ta_look || ta_idx != six(pa_e, pa[11:5]))) $fatal(1, "ppc_icache: pending without pa's tags out");
+    if (pre_q && (!ta_v || ta_look)) $fatal(1, "ppc_icache: pre-read without its tags out");
+    if (pend && da_pq != (da == dix(pa_e, pa[11:2]))) $fatal(1, "ppc_icache: da_pq");
+    if (pfast && (ta_idx != six(i_eix, i_addr[11:5]) || da1 != dix(i_eix, i_addr[11:2] + 10'd1))) $fatal(1, "ppc_icache: pfast's T + 1");
+  end
+`endif
 `ifdef PPC_CACHE_SIM
   always_ff @(posedge clk) if (!rst) begin
     if (i_req && pend) $error("ppc_icache: request while one is outstanding");

@@ -49,6 +49,11 @@
 // AREA: no FIFO and no select on the engine's command port (DDR3's beats are the engine's
 // commands); fs and p 16 bits, the clear counted on p; the addresses the block's high bits and
 // the counters; no poll of the server; the engine's output is the audio.
+//
+// TIMING: the sample tick is a register (cyc's next value compared, not cyc); the sound port's write
+// is registered with fs as it stood, so a byte is filed a clock later with the same fs (the header,
+// which shares m_fs, does not start in that clock); the engine's channel is registered before the
+// down-mix, so the audio is loaded a clock later in the pop (8 ns, inside the sample it was made for).
 
 `timescale 1ns/1ps
 
@@ -118,12 +123,12 @@ module m3_sndbridge #(
 
   logic [PB-1:0] cyc;
   logic [EB-1:0] err;
-  logic          tick;
+  logic          tick;                                 // cyc == 0, as a register (its next value: cyc is 1)
   logic   [15:0] fs;
   // the bridge's own reset (wd_rst, below) leaves the sample clock and the sound port running
-  assign tick = cyc == '0;
   wire           carry = err >= EB'(MOD - RR);         // the fraction passes 1 this sample
   always_ff @(posedge clk) begin
+    tick <= !rst && cyc == PB'(1);                     // (rst, tick and sim_ff's jump all load cyc above 0)
     if (rst) begin
       cyc <= PB'(PER - 1); err <= '0; fs <= '0;
     end else if (tick) begin
@@ -201,7 +206,9 @@ module m3_sndbridge #(
     endcase
   end
   assign d_be = 8'hFF;
-  wire [16:0] mix = {f0[15], f0} + {e_q[17], e_q[17:2]};   // front + rear
+  logic [17:0] e_qr;                    // the engine's channel, a clock after e_q
+  logic  [1:0] sel_qq;
+  wire [16:0] mix = {f0[15], f0} + {e_qr[17], e_qr[17:2]};   // front + rear
   // times 2^(GAIN + vol) / 2 (floor), saturated: the sum sign-extended, shifted, and the bits above the
   // 16 kept checked against its sign
   localparam int XW = 17 + GAIN + 2;
@@ -210,10 +217,19 @@ module m3_sndbridge #(
   wire        ovf = mx[XW-1:16] != {(XW-16){mx[XW-1]}};
   wire [15:0] gq  = ovf ? {mx[XW-1], {15{!mx[XW-1]}}} : mx[16:1];
 
+  // the sound port's write, registered with fs as it stood (the byte filed a clock later, its fs the same)
+  logic        mw_r;
+  logic  [8:0] mb_r;
+  logic [15:0] mf_r;
+  always_ff @(posedge clk) begin
+    mw_r <= midi_we && !rst; mb_r <= {midi_data, midi_byte}; mf_r <= fs;
+    e_qr <= e_q; sel_qq <= sel_q;
+  end
+
   always_ff @(posedge clk) begin
     // the sound port: one byte held until it is out (the CPU waits 320 us between bytes); the MIDI ring
     // and fs run on through the bridge's own reset, so a session that starts later has every byte
-    if (!rst && midi_we && !m_full) begin m_full <= 1'b1; m_byte <= {midi_data, midi_byte}; m_fs <= fs; end
+    if (!rst && mw_r && !m_full) begin m_full <= 1'b1; m_byte <= mb_r; m_fs <= mf_r; end
     if (srst) begin
       // the bridge's own reset keeps p's high bits (p trails fs); the clear starts at slot D - 1 either way
       s <= S_CLR; p <= {rst ? P0[15:9] : p[15:9], 9'(D - 1)}; c <= '0; c_end <= '0; rec_ok <= 1'b0; retry <= 1'b0;
@@ -233,12 +249,14 @@ module m3_sndbridge #(
       // the header, the reads
       if (job == J_NONE) begin
         beat <= '0;
-        d_req <= s == S_CLR || m_full || hdr_pend || want_rec || want_cmd;
+        // (the header waits out the clock a registered byte is filed: m_fs is the byte's then, and a header
+        // starting in that clock would take fs a sample on into it)
+        d_req <= s == S_CLR || m_full || (hdr_pend && !mw_r) || want_rec || want_cmd;
         if (m_full) begin
           job <= J_MIDI; d_we <= 1'b1; d_blen <= 8'd1; d_addr <= BLOCK | 25'({7'd1, m_count[8:0]});
         end else if (s == S_CLR) begin
           job <= J_CLR; d_we <= 1'b1; d_blen <= 8'd64; d_addr <= BLOCK | 25'({1'b1, p[8:0], 6'd0});
-        end else if (hdr_pend) begin
+        end else if (hdr_pend && !mw_r) begin
           job <= J_HDR; d_we <= 1'b1; d_blen <= 8'd1; d_addr <= BLOCK; m_fs <= fs;
         end else if (want_rec) begin
           job <= J_REC; want_rec <= 1'b0; d_we <= 1'b0; d_blen <= 8'd37; d_addr <= BLOCK | 25'({1'b1, p[8:0], 6'd0});
@@ -288,13 +306,13 @@ module m3_sndbridge #(
         // the channels go out at the next tick, or at once if this sample is already late
         S_HOLD: if (tick || lag != '0) begin s <= S_POP; pop <= '0; end
         S_POP: begin
-          // the channels read in the order front L, rear L, front R, rear R (each a clock behind its
-          // select): (front + rear) / 2 a side, from the top 16 bits, with the gain
+          // the channels read in the order front L, rear L, front R, rear R (each two clocks behind its
+          // select, e_qr): (front + rear) / 2 a side, from the top 16 bits, with the gain
           pop <= pop + 3'd1;
           case (pop)
-            3'd1, 3'd3: f0 <= e_q[17:2];
-            3'd2: audio_l <= gq;
-            3'd4: begin audio_r <= gq; p <= p + 16'd1; s <= S_WAIT; pop <= '0; end
+            3'd2, 3'd4: f0 <= e_qr[17:2];
+            3'd3: audio_l <= gq;
+            3'd5: begin audio_r <= gq; p <= p + 16'd1; s <= S_WAIT; pop <= '0; end
             default: ;
           endcase
         end
@@ -318,15 +336,15 @@ module m3_sndbridge #(
   assign dbg_cyc   = DBG ? 16'(cyc) : 16'd0;
   assign dbg_fs    = DBG ? fs : 16'd0;
   assign dbg_p     = DBG ? p : 16'd0;
-  assign dbg_pop   = DBG ? s == S_POP && pop != 3'd0 : 1'b0;
-  assign dbg_ch    = DBG ? sel_q : 2'd0;
-  assign dbg_q     = DBG ? e_q : 18'd0;
+  assign dbg_pop   = DBG ? s == S_POP && pop >= 3'd2 : 1'b0;   // each channel as the down-mix takes it
+  assign dbg_ch    = DBG ? sel_qq : 2'd0;
+  assign dbg_q     = DBG ? e_qr : 18'd0;
   assign dbg_epoch = DBG ? epoch : 2'd0;
-  assign dbg_idle  = DBG ? job == J_NONE && !m_full && !hdr_pend && !midi_we &&
+  assign dbg_idle  = DBG ? job == J_NONE && !m_full && !hdr_pend && !midi_we && !mw_r &&
                            ((s == S_WAIT && (retry || !due)) || (s == S_HOLD && lag == '0)) : 1'b0;
 
   /* verilator lint_off UNUSEDSIGNAL */
-  wire _unused = &{1'b0, sim_ff, skip, e_d18, e_busy, e_ready, mx[0], d_wacc, d_dout[60:57], d_dout[40:24], d_dout[31:18], sel_q};   // writes are one beat, or the clear's constant
+  wire _unused = &{1'b0, sim_ff, skip, e_d18, e_busy, e_ready, mx[0], d_wacc, d_dout[60:57], d_dout[40:24], d_dout[31:18], sel_qq};   // writes are one beat, or the clear's constant
   /* verilator lint_on UNUSEDSIGNAL */
 
 endmodule

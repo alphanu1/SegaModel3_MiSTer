@@ -1,5 +1,76 @@
 # Handoff
 
+## Update (2026-11-16)
+
+One squashed commit on branch `sdram-130` (pushed, no PR yet) takes everything since 718e9e4 that the board build
+has. That is `sm3-builds/ddio/ddio-718e9e4.patch` (md5 99698145…) at 130 MHz with 3125 / 2885 ps, plus the study's
+D-59 to D-73 and R169 to R187 (there is no R181).
+
+**130 MHz is back on the new SDRAM modules** (R187). The SDRAM clock pins come from DDIO cells, each clocked by its own PLL output. The SDRAM interfaces are
+reported in every fit (`sdram_io.txt`). SU_PAIR and fix B are in.
+- **Model3.rbf on the board: `c130ddpa_s1`** (2629cdbc), dual, 130 MHz, outclk_2 3125 / outclk_3 2885 ps. No lockup in
+  VF3 (20 minutes of attract plus an in-game round), Scud Race or Daytona 2. Frame rate: Sega Rally 2 is mostly 30 in
+  game and 60 in attract, Scud Race has small drops to 30, Daytona 2 is 60 in attract and mostly 30 on track 1. Those
+  are CPU-bound; the next speed step is the CPU (the cpi3 items need about 110 ALM freed).
+- `c130ddpp_s1` (3365 / 3125) locked up in VF3. It is the same fit as (a), so the lockup was the SDRAM read timing,
+  not a clk_sys path. `c125ddpp_s1` (3500 / 3250 at 125) passed. At 125, 4000 ps does not work on the dual board
+  (D-72). The plain-DDIO builds put the second SDRAM about there and were not tried.
+- `c130ddpb_s1` (280a590d, 3365 / 2885, only SDRAM2 moved) also runs VF3, so the 130 MHz failure was the second
+  SDRAM's read. (a)'s 3125 ps stays the first SDRAM's default: its eye centre is nearer c125ddpp's. Model3.rbf on the
+  board is (a) again.
+- **Deferred (D-73): the old single module.** I am not stripping the MiSTer down to swap it back yet. The build
+  for it is `c130sd_s1` (ade245af, single, 130, 3125 ps). If VF3 locks there, the power-up read-phase sweep is next.
+- The plain-DDIO builds (`c125dd_s1`, `c130dd_s2`, `c125sd_s1`, `c125dd35_s1`) are reference only.
+- Under way: the CPU speed pass in `sm3-builds/cpuspeed/`. It measures Daytona 2's race frames against the vblank, then
+  cpi3's items with the fetch fix and a zero-cycle area pass to pay for them.
+
+## Update (2026-11-14), not committed
+
+Nothing new is committed or pushed since 718e9e4. The study's working tree carries D-59 to D-69. The R-entries
+below were drafts in `sm3-builds/` then; they are in the study since 2026-11-16.
+
+**The board** (MiSTer Pi R2, now 192.168.1.128):
+- Two new 128 MB SDRAM modules are fitted. The second sits where the analog board was; the analog board is off.
+- SW3 is ON and SW1 is OFF (SW1 had been routing HDMI audio to the user port).
+- MemTest256, built from source in `sm3-builds/memtest256`, reads 256 MB = 128 + 128. Slot 1 passes at 153 MHz, slot 2 at 157 MHz.
+- arcsnd is not in `user-startup.sh` and has to be started by hand after a boot.
+- `Model3.rbf` is `d130_s2_3728ac8d`.
+
+**130 MHz broke with the new modules, and the second SDRAM floating was the main cause** (`sm3-builds/cl3/NOTES.md`):
+- so130 (CL2) froze when the 3D started. b10 at 120 MHz worked.
+- CL3 (`cl3_130_s2`) changed nothing. That was a wrong turn: the SDRAM reads fine at CL2.
+- `d130` (so130 built as a dual-SDRAM core with the module held deselected) runs Scud, Daytona 2, Bass Fishing,
+  Spikeout, Lost World and Sega Rally 2 at 130. VF3 still freezes as its 3D starts; the cause is not found.
+- c125 (125 MHz everywhere) works.
+- A single build on a board that has the second SDRAM is therefore unsafe at 130 (D-67 amended).
+
+**Decisions D-62 to D-69, in the study table:**
+- D-62: sound into the FPGA if it fits, plus the audio-filter patch.
+- D-63: built for the second SDRAM.
+- D-64: a Step 1.x / 2.x split, Model3s1x and Model3s2x. It waits on the sound board.
+- D-65: the wide micro-ROM for m3_s68k.
+- D-66: the CPU's work RAM goes on the second SDRAM.
+- D-67: single builds use arcsnd, dual builds the FPGA, one MRA per game. Amended.
+- D-68: until the sound board fits, dual builds keep arcsnd and stay one core.
+- D-69: the target is a single core and a dual core at CPU 125 / rest 130, from a second PLL, with the RPE bug fixed first.
+
+**Drafts, all to revisit:**
+- R174, `cpi3`: CPI items 2 and 4 are built. Daytona 2 is −3.1% busy; it does not fit.
+  The VF3 2-word DMA difference is the game's own stfs/lfs round trip, not a core bug.
+- R175, `tclose3`: timing round 2, b10. Mean TNS is −11%; b10 is on the board.
+- R176, `snd`: FPGA sound priced; the opcode census; the filter patch is −470 ALM in its block.
+- R177, `s68k`: m3_s68k at 1,153 ALM, lock-step with fx68k on all ten programs.
+- R178, `snd2`: the FPGA sound board built and benched. It is about +5,750 ALM net and does not fit.
+- R179, `area3`: b4 is about −790 ALM needed. It also found the RPE bug.
+- R180, `split`: the Step 1.x / 2.x measurement, still running.
+- R182, `csplit2`: the split on b10. `cs2f_120_s1_c62b7c40` is CPU 120 / rest 130, dual, with the filter patch. It is not yet on the board.
+
+**Open:**
+- The RPE bug (`test_cpu --mis` seed 9). The first fix job was stopped by a safety filter before it finished.
+- VF3 at 130.
+- The FPGA sound board's room, about 2,500-3,500 ALM short per Step core.
+- The one-sample SCSP engine mismatch at extreme latency.
+
 ## Update (2026-11-12)
 
 `main` is e8a06ac, pushed: a `--no-ff` merge of `spikeout` (87e7f16), on top of 18026dd (README and LICENSE).
@@ -38,7 +109,9 @@ every game at 130 MHz. The full 130 build adbc4c0e is at `/media/fat/model3_back
 `_Arcade/cores/Model3.rbf.f130sr2`. arcsnd release 20261112 runs by hand.
 
 **Still queued:** the black quad in Spikeout, timing closure, Daytona 2's race, the Bass Fishing hiss, the 93 ms
-watchdog, the arcsnd PR to ppriest (waiting on longer testing; the draft needs Sega Rally 2, Spikeout and the release).
+watchdog; Lost World's guns from a Sinden, a mouse and a stick (D-61); edge smoothing as a post-pass on the finished
+picture (FXAA-like: 3-4 line buffers, about 4-5 M10K and a few hundred ALM; no room yet). Done since: the arcsnd PR is
+open (ppriest/MiSTer_ArcadeSoundServer#2, one commit 6c551fd, with the interrupt move for the Sinden driver's USB load).
 
 ## Paused work and queue (2026-11-10, night)
 

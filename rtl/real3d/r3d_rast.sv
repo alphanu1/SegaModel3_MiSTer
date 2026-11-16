@@ -229,7 +229,10 @@ module r3d_rast #(
   logic        [20:0] th4;                  // MIP: {highest level, K}
   logic        [31:0] tv [6];
   logic signed [8:0]  pe [4];
+`ifdef VERILATOR
+  // the planes held until t_go, as they were before R179: the old tables' words, for the check below
   logic signed [39:0] pc [4], pdx [4], pdy [4];
+`endif
   assign g_ready = !t_full;
   wire t_go;
   // the plane's slot: p, except an untextured triangle's shade (p = 1) into slot 3, where table 1's
@@ -267,8 +270,11 @@ module r3d_rast #(
           // an untextured triangle's u and v planes go into table 1 as zeros: cleared here, before its
           // planes arrive (its shade plane, plane 1, is written into slot 3, the textured shade's)
           if (hk == 3'd0 && !g_data[4]) begin
-            pe[1] <= '0; pc[1] <= '0; pdx[1] <= '0; pdy[1] <= '0;
-            pe[2] <= '0; pc[2] <= '0; pdx[2] <= '0; pdy[2] <= '0;
+            pe[1] <= '0; pe[2] <= '0;
+`ifdef VERILATOR
+            pc[1] <= '0; pdx[1] <= '0; pdy[1] <= '0;
+            pc[2] <= '0; pdx[2] <= '0; pdy[2] <= '0;
+`endif
           end
           if (hk == 3'd1) th1 <= g_data[31:0];
           if (hk == 3'd2) th2 <= g_data[31:0];
@@ -276,12 +282,16 @@ module r3d_rast #(
           if (hk == 3'd4) th4 <= g_data[20:0];
         end else if (g_tag <= 5'd5) tv[g_tag[2:0]] <= g_data[31:0];
         else if (g_tag >= 5'd8) begin                 // tag 8 + 4p + k: k 0 e, 1 c, 2 dx, 3 dy
+          // e waits here for its dx beat; c, dx and dy go into the tables as they come (below)
+          if (g_tag[1:0] == 2'd0) pe[g_ps] <= g_data[8:0];
+`ifdef VERILATOR
           case (g_tag[1:0])
-            2'd0: pe[g_ps] <= g_data[8:0];
+            2'd0: ;
             2'd1: pc[g_ps] <= g_data;
             2'd2: pdx[g_ps] <= g_data;
             default: pdy[g_ps] <= g_data;
           endcase
+`endif
         end
       end
     end
@@ -327,14 +337,36 @@ module r3d_rast #(
     .s_tag(f_stag), .s_tag_n(f_stag_n),
     .busy(f_busy));
 
-  // table Z: {Z kind, the 1/w plane} by tag, written at t_go, read registered at the tag the span
-  // register will hold, so its word is the span's whenever the Z walk takes it
-  (* ramstyle = "M10K, no_rw_check" *) logic [130:0] tabz [256];
+  // The plane words are written into tables Z and 1 at tag_n as they arrive (area, R179), not held in
+  // 426 registers until t_go: each table is split by field, so a beat writes its own block; e waits in pe
+  // for its dx beat ({dx, e} one word). An untextured triangle's u and v slots are cleared at its header's
+  // first beat (zeros, written). No beat comes while t_full (g_ready), so tag_n is the record's own tag
+  // from its first beat. The entry is written a record earlier than at t_go, so a pixel of the triangle
+  // 256 back at the same tag must not be read after the next record's first plane beat: the live tag
+  // span is measured below (VERILATOR), and the old tables are kept there and compared at every read
+  // that is used. The block count is the same: table Z four, table 1 ten.
+  wire        g_take = g_valid && g_ready;
+  wire        pw  = g_take && g_tag >= 5'd8 && g_tag != 5'd31;      // a plane's beat (slot g_ps, field g_tag[1:0])
+  wire        pclr = g_take && g_tag == 5'd31 && hk == 3'd0 && !g_data[4];
+  wire [39:0] wdm = pclr ? 40'd0 : g_data;
+  wire        wc = g_tag[1:0] == 2'd1, wx = g_tag[1:0] == 2'd2, wy = g_tag[1:0] == 2'd3;
+
+  // table Z: {Z kind, the 1/w plane} by tag, read registered at the tag the span register will hold, so
+  // its word is the span's whenever the Z walk takes it; the plane's c, dx, dy as they come, {Z kind, e}
+  // at t_go
+  (* ramstyle = "M10K, no_rw_check" *) logic [39:0] zc_m [256], zx_m [256], zy_m [256];
+  (* ramstyle = "M10K, no_rw_check" *) logic [10:0] zm_m [256];
+  logic [39:0]  zc_q, zx_q, zy_q;
+  logic [10:0]  zm_q;
   logic [130:0] tz_q;
   always_ff @(posedge clk) begin
-    if (t_go) tabz[tag_n] <= {kind_zk, pc[0], pdx[0], pdy[0], pe[0]};
-    tz_q <= tabz[f_stag_n];
+    if (pw && g_ps == 2'd0 && wc) zc_m[tag_n] <= g_data;
+    if (pw && g_ps == 2'd0 && wx) zx_m[tag_n] <= g_data;
+    if (pw && g_ps == 2'd0 && wy) zy_m[tag_n] <= g_data;
+    if (t_go) zm_m[tag_n] <= {kind_zk, pe[0]};
+    zc_q <= zc_m[f_stag_n]; zx_q <= zx_m[f_stag_n]; zy_q <= zy_m[f_stag_n]; zm_q <= zm_m[f_stag_n];
   end
+  assign tz_q = {zm_q[10:9], zc_q, zx_q, zy_q, zm_q[8:0]};
   always_comb begin
     {cur_zk, zc, zdx, zdy, ze} = tz_q;
     cur_tag = f_stag;
@@ -344,7 +376,15 @@ module r3d_rast #(
   // dx and dy [30:0], e 9), the 1/w plane's e, textured; MIP the LOD terms
   localparam int LW  = MIP ? 21 : 1;       // (one constant bit without MIP: no zero-width field)
   localparam int T1W = 3 * 111 + 9 + 1 + LW;
-  (* ramstyle = "M10K, no_rw_check" *) logic [T1W-1:0] tab1 [256];
+  // by field (R179): per slot 1-3 c, {dx, e}, dy as the beats come; {the 1/w plane's e, textured, LOD} at
+  // t_go
+  (* ramstyle = "M10K, no_rw_check" *) logic [39:0] c_m1 [256], c_m2 [256], c_m3 [256], x_m1 [256], x_m2 [256], x_m3 [256];
+  (* ramstyle = "M10K, no_rw_check" *) logic [30:0] y_m1 [256], y_m2 [256], y_m3 [256];
+  (* ramstyle = "M10K, no_rw_check" *) logic [9+1+LW-1:0] m_m [256];
+  logic [39:0] c_q1, c_q2, c_q3, x_q1, x_q2, x_q3;
+  logic [30:0] y_q1, y_q2, y_q3;
+  logic [9+1+LW-1:0] m_q;
+  wire w1 = pw && g_ps == 2'd1, w2 = pw && g_ps == 2'd2, w3 = pw && g_ps == 2'd3;
   // table 2, read as the pixel leaves them: the texture's words {page, x / 32,
   // y / 32, w, h, mirror u, mirror v, format}, the colour's {kind,
   // transparency, colour}, fog's {viewport, intensity}; then (study R135) the
@@ -355,26 +395,60 @@ module r3d_rast #(
     pl = {c, dx[30:0], dy[30:0], e};
   endfunction
   logic [7:0]     t1_ra, t2_ra;
-  logic [T1W-1:0] t1_q, t1_wd;
+  logic [T1W-1:0] t1_q;
   logic [T2W-1:0] t2_q;
-  always_comb begin
+  always_ff @(posedge clk) begin
     // the shade from slot 3; u and v from slots 1 and 2, zero for an untextured triangle (cleared at
     // its header), so no select is built here (it was 222 LUTs)
+    if ((w1 && wc) || pclr) c_m1[tag_n] <= wdm;
+    if ((w2 && wc) || pclr) c_m2[tag_n] <= wdm;
+    if (w3 && wc)           c_m3[tag_n] <= g_data;
+    if ((w1 && wx) || pclr) x_m1[tag_n] <= {wdm[30:0], pclr ? 9'd0 : pe[1]};
+    if ((w2 && wx) || pclr) x_m2[tag_n] <= {wdm[30:0], pclr ? 9'd0 : pe[2]};
+    if (w3 && wx)           x_m3[tag_n] <= {g_data[30:0], pe[3]};
+    if ((w1 && wy) || pclr) y_m1[tag_n] <= wdm[30:0];
+    if ((w2 && wy) || pclr) y_m2[tag_n] <= wdm[30:0];
+    if (w3 && wy)           y_m3[tag_n] <= g_data[30:0];
+    if (t_go) begin
+      m_m[tag_n]  <= {pe[0], th0[4], MIP ? LW'(th4) : LW'(0)};
+      tab2[tag_n] <= {th0[5], th1[25:20], th1[30:26], th0[8:6], th0[11:9], th0[16], th0[17], th0[14:12],
+                      kind, th0[26:21], th2[23:0], t_vp, t_fogint, k_ctr, t_am};
+    end
+    // (read on en_f only, at the pixel's tag, so a stall holds the word read: the M10Ks' read enable, where the
+    // stall's re-read at the held tag put en_f through a select in front of 20 blocks' addresses, R5's worst
+    // path at 120 MHz; tclose3. A held tag's entry is not rewritten while held, asserted below.)
+    if (en_f) begin
+      c_q1 <= c_m1[t1_ra]; c_q2 <= c_m2[t1_ra]; c_q3 <= c_m3[t1_ra];
+      x_q1 <= x_m1[t1_ra]; x_q2 <= x_m2[t1_ra]; x_q3 <= x_m3[t1_ra];
+      y_q1 <= y_m1[t1_ra]; y_q2 <= y_m2[t1_ra]; y_q3 <= y_m3[t1_ra];
+      m_q  <= m_m[t1_ra];
+      t2_q <= tab2[t2_ra];
+    end
+  end
+  // the old word's layout: pl(c, dx, dy, e) for slots 3, 1, 2, then the 1/w plane's e, textured, LOD
+  assign t1_q = {c_q3, x_q3[39:9], y_q3, x_q3[8:0], c_q1, x_q1[39:9], y_q1, x_q1[8:0],
+                 c_q2, x_q2[39:9], y_q2, x_q2[8:0], m_q};
+`ifdef VERILATOR
+  // the tables as they were (written whole at t_go), for the check at every used read (below)
+  logic [T1W-1:0] t1_wd;
+  always_comb begin
     t1_wd[T1W-1 -: 343] = {pl(pc[3], pdx[3], pdy[3], pe[3]),
                            pl(pc[1], pdx[1], pdy[1], pe[1]),
                            pl(pc[2], pdx[2], pdy[2], pe[2]),
                            pe[0], th0[4]};
     t1_wd[LW-1:0] = MIP ? LW'(th4) : '0;
   end
+  logic [130:0]   tabz [256];
+  logic [T1W-1:0] tab1 [256];
+  logic [130:0]   tzo_q;
   always_ff @(posedge clk) begin
     if (t_go) begin
+      tabz[tag_n] <= {kind_zk, pc[0], pdx[0], pdy[0], pe[0]};
       tab1[tag_n] <= t1_wd;
-      tab2[tag_n] <= {th0[5], th1[25:20], th1[30:26], th0[8:6], th0[11:9], th0[16], th0[17], th0[14:12],
-                      kind, th0[26:21], th2[23:0], t_vp, t_fogint, k_ctr, t_am};
     end
-    t1_q <= tab1[t1_ra];
-    t2_q <= tab2[t2_ra];
+    tzo_q <= tabz[f_stag_n];
   end
+`endif
 
   logic gen_carry;                          // a new generation waits for the next span
   always_ff @(posedge clk) begin
@@ -394,7 +468,7 @@ module r3d_rast #(
   // and its own assert), so the span test that was here (f_sx0 < f_sx1, a 9-bit compare from the edge's output
   // registers through f_sready into its row pipeline's advance and the ~500 enables behind m_load) passed every
   // span it saw. Without it the handshake is registers only (study R165).
-  wire  tq_full;
+  logic tq_full;
   assign f_sready = za_sready && !tq_full;
   wire  s_take = f_svalid && za_sready && !tq_full;
 `ifdef VERILATOR
@@ -412,7 +486,11 @@ module r3d_rast #(
   (* ramstyle = "MLAB, no_rw_check" *) logic [10:0] tq [8];
   logic [2:0]  tq_wp, tq_rp;
   logic [3:0]  tq_n;
-  assign tq_full = tq_n >= 4'd7;
+  // tq_full is tq_n >= 7, held as a register from tq_n's next value: f_sready, and through it the edge
+  // unit's ~500 enables, start at registers, not at the count's compare (the same value every clock)
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && tq_full != (tq_n >= 4'd7)) $fatal(1, "rast: tq_full is not tq_n >= 7");
+`endif
   wire  [10:0] tq_h = tq[tq_rp];
   logic        zs_ready, zfirst;
   // a skid between the Z walk and the Z band: the walk moves whenever the skid is
@@ -426,6 +504,7 @@ module r3d_rast #(
   logic [SKW-1:0] sk_d;
   wire         pair_take = pair_v && !sk_v;
   assign za_pready = pair_take;
+  wire  [3:0]  tq_n_n = tq_n + {3'd0, s_take} - {3'd0, pair_take && za_plast};
   wire  [SKW-1:0] up_d = {tq_h[10] && zfirst, za_py, za_px, za_pon, za_z0, za_z1, za_v0, za_v1, tq_h[9:8], tq_h[7:0]};
   wire  [SKW-1:0] zb_d = sk_v ? sk_d : up_d;
   wire         zb_v = sk_v || pair_v;
@@ -443,13 +522,14 @@ module r3d_rast #(
   end
   always_ff @(posedge clk) begin
     if (rst) begin
-      tq_wp <= '0; tq_rp <= '0; tq_n <= '0; gen_carry <= 1'b0; zfirst <= 1'b1;
+      tq_wp <= '0; tq_rp <= '0; tq_n <= '0; tq_full <= 1'b0; gen_carry <= 1'b0; zfirst <= 1'b1;
     end else begin
       if (t_go && t_gen) gen_carry <= 1'b1;
       if (s_take) begin tq[tq_wp] <= {gen_carry, cur_zk, cur_tag}; tq_wp <= tq_wp + 3'd1; gen_carry <= 1'b0; end
       if (pair_take && za_plast) tq_rp <= tq_rp + 3'd1;
       if (pair_take) zfirst <= za_plast;
-      tq_n <= tq_n + {3'd0, s_take} - {3'd0, pair_take && za_plast};
+      tq_n <= tq_n_n;
+      tq_full <= tq_n_n >= 4'd7;
     end
   end
 
@@ -515,7 +595,7 @@ module r3d_rast #(
   logic [8:0]  p_y, p_x;
   logic signed [41:0] p_o2;
   logic [7:0]  p_tag;
-  assign t1_ra = en_f ? h_tag : p_tag;
+  assign t1_ra = h_tag;
   always_ff @(posedge clk) begin
     if (rst) p_v <= 1'b0;
     else if (en_f) begin
@@ -560,7 +640,7 @@ module r3d_rast #(
   logic [5:0]  r_n;
   logic signed [8:0] r_eo;
   logic [3:0]  r_lv;
-  assign t2_ra = en_f ? n_tag[7:0] : r_tag;
+  assign t2_ra = n_tag[7:0];
   always_ff @(posedge clk) begin
     if (rst) r_v <= 1'b0;
     else if (en_f) begin
@@ -570,6 +650,41 @@ module r3d_rast #(
       r_r <= n_r; r_n <= n_n; r_eo <= n_eo; r_pos <= n_pos; r_lv <= MIP ? n_lv : 4'd0;
     end
   end
+`ifdef VERILATOR
+  logic [T1W-1:0] t1_chk;
+  logic [T2W-1:0] t2_chk;
+  always_ff @(posedge clk) begin
+    t1_chk <= tab1[en_f ? h_tag : p_tag];
+    t2_chk <= tab2[en_f ? n_tag[7:0] : r_tag];
+  end
+  always_ff @(posedge clk) if (!rst && ((p_v && t1_chk != t1_q) || (r_v && t2_chk != t2_q))) $fatal(1, "rast: table read on en_f");
+  // R179: tab1 above is the old table (written whole at t_go), so t1_chk also checks table 1 by field
+  // against it at every pixel; table Z by field against the old one at every span the Z walk takes
+  always_ff @(posedge clk) if (!rst && s_take && tz_q != tzo_q) $fatal(1, "rast: table Z by field against the old table");
+  // the live tag span: triangles since the one a read's tag names (its t_go), at each read that is used
+  // (table Z at s_take, table 1 at h_go, table 2 at n_valid && en_f). Tables Z and 1 are now written from
+  // the next record's first plane beat at the same tag, so a span of 256 (a read of the triangle 256
+  // back) would read new words; before R179 the margin was 256 + the record being received. Each new
+  // maximum is printed.
+  int unsigned tg_ser, tg_max;
+  int unsigned tg_gen [256];
+  always_ff @(posedge clk) begin
+    int unsigned az, a1, a2, am;
+    if (rst) begin tg_ser <= 0; tg_max <= 0; for (int i = 0; i < 256; i++) tg_gen[i] <= 0; end
+    else begin
+      if (t_go) begin tg_gen[tag_n] <= tg_ser; tg_ser <= tg_ser + 1; end
+      az = s_take ? tg_ser - tg_gen[f_stag] : 0;
+      a1 = h_go ? tg_ser - tg_gen[h_tag] : 0;
+      a2 = (n_valid && en_f) ? tg_ser - tg_gen[n_tag[7:0]] : 0;
+      am = (az > a1) ? az : a1; if (a2 > am) am = a2;
+      if (am > tg_max) begin
+        tg_max <= am;
+        $display("rast: live tag span %0d (Z %0d, table 1 %0d, table 2 %0d) at triangle %0d", am, az, a1, a2, tg_ser);
+      end
+      if (am >= 256) $fatal(1, "rast: a read of a tag 256 or more triangles back");
+    end
+  end
+`endif
   // table 2's fields
   wire        a_page = t2_q[71];
   wire [5:0]  a_tx = t2_q[70:65];
@@ -597,7 +712,19 @@ module r3d_rast #(
   // contour, level} at R. Ring B: the colour's {kind, transparency, colour, shade, fog intensity, alpha mode}.
   localparam int RAW = TSPLIT ? 8 + 8 + 8 + 3 + 1 : 21 + 21 + 23 + 1 + LVW, RBW = 3 + 6 + 24 + 32 + 5 + 4, RCW = 9 + 9 + 1;
   (* ramstyle = "M10K, no_rw_check" *) logic [RAW-1:0] ring_a [128];
-  (* ramstyle = "M10K, no_rw_check" *) logic [RBW-1:0] ring_b [128];
+  // (ring B in two arrays, bits [RBW-1:34] and [33:0]: the inversion bit, am[3] at bit 3, is used from the low
+  // array's output before its register (the cb stage below), so only that array's 34 output registers leave the
+  // M10K; one array of 74 lost all 74 and tz3_b2_s3 did not fit, 4,222 of 4,191 LABs; tclose3)
+  (* ramstyle = "M10K, no_rw_check" *) logic [RBW-35:0] ring_bh [128];
+  (* ramstyle = "M10K, no_rw_check" *) logic [33:0] ring_bl [128];
+  wire [RBW-1:0] rb_wd = {a_kind, a_trans, a_col, r_shade, a_fogint, a_am};
+  // (the low array holds the colour, shade[0], fog intensity and alpha mode, the high one kind, transparency and
+  // shade[31:1]: the colour is taken from the low array's output into cb_col beside cb_texel, so both 8 x 8
+  // products' operands can be the DSPs' own input registers; with the colour from ring B's output register the
+  // hop from the M10K into the DSP was 3.35 ns in tz3_b4_s3; tclose3)
+  function automatic logic [RBW-1:0] rb_cat(input logic [39:0] h, input logic [33:0] l);
+    rb_cat = {h[39:31], l[33:10], h[30:0], l[9:0]};
+  endfunction
   (* ramstyle = "M10K, no_rw_check" *) logic [RCW-1:0] ring_c [128];
   logic [6:0]     ra_a, ra_b, ra_c;
   logic [RAW-1:0] rq_a, ra_wd;
@@ -621,14 +748,15 @@ module r3d_rast #(
   end endgenerate
   always_ff @(posedge clk) begin
     if (r_go) begin
-      ring_b[pn] <= {a_kind, a_trans, a_col, r_shade, a_fogint, a_am};
+      ring_bh[pn] <= {rb_wd[73:65], rb_wd[40:10]};
+      ring_bl[pn] <= {rb_wd[64:41], rb_wd[9:0]};
       ring_c[pn] <= {r_x, r_y, r_ctr && (a_kind == K_CONTOUR)};
     end
     rq_a <= ring_a[ra_a];
     // ring B is read a cycle early, at the filter's next tag, and registered again, as D1 and D2 are: the
     // M10K's output ran through the kind's decode and the 8 x 8 product into b1 (two full fits at 110 MHz).
     // The entry was written at R, long before, and is not rewritten until its number comes round.
-    rq_bm <= ring_b[tb_ne];
+    rq_bm <= rb_cat(ring_bh[tb_ne], ring_bl[tb_ne]);
     rq_b <= rq_bm;
     rq_c <= ring_c[ra_c];
   end
@@ -788,14 +916,19 @@ module r3d_rast #(
   logic        cb_v;
   logic [6:0]  cb_n;
   logic [31:0] cb_texel;
+  logic [23:0] cb_col;
+  // (SMTX: the texel's RGB is inverted here, with the entry's inversion bit read from ring B as it goes into
+  // rq_b, and the colour unit is given am[3] = 0: the bit ran from ring B's output through the inversion into
+  // the colour unit's 8 x 8 products and on into b1, the design's worst Real3D path at 120 MHz; tclose3)
   always_ff @(posedge clk) begin
     if (rst) cb_v <= 1'b0; else cb_v <= tb_valid;
-    cb_n <= tb_n; cb_texel <= tb_texel;
+    cb_n <= tb_n; cb_texel <= {tb_texel[31:24], tb_texel[23:0] ^ {24{SMTX && rq_bm[3]}}};
+    cb_col <= rq_bm[64:41];
   end
 `ifdef VERILATOR
   logic [RBW-1:0] rq_bc;
   always_ff @(posedge clk) begin
-    rq_bc <= ring_b[ra_b];
+    rq_bc <= rb_cat(ring_bh[ra_b], ring_bl[ra_b]);
     if (!rst && cb_v && rq_b != rq_bc) $fatal(1, "rast: ring B read early");
   end
 `endif
@@ -806,8 +939,8 @@ module r3d_rast #(
   r3d_rast_colour #(.TW(7), .SMTX(SMTX)) u_col (
     .clk, .rst, .en(1'b1),
     .i_valid(cb_v), .i_tag(cb_n), .i_kind(rq_b[RBW-1 -: 3]), .i_texel(cb_texel),
-    .i_color(rq_b[64:41]), .i_trans(rq_b[70:65]), .i_shade(rq_b[40:9]),
-    .i_fogint(rq_b[8:4]), .i_am(rq_b[3:0]), .i_fc(rq_d1[23:0]), .i_fs({{4{rq_d1[37]}}, rq_d1[37:24]}), .i_fp(rq_d2),
+    .i_color(cb_col), .i_trans(rq_b[70:65]), .i_shade(rq_b[40:9]),
+    .i_fogint(rq_b[8:4]), .i_am({1'b0, rq_b[2:0]}), .i_fc(rq_d1[23:0]), .i_fs({{4{rq_d1[37]}}, rq_d1[37:24]}), .i_fp(rq_d2),
     .o_valid(co_v), .o_tag(co_n), .o_ok(co_ok), .o_zw(co_zw), .o_fbv(co_fbv), .o_fb(co_fb), .o_rgb(co_rgb));
 
   // ring C a cycle on: the pixel's place; the contour verdict

@@ -128,7 +128,14 @@ module r3d_geo
   // the ROM with the set-up kernels (r3d_ucode_su). SO_M10K: the set-up output
   // memory in block RAM (else MLAB).
   parameter bit SETUP_OUT  = 1'b0,
-  parameter bit SO_M10K    = 1'b1
+  parameter bit SO_M10K    = 1'b1,
+  // SU_PAIR (study R185): when the engine is granted to the set-up machine with both staging halves closed (the
+  // same kind) and both set-up output halves free, one kernel sets up both groups (SETUP44 / SETUP22, 168 / 119
+  // clocks for 2 x 116 / 2 x 110). The first group's operations sit at the single kernel's cycles, so its half
+  // goes to the emitter (and its staging half back to the staging machine) at the clock a single kernel's would;
+  // the second group's operations fill the cycles left, and its addresses carry bit 6, which selects the other
+  // half. 0: one group a kernel, as before.
+  parameter bit SU_PAIR    = 1'b1
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -519,7 +526,8 @@ module r3d_geo
       .ra({e_tbank, sa_addr[4:3], sa_addr[1:0]}), .rq(tn_q));
     logic [PQA-1:0] pq_ra;
     if (SETUP_OUT) begin : g_pqs
-      assign pq_ra = {e_cls == 2'd3, e_pbuf, sa_addr[4:3], sa_addr[1:0]};
+      // SU_PAIR: a set-up kernel's address bit 6 is the other staging half (no other class reads that high)
+      assign pq_ra = {e_cls == 2'd3, e_pbuf ^ (SU_PAIR && e_cls == 2'd3 && sa_addr[6]), sa_addr[4:3], sa_addr[1:0]};
     end else begin : g_pqn
       assign pq_ra = {e_pbuf, sa_addr[4:3], sa_addr[1:0]};
     end
@@ -569,7 +577,7 @@ module r3d_geo
       .wd(sw_data[gl]), .ra(po_ra), .rq(po_q[gl]));
     // SETUP_OUT: the set-up kernel's results, a 32-word slot a lane in each of two halves
     if (SETUP_OUT) begin : g_so
-      r3d_ram #(.W(32), .A(6), .SYNC(1'b1), .BLOCK(SO_M10K)) u_so (.clk, .we(sw_we[gl] && e_cls == 2'd3), .wa({e_sbuf, sw_addr[4:0]}),
+      r3d_ram #(.W(32), .A(6), .SYNC(1'b1), .BLOCK(SO_M10K)) u_so (.clk, .we(sw_we[gl] && e_cls == 2'd3), .wa({e_sbuf ^ (SU_PAIR && sw_addr[6]), sw_addr[4:0]}),
         .wd(sw_data[gl]), .ra(so_ra), .rq(so_q[gl]));
     end else begin : g_noso
       assign so_q[gl] = 32'd0;
@@ -1091,6 +1099,21 @@ module r3d_geo
   logic        skb;                       // the next half to set up
   logic        so_set, so_setb, so_clr, so_clrb;
   logic [2:0]  so_setn;
+  logic        s_pair, s_half;            // SU_PAIR: this kernel sets up both halves; the first half handed on
+  logic [7:0]  s_cyc;                     // clocks in K_RUN
+  // a set-up kernel of length L (gen_ucode's cycles) leaves K_RUN at s_cyc = L + SU_EXIT: the start, the
+  // ROM's first fetch and busy's fall (r3d_vpu)
+  localparam int SU_EXIT = 2;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && SETUP_OUT && kst == K_RUN && !vk_busy && !vk_start && !s_pair &&
+        s_cyc != (g_tex[skb] ? 8'(LEN_SETUP4 + SU_EXIT) : 8'(LEN_SETUP2 + SU_EXIT)))
+      $fatal(1, "r3d_geo: a single set-up kernel left K_RUN at %0d, not its length + SU_EXIT", s_cyc);
+  // and nothing is written into a pair's first output half after it was handed on
+  always_ff @(posedge clk)
+    if (!rst && SU_PAIR && s_half && kst == K_RUN && e_cls == 2'd3 && sw_we != '0 && !sw_addr[6])
+      $fatal(1, "r3d_geo: a set-up write into the first half after it was handed on");
+`endif
   logic [1:0]  so_full;                  // a set-up output half with results the emitter has not sent
   logic [2:0]  so_n [2];
   // triangle queue: {textured, cull flag, inverted copy, polygon}
@@ -1261,7 +1284,7 @@ module r3d_geo
       cu_v <= 1'b0; f_tclr <= 1'b0; f_tset <= 1'b0; tbuf_m <= 1'b0; vr_go <= 1'b0; f_cwe <= 1'b0;
       pq_wea <= '0; pq_web <= '0;
       s_st <= S_IDLE; kst <= K_IDLE; s_req <= 1'b0; s_pop <= 1'b0; s_dv <= 1'b0; sl <= '0; sg <= 1'b0; s_gtex <= 1'b0;
-      skb <= 1'b0; stg_busy <= '0; so_set <= 1'b0; tq_we <= 1'b0; tq_wp <= '0;
+      skb <= 1'b0; stg_busy <= '0; so_set <= 1'b0; s_pair <= 1'b0; s_half <= 1'b0; s_cyc <= '0; tq_we <= 1'b0; tq_wp <= '0;
     end else begin
       w_start <= 1'b0; vk_start <= 1'b0; cr_in <= 1'b0; sq_in <= 1'b0; cu_v <= 1'b0; f_init <= 1'b0;
       f_tclr <= 1'b0; f_tset <= 1'b0; f_cwe <= 1'b0;
@@ -2105,14 +2128,35 @@ module r3d_geo
         case (kst)
           K_IDLE: if (stg_busy[skb] && !so_full[skb]) begin s_req <= 1'b1; kst <= K_OWN; end
           K_OWN: if (own_s) begin
-            s_entry <= g_tex[skb] ? K_SETUP4 : K_SETUP2; vk_cls <= 2'd3; k_pbuf <= skb; k_sbuf <= skb;
-            vk_start <= 1'b1; kst <= K_RUN;
+            // SU_PAIR: the other half closed too, of the same kind, and its output half sent: both in one kernel
+            if (SU_PAIR && stg_busy[!skb] && !so_full[!skb] && g_tex[!skb] == g_tex[skb]) begin
+              s_entry <= g_tex[skb] ? K_SETUP44 : K_SETUP22; s_pair <= 1'b1;
+            end else begin
+              s_entry <= g_tex[skb] ? K_SETUP4 : K_SETUP2; s_pair <= 1'b0;
+            end
+            vk_cls <= 2'd3; k_pbuf <= skb; k_sbuf <= skb;
+            vk_start <= 1'b1; kst <= K_RUN; s_cyc <= '0; s_half <= 1'b0;
           end
-          K_RUN: if (!vk_busy && !vk_start) begin
-            s_req <= 1'b0; vk_cls <= 2'd0;
-            so_set <= 1'b1; so_setb <= skb; so_setn <= g_n[skb];
-            stg_busy[skb] <= 1'b0; skb <= !skb;
-            kst <= K_REL;
+          K_RUN: begin
+            s_cyc <= s_cyc + 8'd1;
+            // a pair's first half: done at the clock a single kernel of its kind leaves K_RUN (its operations at the
+            // single's cycles), so it is handed on then, as a single's would be
+            if (s_pair && !s_half && s_cyc == (g_tex[skb] ? 8'(LEN_SETUP4 + SU_EXIT) : 8'(LEN_SETUP2 + SU_EXIT))) begin
+              so_set <= 1'b1; so_setb <= skb; so_setn <= g_n[skb];
+              stg_busy[skb] <= 1'b0; s_half <= 1'b1;
+            end
+            if (!vk_busy && !vk_start) begin
+              s_req <= 1'b0; vk_cls <= 2'd0;
+              if (s_pair) begin
+                // the second half; the next to set up is skb again
+                so_set <= 1'b1; so_setb <= !skb; so_setn <= g_n[!skb];
+                stg_busy[!skb] <= 1'b0;
+              end else begin
+                so_set <= 1'b1; so_setb <= skb; so_setn <= g_n[skb];
+                stg_busy[skb] <= 1'b0; skb <= !skb;
+              end
+              kst <= K_REL;
+            end
           end
           default: if (!own_s) kst <= K_IDLE;
         endcase
@@ -2568,28 +2612,48 @@ module r3d_geo
   logic [4:0]  tc_pmsb;           // its leading one
   logic [7:0]  tc_peb;            // the exponent base
   // the byte's 1/255 product as a table of the byte (study R109): k255 is a function of eight bits, so
-  // only the sign and the byte are registered, and the 256 words are constants (folded at synthesis;
-  // kept in logic, not a block RAM). The product's add, the shift, the round and the pack ran tq_w ->
-  // tc_k -> xb_data and ts_wn over two cycles.
+  // only the sign and the byte are registered, and the 256 words are constants. The product's add,
+  // the shift, the round and the pack ran tq_w -> tc_k -> xb_data and ts_wn over two cycles.
+  // R109 kept the words in logic; they are now one M10K (area, R179): the word is read with the
+  // byte's next value and the enable tc_km had, so the block's address register stands where tc_km
+  // stood (output unregistered) and tc_kq is the same word in the same clock. Quartus 17 infers the
+  // ROM only in this form (q <= rom[a]); with an explicit address register it built logic. Entry 0
+  // holds 0, and the byte is 0 only as it is (the ambient or the specular shade), whose sign is 0, so
+  // the old zero test is not needed (asserted against the old form below).
   logic        tc_ks;
-  logic [7:0]  tc_km;
-  (* romstyle = "logic" *) logic [30:0] k255t [256];
-  genvar gk;
-  generate for (gk = 0; gk < 256; gk = gk + 1) begin : g_k255t
-    wire [31:0] kw = k255(1'b0, 8'(gk));
-    assign k255t[gk] = kw[30:0];
-  end endgenerate
+  logic        tc_ken;            // the byte is loaded (tc_km's enable)
+  logic        tc_kfix;           // the byte as it is (the ambient, or the specular fixed shade)
+  logic [7:0]  tc_kb, tc_kn;      // the byte; the table's next address (tc_km's D)
+  logic [30:0] tc_kr;             // the table's word (the block's output)
+  (* romstyle = "M10K" *) logic [30:0] k255t [256];
+  initial for (int i = 0; i < 256; i++) k255t[i] = 31'(k255(1'b0, 8'(i)));   // the sign bit, 0 here, dropped
+  always_comb begin
+    tc_ken  = tq_v || amb_ld;
+    tc_kb   = amb_ld ? amb_b : tq_w[7:0];
+    tc_kfix = amb_ld || (tq_fw && tq_spec);
+    // |2b + 1| of the signed byte b: 2b + 1 is odd, so -(2b + 1) is {~b, 1}
+    // in nine bits, and its low eight bits are {~b[6:0], 1}; no subtract
+    // (the subtract's carry chain made this the slowest path at -40C)
+    tc_kn   = tc_kfix ? tc_kb : {tc_kb[6:0] ^ {7{tc_kb[7]}}, 1'b1};
+  end
+  always_ff @(posedge clk) if (!rst && tc_ken) tc_kr <= k255t[tc_kn];
+  logic [31:0] tc_kq;             // k255(tc_ks, byte): the staged normal or fixed shade, or the ambient
+  assign tc_kq = {tc_ks, tc_kr};
 `ifdef VERILATOR
   logic [31:0] tc_wpc;            // the one-cycle conversion, for the check
   logic [31:0] tc_kchk;           // k255 as functions, for the table's check
   logic        tc_kv;
+  // the old form, kept for the check: the byte registered, the table in logic, the zero test after it
+  logic [7:0]  tc_km;
+  always_ff @(posedge clk) if (!rst && tc_ken) tc_km <= tc_kn;
+  wire [31:0]  tc_kow = k255(1'b0, tc_km);
+  wire [31:0]  tc_kqo = (tc_km == 8'd0) ? 32'd0 : {tc_ks, tc_kow[30:0]};
   always_ff @(posedge clk) begin
     if (rst) tc_kv <= 1'b0; else if (tq_v || amb_ld) tc_kv <= 1'b1;
     if (!rst && tc_kv && tc_kq != tc_kchk) $fatal(1, "geo: the k255 table");
+    if (!rst && tc_kv && tc_kq != tc_kqo) $fatal(1, "geo: the k255 M10K against the table in logic");
   end
 `endif
-  logic [31:0] tc_kq;             // k255(tc_ks, tc_km): the staged normal or fixed shade, or the ambient
-  assign tc_kq = (tc_km == 8'd0) ? 32'd0 : {tc_ks, k255t[tc_km]};
   // vertex slots by reference: eight raw-word entries, MAME's prev[k] is entry
   // pmap[k] and the polygon's vertex[k] entry cmap[k]. A reuse copies the
   // reference, not the words; a new vertex takes an entry no other cur slot
@@ -2715,17 +2779,11 @@ module r3d_geo
       // the 1/255 product of one byte: the F word's fixed shade (b / 255 with
       // the specular bit, else (2b + 1) / 255), the normal byte, or in M_VPW
       // the ambient byte (the decoder is idle there, M_VPD)
-      if (tq_v || amb_ld) begin
-        logic [7:0] kb;
-        kb = amb_ld ? amb_b : tq_w[7:0];
-        // |2b + 1| of the signed byte b: 2b + 1 is odd, so -(2b + 1) is {~b, 1}
-        // in nine bits, and its low eight bits are {~b[6:0], 1}; no subtract
-        // (the subtract's carry chain made this the slowest path at -40C)
-        if (amb_ld || (tq_fw && tq_spec)) begin tc_ks <= 1'b0; tc_km <= kb; end
-        else begin tc_ks <= kb[7]; tc_km <= {kb[6:0] ^ {7{kb[7]}}, 1'b1}; end
+      if (tc_ken) begin
+        // the byte into the table's read (tc_kr, above); the sign here
+        tc_ks <= tc_kfix ? 1'b0 : tc_kb[7];
 `ifdef VERILATOR
-        if (amb_ld || (tq_fw && tq_spec)) tc_kchk <= k255(1'b0, kb);
-        else tc_kchk <= k255(kb[7], {kb[6:0] ^ {7{kb[7]}}, 1'b1});
+        tc_kchk <= k255(tc_kfix ? 1'b0 : tc_kb[7], tc_kn);
 `endif
       end
       if (tq_v) begin

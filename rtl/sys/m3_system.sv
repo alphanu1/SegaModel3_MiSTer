@@ -144,6 +144,11 @@ module m3_system
   parameter bit          SDR_PAIR    = 1'b0,
   parameter bit          SDR_RA      = 1'b0,
   parameter bit          SDR_PW      = 1'b0,
+  // CPU_WV       the D-cache's write-validate (ppc_dcache WV, study D-60): a store miss to work RAM allocates
+  //              without reading the line, and a cast-out writes only the bytes written
+  parameter bit          CPU_WV      = 1'b1,
+  // CPU_RPE      a data micro-TLB miss refetched as its translation starts, not after it (ppc_core RPE, D-60)
+  parameter bit          CPU_RPE     = 1'b1,
   parameter bit          SDR_RA_CONF = 1'b0,            // SDR_RA: arm only on a stream seen (m3_sdr_port RA_CONF)
   // ---- the CPU's miss path, clocks taken out (study R112; all 0: as it was)
   //   BUS_FAST     m3_bus: the CPU's work-RAM reads go to the port from B_IDLE (m3_bus FAST)
@@ -182,7 +187,12 @@ module m3_system
   parameter bit          BR_SEC      = 1'b1,
   parameter bit          BR_BUS      = 1'b1,
   //   BR_LD        m3_loader: the destinations' fields wired from the drain's registers (m3_loader OWIRE)
-  parameter bit          BR_LD       = 1'b1
+  parameter bit          BR_LD       = 1'b1,
+  // ---- D-66 / D-68: W2 puts the CPU's work RAM (the bus's work-RAM transactions, both masters') on the second
+  //   SDRAM (m3_sdr2, its own m2_sdram on the sd2_* pins, the CPU's port at priority), at the same byte address; the
+  //   game is held in reset until its start-up probe passes. 0: work RAM on the first SDRAM, the sd2_* outputs
+  //   idle (Model3.sv does not use them), as before
+  parameter bit          W2          = 1'b0
 ) (
   input  logic        clk,
   input  logic        mem_rst_n,
@@ -203,6 +213,18 @@ module m3_system
   output logic [15:0] sd_dq_o,
   output logic        sd_dq_oe,
   input  logic [15:0] sd_dq_i,
+
+  // W2: the second SDRAM (its pins; SDRAM2_EN), and its probe for the OSD
+  input  logic        sd2_en,
+  input  logic [2:0]  sd2_rd_lat_sel, // its read capture (m2_sdram rd_lat_sel), as rd_lat_sel is the first's
+  output logic        sd2_cs_n, sd2_ras_n, sd2_cas_n, sd2_we_n,
+  output logic [1:0]  sd2_ba,
+  output logic [12:0] sd2_a,
+  output logic [15:0] sd2_dq_o,
+  output logic        sd2_dq_oe,
+  input  logic [15:0] sd2_dq_i,
+  output logic        sd2_missing,   // the probe found no second SDRAM: the game stays in reset (sticky)
+  output logic        sd2_info_req,  // hps_io info_req for the OSD's message
 
   // DDR3 (the framework's DDRAM port), and the gate on it (R71)
   input  logic        ddr_ok,
@@ -290,8 +312,9 @@ module m3_system
   // reset
   // ===========================================================================
   logic loader_busy /* verilator public_flat_rd */;
+  logic sd2_ok;                      // W2: the second SDRAM's probe passed (1 without W2)
   logic [2:0] rst_s = 3'b111;
-  always_ff @(posedge clk) rst_s <= {rst_s[1:0], reset || !mem_rst_n || !rom_loaded || loader_busy};
+  always_ff @(posedge clk) rst_s <= {rst_s[1:0], reset || !mem_rst_n || !rom_loaded || loader_busy || !sd2_ok};
   wire rst = rst_s[2];
   // copies of rst_s[2] for the geometry and the rasteriser, the same function and timing, kept apart
   // (preserve) so each block's reset fans out from a flip-flop of its own (rst_s[2] into the
@@ -418,6 +441,7 @@ module m3_system
   logic [1:0][1:0]  m_cmd;
   logic [1:0][31:0] m_addr, m_wdata;
   logic [1:0][3:0]  m_be;
+  logic [1:0][3:0]  m_wbe;                // a line write's beat lanes (the D-cache's write-validate; the 53C810's are whole)
   logic [31:0]      m_rdata;
   logic             sn_req, sn_inv, sn_ack;
   logic [31:5]      sn_addr;
@@ -437,9 +461,9 @@ module m3_system
   localparam bit FB_ON  = FBUSY   && !RELEASE;
   localparam bit XC_ON  = XCAP    && OV_ON;
 
-  ppc_cpu #(.PVR(PVR), .PVR2(PVR2), .ISB(ISB)) u_cpu (
+  ppc_cpu #(.PVR(PVR), .PVR2(PVR2), .ISB(ISB), .WV(CPU_WV), .RPE(CPU_RPE)) u_cpu (
     .clk, .rst(rst_cpu), .pvr_alt(step2),
-    .m_req(m_req[0]), .m_cmd(m_cmd[0]), .m_addr(m_addr[0]), .m_be(m_be[0]), .m_wdata(m_wdata[0]),
+    .m_req(m_req[0]), .m_cmd(m_cmd[0]), .m_addr(m_addr[0]), .m_be(m_be[0]), .m_wdata(m_wdata[0]), .m_wbe(m_wbe[0]),
     .m_ack(m_ack[0]), .m_wnext(m_wnext[0]), .m_rvalid(m_rvalid[0]), .m_rdata,
     // the D-cache snoop (D-41): the 53C810's RAM accesses, from m3_bus
     .sn_req, .sn_addr, .sn_inv, .sn_ack,
@@ -524,10 +548,14 @@ module m3_system
   logic        s_req, s_swap, s_zero, s_ack, s_wnext, s_rvalid, s_idle;
   logic        s_x, sp_ack, sp_rvalid, xc_ack, xc_rvalid;     // R170: a read of a bank in the extra memory, to m3_xcrom
   logic [31:0] sp_rdata, xc_rdata;
+  logic        s_w2, sp_wnext, w2_ack, w2_wnext, w2_rvalid;   // W2: a work-RAM transaction, to the second SDRAM (m3_sdr2)
+  logic [31:0] w2_rdata;
   logic [1:0]  s_cmd;
   logic [AW:0] s_sa;
   logic [3:0]  s_be;
   logic [31:0] s_wdata, s_rdata;
+  logic [3:0]  s_wbe;
+  assign m_wbe[1] = 4'hF;
   logic        io_sel, io_we;
   logic [3:0]  io_off;
   logic [7:0]  io_wbyte, io_rbyte, io_pa;
@@ -537,6 +565,7 @@ module m3_system
   logic [14:0] tg_pal_addr;
   logic [15:0] tg_pal_wdata;
   logic        ln_start;
+  logic        ln_vis;                       // ln < 384, registered with ln (m3_bus's tile-generator timing)
   logic [9:0]  ln;
   logic [7:0]  irq_state, irq_enable, crom_bank;
   logic [23:0] n_submit, n_cull_lo, n_cull_hi, n_poly, n_tex, n_vrom;
@@ -576,8 +605,16 @@ module m3_system
   // count each of them kept, from the game's reset
   localparam int SCW = $clog2(CLK_HZ);
   logic [SCW-1:0] sec_cnt;
-  wire            sec_tick = BR_SEC && (sec_cnt == SCW'(CLK_HZ - 1));
+  // (sec_tick a register, set from the count's last value but one: the 27-bit compare ran into the RTC's digits in
+  // m3_bus, the bus's worst path at 120 MHz in tz3_base_s3; tclose3. It equals sec_cnt == CLK_HZ - 1, asserted.)
+  logic           sec_tick;
+  always_ff @(posedge clk)
+    if (rst) sec_tick <= 1'b0;
+    else sec_tick <= BR_SEC && !sec_tick && (sec_cnt == SCW'(CLK_HZ - 2));
   always_ff @(posedge clk) if (rst || sec_tick) sec_cnt <= '0; else sec_cnt <= sec_cnt + 1'd1;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && sec_tick != (BR_SEC && (sec_cnt == SCW'(CLK_HZ - 1)))) $fatal(1, "m3_system: sec_tick registered");
+`endif
 `ifdef VERILATOR
   // the counter m3_bus's rtc_pre and m3_fps's tcnt each were (reset with rst, CLK_HZ - 1 then 0): sec_tick is its wrap
   logic [SCW-1:0] sec_chk;
@@ -587,9 +624,10 @@ module m3_system
   end
 `endif
 
+  logic       tg_nw;                      // a write into the name table (the bus's tr_nw; R103, R179)
   m3_bus #(.AW(AW), .SDR_CROM(SDR_CROM), .SDR_FIXED(SDR_FIXED), .SDR_BACKUP(SDR_BACKUP), .SDR_RAM(SDR_RAM),
            .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P), .TGT(TG_TIMING), .TG_MHZ(CLK_MHZ),
-           .C106_M10K(BR_C106), .OWIRE(BR_BUS), .WD_DEC(BR_BUS)
+           .C106_M10K(BR_C106), .OWIRE(BR_BUS), .WD_DEC(BR_BUS), .W2(W2)
 `ifdef M3_STEP2_BUS
            , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ), .EXT_SEC(BR_SEC)
 `endif
@@ -599,25 +637,25 @@ module m3_system
     .step2, .fixed8, .crom_slot(crom_map[3:0]), .crom_zero(crom_map[5]), .crom_x(crom_map[4]), .s_x,
     .sec_req, .sec_we, .sec_addr, .sec_be, .sec_wdata, .sec_ack, .sec_rdata,
 `endif
-    .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
+    .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_wbe, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
     .sn_req, .sn_addr, .sn_inv, .sn_ack,
-    .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata,
+    .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_wbe, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_w2,
     .sc_req, .sc_we, .sc_addr, .sc_be, .sc_wdata, .sc_ack, .sc_rdata, .sc_win_en, .sc_win_base,
     .cf_req, .cf_we, .cf_idx, .cf_be, .cf_wdata, .cf_ack, .cf_rdata, .scsi_irq,
     .io_sel, .io_we, .io_off, .io_wbyte, .io_rbyte,
     .tg_reg_we, .tg_reg_addr, .tg_reg_wdata, .tg_pal_we, .tg_pal_addr, .tg_pal_wdata,
-    .ln_start, .ln, .ext_int,
+    .ln_start, .ln, .ln_vis, .ext_int,
     .irq_state_o(irq_state), .irq_enable_o(irq_enable), .crom_bank_o(crom_bank),
     .n_submit, .n_cull_lo, .n_cull_hi, .n_poly, .n_tex, .n_vrom, .n_unmapped, .last_unmapped,
     .pingpong_o(pingpong), .pingpong_i(r3_pingpong), .h_go, .h_rdy, .h_we, .h_addr, .h_wdata, .h_rv, .h_rdata,
     .r3d_cfg0, .r3d_cfg1, .r3d_cfg2,
     .jt_wr, .jt_wdata, .jt_busy, .jt_tdo, .jt_cfg_we, .jt_cfg0, .jt_cfg1, .jt_cfg2,
     .snd_we, .snd_data, .snd_byte,
-    .tr_v, .tr_master, .tr_we, .tr_addr, .tr_be, .tr_data);
+    .tr_v, .tr_master, .tr_we, .tr_addr, .tr_be, .tr_data, .tr_nw(tg_nw));
 
   m3_sdr_port #(.AW(AW), .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .RA(SDR_RA), .RA_TOP(SDR_VRAM), .RA_CONF(SDR_RA_CONF), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ), .PW_DLY(SDR_PW_DLY)) u_sport (
     .clk, .rst(!mem_rst_n), .ra_clr(rst),
-    .s_req(s_req && !s_x), .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack(sp_ack), .s_wnext, .s_rvalid(sp_rvalid),
+    .s_req(s_req && !s_x && !s_w2), .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_wbe, .s_ack(sp_ack), .s_wnext(sp_wnext), .s_rvalid(sp_rvalid),
     .s_rdata(sp_rdata), .s_idle,
     .p_req(p_req[0]), .p_we(p_we[0]), .p_addr(p_addr[0]), .p_din(p_din[0]), .p_be(p_be[0]), .p_long(p_long[0]),
 `ifdef M3_R3B
@@ -628,9 +666,33 @@ module m3_system
 
   // R170: the bus's SDRAM port answers from m3_sdr_port, or from m3_xcrom for a bank in the extra memory (s_x,
   // registered in the bus with the transaction; m3_xcrom's word is zero outside its s_rvalid)
-  assign s_ack    = sp_ack | xc_ack;
-  assign s_rvalid = sp_rvalid | xc_rvalid;
-  assign s_rdata  = s_x ? xc_rdata : sp_rdata;
+  assign s_ack    = sp_ack | xc_ack | w2_ack;
+  assign s_wnext  = sp_wnext | w2_wnext;
+  assign s_rvalid = sp_rvalid | xc_rvalid | w2_rvalid;
+  assign s_rdata  = s_x ? xc_rdata : (W2 && s_w2) ? w2_rdata : sp_rdata;
+
+  // D-66 / D-68: the second SDRAM, the CPU's work RAM (W2)
+  generate if (W2) begin : g_w2
+    logic sd2_ok_q;
+    m3_sdr2 #(.AW(AW), .CLK_MHZ(CLK_MHZ), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .PROBE_SA(SDR_RAM),
+              .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ),
+              .PW_DLY(SDR_PW_DLY), .BXOR(SDR_BXOR), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdr2 (
+      .clk, .mem_rst_n, .ra_clr(rst), .en(sd2_en), .ok(sd2_ok_q), .missing(sd2_missing), .info_req(sd2_info_req),
+      .s_req(s_req && s_w2), .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_wbe,
+      .s_ack(w2_ack), .s_wnext(w2_wnext), .s_rvalid(w2_rvalid), .s_rdata(w2_rdata),
+      .rd_lat_sel(sd2_rd_lat_sel), .sd_cs_n(sd2_cs_n), .sd_ras_n(sd2_ras_n), .sd_cas_n(sd2_cas_n), .sd_we_n(sd2_we_n),
+      .sd_ba(sd2_ba), .sd_a(sd2_a), .sd_dq_o(sd2_dq_o), .sd_dq_oe(sd2_dq_oe), .sd_dq_i(sd2_dq_i));
+    assign sd2_ok = sd2_ok_q;
+  end else begin : g_now2
+    assign sd2_ok = 1'b1; assign sd2_missing = 1'b0; assign sd2_info_req = 1'b0;
+    assign w2_ack = 1'b0; assign w2_wnext = 1'b0; assign w2_rvalid = 1'b0; assign w2_rdata = '0;
+    // the pins as d130 held them: deselected (NOP), DQ not driven
+    assign {sd2_cs_n, sd2_ras_n, sd2_cas_n, sd2_we_n} = 4'b1111;
+    assign sd2_ba = '0; assign sd2_a = '0; assign sd2_dq_o = '0; assign sd2_dq_oe = 1'b0;
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire _unused_w2 = &{1'b0, sd2_en, sd2_dq_i, s_w2, sd2_rd_lat_sel};
+    /* verilator lint_on UNUSEDSIGNAL */
+  end endgenerate
 
   // the cabinet (m3_inputs): the sticks, triggers and paddle registered once here, beside the logic they feed
   // (Model 2 R842: hps_io's analog outputs straight into the steering block failed clk_sys there)
@@ -945,6 +1007,7 @@ module m3_system
   always_ff @(posedge clk) begin
     ln_start <= ce_pix && hcnt == 10'd655;
     ln <= (vcnt == 10'd423) ? 10'd0 : vcnt + 10'd1;
+    ln_vis <= ((vcnt == 10'd423) ? 10'd0 : vcnt + 10'd1) < 10'd384;
   end
 
   // tile generator: at the start of the horizontal blank of line L, the line
@@ -968,7 +1031,7 @@ module m3_system
   logic [15:0] tg_ovr_n;
   always_ff @(posedge clk) if (rst) tg_ovr_n <= '0; else if (tg_swap && tg_busy) tg_ovr_n <= tg_ovr_n + 16'd1;
 
-  logic       t_long, tg_ninv, tg_nw;     // R103: the name row buffer's eight-word reads and its emptying
+  logic       t_long, tg_ninv;            // R103: the name row buffer's eight-word reads and its emptying
   logic [5:0] tg_ncnt;
   m3_tilegen #(.AW(AW), .VBASE(AW'(SDR_VRAM >> 1))) u_tg (
     .clk, .rst_n(!rst), .ready(tg_ready),
@@ -985,7 +1048,8 @@ module m3_system
   // R103: a write to the name tables (F10F8000-F10FFFFF, either master) empties the tile generator's name row
   // buffer, at the bus's acknowledge and again 64 clocks later, when the posted write has surely reached SDRAM
   // (a refetch in between could otherwise read the old word and keep it)
-  assign tg_nw = tr_v && tr_we && (tr_addr[31:15] == {12'hF10, 5'h1F});
+  // tg_nw: a write into the name table (F10F8000-F10FFFFF), the bus's tr_nw (R179: it was formed here from
+  // tr_v, tr_we and tr_addr[31:15], which kept the trace's address registers in the release; the same pulse)
   always_ff @(posedge clk) begin
     if (rst) tg_ncnt <= '0;
     else if (tg_nw) tg_ncnt <= 6'd63;

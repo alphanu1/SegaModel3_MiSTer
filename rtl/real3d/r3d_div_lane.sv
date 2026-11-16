@@ -25,6 +25,7 @@ module r3d_div_lane (
   input  logic        clk,
   input  logic        rst,
   input  logic        start,      // load; ignored while busy
+  input  logic        hold,       // q is still to be read: it holds while idle (else q and r follow the load)
   input  logic [53:0] n,          // dividend bits, next at [53]
   input  logic [31:0] r0,         // initial remainder, < d
   input  logic [31:0] d,          // sampled at start
@@ -48,14 +49,20 @@ module r3d_div_lane (
 
   assign busy = k_r != 5'd0;
 
+  // q and r take the load's values in every idle cycle where q is not still to be read (hold), so at a start
+  // they hold them as before; only k_r waits on start. A start never comes with hold (the caller takes a
+  // division only once the last is read). start ran into q's 54 enables a lane through the front's t_go, the
+  // rasteriser front's worst path at 120 MHz (tclose3).
   always_ff @(posedge clk) begin
     if (rst) begin
       k_r <= 5'd0;
-    end else if (start && !busy) begin
-      r   <= r0;
-      q   <= 54'd0;
-      k_r <= nb2;
-    end else if (busy) begin
+    end else if (!busy) begin
+      if (!hold) begin
+        r <= r0;
+        q <= 54'd0;
+      end
+      if (start) k_r <= nb2;
+    end else begin
       logic [32:0] t1, t2;
       t1 = step(r, n_r[53], d_r);
       t2 = step(t1[31:0], n_r[52], d_r);
@@ -71,6 +78,10 @@ module r3d_div_lane (
   always_ff @(posedge clk)
     if (!busy) begin n_r <= n; d_r <= d; end
     else n_r <= {n_r[51:0], 2'b00};
+
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && start && !busy && hold) $fatal(1, "div_lane: a start while q is held");
+`endif
 
   // a 33-bit {r, b} is kept in 32 bits: r < d < 2^32 and the step's result is
   // either r'' < d or the shifted r, whose top bit is lost only when 2 r + b

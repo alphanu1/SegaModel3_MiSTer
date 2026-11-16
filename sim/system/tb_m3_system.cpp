@@ -91,6 +91,15 @@ struct Rec { uint32_t frame, pc, addr; uint8_t kind, size, master, pad; uint64_t
 
 static Vm3_system *t;
 static sdram_dev sd;
+// D-66 / D-68 (--w2, a W2 build): the second SDRAM at the sd2_* pins, the CPU's work RAM (0x6400000-0x6BFFFFF, the
+// same byte addresses); unwritten words read FFFF (--sd2-zero: zero, as the first SDRAM's work RAM starts here, the
+// image ending below it). --sd2-missing: no module (every read FFFF), --sd2-en0: SDRAM2_EN low. --max-cycles N ends
+// a run after N clocks (a dual model with no module holds the game in reset, so no frame ever ends)
+static sdram_dev sd2;
+static bool w2 = false, sd2_zero = false;
+static int sd2_nomod = 0;
+static uint64_t max_cycles = 0;
+static sdram_dev &mem_of(uint32_t sa) { return (w2 && sa >= 0x6400000 && sa < 0x6C00000) ? sd2 : sd; }
 static uint64_t cyc;
 
 // DDR3 at the framework's DDRAM pins (64-bit words from the core's base)
@@ -118,8 +127,10 @@ static Prof2 p2;
 // the SDRAM when m3_sdr_port takes its next write: the port takes the beats as shown
 struct LwCheck {
   bool on = false; uint64_t n = 0, bad = 0, lost = 0;
-  uint32_t a[2] = {}; int k[2] = {}; bool act[2] = {}, req_d[2] = {}; uint32_t bt[2][8] = {};
+  uint32_t a[2] = {}; int k[2] = {}; bool act[2] = {}, req_d[2] = {}; uint32_t bt[2][8] = {}, bm[2][8] = {};
   std::map<uint32_t, std::vector<uint32_t>> got;   // line (CPU address) -> its beats, as handed over
+  std::map<uint32_t, std::vector<uint32_t>> gotm;  // and their lanes (m_wbe, the D-cache's write-validate)
+  uint64_t part = 0, beats0 = 0;
   uint8_t st_d = 0; uint32_t sa = 0; bool sw = false;
 };
 static LwCheck lwc;
@@ -172,7 +183,12 @@ int main(int argc, char **argv) {
     else if (a == "--tgw") tgw = true;
     else if (a == "--prof") prof = true;
     else if (a == "--check-lw") lwc.on = true;
-    else if (a == "--sdr-bxor") sd.bxor = true;   // the build's SDR_BXOR (R107): the device array takes the bank hash back
+    else if (a == "--w2") w2 = true;
+    else if (a == "--sd2-missing") sd2_nomod = 1;
+    else if (a == "--sd2-en0") sd2_nomod = 2;
+    else if (a == "--sd2-zero") sd2_zero = true;
+    else if (a == "--max-cycles") max_cycles = std::strtoull(nx().c_str(), nullptr, 0);
+    else if (a == "--sdr-bxor") sd.bxor = sd2.bxor = true;   // the build's SDR_BXOR (R107): the device array takes the bank hash back
     else if (a == "--prof2") { p2.f = std::fopen(nx().c_str(), "w"); p2.header(); }
     else if (a == "--tb-fast") tb_fast = true;
     else if (a == "--tb-fast-pc") tb_pc = uint32_t(std::strtoul(nx().c_str(), nullptr, 16));
@@ -184,6 +200,10 @@ int main(int argc, char **argv) {
     else if (a == "--ddr-busy") dd.busy_pct = std::atoi(nx().c_str());
     else if (a == "--ddr-lat") { dd.lat_lo = std::atoi(nx().c_str()); dd.lat_hi = std::atoi(nx().c_str()); }
   }
+  std::fill(sd2.m.begin(), sd2.m.end(), uint16_t(sd2_zero ? 0 : 0xFFFF));   // the second SDRAM's array before the run
+  if (w2 && lwc.on) { std::fprintf(stderr, "--check-lw reads the first SDRAM's port: not with --w2\n"); return 2; }
+  if (w2) std::printf("W2: the CPU's work RAM on the second SDRAM%s%s\n", sd2_nomod == 1 ? " (no module)" : sd2_nomod == 2 ? " (SDRAM2_EN low)" : "",
+                      sd2_zero ? ", starting at zero" : ", starting at FFFF");
   std::vector<uint8_t> img;
   {
     std::FILE *f = std::fopen(img_fn.c_str(), "rb");
@@ -208,6 +228,8 @@ int main(int argc, char **argv) {
   t = new Vm3_system;
   auto tick = [&]() {
     t->sd_dq_i = sd.dq(cyc);
+    t->sd2_dq_i = sd2_nomod ? 0xFFFF : sd2.dq(cyc);
+    t->sd2_en = sd2_nomod != 2;
     // DDR3: this cycle's BUSY and read beat
     t->DDRAM_BUSY = int(dd.rng() % 100) < dd.busy_pct;
     t->DDRAM_DOUT_READY = 0;
@@ -218,6 +240,7 @@ int main(int argc, char **argv) {
     }
     t->clk = 0; t->eval();
     sd.cmd(cyc, t->sd_cke, t->sd_cs_n, t->sd_ras_n, t->sd_cas_n, t->sd_we_n, t->sd_ba, t->sd_a, t->sd_dq_o);
+    if (!sd2_nomod) sd2.cmd(cyc, 1, t->sd2_cs_n, t->sd2_ras_n, t->sd2_cas_n, t->sd2_we_n, t->sd2_ba, t->sd2_a, t->sd2_dq_o);
     if (!t->DDRAM_BUSY && t->mem_rst_n) {
       if (t->DDRAM_WE) {
         if (dd.wr_left == 0) { dd.wr_addr = t->DDRAM_ADDR; dd.wr_left = t->DDRAM_BURSTCNT ? t->DDRAM_BURSTCNT : 256; }
@@ -238,6 +261,7 @@ int main(int argc, char **argv) {
       auto *q = t->rootp;
       for (int m = 0; m < 2; m++) {
         bool const rq = (q->m3_system__DOT__m_req >> m) & 1;
+          lwc.bm[m][lwc.k[m] & 7] = (q->m3_system__DOT__m_wbe >> (4 * m)) & 15;
         if (rq && !lwc.req_d[m] && ((q->m3_system__DOT__m_cmd >> (2 * m)) & 3) == 1) {
           lwc.act[m] = true; lwc.k[m] = 0; lwc.a[m] = uint32_t(q->m3_system__DOT__m_addr >> (32 * m)) & ~31u;
         }
@@ -246,7 +270,19 @@ int main(int argc, char **argv) {
           lwc.bt[m][lwc.k[m]++ & 7] = uint32_t(q->m3_system__DOT__m_wdata >> (32 * m));
           if (lwc.k[m] == 8) {
             lwc.act[m] = false;
-            if (lwc.a[m] < 0x00800000) lwc.got[lwc.a[m]] = std::vector<uint32_t>(lwc.bt[m], lwc.bt[m] + 8);
+            bool pt = false; for (int b = 0; b < 8; b++) { pt |= lwc.bm[m][b] != 15; lwc.beats0 += lwc.bm[m][b] == 0; }
+            lwc.part += pt;
+            if (lwc.a[m] < 0x00800000) {
+              // a line in part over one written whole and not yet checked: the bytes it leaves are the earlier's
+              auto it = lwc.got.find(lwc.a[m]);
+              std::vector<uint32_t> w(lwc.bt[m], lwc.bt[m] + 8), mk(lwc.bm[m], lwc.bm[m] + 8);
+              if (it != lwc.got.end())
+                for (int b = 0; b < 8; b++) {
+                  uint32_t lm = 0; for (int l = 0; l < 4; l++) if (mk[b] & (8 >> l)) lm |= 0xFFu << (24 - 8 * l);
+                  w[b] = (it->second[b] & ~lm) | (w[b] & lm); mk[b] |= lwc.gotm[lwc.a[m]][b];
+                }
+              lwc.got[lwc.a[m]] = w; lwc.gotm[lwc.a[m]] = mk;
+            }
           }
         }
       }
@@ -260,10 +296,11 @@ int main(int argc, char **argv) {
           for (int b = 0; b < 8; b++) {
             uint32_t const sa = 0x6400000 + e.first + 4 * b;
             uint32_t const v = uint32_t(sd.m[sa >> 1]) | (uint32_t(sd.m[(sa >> 1) + 1]) << 16);   // (the array is by address)
-            if (v != e.second[b]) { if (lwc.bad++ < 10) std::printf("check-lw: line %08X beat %d: SDRAM %08X, handed over %08X\n", e.first, b, v, e.second[b]); }
+            uint32_t lm = 0; for (int l = 0; l < 4; l++) if (lwc.gotm[e.first][b] & (8 >> l)) lm |= 0xFFu << (24 - 8 * l);
+            if ((v & lm) != (e.second[b] & lm)) { if (lwc.bad++ < 10) std::printf("check-lw: line %08X beat %d: SDRAM %08X, handed over %08X lanes %X\n", e.first, b, v, e.second[b], lwc.gotm[e.first][b]); }
           }
         }
-        lwc.got.clear();
+        lwc.got.clear(); lwc.gotm.clear();
       }
       lwc.st_d = st;
     }
@@ -289,7 +326,7 @@ int main(int argc, char **argv) {
 
   // power-on
   t->mem_rst_n = 0; t->reset = 0; t->ioctl_download = 0; t->ioctl_wr = 0; t->ioctl_index = 0;
-  t->rd_lat_sel = 2; t->overlay_en = 0; t->fps_en = 0; t->tb_fast = 0; t->ddr_ok = 1;
+  t->rd_lat_sel = 2; t->sd2_rd_lat_sel = 2; t->overlay_en = 0; t->fps_en = 0; t->tb_fast = 0; t->ddr_ok = 1;
   for (int i = 0; i < 8; i++) tick();
   t->mem_rst_n = 1;
 
@@ -303,6 +340,7 @@ int main(int argc, char **argv) {
     is.read(&cyc, sizeof cyc);
     is.read(sd.m.data(), sd.m.size() * 2);
     is.read(sd.row, sizeof sd.row);
+    if (w2) { is.read(sd2.m.data(), sd2.m.size() * 2); is.read(sd2.row, sizeof sd2.row); }
     is.read(&n, sizeof n);
     sd.rq.clear();
     for (uint64_t i = 0; i < n; i++) { std::pair<uint64_t, uint16_t> e; is.read(&e.first, 8); is.read(&e.second, 2); sd.rq.push_back(e); }
@@ -549,9 +587,28 @@ int main(int argc, char **argv) {
     }
   };
   uint32_t inp_frame = ~0u;
+  // the CPU's port (m3_bus master 0), as csplit2's M3_CDC_STATS counted it: a read's clocks from its request to its
+  // first beat, a line fill's to its last beat too, and the clocks a read is outstanding
+  struct { bool in = false, rd = false, line = false; uint64_t t0 = 0, n = 0, sum = 0, nl = 0, suml = 0, sumll = 0, rdclk = 0; int beats = 0; } cp;
   while (t->frame < uint32_t(nframes) || (save_idle && idle_n < 8)) {
     if (t->frame != inp_frame) { inp_frame = t->frame; inp_apply(); }
     tick();
+    if (max_cycles && cyc >= max_cycles) { std::printf("--max-cycles: stopped at cycle %" PRIu64 ", frame %u\n", cyc, t->frame); break; }
+    {
+      auto *q = t->rootp;
+      bool const mreq = q->m3_system__DOT__m_req & 1, mack = q->m3_system__DOT__m_ack & 1, mrv = q->m3_system__DOT__m_rvalid & 1;
+      uint32_t const mcmd = q->m3_system__DOT__m_cmd & 3;
+      if (!q->m3_system__DOT__rst_cpu) {
+        if (cp.in && cp.rd) cp.rdclk++;
+        if (mreq && !mack && !cp.in) { cp.in = true; cp.t0 = cyc; cp.rd = !(mcmd & 1); cp.line = mcmd == 0; cp.beats = 0; }   // ppc_cache_pkg: MC_LINE_RD 0, MC_LINE_WR 1, MC_RD 2, MC_WR 3
+        if (cp.in && cp.rd && mrv) {
+          if (cp.beats == 0) { cp.sum += cyc - cp.t0; cp.n++; if (cp.line) { cp.suml += cyc - cp.t0; cp.nl++; } }
+          cp.beats++;
+          if (!cp.line || cp.beats == 8) { if (cp.line) cp.sumll += cyc - cp.t0; cp.in = false; }
+        }
+        if (cp.in && !cp.rd && mack) cp.in = false;
+      }
+    }
     if (tgw) {
       bool const h = t->rootp->m3_system__DOT__u_bus__DOT__bs == 1 && t->rootp->m3_system__DOT__u_bus__DOT__tg_hold;
       if (h) { tgw_clk++; if (!tgw_prev) tgw_acc++; }
@@ -641,7 +698,8 @@ int main(int argc, char **argv) {
                 uint32_t sa;
                 if (a < 0x800000) sa = 0x6400000 + a; else if (a >= 0xFFE00000) sa = 0x6000000 + (a - 0xFFE00000); else { ok = false; return 0; }
                 uint32_t const w = sa & ~3u, k = sa & 3;
-                uint32_t const v = uint32_t(sd.m[w >> 1]) | (uint32_t(sd.m[(w >> 1) + 1]) << 16);
+                sdram_dev &md = mem_of(w);
+                uint32_t const v = uint32_t(md.m[w >> 1]) | (uint32_t(md.m[(w >> 1) + 1]) << 16);
                 return uint8_t(v >> (8 * (3 - k)));
               };
               bool ok = true;
@@ -700,7 +758,7 @@ int main(int argc, char **argv) {
         }
         for (uint32_t a = 0xF0; a < 0x120; a += 4) {
           uint32_t const sa = 0x6400000 + a;
-          std::printf("  RAM %06X in SDRAM: %08X\n", a, uint32_t(sd.m[sa >> 1]) | (uint32_t(sd.m[(sa >> 1) + 1]) << 16));
+          std::printf("  RAM %06X in SDRAM: %08X\n", a, uint32_t(mem_of(sa).m[sa >> 1]) | (uint32_t(mem_of(sa).m[(sa >> 1) + 1]) << 16));
         }
         {
           int shown = 0;
@@ -862,7 +920,7 @@ int main(int argc, char **argv) {
   (void)nunm;
   if (trf) std::fclose(trf);
   if (p2.f) { p2.report(); std::fclose(p2.f); }
-  if (lwc.on) std::printf("check-lw: %llu work-RAM line writes checked, %llu words wrong, %llu not seen handed over\n", (unsigned long long)lwc.n, (unsigned long long)lwc.bad, (unsigned long long)lwc.lost);
+  if (lwc.on) std::printf("check-lw: %llu work-RAM line writes checked, %llu words wrong, %llu not seen handed over; %llu line writes in part, %llu beats of no lanes\n", (unsigned long long)lwc.n, (unsigned long long)lwc.bad, (unsigned long long)lwc.lost, (unsigned long long)lwc.part, (unsigned long long)lwc.beats0);
   if (vtf) std::fclose(vtf);
   if (!save_fn.empty()) {
     VerilatedSave os;
@@ -872,6 +930,7 @@ int main(int argc, char **argv) {
     os.write(&cyc, sizeof cyc);
     os.write(sd.m.data(), sd.m.size() * 2);
     os.write(sd.row, sizeof sd.row);
+    if (w2) { os.write(sd2.m.data(), sd2.m.size() * 2); os.write(sd2.row, sizeof sd2.row); }
     os.write(&n, sizeof n);
     for (auto &e : sd.rq) { os.write(&e.first, 8); os.write(&e.second, 2); }
     os.write(pal.data(), pal.size()); os.write(regs.data(), regs.size()); os.write(gpr, sizeof gpr);
@@ -883,6 +942,10 @@ int main(int argc, char **argv) {
     os.close();
     std::printf("saved %s at frame %u, cycle %" PRIu64 "\n", save_fn.c_str(), t->frame, cyc);
   }
+  std::printf("cpu port: reads %" PRIu64 ", request to first beat %.3f clocks mean; line fills %" PRIu64 ", first beat %.3f, last beat %.3f; "
+              "clocks with a read outstanding %" PRIu64 " of %" PRIu64 " (%.2f%%)\n", cp.n, double(cp.sum) / double(cp.n ? cp.n : 1), cp.nl,
+              double(cp.suml) / double(cp.nl ? cp.nl : 1), double(cp.sumll) / double(cp.nl ? cp.nl : 1), cp.rdclk, cyc, 100.0 * double(cp.rdclk) / double(cyc ? cyc : 1));
+  if (w2) std::printf("second SDRAM: %" PRIu64 " reads, %" PRIu64 " writes at the pins; missing %d\n", sd2.reads, sd2.writes, int(t->sd2_missing));
   delete t;
   return 0;
 }

@@ -90,6 +90,12 @@
 // a read follows the push. ROM, VRAM and the I/O space are not snooped (the
 // game maps them cache-inhibited). The I-cache is not snooped (603e 3.1).
 //
+// Write-validate (study D-60, R172): a master's line write may carry fewer than
+// four lanes in a beat (m_wbe, the CPU's D-cache writing back a line it has
+// written only in part; the 53C810 gives 4'hF). The lanes go to the SDRAM port
+// beside each beat (s_wbe). The D-cache makes such lines in work RAM only, so
+// no other target sees one; the internal targets take every line write whole.
+//
 // Bench: every access outside RAM and CROM reads is offered on the tr_*
 // port, for the bus trace (sim/system/bustrace.py).
 
@@ -126,7 +132,11 @@ module m3_bus
   parameter bit          C106_M10K  = 1'b0,
   parameter bit          EXT_SEC    = 1'b0,
   parameter bit          OWIRE      = 1'b0,
-  parameter bit          WD_DEC     = 1'b0
+  parameter bit          WD_DEC     = 1'b0,
+  // W2 (D-66, D-68): work RAM is on the second SDRAM (m3_sdr2). Its transactions, either master's, go out on the
+  // same s_* port with s_w2 set, at the same SDRAM byte address (SDR_RAM + the low 23 bits), and the caller routes
+  // them; 0: s_w2 is 0, as before
+  parameter bit          W2         = 1'b0
 ) (
   input  logic          clk,
   input  logic          rst,
@@ -152,6 +162,7 @@ module m3_bus
   input  logic [1:0][31:0]  m_addr,
   input  logic [1:0][3:0]   m_be,
   input  logic [1:0][31:0]  m_wdata,
+  input  logic [1:0][3:0]   m_wbe,          // a line write's lanes for the beat m_wdata shows (the D-cache's write-validate)
   output logic [1:0]        m_ack,
   output logic [1:0]        m_wnext,
   output logic [1:0]        m_rvalid,
@@ -170,8 +181,10 @@ module m3_bus
   output logic              s_swap,
   output logic              s_zero,
   output logic              s_x,            // STEP2: a banked CROM read of a bank in the extra memory (R170)
+  output logic              s_w2,           // W2: a work-RAM transaction, for the second SDRAM
   output logic [3:0]        s_be,
   output logic [31:0]       s_wdata,
+  output logic [3:0]        s_wbe,          // with s_wdata: a line write's beat lanes (m_wbe)
   input  logic              s_ack,
   input  logic              s_wnext,
   input  logic              s_rvalid,
@@ -214,6 +227,7 @@ module m3_bus
   // video: a pulse at the start of each line, and the line (0-383 shown, 384-423 blanking)
   input  logic              ln_start,
   input  logic [9:0]        ln,
+  input  logic              ln_vis,         // ln < 384, the caller's register beside ln (TGT timing)
 
   output logic              ext_int,
 
@@ -255,7 +269,10 @@ module m3_bus
   output logic              tr_we,
   output logic [31:0]       tr_addr,
   output logic [3:0]        tr_be,
-  output logic [31:0]       tr_data
+  output logic [31:0]       tr_data,
+  // a write into the name table (F10F8000-F10FFFFF), registered beside tr_v: the tile generator's name
+  // buffer invalidate, which m3_system formed from the trace's we and address (area, R179)
+  output logic              tr_nw
 );
 
   function automatic logic [31:0] bswap(input logic [31:0] v);
@@ -273,6 +290,7 @@ module m3_bus
   logic        last;              // the master granted last (turns)
   logic [1:0]  cmd;
   logic [31:0] addr;
+  wire         a_nt = addr[31:15] == {12'hF10, 5'h1F};   // the name table (tr_nw); a line beat has the same top bits
   logic [3:0]  be;
   logic [31:0] wd;
   logic [2:0]  beat;              // line transactions to internal targets: beats done
@@ -732,10 +750,22 @@ module m3_bus
   logic [9:0]  tg_free;           // busy time - now + 16, sixteenths; 0 when long past
   logic [10:0] tg_done;           // landing time - now + 16
   logic        tg_w;              // the access in B_DEC waited last clock
-  wire         tg_fetch = ln_start ? (ln < 10'd384) : (tg_act && !tg_pn[5]);   // the line starts in this clock
+  // (the tile and palette ranges straight from addr, the decode's priority being only the SCSI window's before
+  // them: the decode chain ran through tg_inslot into tg_free and the bus state, the bus's worst paths at 120 MHz;
+  // tclose3)
+  wire         tg_f1    = (a_hi == 8'hF1) && !(sc_win_en && addr[31:8] == sc_win_base);
+  // (ln < 384 from the caller's register ln_vis, kept with ln: the compare after ln's long route into tg_inslot
+  // and tg_free was the bus's worst path at 120 MHz in tz3_b4_s3; tclose3. Asserted.)
+  wire         tg_fetch = ln_start ? ln_vis : (tg_act && !tg_pn[5]);   // the line starts in this clock
   wire         tg_slot  = !ln_start && (tg_pp == 8'(TG_SLOT));
-  wire         tg_tile  = (tgt == X_SDR) && dswap;                                   // F1000000-F10FFFFF
-  wire         tg_ram   = tg_tile || (tgt == X_PAL);                                 // and F1100000-F111FFFF
+  wire         tg_tile  = tg_f1 && (addr[23:20] == 4'h0);                           // F1000000-F10FFFFF
+  wire         tg_ram   = tg_f1 && (addr[23:20] == 4'h0 || addr[23:17] == 7'b0001000); // and F1100000-F111FFFF
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && TGT && ln_vis != (ln < 10'd384)) $fatal(1, "m3_bus: ln_vis");
+  always_ff @(posedge clk) if (!rst && TGT && (tg_tile != ((tgt == X_SDR) && dswap) ||
+      tg_ram != (((tgt == X_SDR) && dswap) || (tgt == X_PAL))))
+    $fatal(1, "m3_bus: tg_fetch / tg_tile / tg_ram");
+`endif
   wire         tg_rd    = !cur_w && (addr[31:23] != 9'd0) && !(a_hi == 8'hF1 && addr[23:21] == 3'd0);
   wire         tg_inslot = tg_tile && tg_fetch;
   wire         tg_hold  = TGT && !who && (tg_ram ? ((tg_inslot ? !(tg_slot && tg_free <= 10'(16 + TG_SFRAC)) : (tg_free > 10'd16)) ||
@@ -749,7 +779,7 @@ module m3_bus
       tg_pp <= '0; tg_pn <= 6'd32; tg_act <= 1'b0; tg_free <= '0; tg_done <= '0; tg_w <= 1'b0;
     end else begin
       if (ln_start) begin
-        tg_pp <= 8'd1; tg_pn <= '0; tg_act <= (ln < 10'd384);
+        tg_pp <= 8'd1; tg_pn <= '0; tg_act <= ln_vis;
       end else if (tg_pp == 8'(TG_PAIR - 1)) begin
         tg_pp <= '0; if (!tg_pn[5]) tg_pn <= tg_pn + 6'd1;
       end else tg_pp <= tg_pp + 8'd1;
@@ -772,22 +802,22 @@ module m3_bus
     sec_req <= sec_req && !sec_ack;
     cf_req <= cf_req && !cf_ack;
     do_w <= 1'b0; do_r <= 1'b0;
-    tr_v <= 1'b0;
+    tr_v <= 1'b0; tr_nw <= 1'b0;
     if (rst) begin
       bs <= B_IDLE; last <= 1'b1; s_req <= 1'b0; sc_req <= 1'b0; cf_req <= 1'b0; r_pend <= 1'b0; sec_req <= 1'b0;
-      s_x <= 1'b0;
+      s_x <= 1'b0; s_w2 <= 1'b0;
     end else begin
       case (bs)
         B_IDLE: begin
           // the beat a master shows, a clock longer: m3_sdr_port's LW1 takes a cast-out's last beat
           // the clock after the bus has seen its last s_wnext (study R107); B_DEC sets s_wdata for
           // the next transaction after this
-          s_wdata <= m_wdata[who];
+          s_wdata <= m_wdata[who]; s_wbe <= m_wbe[who];
           // FAST: the CPU's SDRAM fields loaded every idle clock (nothing reads them while s_req is low), so
           // only s_req and the state wait on the grant and the decode below
           if (FAST) begin
             s_cmd <= m_cmd[0]; s_sa <= SDR_RAM + {4'd0, m_addr[0][22:0]}; s_swap <= 1'b0; s_zero <= 1'b0; s_be <= m_be[0];
-            s_x <= 1'b0;
+            s_x <= 1'b0; s_w2 <= W2;     // (FAST's early request is a work-RAM read)
           end
           if (rq != 2'b00) begin
           who <= g; last <= g;
@@ -814,7 +844,8 @@ module m3_bus
             // decode, so the hold adds no level to B_DEC's choice: br2_s3 had the decode in it, addr -0.66 ns)
           end else if (tgt == X_SDR) begin
             s_req <= 1'b1; s_cmd <= cmd; s_sa <= dsa; s_swap <= dswap; s_zero <= dzero; s_be <= be; s_x <= STEP2 && dx;
-            s_wdata <= WD_DEC ? m_wdata[who] : wd;
+            s_w2 <= W2 && (addr[31:23] == 9'd0);     // work RAM (the decode's first case)
+            s_wdata <= WD_DEC ? m_wdata[who] : wd; s_wbe <= m_wbe[who];
             bs <= B_SDR;
           end else if (R3P && !(tgt == X_R3DH && cur_w) && (!r3_empty || r3_push)) begin
             // R3P (R114): on the board every processor access to PCI leaves the MPC105 behind the writes it
@@ -847,10 +878,11 @@ module m3_bus
             if (cmd == MC_RD || beat == 3'd7) bs <= B_IDLE;
             beat <= beat + 3'd1;
           end
-          s_wdata <= m_wdata[who];    // the master shows the next beat
+          s_wdata <= m_wdata[who]; s_wbe <= m_wbe[who];   // the master shows the next beat
           // the trace: tile RAM and backup RAM (not work RAM, not CROM reads)
           if ((s_rvalid || (s_ack && cmd == MC_WR) || s_wnext) && addr[31:23] != 9'd0 && addr[31:24] != 8'hFF) begin
             tr_v <= 1'b1; tr_master <= who; tr_we <= cur_w;
+            tr_nw <= cur_w && a_nt;
             tr_addr <= is_line ? {addr[31:5], (crit + beat), 2'b00} : addr;
             tr_be <= be; tr_data <= s_rvalid ? s_rdata : s_wnext ? m_wdata[who] : wd;
           end
@@ -866,6 +898,7 @@ module m3_bus
               r3_push <= 1'b1;
               r3_pd   <= {addr[31:24], addr[21:2], (cmd == MC_LINE_WR) ? m_wdata[who] : wd};
               tr_v <= 1'b1; tr_master <= who; tr_we <= 1'b1; tr_addr <= addr; tr_be <= (cmd == MC_LINE_WR) ? 4'hF : be;
+              tr_nw <= a_nt;
               tr_data <= (cmd == MC_LINE_WR) ? m_wdata[who] : wd;
               bs <= B_R3P;
             end
@@ -895,6 +928,7 @@ module m3_bus
             do_w <= 1'b1;            // the beat taken last cycle
           end else begin
             tr_v <= 1'b1; tr_master <= who; tr_we <= 1'b1; tr_addr <= addr; tr_be <= be; tr_data <= wd;
+            tr_nw <= a_nt;
             if (cmd == MC_LINE_WR && beat != 3'd7) begin
               beat <= beat + 3'd1; addr <= {addr[31:5], addr[4:2] + 3'd1, 2'b00}; bs <= B_BEAT;
             end else bs <= B_IDLE;
@@ -920,6 +954,7 @@ module m3_bus
         B_R3D: if (h_rdy && !(R3P && r3_go)) begin
           if (cur_w) begin
             tr_v <= 1'b1; tr_master <= who; tr_we <= 1'b1; tr_addr <= addr; tr_be <= be; tr_data <= wd;
+            tr_nw <= a_nt;
             if (cmd == MC_LINE_WR && beat != 3'd7) begin
               beat <= beat + 3'd1; addr <= {addr[31:5], addr[4:2] + 3'd1, 2'b00}; bs <= B_BEAT;
             end else bs <= B_IDLE;
@@ -940,6 +975,7 @@ module m3_bus
           if (sc_ack) begin
             r_pend <= 1'b0;
             tr_v <= 1'b1; tr_master <= who; tr_we <= cur_w; tr_addr <= addr; tr_be <= be; tr_data <= cur_w ? wd : sc_rdata;
+            tr_nw <= cur_w && a_nt;
             if (!cur_w) begin m_rvalid[who] <= 1'b1; m_rdata <= sc_rdata; end
             bs <= B_IDLE;
           end
@@ -953,6 +989,7 @@ module m3_bus
           if (sec_ack) begin
             r_pend <= 1'b0;
             tr_v <= 1'b1; tr_master <= who; tr_we <= cur_w; tr_addr <= addr; tr_be <= be; tr_data <= cur_w ? wd : sec_rdata;
+            tr_nw <= cur_w && a_nt;
             if (!cur_w) begin m_rvalid[who] <= 1'b1; m_rdata <= sec_rdata; end
             bs <= B_IDLE;
           end
@@ -966,6 +1003,7 @@ module m3_bus
           if (cf_ack) begin
             r_pend <= 1'b0;
             tr_v <= 1'b1; tr_master <= who; tr_we <= cur_w; tr_addr <= addr; tr_be <= be; tr_data <= cur_w ? wd : bswap(cf_rdata);
+            tr_nw <= cur_w && a_nt;
             if (!cur_w) begin m_rvalid[who] <= 1'b1; m_rdata <= bswap(cf_rdata); end
             bs <= B_IDLE;
           end
@@ -987,4 +1025,9 @@ module m3_bus
   assign h_addr  = r3_go ? {r3_head[59:52], 2'b00, r3_head[51:32], 2'b00} : addr;
   assign h_wdata = r3_go ? bswap(r3_head[31:0]) : wd_le;
 
+`ifdef VERILATOR
+  // tr_nw against m3_system's old form, from the trace's we and address (R179)
+  always_ff @(posedge clk)
+    if (!rst && tr_nw != (tr_v && tr_we && tr_addr[31:15] == {12'hF10, 5'h1F})) $fatal(1, "m3_bus: tr_nw against the trace's name-table write");
+`endif
 endmodule

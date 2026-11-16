@@ -105,7 +105,6 @@ module r3d_rast_zband #(
   logic        [8:0]  a_y, a_x;
   logic        [1:0]  a_on, a_zk;
   logic        [23:0] a_z0, a_z1;
-  logic      [PW-1:0] a_p0, a_p1;
   logic      [TW-1:0] a_tag;
   logic               a_stip, a_pinv;
   logic        [4:0]  a_tr;
@@ -114,7 +113,22 @@ module r3d_rast_zband #(
   logic        [8:0]  b_y, b_x, c_y, c_x;
   logic        [1:0]  b_on, b_zk, c_on, c_zk;   // b_on, c_on: after the screen door
   logic        [23:0] b_z0, b_z1, c_z0, c_z1;
-  logic      [PW-1:0] b_p0, b_p1, c_p0, c_p1;
+  logic      [PW-1:0] c_p0, c_p1;
+  // The payloads ride A, B and C untouched to O, so they wait in an eight-entry ring (area, R179) instead of
+  // 6 x PW registers: written from s_p0 / s_p1 as A loads, at pw_i, its index carried through A and B, and read
+  // at B's index as C loads (adv, the block's address register and read enable), so the block's output is C's
+  // word in C's clock and O stays a register. A loads at most twice between a pair's write and its read (A
+  // loads only empty or going, and going needs adv), so a live entry is never written over, and the read is
+  // never at the entry being written.
+  logic        [2:0]  pw_i, a_i, b_i;
+  (* ramstyle = "M10K, no_rw_check" *) logic [2*PW-1:0] pring [8];
+  always_ff @(posedge clk) begin
+    if (s_valid && s_ready) pring[pw_i] <= {s_p0, s_p1};
+    if (adv) {c_p0, c_p1} <= pring[b_i];
+  end
+`ifdef VERILATOR
+  logic      [PW-1:0] a_p0, a_p1, b_p0, b_p1, co_p0, co_p1;   // the old registers, for the check
+`endif
   logic      [TW-1:0] b_tag, c_tag;
   logic        [10:0] b_a0, b_a1, c_a0, c_a1;   // bank addresses
   logic        [23:0] c_q0, c_q1;
@@ -324,7 +338,11 @@ module r3d_rast_zband #(
       if (s_valid && s_ready) begin
         a_v <= 1'b1; a_new <= s_new;
         a_y <= s_y; a_x <= s_x; a_on <= s_on; a_zk <= s_zk;
-        a_z0 <= s_z0; a_z1 <= s_z1; a_p0 <= s_p0; a_p1 <= s_p1; a_tag <= s_tag;
+        a_z0 <= s_z0; a_z1 <= s_z1; a_tag <= s_tag;
+        a_i <= pw_i; pw_i <= pw_i + 3'd1;
+`ifdef VERILATOR
+        a_p0 <= s_p0; a_p1 <= s_p1;
+`endif
         a_stip <= s_stip; a_pinv <= s_pinv; a_tr <= s_trans;
         a_r1 <= 8'(1) << s_y[2:0]; a_xh <= s_x + {8'd0, s_on[1]};
         gen_ok <= 1'b0;
@@ -343,15 +361,22 @@ module r3d_rast_zband #(
       end
       // B, C, O
       if (adv) begin
+        // B's words load on every advance, b_v saying whether A went: a_go (the scoreboard's compares)
+        // is in b_v's enable alone, not in the ~200 of B's words. B's old words have gone to C at this
+        // edge, and B's words are read only through b_v (ctr_bc, a_gen_wait) or by C as c_v
         b_v <= a_go;
-        if (a_go) begin
-          b_y <= a_y; b_x <= a_x; b_on <= a_on & a_door; b_zk <= a_zk;
-          b_z0 <= a_z0; b_z1 <= a_z1; b_p0 <= a_p0; b_p1 <= a_p1; b_tag <= a_tag;
-          b_a0 <= ba0(a_y, a_x); b_a1 <= ba1(a_y, a_x);
-        end
+        b_y <= a_y; b_x <= a_x; b_on <= a_on & a_door; b_zk <= a_zk;
+        b_z0 <= a_z0; b_z1 <= a_z1; b_i <= a_i; b_tag <= a_tag;
+`ifdef VERILATOR
+        b_p0 <= a_p0; b_p1 <= a_p1;
+`endif
+        b_a0 <= ba0(a_y, a_x); b_a1 <= ba1(a_y, a_x);
         c_v <= b_v;
         c_y <= b_y; c_x <= b_x; c_on <= b_on; c_zk <= b_zk;
-        c_z0 <= b_z0; c_z1 <= b_z1; c_p0 <= b_p0; c_p1 <= b_p1; c_tag <= b_tag;
+        c_z0 <= b_z0; c_z1 <= b_z1; c_tag <= b_tag;
+`ifdef VERILATOR
+        co_p0 <= b_p0; co_p1 <= b_p1;
+`endif
         cz_b0 <= b_x[0] ? b_z1 : b_z0;    cz_b1 <= b_x[0] ? b_z0 : b_z1;
         con_b0 <= b_x[0] ? b_on[1] : b_on[0]; con_b1 <= b_x[0] ? b_on[0] : b_on[1];
         c_a0 <= b_a0; c_a1 <= b_a1; c_q0 <= q0[23:0]; c_q1 <= q1[23:0];
@@ -408,4 +433,8 @@ module r3d_rast_zband #(
   always_ff @(posedge clk)
     if (p_v) pf[pf_wp] <= p_e;
 
+`ifdef VERILATOR
+  // the ring against the old registers wherever C's words are used (R179)
+  always_ff @(posedge clk) if (!rst && c_v && {c_p0, c_p1} != {co_p0, co_p1}) $fatal(1, "zband: the payload ring against C's registers");
+`endif
 endmodule

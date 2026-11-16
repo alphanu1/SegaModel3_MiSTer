@@ -59,19 +59,44 @@ module m3_ddr_arb #(
   logic [PB-1:0] owner, last, win;
   logic          any;
 
-  // port 0 first, then the others in turn after the last granted
-  logic [PB:0] cand;
+  // port 0 first, then the others in turn after the last granted: the first requester above last, else the
+  // first from port 1 up. hm, the ports above last, is a register kept with last, so the choice is two
+  // lowest-set-bit searches over the requests and not seven wrapped adds in a chain from last (the arbiter's
+  // loop through win into owner and last was the DDR side's worst at 120 MHz; tclose3)
+  logic [NP-1:0] hm;
+  // (no parameter-width casts in this module: Quartus 17 rejects them, Error 10170)
+  function automatic logic [PB-1:0] ffs(input logic [NP-1:0] v);
+    logic [31:0] kk;
+    ffs = '0;
+    for (int k = NP - 1; k >= 0; k--) if (v[k]) begin kk = k; ffs = kk[PB-1:0]; end
+  endfunction
+  function automatic logic [NP-1:0] above(input logic [PB-1:0] l);
+    above = {NP{1'b1}} << l;
+    above = above << 1;
+  endfunction
+  wire [NP-1:0] rq_hi = req & hm, rq_lo = req & ~hm & {{(NP-1){1'b1}}, 1'b0};
   always_comb begin
-    win = '0; any = 1'b0; cand = '0;
-    if (req[0]) begin win = '0; any = 1'b1; end
+    any = |req;
+    win = req[0] ? '0 : (rq_hi != '0) ? ffs(rq_hi) : ffs(rq_lo);
+  end
+`ifdef VERILATOR
+  logic [PB:0] cand;
+  logic [PB-1:0] win_r;
+  logic          any_r;
+  always_comb begin
+    win_r = '0; any_r = 1'b0; cand = '0;
+    if (req[0]) begin win_r = '0; any_r = 1'b1; end
     else begin
       for (int k = 1; k < NP; k++) begin
         cand = (PB+1)'(last) + (PB+1)'(k);
         if (cand >= (PB+1)'(NP)) cand = cand - (PB+1)'(NP - 1);
-        if (!any && req[cand[PB-1:0]]) begin win = cand[PB-1:0]; any = 1'b1; end
+        if (!any_r && req[cand[PB-1:0]]) begin win_r = cand[PB-1:0]; any_r = 1'b1; end
       end
     end
   end
+  always_ff @(posedge clk) if (!rst && (any != any_r || (any && win != win_r) || hm != above(last)))
+    $fatal(1, "m3_ddr_arb: win against the turn's loop");
+`endif
 
   assign m_req  = busy && req[owner];
   assign m_we   = we[owner];
@@ -89,13 +114,13 @@ module m3_ddr_arb #(
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      busy <= 1'b0; cool <= 1'b0; owner <= '0; last <= '0;
+      busy <= 1'b0; cool <= 1'b0; owner <= '0; last <= '0; hm <= above('0);
     end else begin
       cool <= 1'b0;
       if (!busy) begin
         if (!cool && any) begin
           busy <= 1'b1; owner <= win;
-          if (win != '0) last <= win;
+          if (win != '0) begin last <= win; hm <= above(win); end
         end
       end else if (m_ack) begin
         busy <= 1'b0; cool <= 1'b1;

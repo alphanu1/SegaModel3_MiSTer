@@ -41,10 +41,10 @@ R3D_SYS = rtl/real3d/r3d_ucode_pkg.sv rtl/real3d/r3d_fp_add.sv rtl/real3d/r3d_fp
 BUS_RTL  ?= rtl/sys/m3_bus.sv
 TEXUP_RTL ?= rtl/real3d/r3d_texup.sv    # R100: with M3_STEP2_TEX, sm3-builds/dt2/handoff2/rtl/r3d_texup.sv
 SYS_DEFS ?= +define+M3_STEP2_BUS=1 +define+M3_STEP2_TEX=1 +define+M3_DMAFAST=1 +define+M3_R3B=1   # (R144: as Model3.qsf)
-SYS_RTL = $(R3D_SYS) rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/sys/m3_jtag.sv rtl/io/m3_93c46.sv rtl/io/m3_io.sv rtl/io/m3_cab_inputs.sv rtl/io/m3_inputs.sv rtl/sys/m3_sdr_port.sv $(BUS_RTL) \
+SYS_RTL = $(R3D_SYS) rtl/dbg/m3_uart_tx.sv rtl/dbg/m3_cpu_mon.sv rtl/sys/m3_jtag.sv rtl/io/m3_93c46.sv rtl/io/m3_io.sv rtl/io/m3_cab_inputs.sv rtl/io/m3_inputs.sv rtl/sys/m3_sdr_port.sv rtl/sys/m3_sdr2.sv $(BUS_RTL) \
           rtl/io/m3_scripts.sv rtl/mem/m2_sdram.sv rtl/video/m2_video_timing.sv rtl/viewer/m3v_overlay.sv \
           rtl/dbg/m3_frame_busy.sv rtl/dbg/m3_fps.sv rtl/sys/m3_xmem.sv rtl/sys/m3_xcrom.sv rtl/sys/m3_5881.sv rtl/sys/m3_sec.sv rtl/sys/m3_loader.sv \
-          rtl/sound/m3_scsp_dsp.sv rtl/sound/m3_sndbridge.sv rtl/sys/m3_system.sv
+          rtl/sound/m3_dsp_ring.sv rtl/sound/m3_scsp_dsp.sv rtl/sound/m3_sndbridge.sv rtl/sys/m3_system.sv
 
 .PHONY: test_jtag test_jtag_fault lint_sys test_inputs test_io test_sdr_port test_bus test_bus_tg system test_xmem test_sec test_texup2 test_xcrom
 
@@ -219,6 +219,27 @@ test_sdr_port_r107: $(foreach v,$(SDR_VARIANTS),$(SYS_OBJ)/sdr_$(v)/Vm3_sdr_tb)
 	./$(SYS_OBJ)/sdr_b112/Vm3_sdr_tb 200000 34 --bxor --lw1 --nowait
 	./$(SYS_OBJ)/sdr_b112/Vm3_sdr_tb 200000 35 --bxor --lw1 --idle 12
 	./$(SYS_OBJ)/sdr_b112/Vm3_sdr_tb 200000 36 --bxor --lw1 --nowait --idle 40
+
+# D-66 / D-68: the second SDRAM's module whole (m3_sdr2: the port, the controller with port 0 alone, the start-up
+# probe), the port bench's transactions against its reference memory, as the build sets it (b112's options). Then
+# the planted faults: no module (reads FFFF), a floating bus, SDRAM2_EN low (the probe must find it missing), the
+# device a clock late (data mismatches), a data fault (--fault)
+$(SYS_OBJ)/sdr2/Vm3_sdr_tb: rtl/sys/m3_sdr2.sv rtl/sys/m3_sdr_port.sv rtl/mem/m2_sdram.sv sim/system/m3_sdr2_tb.sv sim/system/tb_m3_sdr_port.cpp rtl/cpu/ppc_cache_pkg.sv
+	@mkdir -p $(SYS_OBJ)/sdr2
+	@$(VERILATOR) $(VFLAGS) $(SYS_DEFS) --top-module m3_sdr2_tb --prefix Vm3_sdr_tb -CFLAGS "$(CFLAGS_SYS) -DSDR2" --Mdir $(SYS_OBJ)/sdr2 \
+	  rtl/cpu/ppc_cache_pkg.sv rtl/mem/m2_sdram.sv rtl/sys/m3_sdr_port.sv rtl/sys/m3_sdr2.sv sim/system/m3_sdr2_tb.sv sim/system/tb_m3_sdr_port.cpp >/dev/null
+
+test_sdr2: $(SYS_OBJ)/sdr2/Vm3_sdr_tb
+	@echo "== m3_sdr2: the second SDRAM, random transactions against a reference memory, then planted faults"
+	./$(SYS_OBJ)/sdr2/Vm3_sdr_tb 200000 41 --bxor --lw1 --noq --ff
+	./$(SYS_OBJ)/sdr2/Vm3_sdr_tb 200000 42 --bxor --lw1 --noq --ff --nowait
+	./$(SYS_OBJ)/sdr2/Vm3_sdr_tb 200000 43 --bxor --lw1 --noq --ff --idle 12
+	./$(SYS_OBJ)/sdr2/Vm3_sdr_tb 200000 44 --bxor --lw1 --noq --ff --nowait --idle 40
+	! ./$(SYS_OBJ)/sdr2/Vm3_sdr_tb 1000 45 --bxor --lw1 --noq --ff --nomod > /dev/null
+	! ./$(SYS_OBJ)/sdr2/Vm3_sdr_tb 1000 46 --bxor --lw1 --noq --ff --float > /dev/null
+	! ./$(SYS_OBJ)/sdr2/Vm3_sdr_tb 1000 47 --bxor --lw1 --noq --ff --en0 > /dev/null
+	! ./$(SYS_OBJ)/sdr2/Vm3_sdr_tb 20000 48 --bxor --lw1 --noq --ff --lat 3 > /dev/null
+	! ./$(SYS_OBJ)/sdr2/Vm3_sdr_tb 20000 49 --bxor --lw1 --noq --ff --fault > /dev/null
 
 lint_sys:
 	@echo "== lint m3_system"

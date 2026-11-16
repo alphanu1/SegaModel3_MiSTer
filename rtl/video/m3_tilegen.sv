@@ -140,23 +140,37 @@ module m3_tilegen #(
   wire       kill    = (go && ready && f_busy) || flush;
   assign q_pop = q_valid && (!ec_v || ec_last) && !kill;
 
-  wire [2:0] pc = ec_col + ec_i[2:0];
-  logic [7:0] pix8;
-  logic [3:0] pix4;
-  always_comb begin
+  // the palette address of pixel pc of a burst
+  function automatic logic [14:0] pra(input logic is4, input logic [10:0] palhi, input logic [63:0] d, input logic [2:0] pc);
+    logic [7:0] pix8;
+    logic [3:0] pix4;
     // 8-bit: the burst is two little-endian words, pixel 0 in bits 31:24 of the first
     case (pc)
-      3'd0: pix8 = ec_data[31:24]; 3'd1: pix8 = ec_data[23:16]; 3'd2: pix8 = ec_data[15:8];  3'd3: pix8 = ec_data[7:0];
-      3'd4: pix8 = ec_data[63:56]; 3'd5: pix8 = ec_data[55:48]; 3'd6: pix8 = ec_data[47:40]; default: pix8 = ec_data[39:32];
+      3'd0: pix8 = d[31:24]; 3'd1: pix8 = d[23:16]; 3'd2: pix8 = d[15:8];  3'd3: pix8 = d[7:0];
+      3'd4: pix8 = d[63:56]; 3'd5: pix8 = d[55:48]; 3'd6: pix8 = d[47:40]; default: pix8 = d[39:32];
     endcase
     // 4-bit: one little-endian word, pixel 0 in bits 31:28
 `ifdef TG_FAULT_BPP
-    pix4 = ec_data[{pc, 2'b00} +: 4];
+    pix4 = d[{pc, 2'b00} +: 4];
 `else
-    pix4 = ec_data[{~pc, 2'b00} +: 4];
+    pix4 = d[{~pc, 2'b00} +: 4];
 `endif
-  end
-  wire [14:0] pal_ra = ec_is4 ? {ec_palhi, pix4} : {ec_palhi[10:4], pix8};
+    pra = is4 ? {palhi, pix4} : {palhi[10:4], pix8};
+  endfunction
+  // The palette's read address is a register, loaded with the next pixel's address: the burst's first from
+  // the queue's head as it is popped, else the next of the burst in hand. It is read only while ec_v (e1_v and
+  // e2_we follow it), and there it equals the address from ec_* (asserted below). From ec_* the pixel select ran
+  // into the 52 palette M10Ks spread across the die (4.4 ns of route; tclose3). MAX_FANOUT in the qsf lets its
+  // copies sit by the blocks.
+  logic [14:0] pal_ra;
+  always_ff @(posedge clk)
+    pal_ra <= q_pop ? pra(q_is4, q_palhi, q_data, q_col) : pra(ec_is4, ec_palhi, ec_data, ec_col + ec_i[2:0] + 3'd1);
+`ifdef VERILATOR
+  /* verilator lint_off SYNCASYNCNET */
+  always_ff @(posedge clk)
+    if (rst_n && ec_v && pal_ra != pra(ec_is4, ec_palhi, ec_data, ec_col + ec_i[2:0])) $fatal(1, "m3_tilegen: pal_ra");
+  /* verilator lint_on SYNCASYNCNET */
+`endif
 
   // E1: palette read in flight
   logic        e1_v, e1_above, e1_pair, e1_bank;

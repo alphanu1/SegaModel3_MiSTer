@@ -24,6 +24,10 @@ package r3d_ucode_pkg;
   localparam logic [9:0] K_SMFR = 10'd469;  // 119 cycles, 15 ops
   localparam logic [9:0] K_SETUP4 = 10'd493;  // 116 cycles, 73 ops  (set-up output ROM, r3d_ucode_su)
   localparam logic [9:0] K_SETUP2 = 10'd575;  // 110 cycles, 47 ops  (set-up output ROM, r3d_ucode_su)
+  localparam logic [9:0] K_SETUP44 = 10'd630;  // 168 cycles, 146 ops  (set-up output ROM, r3d_ucode_su)
+  localparam logic [9:0] K_SETUP22 = 10'd780;  // 119 cycles, 94 ops  (set-up output ROM, r3d_ucode_su)
+  localparam int LEN_SETUP4 = 116;  // its length in clocks (r3d_geo SU_PAIR)
+  localparam int LEN_SETUP2 = 110;  // its length in clocks (r3d_geo SU_PAIR)
   localparam logic [9:0] K_FACE = 10'd0;  // not built (--setup-kernels --3r)
   localparam int R_MT = 0;
   localparam int R_CO = 8;

@@ -69,6 +69,7 @@ struct Txn {
   int cmd;                 // 0 LINE_RD, 1 LINE_WR, 2 RD, 3 WR
   uint32_t addr, be;
   uint32_t wd[8];
+  uint32_t wbe[8] = {15, 15, 15, 15, 15, 15, 15, 15};   // a line write's beat lanes (the D-cache's write-validate)
   std::vector<uint32_t> exp;   // read beats expected (empty: not checked here)
   bool check = true;
   int kind = 0;            // what it touches, for the counters
@@ -82,7 +83,7 @@ struct Line { uint32_t d[8]; bool dirty; };
 static std::map<uint32_t, Line> dc;            // by line address
 static std::map<uint32_t, uint32_t> tru;       // the coherent value of every word in C
 static long n_hit = 0, n_fill = 0, n_co = 0, n_push = 0, n_snoop = 0, n_inv = 0, n_dmaw_c = 0, n_dmar_c = 0, n_raw = 0;
-static long stale = 0, unpushed = 0;
+static long stale = 0, unpushed = 0, n_lwp = 0;
 static uint32_t snap[8];                       // the line at the last read snoop's sn_ack
 static uint32_t snap_line = ~0u, hot_line = ~0u;
 static uint32_t last_w = 0; static int last_w_ok = 0;
@@ -133,6 +134,8 @@ static Txn gen(int m) {
     x.cmd = c;
     if (c == 3) x.be = rng() & 15;
     if (c == 1) x.addr &= ~31u;
+    // a line write to work RAM in part, half the time: random lanes a beat, none sometimes (study R172)
+    if (c == 1 && x.addr < 0x00800000u && (rng() & 1)) { for (auto &b : x.wbe) b = (rng() % 4 == 0) ? 0 : (rng() & 15); n_lwp++; }
     if ((c == 0 || c == 2) && last_w_ok && (rng() & 1)) { x.addr = c == 0 ? (last_w & ~31u) : last_w; n_raw++; }
   } else if (r < 60) { x.kind = K_IRQEN; x.cmd = (rng() & 1) ? 3 : 2; x.addr = 0xF0100014; x.be = 8; }
   else if (r < 64) { x.kind = K_PCIA; x.cmd = (rng() & 1) ? 3 : 2; x.addr = 0xF0800CF8; }
@@ -180,7 +183,7 @@ static void at_ack(Txn &x, int m) {
     case K_FILL: { fill_line = x.addr >> 5; uint32_t c = (x.addr >> 2) & 7; for (int k = 0; k < 8; k++) x.exp.push_back(tru[(x.addr & ~31u) + 4 * ((c + k) & 7)]); break; }
     case K_MEM:
       if (x.cmd == 3) ref_write(x.addr, x.wd[0], x.be);
-      else if (x.cmd == 1) for (int k = 0; k < 8; k++) ref_write(x.addr + 4 * k, x.wd[k], 15);
+      else if (x.cmd == 1) for (int k = 0; k < 8; k++) ref_write(x.addr + 4 * k, x.wd[k], x.wbe[k]);
       else if (x.cmd == 2) x.exp = {ref_word(x.addr)};
       else { uint32_t c = (x.addr >> 2) & 7; for (int k = 0; k < 8; k++) x.exp.push_back(ref_word((x.addr & ~31u) + 4 * ((c + k) & 7))); }
       break;
@@ -335,6 +338,7 @@ int main(int argc, char **argv) {
       t->m_addr = (t->m_addr & ~(0xFFFFFFFFull << (32 * idx))) | (uint64_t(m.x.addr) << (32 * idx));
       t->m_be = uint8_t((t->m_be & ~(15u << (4 * idx))) | (m.x.be << (4 * idx)));
       t->m_wdata = (t->m_wdata & ~(0xFFFFFFFFull << (32 * idx))) | (uint64_t(m.x.wd[m.wbeat < 8 ? m.wbeat : 7]) << (32 * idx));
+      t->m_wbe = uint8_t((t->m_wbe & ~(15u << (4 * idx))) | (m.x.wbe[m.wbeat < 8 ? m.wbeat : 7] << (4 * idx)));
     }
     // the 53C810 window: acknowledge after a random delay
     if (t->sc_req && !sc_pend) { sc_pend = true; sc_wait = long(rng() % 6); }
@@ -429,6 +433,7 @@ int main(int argc, char **argv) {
               nunm, unsigned(t->n_unmapped), io_sel_n, n_io, jt_wr_n, n_jt, jt_early, n_sc);
   std::printf("  coherent lines: %ld load/store hits, %ld fills, %ld cast-outs, %ld snoops (%ld pushes, %ld invalidates), 53C810 %ld writes / %ld reads; %ld reads after a write\n",
               n_hit, n_fill, n_co, n_snoop, n_push, n_inv, n_dmaw_c, n_dmar_c, n_raw);
+  std::printf("  line writes in part (write-validate lanes): %ld\n", n_lwp);
   std::printf("  %ld stale (a write landing on a held line, or a stale hit), %ld 53C810 reads before the push\n", stale, unpushed);
   std::printf("  %ld read mismatches, %ld protocol errors, %ld image bytes wrong, %ld tile register / %ld palette strobes wrong, %ld counters wrong, %zu/%zu strobes missing\n",
               bad, proto, img_bad, tg_bad, pal_bad, cnt_bad, tg_regs_exp.size(), pal_exp.size());

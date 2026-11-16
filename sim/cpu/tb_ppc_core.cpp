@@ -1333,7 +1333,9 @@ struct Cov {
   uint64_t alias[5] = {}, alias_chk = 0;
   uint64_t sn_n[2] = {}, sn_b2b = 0, sn_eager = 0, sn_bytes = 0, sn_unchk = 0, sn_dmaw_new = 0, sn_dmaw_same = 0;
   uint64_t sn_lat = 0, sn_lat_max = 0, sn_rsv_lost = 0;
+  uint64_t lw = 0, lw_part = 0, lw_fill = 0;  // PPC_CPU: the port's line writes, those in part (D-cache WV), line fills
   void add(const Cov &c) {
+    lw += c.lw; lw_part += c.lw_part; lw_fill += c.lw_fill;
     for (int i = 0; i < 2; i++) sn_n[i] += c.sn_n[i];
     sn_b2b += c.sn_b2b; sn_eager += c.sn_eager; sn_bytes += c.sn_bytes; sn_unchk += c.sn_unchk;
     sn_dmaw_new += c.sn_dmaw_new; sn_dmaw_same += c.sn_dmaw_same; sn_lat += c.sn_lat; sn_rsv_lost += c.sn_rsv_lost;
@@ -1568,7 +1570,7 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
       }
       top.sn_req = sn.act; top.sn_addr = sn.line >> 5; top.sn_inv = sn.inv;
     }
-    ma.step(top.m_req, top.m_cmd, top.m_addr, top.m_be, top.m_wdata);
+    ma.step(top.m_req, top.m_cmd, top.m_addr, top.m_be, top.m_wdata, top.m_wbe);
     top.m_ack = ma.ack; top.m_rvalid = ma.rvalid; top.m_wnext = ma.wnext; top.m_rdata = ma.rdata;
     if (ma.err) { printf("seed %u: memory agent protocol error\n", seed); return false; }
     top.clk = 0; top.eval();
@@ -1810,6 +1812,9 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
         for (int i = 0; i < ppcfpu::NUM_OPS; i++) cov.fpops[i] = iss.fp_ops[i];
         cov.insns[mode] = insns_here; cov.cycles[mode] = cycles;
         cov.fpc = fp_checks;
+#ifdef PPC_CPU
+        cov.lw = ma.n_wb; cov.lw_part = ma.n_wbp; cov.lw_fill = ma.n_fill;
+#endif
         g_cov.add(cov);
         dumper.armed = false;
         return true;
@@ -1992,6 +1997,10 @@ int main(int argc, char **argv) {
          (unsigned long long)c.fpld, (unsigned long long)c.fpst, (unsigned long long)c.fpc);
   for (int i = 0; i < ppcfpu::NUM_OPS; i++) printf(" %s %llu", ppcfpu::op_name[i], (unsigned long long)c.fpops[i]);
   printf("\n");
+#ifdef PPC_CPU
+  printf("  memory port: line fills %llu, line writes %llu, of them in part (write-validate) %llu\n",
+         (unsigned long long)c.lw_fill, (unsigned long long)c.lw, (unsigned long long)c.lw_part);
+#endif
   printf("  TGPR shadow writes %llu, data micro-TLB replays %llu, fetch translation slow cycles %llu\n",
          (unsigned long long)c.sh_writes, (unsigned long long)c.replays, (unsigned long long)c.fslow);
   printf("  BTB: targets predicted %llu, failed word checks %llu, register targets refetched %llu, entries written %llu\n",

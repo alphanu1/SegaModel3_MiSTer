@@ -205,6 +205,9 @@ module r3d_face #(
   logic [31:0] opa, opb;
   logic [5:1]  c0_d;
   logic [31:0] prod, sum /* verilator public_flat_rd */, sd1, sd2;
+`ifdef VERILATOR
+  logic [31:0] sd2_was;
+`endif
   typedef struct packed { logic v; logic [2:0] k; logic [1:0] j, slot; logic par; } wb_t;
   wb_t         wb [1:11] /* verilator public_flat_rd */;
   // the write-back tag at +11 (area pass): v from the chain of registers (it is reset), {k, j, slot, par} from
@@ -250,7 +253,13 @@ module r3d_face #(
     opb <= (LOD && bc_q) ? creg : br_q;
     c0_d[1] <= op_c0;
     for (int q = 2; q <= 5; q++) c0_d[q] <= c0_d[q - 1];
-    sd1 <= sum; sd2 <= sd1;
+    // (the adder's b operand, c0_d[5] ? -0 : sd1 a clock on, selected as it is registered: the select sat between
+    // sd2 and the adder's exponent compare, the face's worst path at 120 MHz; tclose3)
+    sd1 <= sum; sd2 <= c0_d[4] ? 32'h8000_0000 : sd1;
+`ifdef VERILATOR
+    sd2_was <= sd1;
+    if (!rst && sd2 != (c0_d[5] ? 32'h8000_0000 : sd2_was)) $fatal(1, "face: sd2");
+`endif
     wb[1] <= '{v: op_v && op_wk != W_NO, k: op_wk, j: op_wj, slot: op_wslot, par: op_wpar};
     for (int q = 2; q <= 11; q++) wb[q].v <= wb[q - 1].v;
     if (rst) for (int q = 1; q <= 11; q++) wb[q].v <= 1'b0;
@@ -260,7 +269,7 @@ module r3d_face #(
     .clk, .rst_n(!rst), .in_valid(1'b1), .a(opa), .b(opb),
     .out_valid(), .result(prod), .overflow(), .underflow(), .invalid());
   r3d_fp_add #(.SUBNORM(1'b0), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP), .NORM_B(1'b1)) u_add (
-    .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(c0_d[5] ? 32'h8000_0000 : sd2), .sub(1'b0),
+    .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(sd2), .sub(1'b0),
     .out_valid(), .result(sum), .overflow(), .underflow(), .invalid());
 
   // ---- write-back (t+11): V into A, N and Q into B, the verdict, B, C -----

@@ -21,6 +21,7 @@ module m3_bus_tb
   input  logic [1:0][31:0]  m_addr,
   input  logic [1:0][3:0]   m_be,
   input  logic [1:0][31:0]  m_wdata,
+  input  logic [1:0][3:0]   m_wbe,
   output logic [1:0]        m_ack,
   output logic [1:0]        m_wnext,
   output logic [1:0]        m_rvalid,
@@ -78,6 +79,7 @@ module m3_bus_tb
   logic [26:0] s_sa;
   logic [3:0]  s_be;
   logic [31:0] s_wdata, s_rdata;
+  logic [3:0]  s_wbe;
   logic        p_req, p_we, p_long, p_lo, p_ack;
   logic [26:1] p_addr;
   logic [15:0] p_din;
@@ -95,24 +97,24 @@ module m3_bus_tb
 
   m3_bus #(.AW(26), .MIDI_GAP(500), .FAST(FAST), .R3P(R3P), .TGT(TGT), .OWIRE(BR), .WD_DEC(BR)) u_bus (
     .clk, .rst, .sec_tick(1'b0),
-    .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
+    .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_wbe, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
     .sn_req, .sn_addr, .sn_inv, .sn_ack,
-    .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata,
+    .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_wbe, .s_ack, .s_wnext, .s_rvalid, .s_rdata,
     .sc_req, .sc_we, .sc_addr, .sc_be, .sc_wdata, .sc_ack, .sc_rdata, .sc_win_en, .sc_win_base,
     .cf_req, .cf_we, .cf_idx, .cf_be, .cf_wdata, .cf_ack, .cf_rdata, .scsi_irq,
     .io_sel, .io_we, .io_off, .io_wbyte, .io_rbyte,
     .tg_reg_we, .tg_reg_addr, .tg_reg_wdata, .tg_pal_we, .tg_pal_addr, .tg_pal_wdata,
-    .ln_start, .ln, .ext_int,
+    .ln_start, .ln, .ln_vis(ln < 10'd384), .ext_int,
     .irq_state_o, .irq_enable_o(), .crom_bank_o(),
     .n_submit, .n_cull_lo, .n_cull_hi(), .n_poly, .n_tex(), .n_vrom(), .n_unmapped, .last_unmapped(),
     .pingpong_o(), .pingpong_i(1'b0), .h_go, .h_rdy(h_rdy_i), .h_we, .h_addr(h_addr_o), .h_wdata(h_wdata_o), .h_rv, .h_rdata,
     .r3d_cfg0(), .r3d_cfg1(), .r3d_cfg2(),
     .jt_wr, .jt_wdata, .jt_busy, .jt_tdo, .jt_cfg_we(1'b0), .jt_cfg0('0), .jt_cfg1('0), .jt_cfg2('0),
-    .tr_v(), .tr_master(), .tr_we(), .tr_addr(), .tr_be(), .tr_data());
+    .tr_v(), .tr_master(), .tr_we(), .tr_addr(), .tr_be(), .tr_data(), .tr_nw());
 
   m3_sdr_port #(.AW(26), .L16(L16), .LW1(LW1), .PAIR(PAIR), .RA(RA), .PW(PW), .RA_CONF(RA_CONF), .FWD(FWD), .FREQ(FREQ), .PW_DLY(PW_DLY)) u_port (
     .clk, .rst(!rst_n), .ra_clr(1'b0),
-    .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
+    .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_wbe, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
     .p_req, .p_we, .p_addr, .p_din, .p_be, .p_long, .p_dout, .p_lo, .p_ack, .wb_col, .wb_din, .wb_be);
 
   logic [1:0] pk, pl;
