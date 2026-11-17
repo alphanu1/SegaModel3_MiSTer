@@ -38,6 +38,23 @@
 // I = 1 or W = 1 while their line is resident, so an access that wrongly
 // looks at the arrays reads or writes a different value than the reference.
 //
+// Write-validate (the cache built with -GWV=1; study D-60). Two references:
+//   WV_REF=1  the reference models write-validate itself: a store miss to work
+//             RAM (PA < 8 MiB) allocates its line with every byte unwritten, a
+//             load of an unwritten byte merges the line from memory as the load
+//             is made, a write-back writes the written bytes only. All the traffic
+//             above runs against it, the inhibited accesses to resident lines too.
+//   WV_REF=0  the 603e's own reference (RWITM: every store miss fills): with
+//             write-validate the program must see exactly this. The one exception
+//             is 3.6.4.1's boundedly undefined case, an inhibited store to a
+//             resident line, which NO_IPAR=1 turns into a cacheable store, and
+//             a store with the cache disabled (HID0[DCE] = 0) over a resident line
+//             (3.2.3.2: "potential coherency errors"), which it turns into a load.
+// A directed section (after the hit streams) makes partial lines and takes each
+// one through a load of a written and of an unwritten byte, byte stores, a
+// cast-out, dcbz, dcbst, dcbf, dcbi and an lwarx; the counts at the end say how
+// often the random traffic met each case.
+//
 // usage: Vppc_dcache [ops] [seed] [lat_lo lat_hi] [stream] [snoop]
 
 #include "Vppc_dcache.h"
@@ -56,7 +73,7 @@
 static const uint32_t RSV = 0xF00FF;
 
 // ------------------------------------------------------------- reference
-struct RefLine { bool v = false; uint32_t tag = 0; bool d = false; uint32_t w[8]; };
+struct RefLine { bool v = false; uint32_t tag = 0; bool d = false; uint32_t w[8]; uint8_t um[8] = {}; };   // um: unwritten lanes (WV_REF)
 struct Alloc { unsigned set, way; uint32_t tag; };
 
 struct Ref {
@@ -66,7 +83,12 @@ struct Ref {
   std::vector<Single> singles;
   std::vector<Alloc> allocs;
   bool dce = true, dlock = false, noopti = false;
+  bool wv = false;                            // the write-validate reference (WV_REF)
   uint64_t hits = 0, misses = 0, wbs = 0, byp = 0;
+  // write-validate cases met (counted in either reference, from the line's unwritten lanes)
+  uint64_t wv_alloc = 0, wv_merge = 0, wv_wbp = 0, wv_snp = 0, wv_dcbz = 0, wv_rsv = 0, wv_sthit = 0, wv_ldok = 0, wv_dcbi = 0;
+  static bool ram(uint32_t a) { return (a >> 23) == 0; }
+  static bool partial(const RefLine &L) { for (int k = 0; k < 8; k++) if (L.um[k]) return true; return false; }
   uint32_t last_evict = 0;                    // the line most recently cast out (or flushed)
 
   static unsigned victim_plru(uint8_t p) { return (p & 1) ? 2 + ((p >> 2) & 1) : ((p >> 1) & 1); }
@@ -88,11 +110,21 @@ struct Ref {
     { static long wa = getenv("WATCH") ? strtol(getenv("WATCH"), 0, 16) : -1;
       if (((L.tag << 12) | (s << 5)) == (uint32_t(wa) & ~31u)) std::printf("   REF writeback %08X word %08X dirty %d\n", (L.tag << 12) | (s << 5), L.w[(wa >> 2) & 7], int(L.d)); }
 #endif
-    for (int k = 0; k < 8; k++) mem.wr((L.tag << 12) | (s << 5) | (k << 2), L.w[k], 0xF);
+    for (int k = 0; k < 8; k++) mem.wr((L.tag << 12) | (s << 5) | (k << 2), L.w[k], 0xF & ~L.um[k]);
+    if (partial(L)) wv_wbp++;
     last_evict = (L.tag << 12) | (s << 5);
     wbs++;
   }
-  unsigned alloc(uint32_t a, bool fill) {
+  // a load of an unwritten byte: the line merged from memory, the written bytes kept
+  void merge_line(unsigned s, unsigned w) {
+    RefLine &L = c[s][w];
+    for (int k = 0; k < 8; k++) {
+      L.w[k] = merge(mem.rd((L.tag << 12) | (s << 5) | (k << 2)), L.w[k], 0xF & ~L.um[k]);
+      L.um[k] = 0;
+    }
+    wv_merge++;
+  }
+  unsigned alloc(uint32_t a, bool fill, bool wvalloc = false) {
     unsigned s = (a >> 5) & 127;
     int v = -1;
     for (int w = 0; w < 4 && v < 0; w++) if (!c[s][w].v) v = w;
@@ -100,7 +132,8 @@ struct Ref {
     RefLine &L = c[s][v];
     if (L.v && L.d) writeback(s, v);
     L.v = true; L.tag = a >> 12; L.d = false;
-    for (int k = 0; k < 8; k++) L.w[k] = fill ? mem.rd((a & ~31u) | (k << 2)) : 0;
+    for (int k = 0; k < 8; k++) { L.w[k] = fill ? mem.rd((a & ~31u) | (k << 2)) : 0; L.um[k] = wvalloc ? 0xF : 0; }
+    if (wvalloc) wv_alloc++;
     touch(s, v);
     allocs.push_back({s, (unsigned)v, a >> 12});
     return v;
@@ -115,7 +148,12 @@ struct Ref {
   uint32_t load(uint32_t a, unsigned be, unsigned wimg) {
     if (bypass(a, wimg)) { byp++; singles.push_back({false, a, be, 0}); return mem.rd(a); }
     int w = find(a); unsigned s = (a >> 5) & 127;
-    if (w >= 0) { hits++; touch(s, w); return c[s][w].w[(a >> 2) & 7]; }
+    if (w >= 0) {
+      hits++; touch(s, w);
+      if (c[s][w].um[(a >> 2) & 7] & be) merge_line(s, w);
+      else if (partial(c[s][w])) wv_ldok++;
+      return c[s][w].w[(a >> 2) & 7];
+    }
     misses++;
     if (dlock) { singles.push_back({false, a, be, 0}); return mem.rd(a); }
     w = alloc(a, true);
@@ -128,16 +166,20 @@ struct Ref {
     if (w >= 0) {
       hits++; touch(s, w);
       RefLine &L = c[s][w];
+      if (partial(L)) wv_sthit++;
       L.w[(a >> 2) & 7] = merge(L.w[(a >> 2) & 7], d, be);
+      L.um[(a >> 2) & 7] &= ~be;
       if (wt) { singles.push_back({true, a, be, d}); mem.wr(a, d, be); }
       else L.d = true;
       return;
     }
     misses++;
     if (wt || dlock) { singles.push_back({true, a, be, d}); mem.wr(a, d, be); return; }
-    w = alloc(a, true);
+    bool wva = wv && ram(a);
+    w = alloc(a, !wva, wva);
     RefLine &L = c[s][w];
     L.w[(a >> 2) & 7] = merge(L.w[(a >> 2) & 7], d, be);
+    L.um[(a >> 2) & 7] &= ~be;
     L.d = true;
   }
   void dcbt(uint32_t a, unsigned wimg) {
@@ -151,7 +193,8 @@ struct Ref {
     bool rsv = (a >> 12) == RSV;
     int w = rsv ? -1 : find(a); unsigned s = (a >> 5) & 127;
     if (w >= 0) {
-      touch(s, w); for (auto &x : c[s][w].w) x = 0; c[s][w].d = true; return;
+      if (partial(c[s][w])) wv_dcbz++;
+      touch(s, w); for (auto &x : c[s][w].w) x = 0; for (auto &u : c[s][w].um) u = 0; c[s][w].d = true; return;
     }
     if (!dlock && !rsv) { w = alloc(a, false); c[s][w].d = true; return; }
     for (int k = 0; k < 8; k++) mem.wr((a & ~31u) | (k << 2), 0, 0xF);
@@ -169,7 +212,7 @@ struct Ref {
   void dcbi(uint32_t a) {
     if ((a >> 12) == RSV) return;
     int w = find(a); unsigned s = (a >> 5) & 127;
-    if (w >= 0) { c[s][w].v = false; c[s][w].d = false; }
+    if (w >= 0) { if (partial(c[s][w])) wv_dcbi++; c[s][w].v = false; c[s][w].d = false; }
   }
   // the line as another master sees it through the snoop: the cache's copy if
   // modified, else memory (a clean copy differs from memory only after an
@@ -178,20 +221,20 @@ struct Ref {
   void view(uint32_t line, uint32_t v[8]) {
     int w = find(line); unsigned s = (line >> 5) & 127;
     bool d = w >= 0 && c[s][w].d;
-    for (int k = 0; k < 8; k++) v[k] = d ? c[s][w].w[k] : mem.rd(line | (k << 2));
+    for (int k = 0; k < 8; k++) v[k] = d ? merge(mem.rd(line | (k << 2)), c[s][w].w[k], 0xF & ~c[s][w].um[k]) : mem.rd(line | (k << 2));
   }
   // a snooped read (the caching-inhibited read of 603e table 3-6): written
   // back if modified, then clean
   void snoop_rd(uint32_t line) {
     if ((line >> 12) == RSV || !dce) return;
     int w = find(line); unsigned s = (line >> 5) & 127;
-    if (w >= 0 && c[s][w].d) { writeback(s, w); c[s][w].d = false; }
+    if (w >= 0 && c[s][w].d) { if (partial(c[s][w])) wv_snp++; writeback(s, w); c[s][w].d = false; }
   }
   // a snooped write (603e table 3-6): written back if modified, invalidated
   void snoop_inv(uint32_t line) {
     if ((line >> 12) == RSV || !dce) return;
     int w = find(line); unsigned s = (line >> 5) & 127;
-    if (w >= 0) { if (c[s][w].d) writeback(s, w); c[s][w].v = false; c[s][w].d = false; }
+    if (w >= 0) { if (c[s][w].d && partial(c[s][w])) wv_snp++; if (c[s][w].d) writeback(s, w); c[s][w].v = false; c[s][w].d = false; }
   }
   void flash() { for (auto &s : c) for (auto &l : s) { l.v = false; l.d = false; } for (auto &p : plru) p = 0; }
 };
@@ -253,6 +296,9 @@ int main(int argc, char **argv) {
   Vppc_dcache *t = new Vppc_dcache;
   Ref ref;
   gref = &ref;
+  ref.wv = getenv("WV_REF") && atoi(getenv("WV_REF"));
+  const bool no_ipar = getenv("NO_IPAR") && atoi(getenv("NO_IPAR"));   // no inhibited store to a resident line
+  uint64_t n_ipar_off = 0;
   Memory dmem;
   MemAgent ma; ma.rng = &rng; ma.mem = &dmem; ma.lat_lo = lat_lo; ma.lat_hi = lat_hi;
   if (getenv("CACHE_FIXED")) { ma.ack_max = 0; ma.lat_wide = 0; ma.gap_max = 0; }   // deterministic memory: ack at once, beats every cycle
@@ -293,6 +339,25 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 64; i++) script.push_back({OP_ST, a | ((i & 7) << 2), 15, (uint32_t)(0x1000 + i), 0, 0, 0, false});
     for (int i = 0; i < 64; i++)                                  // store then load of the same word
       script.push_back({(i & 1) ? OP_LD : OP_ST, a | (((i >> 1) & 7) << 2), 15, (uint32_t)(0x2000 + i), 0, 0, 0, false});
+    // write-validate, directed (work RAM, page 5, sets 3-12; every line here starts with a store miss)
+    auto L = [&](uint32_t x, unsigned be = 15, bool rsv = false) { Op o{OP_LD, x, be, 0, 0, 0, 0, false}; o.rsv = rsv; script.push_back(o); };
+    auto S = [&](uint32_t x, uint32_t d, unsigned be = 15) { script.push_back({OP_ST, x, be, d, 0, 0, 0, false}); };
+    auto K = [&](int k, uint32_t x) { script.push_back({k, x, 15, 0, 0, 0, 0, false}); };
+    const uint32_t A = 0x5060, B = 0x5080, C = 0x50A0, D = 0x50C0, E = 0x50E0, F = 0x5100, G = 0x5120, H = 0x5140,
+                   I = 0x5160, J = 0x5180;
+    S(A, 0xA0A0A0A0); L(A); L(A + 4); L(A + 4); L(A);                   // the written word, then an unwritten one
+    S(B + 1, 0xB1, 4); L(B); L(B + 1, 4);                            // a byte, then its word
+    S(C + 8, 0xC8C8C8C8); for (uint32_t pg : {0x6000u, 0x7000u, 0x10000u, 0x11000u}) L(pg | (C & 0xFFF));
+    L(C + 8); L(C);                                                     // cast out in part, then read back from memory
+    S(D + 16, 0xD0D0D0D0); K(OP_DCBZ, D); L(D + 16); L(D);              // dcbz of a partial line
+    S(E, 0xE0E0E0E0); K(OP_DCBST, E); L(E + 4); L(E);                   // pushed in part, clean, then merged
+    S(F + 4, 0xF4F4F4F4); K(OP_DCBF, F); L(F + 4); L(F);                // flushed in part
+    S(G, 0x61616161); K(OP_DCBI, G); L(G);                              // invalidated: the store is lost
+    S(H, 0x48484848); L(H + 28, 15, true); L(H);                        // an lwarx of an unwritten word
+    for (int k = 0; k < 8; k++) S(I + 4 * k, 0x1000 + k);               // a whole line by stores
+    L(I + 16); L(I + 28);
+    S(J, 0x4A4A, 12); L(J, 12); L(J + 2, 3); L(J);                      // halfwords: written, then unwritten
+    S(J + 8, 0x4A4A, 12); S(J + 10, 0x4B4B, 3); L(J + 8);                // a word in two halves
   }
   size_t script_i = 0;
 
@@ -448,6 +513,13 @@ int main(int argc, char **argv) {
         }
         o.t0 = cyc;
         uint32_t wa = o.a & ~3u;
+        // (NO_IPAR: and a store made with the cache disabled over a resident line, 3.2.3.2's "potential coherency
+        // errors": it bypasses the line as an inhibited store does; made a load instead)
+        if (no_ipar && o.k == OP_ST && ((wa >> 12) != RSV) && ref.find(wa) >= 0) {
+          if (o.wimg & 4) { o.wimg &= ~4u; n_ipar_off++; }
+          if (!ref.dce) { o.k = OP_LD; n_ipar_off++; }
+        }
+        if (o.rsv && ref.find(wa) >= 0 && Ref::partial(ref.c[(wa >> 5) & 127][ref.find(wa)])) ref.wv_rsv++;
         o.ref_hit = (o.k == OP_LD || o.k == OP_ST) && !ref.bypass(wa, o.wimg) && ref.find(wa) >= 0;
         // the store's data sits in its lanes, as the core places it
         uint32_t sd = o.d;
@@ -629,7 +701,7 @@ int main(int argc, char **argv) {
     }
 #endif
     // ---------------------------------------------------- memory side
-    ma.step(t->m_req, t->m_cmd, t->m_addr, t->m_be, t->m_wdata);
+    ma.step(t->m_req, t->m_cmd, t->m_addr, t->m_be, t->m_wdata, t->m_wbe);
     t->m_ack = ma.ack; t->m_rvalid = ma.rvalid; t->m_wnext = ma.wnext; t->m_rdata = ma.rdata;
     tick();
     if (ma.err) { errors += ma.err; ma.err = 0; }
@@ -684,12 +756,20 @@ int main(int argc, char **argv) {
 #ifdef TB_EARLY
   std::printf("  early word: load answers with d_eok %lu of %lu loads\n", (unsigned long)n_eok_ld, (unsigned long)n_ld);
 #endif
+  std::printf("  write-validate (%s reference%s): allocations without a fill %lu, loads merging a partial line %lu, loads of written"
+              " bytes only %lu, store hits on partial lines %lu, partial write-backs %lu (port: %lu line writes in part, %lu empty beats),"
+              " partial lines snooped modified %lu, dcbz %lu, dcbi %lu, lwarx %lu\n",
+              ref.wv ? "write-validate" : "RWITM", no_ipar ? ", no inhibited store to a resident line" : "",
+              (unsigned long)ref.wv_alloc, (unsigned long)ref.wv_merge, (unsigned long)ref.wv_ldok, (unsigned long)ref.wv_sthit,
+              (unsigned long)ref.wv_wbp, (unsigned long)ma.n_wbp, (unsigned long)ma.n_wbeat0, (unsigned long)ref.wv_snp,
+              (unsigned long)ref.wv_dcbz, (unsigned long)ref.wv_dcbi, (unsigned long)ref.wv_rsv);
+  if (no_ipar) std::printf("  inhibited stores to resident lines made cacheable: %lu\n", (unsigned long)n_ipar_off);
   const char *cn[4] = {"load hit", "load miss", "store hit", "store miss"};
   for (int c = 0; c < 4; c++) if (lat_n[c])
     std::printf("  %-10s request to d_valid: min %lu mean %.2f max %lu cycles (%lu)\n", cn[c], (unsigned long)lat_min[c],
                 (double)lat_sum[c] / lat_n[c], (unsigned long)lat_max[c], (unsigned long)lat_n[c]);
   std::printf("  hit streams, cycles per access: 64 loads %.2f, 64 stores %.2f, 32 store+load pairs %.2f per pair\n",
-              (s_mark[1] - s_mark[0]) / 64.0, (s_mark[2] - s_mark[1]) / 64.0, (s_t0 - s_mark[2]) / 32.0);
+              (s_mark[1] - s_mark[0]) / 64.0, (s_mark[2] - s_mark[1]) / 64.0, (s_mark[3] - s_mark[2]) / 32.0);
   if (snoop_mode) {
     const char *kn[3] = {"miss", "clean", "modified"};
     for (int i = 0; i < 2; i++) {

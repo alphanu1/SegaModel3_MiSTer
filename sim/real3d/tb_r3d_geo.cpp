@@ -205,6 +205,13 @@ int main(int argc, char **argv) {
   uint64_t subn_frames = 0, subn_total = 0;
 
   for (size_t fi = 0; fi < files.size(); fi++) {
+    // R3D_RESEED (study R185): each frame's random streams from the seed and the frame's number in its name, so
+    // a frame's clocks do not depend on which frames ran before it in the same run (two builds compared frame by
+    // frame see the same port latencies until their timing parts)
+    if (std::getenv("R3D_RESEED")) {
+      unsigned long const fn = std::strtoul(fs::path(files[fi]).filename().string().c_str() + 1, nullptr, 10);
+      rng.seed(seed * 1000003u + unsigned(fn)); hrng.seed(seed * 2654435761u + 12345u + unsigned(fn));
+    }
     if (!load_dump(files[fi], mem)) { std::fprintf(stderr, "bad dump\n"); return 1; }
     // reference
     std::vector<record> ref_all, ref;

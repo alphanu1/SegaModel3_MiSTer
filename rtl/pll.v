@@ -9,8 +9,9 @@ module pll (
 		input  wire  refclk,   //  refclk.clk
 		input  wire  rst,      //   reset.reset
 		output wire  outclk_0, // outclk0.clk  20 MHz, the template's video
-		output wire  outclk_1, // outclk1.clk  100 MHz, the CPU (and the whole Model 3 system)
-		output wire  outclk_2, // outclk2.clk  100 MHz at 180 degrees, SDRAM_CLK (as the viewer's PLL)
+		output wire  outclk_1, // outclk1.clk  clk_sys (125 MHz; pll_0002.v), the whole Model 3 system
+		output wire  outclk_2, // outclk2.clk  clk_sys's rate at 3500 ps (0.5 ns before 180 degrees): SDRAM_CLK's DDIO register (R187)
+		output wire  outclk_3, // outclk3.clk  clk_sys's rate at 3250 ps (0.75 ns before 180 degrees): SDRAM2_CLK's DDIO register (R187)
 		output wire  locked    //  locked.export
 	);
 
@@ -20,6 +21,7 @@ module pll (
 		.outclk_0 (outclk_0), // outclk0.clk
 		.outclk_1 (outclk_1), // outclk1.clk
 		.outclk_2 (outclk_2), // outclk2.clk
+		.outclk_3 (outclk_3), // outclk3.clk
 		.locked   (locked)    //  locked.export
 	);
 

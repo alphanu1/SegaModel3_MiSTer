@@ -44,6 +44,8 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/io/m3_cab_inputs.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/io/m3_inputs.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_jtag.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_sdr_port.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_sdr2.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_sdr_clk.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_bus.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sys/m3_loader.sv
 # D-37 stage B: the Real3D, its host blocks, DDR3 and the compositor
@@ -84,6 +86,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_mem.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_texup.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/real3d/r3d_vrom_rd.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m3_ddr_arb.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/m3_dsp_ring.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/m3_scsp_dsp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/m3_sndbridge.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m3_ddr3p.sv

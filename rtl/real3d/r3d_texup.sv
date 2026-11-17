@@ -179,6 +179,11 @@ module r3d_texup #(
   logic [1:0]    ltx, lty;               // log2 tile width, height
   logic [5:0]    tw;                     // words a tile
   logic [10:0]   x0, y0;                 // the level's origin (y0 with the page)
+  logic          lv1st;                  // the texture's first level: its origin from the header
+`ifdef VERILATOR
+  logic [10:0]   x0o, y0o;               // the origin by the old shifts, for the check (R179)
+  logic          x0v;
+`endif
   logic [8:0]    tcx, tcy;               // tile column, row
   logic [2:0]    xx, yy;
   logic [63:0]   bacc;
@@ -288,6 +293,9 @@ module r3d_texup #(
       us <= U_IDLE; busy <= 1'b0; d_req <= 1'b0; d_busy <= 1'b0; f_on <= 1'b0; fbp <= '0; have <= '0;
       wr_v <= 1'b0; n_tex <= '0; n_skip <= '0; own <= 2'd0;
       p2_w <= 2'd0; p2_st <= 3'd0;
+`ifdef VERILATOR
+      x0v <= 1'b0;
+`endif
     end else begin
       logic        f_done, rs;            // a burst has landed; a restart
       logic [PW-1:0] rsa;                 // ... at this word
@@ -427,8 +435,8 @@ module r3d_texup #(
             dp <= dp + PW'(2); adv = 11'd2;
             n_tex <= n_tex + 16'd1;
             case (rword[31:24])
-              8'h00, 8'h01: begin lv <= 4'd0; us <= U_LV; end
-              8'h02:        begin lv <= 4'd1; us <= U_LV; end
+              8'h00, 8'h01: begin lv <= 4'd0; lv1st <= 1'b1; us <= U_LV; end
+              8'h02:        begin lv <= 4'd1; lv1st <= 1'b1; us <= U_LV; end
               default:      begin n_skip <= n_skip + 16'd1; us <= U_JMPS; end
             endcase
           end
@@ -458,9 +466,23 @@ module r3d_texup #(
             lw <= w; lh <= h; ltx <= tx2; lty <= ty2;
             // words a tile holds: 16-bit 2^(ltx + lty - 1), 8-bit 2^(ltx + lty - 2)
             tw <= b16 ? (6'd1 << (ls - 3'd1)) : (6'd1 << (ls - 3'd2));
-            // 2048 - 2048 / 2^i and 1024 - 1024 / 2^i, as 11 and 10 bits
-            x0 <= (lv == 4'd0) ? hx : (11'd0 - (11'd1 << (4'd11 - lv))) + (hx >> lv);
-            y0 <= {hpage, (lv == 4'd0) ? hy : (lv >= 4'd10) ? 10'd1023 : (10'd0 - (10'd1 << (4'd10 - lv))) + (hy >> lv)};
+            // 2048 - 2048 / 2^i + hx / 2^i and 1024 - 1024 / 2^i + hy / 2^i (y held at 1023 from level 10),
+            // by recurrence (area, R179): level lv + 1's origin is (origin + 2048) / 2, (origin + 1024) / 2
+            // for y, exactly for every level the decode reaches (lv <= 11; checked for every hx, hy and
+            // both first levels, and asserted against the shifts below); a type-2 texture's first level
+            // (lv 1) starts from the header's hx / hy
+            begin
+              logic [10:0] sx; logic [9:0] sy;
+              sx = lv1st ? hx : x0; sy = lv1st ? hy : y0[9:0];
+              x0 <= (lv == 4'd0) ? hx : {1'b1, sx[10:1]};
+              y0 <= {hpage, (lv == 4'd0) ? hy : {1'b1, sy[9:1]}};
+            end
+            lv1st <= 1'b0;
+`ifdef VERILATOR
+            x0o <= (lv == 4'd0) ? hx : (11'd0 - (11'd1 << (4'd11 - lv))) + (hx >> lv);
+            y0o <= {hpage, (lv == 4'd0) ? hy : (lv >= 4'd10) ? 10'd1023 : (10'd0 - (10'd1 << (4'd10 - lv))) + (hy >> lv)};
+            x0v <= 1'b1;
+`endif
             tcx <= '0; tcy <= '0;
             us <= U_TILE;
           end
@@ -517,4 +539,7 @@ module r3d_texup #(
     end
   end
 
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (x0v && (x0 != x0o || y0 != y0o)) $fatal(1, "texup: a level's origin by recurrence against the shifts");
+`endif
 endmodule

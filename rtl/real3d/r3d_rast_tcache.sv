@@ -362,10 +362,18 @@ module r3d_rast_tcache #(
   assign f_req  = alloc_n != iss_n;
   assign f_addr = fq_i[QW-1 -: 18];
   always_ff @(posedge clk) if (f_rvalid) bb[bb_wp[FB+1:0]] <= f_rdata;
-  wire         beats4 = (bb_wp - bb_rp) >= (FB+3)'(4);
+  // (fq_ne = alloc_n != done_n and bb_c = bb_wp - bb_rp as registers, kept with the counts they stand for:
+  // the compare and the subtract ran through wr_go into done_n and the MLABs' read address it drives, the
+  // texture cache's worst paths at 120 MHz; tclose3. Asserted below.)
+  logic          fq_ne;
+  logic [FB+2:0] bb_c;
+  wire         beats4 = bb_c >= (FB+3)'(4);
   logic        gate_ok;
-  wire         wr_go = (alloc_n != done_n) && (wk != 2'd0 || (beats4 && gate_ok));
+  wire         wr_go = fq_ne && (wk != 2'd0 || (beats4 && gate_ok));
   wire         fq_dn = wr_go && wk == 2'd3;     // a fill written: done_n moves
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && (fq_ne != (alloc_n != done_n) || bb_c != bb_wp - bb_rp)) $fatal(1, "tcache: fq_ne / bb_c");
+`endif
   wire  [63:0] bq = bb[bb_rp[FB+1:0]];
   always_comb begin
     dwe = wr_go; dwk = wk; dwa = fq_r[DB+1 +: LB];
@@ -437,7 +445,16 @@ module r3d_rast_tcache #(
     end
     wire [DB:0] g_dl = fs[done_n[FB-1:0]] - rd_n;
     wire [DB:0] g_dp = fq_r[DB:0] - rd_n;
-    assign gate_ok = (st_n != done_n) && (g_dl >= g_dp);
+    // (st_ne = st_n != done_n, a register as fq_ne; tclose3)
+    logic       st_ne;
+    wire [NB-1:0] sd = st_n - done_n;
+    always_ff @(posedge clk)
+      if (rst) st_ne <= 1'b0;
+      else st_ne <= (lq_v && !fq_dn) ? 1'b1 : (!lq_v && fq_dn) ? (sd != NB'(1)) : st_ne;
+`ifdef VERILATOR
+    always_ff @(posedge clk) if (!rst && st_ne != (st_n != done_n)) $fatal(1, "tcache: st_ne");
+`endif
+    assign gate_ok = st_ne && (g_dl >= g_dp);
   end else begin : g_all
     assign gate_ok = rd_n == fq_r[DB:0];   // every pixel before the allocator has read
   end endgenerate
@@ -476,7 +493,7 @@ module r3d_rast_tcache #(
       sw_nz <= 1'b1; hold_q <= 1'b1;
       w_v <= 1'b0; wq_v <= 1'b0; sw_q <= 1'b0; c_mw <= '0; c_mq <= '0;
       alloc_n <= '0; iss_n <= '0; done_n <= '0; pix_n <= '0; rd_n <= '0; rd_n1 <= (DB+1)'(1);
-      fq_full <= 1'b0; pf_full <= 1'b0;
+      fq_full <= 1'b0; pf_full <= 1'b0; fq_ne <= 1'b0; bb_c <= '0;
       sw_n <= (SB+1)'(SETS); rr <= '0; bb_wp <= '0; bb_rp <= '0; wk <= 2'd0;
     end else begin
       if (inval && !sw_nz) begin sw_n <= (SB+1)'(SETS); sw_nz <= 1'b1; end
@@ -540,6 +557,8 @@ module r3d_rast_tcache #(
       end
       if (alloc) begin rr <= vic + WB'(1); alloc_n <= alloc_n + 1'b1; end
       fq_full <= (alloc && !fq_dn) ? (fq_c == NB'(F - 1)) : (!alloc && fq_dn) ? (fq_c == NB'(F + 1)) : (fq_c == NB'(F));
+      fq_ne   <= (alloc && !fq_dn) ? 1'b1 : (!alloc && fq_dn) ? (fq_c != NB'(1)) : fq_ne;
+      bb_c    <= bb_c + (FB+3)'(f_rvalid) - (FB+3)'(wr_go);
       pf_full <= (a_done && !r_go) ? (pf_cnt >= (DB+1)'(D - 2)) : (!a_done && r_go) ? (pf_cnt >= (DB+1)'(D)) :
                                      (pf_cnt >= (DB+1)'(D - 1));
       if (a_done) pix_n <= pix_n + 1'b1;

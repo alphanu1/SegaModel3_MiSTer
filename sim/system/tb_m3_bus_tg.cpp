@@ -89,7 +89,7 @@ int main(int argc, char **argv) {
   std::mt19937 rng(seed);
   auto rnd = [&](int n) { return int(rng() % unsigned(n)); };
   t = new Vm3_bus;
-  t->rst = 1; t->m_req = 0; t->sc_ack = 0; t->cf_ack = 0; t->jt_busy = 0; t->ln_start = 0; t->ln = 0; t->s_ack = 0;
+  t->rst = 1; t->m_req = 0; t->sc_ack = 0; t->cf_ack = 0; t->jt_busy = 0; t->ln_start = 0; t->ln = 0; t->ln_vis = 1; t->s_ack = 0;
   t->s_wnext = 0; t->s_rvalid = 0; t->h_rdy = 1; t->h_rv = 0; t->sn_ack = 0; t->sec_ack = 0; t->sc_win_en = 0;
   t->step2 = 0; t->fixed8 = 0; t->crom_slot = 0; t->crom_zero = 0; t->jt_cfg_we = 0; t->scsi_irq = 0; t->pingpong_i = 0;
   for (int i = 0; i < 8; i++) tick();
@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
     if (ce) {
       if (hcnt == 655) {
         hcnt = 0; vline = (vline == 423) ? 0 : vline + 1;
-        t->ln_start = 1; t->ln = vline;
+        t->ln_start = 1; t->ln = vline; t->ln_vis = vline < 384;
         // Supermodel: a shown line starts the fetch; the frame's blanking stops it
         if (vline < 384) sm.line(cyc); else if (vline == 384) sm.blank();
       } else hcnt++;

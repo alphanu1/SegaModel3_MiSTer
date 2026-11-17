@@ -40,6 +40,20 @@
 //   P4  TEMP is written; the write's word (PACK) is taken
 //   P5  ACC; MEMS is written; FRC, Y, ADRS, INPUTS, MEMVAL; the next access
 //
+// TIMING (the ring is 128 M10K, and the fitter spreads them over the die): the commands and go are
+// registered at the input, so the engine runs a clock behind its ports and the bridge's DDR3 beats
+// never reach a RAM in the clock they arrive. The ring is RING_SL slices of 16 / RING_SL bits, each
+// its own RAM with its own registered port (address, write enable and data) and its own register on
+// the word read, so a slice and its registers can sit together wherever the fitter puts them; one
+// register stage in front of the slices' gathers the port from the engine, and the hop from it to a
+// slice is register to register. The ring is single-port: a step's access, read or write, is at
+// its rwi. Its address is formed in P3 for the next step (addr_h is final from P3), so a step's
+// read is issued in the previous step's P5 and lands in rg_q by P3, as before; its waiting write is
+// taken in P1, as it was, and lands at P3's edge (two clocks after P1's): a step that writes reads
+// nothing, and the next read is the next step's (issued in P5). A sample starts two clocks after go (ph 6 and 7),
+// for the first step's read. Three clocks a sample more in all; no step takes a clock more, and every
+// value is what it was.
+//
 // Commands (c_*), one a clock, only while idle (c_ready), laid out by the HPS as the arrays hold them
 // (arcsnd's dsplink_map), so nothing is decoded here:
 //   0  both lanes of hi / lo, c_data[23:0] at c_addr[8:0]: TEMP, MEMS, MIXS << 4, the dry sums
@@ -58,7 +72,8 @@
 `timescale 1ns/1ps
 
 module m3_scsp_dsp #(
-  parameter int RING_BITS = 15
+  parameter int RING_BITS = 15,
+  parameter int RING_SL   = 4              // the ring's slices (1, 2, 4, 8 or 16)
 ) (
   input  logic        clk,
   input  logic        rst_n,
@@ -79,6 +94,20 @@ module m3_scsp_dsp #(
 );
 
   localparam int RW = RING_BITS;
+  localparam int SB = 16 / RING_SL;        // a ring slice's bits
+
+  // the ports registered, without a reset: the engine runs a clock behind them. (A command during the
+  // reset still writes the RAMs, as it did unregistered; one offered in the reset's last clock is now
+  // taken as the engine comes out, where it was dropped. The bridge offers neither: its port is idle
+  // and its go low through the engine's reset, which is a clock behind its own.)
+  logic        cv_r, go_r;
+  logic  [2:0] ck_r;
+  logic [15:0] ca_r;
+  logic [23:0] cd_r;
+  always_ff @(posedge clk) begin
+    cv_r <= c_valid; ck_r <= c_kind; ca_r <= c_addr; cd_r <= c_data;
+    go_r <= go;
+  end
 
   // ------------------------------------------------------------------ storage
   // MPRO: four 16-bit words a step, one array each (Model 2 R967: one array with byte lanes lost
@@ -94,7 +123,7 @@ module m3_scsp_dsp #(
   (* ramstyle = "M10K" *) logic  [7:0] lo    [512];
   // COEF {0, chip, index 6}, MADRS {10, chip, index 5}, the effect pans {11, chip, right, slot 4}
   (* ramstyle = "M10K" *) logic [15:0] cg    [256];
-  (* ramstyle = "M10K" *) logic [15:0] ring  [2 ** (RW + 1)];   // {chip, offset}
+  // the ring, {chip, offset}: RING_SL slices below
 
   // the running chip's registers, and the other chip's in the shadow (swapped at each chip's end)
   logic signed [25:0] acc,  x_acc;
@@ -172,9 +201,9 @@ module m3_scsp_dsp #(
   logic  [7:0] cg_ra, cg_wa;
   logic        cg_we;
   logic [15:0] cg_q;
-  logic [RW:0] rg_wa;
-  logic        rg_we;
-  logic [15:0] rg_wd, rg_q;
+  logic [RW:0] rg_a;                     // the ring's port, gathered: address, write (run, command), word
+  logic        rg_w;
+  logic [15:0] rg_wd, rg_rq, rg_q;
   logic        mp_we;
   logic  [7:0] mp_wa;
 
@@ -264,8 +293,9 @@ module m3_scsp_dsp #(
   // Commands, as the HPS lays them out (its dsplink_map): 0 both lanes of hi / lo (24 bits), 1 the high
   // lane, 2 the low, 3 the ring {chip, offset}, 4 COEF / MADRS / pans, 5 MPRO {chip, step, word},
   // 6 a chip's setting {chip, which}: 0 RBL, 1 Start {steps run 8, LastStep 8}, 2 DAC18B
-  assign c_ready = st == IDLE;
-  wire        cv   = c_valid && st == IDLE;
+  // (a command offered while c_ready is taken: c_ready falls with go, before the engine leaves IDLE)
+  assign c_ready = st == IDLE && !go_r;
+  wire        cv   = cv_r && st == IDLE;
 
   always_comb begin
     // reads: the row's TEMP in P1, its MEMS / MIXS after; MADRS in P1, COEF after; in the effect
@@ -291,34 +321,50 @@ module m3_scsp_dsp #(
       hl_wa = SUM | {7'd0, mk}; hi_wd = tempv[23:8]; lo_wd = tempv[7:0];
       hi_we = mt == 6'd35; lo_we = mt == 6'd35;
     end else begin
-      hl_wa = c_addr[8:0]; hi_wd = c_data[23:8]; lo_wd = c_data[7:0];
-      hi_we = cv && (c_kind == 3'd0 || c_kind == 3'd1);
-      lo_we = cv && (c_kind == 3'd0 || c_kind == 3'd2);
-      if (c_kind == 3'd1) hi_wd = c_data[15:0];
+      hl_wa = ca_r[8:0]; hi_wd = cd_r[23:8]; lo_wd = cd_r[7:0];
+      hi_we = cv && (ck_r == 3'd0 || ck_r == 3'd1);
+      lo_we = cv && (ck_r == 3'd0 || ck_r == 3'd2);
+      if (ck_r == 3'd1) hi_wd = cd_r[15:0];
     end
-    cg_wa = c_addr[7:0];
-    cg_we = cv && c_kind == 3'd4;
-    mp_wa = c_addr[9:2];
-    mp_we = cv && c_kind == 3'd5;
-    // the ring: the run's waiting write in P1 (no read pending), else a command
-    rg_wa = (st == RUN) ? {ch, rwi} : c_addr[RW:0];
-    rg_wd = (st == RUN) ? wval : c_data[15:0];
-    rg_we = (st == RUN) ? (ph == 3'd1 && rp == 2'd0 && wp) : (cv && c_kind == 3'd3);
+    cg_wa = ca_r[7:0];
+    cg_we = cv && ck_r == 3'd4;
+    mp_wa = ca_r[9:2];
+    mp_we = cv && ck_r == 3'd5;
   end
+
+  // the ring's port, gathered. The address: idle, a command's, else the first step's ({0, rwi}, or chip
+  // 1's {1, x_rwi} with chip 0 stopped); running, the next step's in P3 (chip 1's first at chip 0's
+  // last step), held otherwise. The write: the run's waiting write (no read pending) in P1, as it was,
+  // or a ring command; both go in two clocks later.
+  always_ff @(posedge clk) begin
+    if (st == IDLE)                  rg_a <= cv ? ca_r[RW:0] : stop_r[0] ? {1'b1, x_rwi} : {1'b0, rwi};
+    else if (st == RUN && ph == 3'd3) rg_a <= (k + 8'd1 == nsteps) ? {1'b1, x_rwi} : {ch, addr_h};
+    rg_w  <= (st == RUN) ? (ph == 3'd1 && rp == 2'd0 && wp) : (cv && ck_r == 3'd3);
+    rg_wd <= (st == RUN) ? wval : cd_r[15:0];
+  end
+
+  // the slices (m3_dsp_ring): each its own port registers, its RAM, and two registers on the word
+  // read. A read issued in clock X (the address in the slice's port register) is in rg_q in X + 4.
+  genvar gs;
+  generate
+    for (gs = 0; gs < RING_SL; gs = gs + 1) begin : g_rs
+      m3_dsp_ring #(.AW(RW + 1), .W(SB)) u_ring (
+        .clk, .a_i(rg_a), .we_i(rg_w), .d_i(rg_wd[gs * SB +: SB]), .q(rg_rq[gs * SB +: SB]));
+    end
+  endgenerate
 
   always_ff @(posedge clk) begin
     hi_q <= hi[hl_ra];
     lo_q <= lo[hl_ra];
     cg_q <= cg[cg_ra];
-    rg_q <= ring[{ch, rwi}];
+    rg_q <= rg_rq;
     if (hi_we) hi[hl_wa] <= hi_wd;
     if (lo_we) lo[hl_wa] <= lo_wd;
-    if (cg_we) cg[cg_wa] <= c_data[15:0];
-    if (rg_we) ring[rg_wa] <= rg_wd;
-    if (mp_we && c_addr[1:0] == 2'd0) mpro0[mp_wa] <= c_data[15:0];
-    if (mp_we && c_addr[1:0] == 2'd1) mpro1[mp_wa] <= c_data[15:0];
-    if (mp_we && c_addr[1:0] == 2'd2) mpro2[mp_wa] <= c_data[15:0];
-    if (mp_we && c_addr[1:0] == 2'd3) mpro3[mp_wa] <= c_data[15:0];
+    if (cg_we) cg[cg_wa] <= cd_r[15:0];
+    if (mp_we && ca_r[1:0] == 2'd0) mpro0[mp_wa] <= cd_r[15:0];
+    if (mp_we && ca_r[1:0] == 2'd1) mpro1[mp_wa] <= cd_r[15:0];
+    if (mp_we && ca_r[1:0] == 2'd2) mpro2[mp_wa] <= cd_r[15:0];
+    if (mp_we && ca_r[1:0] == 2'd3) mpro3[mp_wa] <= cd_r[15:0];
   end
 
   // the step's temporaries and the multipliers' operands (no reset: they would cost an enable)
@@ -359,22 +405,25 @@ module m3_scsp_dsp #(
       done <= 1'b0;
 
       // commands
-      if (cv && c_kind == 3'd6)
-        case (c_addr[1:0])
-          2'd0: rbl_r[c_addr[2]] <= c_data[1:0];
-          2'd1: begin stop_r[c_addr[2]] <= 1'b0; nst_r[c_addr[2]] <= c_data[15:8]; end   // (LastStep, 7:0, is the HPS's)
-          default: dac18_r[c_addr[2]] <= c_data[0];
+      if (cv && ck_r == 3'd6)
+        case (ca_r[1:0])
+          2'd0: rbl_r[ca_r[2]] <= cd_r[1:0];
+          2'd1: begin stop_r[ca_r[2]] <= 1'b0; nst_r[ca_r[2]] <= cd_r[15:8]; end   // (LastStep, 7:0, is the HPS's)
+          default: dac18_r[ca_r[2]] <= cd_r[0];
         endcase
 
       case (st)
-        IDLE: if (go && !c_valid) begin
-          ch <= 1'b0; k <= '0; ph <= '0;
-          st <= stop_r[0] ? FIN : RUN;          // chip 0 stopped: straight to its end
+        // two clocks first (ph 6 and 7), for the first step's read; then chip 0's steps, or straight to
+        // its end if it is stopped
+        IDLE: if (go_r && !cv_r) begin
+          ch <= 1'b0; k <= '0; ph <= 3'd6;
+          st <= RUN;
           nsteps <= nst_r[0];
         end
         RUN: begin
           ph <= ph + 3'd1;
           case (ph)
+            3'd7: if (stop_r[0]) st <= FIN;     // (only before chip 0's first step: FIN starts chip 1 at P0)
             3'd4: if (MWT) wval <= NOFL ? shifted[23:8] : {shifted[23], pk_e, sh_p[21:11]};
             3'd5: begin
               ph <= 3'd0;
@@ -425,12 +474,12 @@ module m3_scsp_dsp #(
       endcase
     end
   end
-  assign busy = st != IDLE;
+  assign busy = st != IDLE || go_r;      // go taken, the engine a clock behind
   assign dac18 = dac18_r;
 
   /* verilator lint_off UNUSEDSIGNAL */
-  wire _unused = &{1'b0, ins[63], ins[55], ins[47], ins[28], ins[15], c_addr[15:10], cg_q[2:0],
-                   prod[39:37], prod[11:0], sh_p[36:35], sh_p[10:0], acc_n[25:24], c_data[23:16]};
+  wire _unused = &{1'b0, ins[63], ins[55], ins[47], ins[28], ins[15], ca_r[15:10], cg_q[2:0],
+                   prod[39:37], prod[11:0], sh_p[36:35], sh_p[10:0], acc_n[25:24], cd_r[23:16]};
   /* verilator lint_on UNUSEDSIGNAL */
 
 endmodule

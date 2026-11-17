@@ -170,11 +170,11 @@ module m3_cputest
   logic        m_req, m_ack, m_wnext, m_rvalid;
   logic [1:0]  m_cmd;
   logic [31:0] m_addr, m_wdata, m_rdata;
-  logic [3:0]  m_be;
+  logic [3:0]  m_be, m_wbe;
 
   ppc_cpu #(.SNOOP (1'b0)) u_cpu (
     .clk (clk), .rst (cpu_rst), .pvr_alt (1'b0),
-    .m_req (m_req), .m_cmd (m_cmd), .m_addr (m_addr), .m_be (m_be), .m_wdata (m_wdata),
+    .m_req (m_req), .m_cmd (m_cmd), .m_addr (m_addr), .m_be (m_be), .m_wdata (m_wdata), .m_wbe (m_wbe),
     .m_ack (m_ack), .m_wnext (m_wnext), .m_rvalid (m_rvalid), .m_rdata (m_rdata),
     .sn_req (1'b0), .sn_addr (27'd0), .sn_inv (1'b0), .sn_ack (),   // no DMA here
     .tb_tick (tb_tick), .ext_int (1'b0), .ev (ev), .ev_mmu (), .ev_btb (),
@@ -227,7 +227,7 @@ module m3_cputest
     end else begin
       // a cast-out beat taken: written at the next edge
       if (m_wnext) begin
-        w_v <= c_ram; w_idx <= {c_addr[13:5], c_n[2:0] - 3'd1}; w_d <= m_wdata; w_be <= 4'hF;
+        w_v <= c_ram; w_idx <= {c_addr[13:5], c_n[2:0] - 3'd1}; w_d <= m_wdata; w_be <= m_wbe;   // (the D-cache's write-validate lanes)
       end
       case (c_st)
         C_IDLE: if (m_req) begin

@@ -48,7 +48,9 @@ module ppc_cpu
   parameter bit          LU2      = 1'b1,             // load-use 2: the D-cache's early word into the core (ppc_core LU2)
   parameter bit          ISB      = 1'b0,             // a 32 KiB I-cache (ppc_icache ISB; the 603e's is 16 KiB)
   parameter bit          FAST     = 1'b1,             // the single-precision unit (ppc_core FAST; 0: one FMA)
-  parameter bit          EWL      = 1'b0              // the early word as four ways and the way (ppc_core EWL, R140; 1: +119 ALUTs)
+  parameter bit          EWL      = 1'b0,             // the early word as four ways and the way (ppc_core EWL, R140; 1: +119 ALUTs)
+  parameter bit          WV       = 1'b1,             // the data cache's write-validate (ppc_dcache WV, study D-60): m_wbe carries a cast-out's lanes
+  parameter bit          RPE      = 1'b1              // a data micro-TLB miss refetched as its translation starts (ppc_core RPE, D-60)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -60,6 +62,7 @@ module ppc_cpu
   output logic [31:0] m_addr,
   output logic [3:0]  m_be,
   output logic [31:0] m_wdata,
+  output logic [3:0]  m_wbe,         // MC_LINE_WR: the lanes of the beat m_wdata shows (4'hF without WV)
   input  logic        m_ack,
   input  logic        m_wnext,
   input  logic        m_rvalid,
@@ -136,7 +139,7 @@ module ppc_cpu
   logic [6:0]  icbi_set;
   logic        d_resv, d_cond, res_kill;
 
-  ppc_core #(.RESET_PC (RESET_PC), .PVR (PVR), .PVR2 (PVR2), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA), .LU2 (LU2), .FAST (FAST), .EWL (EWL)) u_core (
+  ppc_core #(.RPE (RPE), .RESET_PC (RESET_PC), .PVR (PVR), .PVR2 (PVR2), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA), .LU2 (LU2), .FAST (FAST), .EWL (EWL)) u_core (
     .clk (clk), .rst (rst), .pvr_alt (pvr_alt),
     .i_req (i_req), .i_addr (i_addr), .i_wimg (i_wimg), .i_seq (i_seq), .i_valid (i_valid), .i_data (i_data),
     .i_way (i_way), .i_arr (i_arr), .i_pa (i_pa), .i_pv (i_pv), .i_pidx (i_pidx), .i_pway (i_pway), .i_ppa (i_ppa),
@@ -175,7 +178,7 @@ module ppc_cpu
   logic        dm_req, dm_ack, dm_wnext, dm_rvalid;
   logic [1:0]  dm_cmd;
   logic [31:0] dm_addr, dm_wdata;
-  logic [3:0]  dm_be;
+  logic [3:0]  dm_be, dm_wbe;
 
   ppc_icache #(.PRE (BTB), .FETCH2 (FETCH2), .ISB (ISB)) u_ic (
     .clk (clk), .rst (rst),
@@ -189,14 +192,14 @@ module ppc_cpu
     .t_alloc (), .t_alloc_set (), .t_alloc_way (), .t_alloc_tag ()
   );
 
-  ppc_dcache #(.SNOOP (SNOOP), .EARLY (LU2)) u_dc (
+  ppc_dcache #(.SNOOP (SNOOP), .EARLY (LU2), .WV (WV)) u_dc (
     .clk (clk), .rst (rst),
     .d_req (d_req), .d_we (d_we), .d_addr (d_addr), .d_be (d_be), .d_wdata (d_wdata), .d_wimg (d_wimg),
     .d_op (d_op), .d_rdy (d_rdy), .d_valid (d_valid), .d_rdata (d_rdata), .d_eword (d_eword), .d_eok (d_eok), .d_ew4 (d_ew4), .d_epw (d_epw),
     .hid_dce (hid_dce), .hid_dlock (hid_dlock), .hid_dcfi (hid_dcfi), .hid_noopti (hid_noopti),
     .dcfi_ack (), .d_idle (d_idle),
     .d_rsv (d_resv), .res_kill (res_kill), .sn_req (sn_req), .sn_addr (sn_addr), .sn_inv (sn_inv), .sn_ack (sn_ack),
-    .m_req (dm_req), .m_cmd (dm_cmd), .m_addr (dm_addr), .m_be (dm_be), .m_wdata (dm_wdata),
+    .m_req (dm_req), .m_cmd (dm_cmd), .m_addr (dm_addr), .m_be (dm_be), .m_wdata (dm_wdata), .m_wbe (dm_wbe),
     .m_ack (dm_ack), .m_wnext (dm_wnext), .m_rvalid (dm_rvalid), .m_rdata (m_rdata),
     .t_alloc (), .t_alloc_set (), .t_alloc_way (), .t_alloc_tag ()
   );
@@ -213,6 +216,7 @@ module ppc_cpu
   assign m_addr  = sel_d ? dm_addr : im_addr;
   assign m_be    = sel_d ? dm_be   : im_be;
   assign m_wdata = dm_wdata;                    // only the data cache writes
+  assign m_wbe   = dm_wbe;
   assign dm_ack    = m_ack && sel_d;
   assign im_ack    = m_ack && !sel_d;
   assign dm_rvalid = m_rvalid && own && od;

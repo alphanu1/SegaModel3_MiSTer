@@ -49,8 +49,28 @@ assign ADC_BUS  = 'Z;
 assign USER_OUT = '1;
 assign {UART_RTS, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
+// D-66 / D-68: every dual-SDRAM build puts the CPU's work RAM on the second SDRAM (m3_system W2, m3_sdr2), so
+// M3_CPU_SDR2 follows MISTER_DUAL_SDRAM (sys/sys_dual_sdram.tcl, the build script's --dual). Set by hand without it,
+// the build stops here (the module below does not exist): a single-SDRAM build has no second SDRAM's pins (R150).
 `ifdef MISTER_DUAL_SDRAM
-assign {SDRAM2_DQ, SDRAM2_A, SDRAM2_BA, SDRAM2_CLK, SDRAM2_nWE, SDRAM2_nCAS, SDRAM2_nRAS, SDRAM2_nCS} = 'Z;
+`ifndef M3_CPUTEST
+`ifndef M3_CPU_SDR2
+`define M3_CPU_SDR2
+`endif
+`endif
+`endif
+`ifdef M3_CPU_SDR2
+`ifndef MISTER_DUAL_SDRAM
+M3_CPU_SDR2_needs_MISTER_DUAL_SDRAM_R150 refuse();
+initial $error("M3_CPU_SDR2 needs MISTER_DUAL_SDRAM (sys/sys_dual_sdram.tcl)");
+`endif
+`elsif MISTER_DUAL_SDRAM
+// the second SDRAM fitted but unused (the CPU test build): held deselected (nCS high, NOP, clock low) rather than
+// left floating (d130, cl3/NOTES.md)
+assign SDRAM2_DQ = 'Z;
+assign {SDRAM2_A, SDRAM2_BA} = '0;
+assign SDRAM2_CLK = 1'b0;
+assign {SDRAM2_nCS, SDRAM2_nRAS, SDRAM2_nCAS, SDRAM2_nWE} = 4'b1111;
 `endif
 `ifdef M3_CPUTEST
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = '0;
@@ -98,6 +118,12 @@ localparam CONF_STR = {
 	"O[9:8],FPS average,1 s,5 s,10 s;",      // the OSD's default is the first entry (m3_fps avg)
 	"O[7:6],Volume,Normal,+6 dB,+12 dB;",    // on the sound link's fixed gain (m3_sndbridge GAIN), saturating
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+	// the SDRAM read capture (m2_sdram rd_lat_sel, n = CL + n), per controller, for the board's margin above 120 MHz
+	// (R184): change, then Reset
+	"O[74:73],SDRAM read capture,CL+2,CL+1,CL+3;",
+`ifdef M3_CPU_SDR2
+	"O[76:75],SDRAM2 read capture,CL+2,CL+1,CL+3;",
+`endif
 `ifndef M3_NO_INPUTS
 	// the driving profile's lines (Scud Race, Daytona USA 2), shown only for it
 	// (status_menumask bit 0): Model 2's lines and status bits (its R816-R958),
@@ -121,6 +147,9 @@ localparam CONF_STR = {
 	// as on Model 2 (between the R items it broke the OSD's Reset there)
 	"J1,B1,B2,B3,B4,Start,Coin,Test,Service,B9,B10,B11,B12;",
 `endif
+`ifdef M3_CPU_SDR2
+	"I,This build needs the second SDRAM;",  // hps_io info 1: m3_sdr2's start-up probe found none (D-67, D-68)
+`endif
 	"V,v",`BUILD_DATE
 };
 
@@ -133,6 +162,20 @@ wire  [31:0] joystick_0, joystick_1;
 wire  [15:0] joy_l0, joy_l1, joy_r0;
 wire   [7:0] joy_lt0, joy_rt0, paddle0;
 wire         inp_drive;
+// the second SDRAM (M3_CPU_SDR2: m3_system W2)
+`ifdef M3_CPU_SDR2
+localparam bit CPU_SDR2 = 1'b1;
+wire        sd2_en = SDRAM2_EN;
+wire [15:0] sd2_dq_i = SDRAM2_DQ;
+`else
+localparam bit CPU_SDR2 = 1'b0;
+wire        sd2_en = 1'b0;
+wire [15:0] sd2_dq_i = 16'd0;
+`endif
+wire        sd2_cs_n, sd2_ras_n, sd2_cas_n, sd2_we_n, sd2_dq_oe, sd2_info_req;
+wire  [1:0] sd2_ba;
+wire [12:0] sd2_a;
+wire [15:0] sd2_dq_o;
 
 // WIDE: 16-bit ioctl words, the address rising by 2 (m3_loader)
 hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
@@ -144,6 +187,9 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.buttons(buttons),
 	.status(status),
 	.status_menumask({15'd0, inp_drive}),
+`ifdef M3_CPU_SDR2
+	.info_req(sd2_info_req), .info(8'd1),
+`endif
 `ifndef M3_NO_INPUTS
 	.joystick_0(joystick_0),
 	.joystick_1(joystick_1),
@@ -167,8 +213,9 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 ///////////////////////   CLOCKS   ///////////////////////////////
 
 // The PLL is named `pll`: sys_top.sdc's clock groups match it by that name.
-wire clk_sys;        // 110 MHz (D-44), everything (outclk_1; outclk_0 is the CPU test's 20 MHz)
-wire clk_sdram_pin;  // 110 MHz at 180 degrees, SDRAM_CLK (Model 2's and the viewer's arrangement)
+wire clk_sys;        // 125 MHz (D-69), everything (outclk_1; outclk_0 is the CPU test's 20 MHz)
+wire clk_sdr;        // outclk_2: clk_sys's rate, 0.5 ns before its 180 degrees (3500 ps at 125 MHz): SDRAM_CLK's DDIO
+wire clk_sdr2;       // outclk_3: 0.75 ns before (3250 ps at 125 MHz): SDRAM2_CLK's DDIO (m3_sdr_clk below; R187)
 wire pll_locked;
 pll pll
 (
@@ -176,14 +223,22 @@ pll pll
 	.rst(0),
 	.outclk_0(),
 	.outclk_1(clk_sys),
-	.outclk_2(clk_sdram_pin),
+	.outclk_2(clk_sdr),
+	.outclk_3(clk_sdr2),
 	.locked(pll_locked)
 );
 
 // The system clock (outclk_1). A diagnostic build at another rate changes this
-// and the PLL's outclk_1 / outclk_2 together; m3_system derives every real-time
-// count from it (pixel enable, timebase, SDRAM refresh, EEPROM, MIDI, UART).
-localparam int SYS_HZ = 120_000_000;
+// and the PLL's outclk_1 / outclk_2 / outclk_3 together; m3_system derives every
+// real-time count from it (pixel enable, timebase, SDRAM refresh, EEPROM, MIDI,
+// UART). outclk_2 / outclk_3 keep their leads in time, not in degrees: T / 2 -
+// 500 ps and T / 2 - 750 ps (3500 / 3250 ps at 125 MHz; at 130 the PLL's 240 ps
+// steps make it 3365 / 3125, leads of 0.48 / 0.72 ns).
+// Two outputs because one lead cannot keep both SDRAMs on board-proven ground
+// (R187: the second SDRAM's read setup wants its clock earlier than the first's
+// fast-corner read hold allows).
+// D-69 as decided on 2026-11-14: 125 MHz everywhere, c125's clock (outclk_1 125 MHz).
+localparam int SYS_HZ = 130_000_000;
 
 // memory: out of reset on PLL lock, and stays out (study rules)
 reg [2:0] mem_rst_s = 3'b000;
@@ -229,17 +284,28 @@ localparam bit INP_LEAN = 1'b1;
 localparam bit INP_LEAN = 1'b0;
 `endif
 
+// the OSD's order to m2_sdram's rd_lat_sel (index n = CL + n): CL+2 (2, the default entry), CL+1 (1), CL+3 (3)
+wire [2:0] sdr_cap1 = (status[74:73] == 2'd1) ? 3'd1 : (status[74:73] == 2'd2) ? 3'd3 : 3'd2;
+`ifdef M3_CPU_SDR2
+wire [2:0] sdr_cap2 = (status[76:75] == 2'd1) ? 3'd1 : (status[76:75] == 2'd2) ? 3'd3 : 3'd2;
+`else
+wire [2:0] sdr_cap2 = 3'd2;
+`endif
 m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN), .SDR_BXOR(1'b1), .SDR_L16(1'b1), .SDR_LW1(1'b1),
             .SDR_PAIR(1'b1), .SDR_PW(1'b1),
             .BUS_FAST(1'b1), .BUS_R3P(1'b1), .SDR_FREQ(1'b1), .SDR_FWD(1'b1), .SDR_FDSP(1'b1),
-            .SDR_PW_DLY(8), .ISB(1'b1)) sys3
+            .SDR_PW_DLY(8), .ISB(1'b1), .W2(CPU_SDR2)) sys3
 (
 	.clk(clk_sys), .mem_rst_n(mem_rst_n), .reset(RESET | status[0] | buttons[1]),
 	.ioctl_download(ioctl_download), .ioctl_index(ioctl_index), .ioctl_wr(ioctl_wr),
 	.ioctl_addr(ioctl_addr), .ioctl_dout(ioctl_dout), .ioctl_wait(ioctl_wait),
-	.rd_lat_sel(3'd2),                       // CL + 2, Model 2's board value (its R411), as the viewer
+	.rd_lat_sel(sdr_cap1),                   // OSD: CL+2 (the default: Model 2's board value, its R411), CL+1, CL+3
+	.sd2_rd_lat_sel(sdr_cap2),               // the second SDRAM's, the same choices
 	.sd_cke(SDRAM_CKE), .sd_cs_n(SDRAM_nCS), .sd_ras_n(SDRAM_nRAS), .sd_cas_n(SDRAM_nCAS), .sd_we_n(SDRAM_nWE),
 	.sd_ba(SDRAM_BA), .sd_a(SDRAM_A), .sd_dqm(sdr_dqm), .sd_dq_o(sd_dq_o), .sd_dq_oe(sd_dq_oe), .sd_dq_i(SDRAM_DQ),
+	.sd2_en(sd2_en), .sd2_cs_n(sd2_cs_n), .sd2_ras_n(sd2_ras_n), .sd2_cas_n(sd2_cas_n), .sd2_we_n(sd2_we_n),
+	.sd2_ba(sd2_ba), .sd2_a(sd2_a), .sd2_dq_o(sd2_dq_o), .sd2_dq_oe(sd2_dq_oe), .sd2_dq_i(sd2_dq_i),
+	.sd2_missing(), .sd2_info_req(sd2_info_req),
 	.ddr_ok(ddr_ok), .DDRAM_CLK(DDRAM_CLK), .DDRAM_BUSY(DDRAM_BUSY), .DDRAM_BURSTCNT(DDRAM_BURSTCNT), .DDRAM_ADDR(DDRAM_ADDR),
 	.DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE), .DDRAM_RD(DDRAM_RD),
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY),
@@ -259,7 +325,24 @@ m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN
 assign SDRAM_DQ  = sd_dq_oe ? sd_dq_o : 16'bZ;
 // the 128 MB module takes its byte mask on A12:A11 (Model 2 R891)
 assign {SDRAM_DQMH, SDRAM_DQML} = SDRAM_A[12:11];
-assign SDRAM_CLK = clk_sdram_pin;
+// R187: clk_sdr from the pin's DDIO output register (after MemTest256), so it leaves its I/O cell as the address,
+// command and DQ registers leave theirs, 0.5 ns ahead of clk_sys's 180 degrees; Model3.sdc's generated clock sd1_pin
+m3_sdr_clk #(.INV(1'b0)) u_sdclk1 (.clk(clk_sdr), .pin(SDRAM_CLK));
+
+`ifdef M3_CPU_SDR2
+// the second SDRAM (D-66, D-68): always driven, straight from its controller's registers (they pack into the I/O
+// cells); idle is a NOP. Its clock is clk_sdr2 (outclk_3, 0.25 ns ahead of the first's) from its own pin's DDIO
+// output register (R187; Model3.sdc's sd2_pin); its byte mask is on A12:A11 (the header has no DQM pins), nCS the
+// 128 MB module's chip select
+assign SDRAM2_DQ   = sd2_dq_oe ? sd2_dq_o : 16'bZ;
+assign SDRAM2_A    = sd2_a;
+assign SDRAM2_BA   = sd2_ba;
+assign SDRAM2_nCS  = sd2_cs_n;
+assign SDRAM2_nRAS = sd2_ras_n;
+assign SDRAM2_nCAS = sd2_cas_n;
+assign SDRAM2_nWE  = sd2_we_n;
+m3_sdr_clk #(.INV(1'b0)) u_sdclk2 (.clk(clk_sdr2), .pin(SDRAM2_CLK));
+`endif
 
 assign CLK_VIDEO = clk_sys;
 assign CE_PIXEL  = ce_pix;
@@ -321,6 +404,7 @@ pll pll
 	.outclk_0(clk_sys),
 	.outclk_1(clk_cpu),
 	.outclk_2(),
+	.outclk_3(),
 	.locked(pll_locked)
 );
 

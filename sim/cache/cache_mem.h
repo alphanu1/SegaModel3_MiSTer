@@ -41,6 +41,8 @@ struct MemAgent {
   std::vector<Single> log;
   // statistics
   uint64_t n_fill = 0, n_wb = 0, n_rd = 0, n_wr = 0;
+  uint64_t n_wbp = 0, n_wbeat0 = 0;   // line writes with a beat of fewer than four lanes (write-validate); beats of none
+  bool wb_part = false;
   // error
   int err = 0;
 
@@ -56,7 +58,8 @@ struct MemAgent {
   bool ack = false, rvalid = false, wnext = false; uint32_t rdata = 0;
 
   // call once per cycle before the edge
-  void step(bool m_req, unsigned m_cmd, uint32_t m_addr, unsigned m_be, uint32_t m_wdata) {
+  // m_wbe: a line write's lanes for the beat m_wdata shows (ppc_dcache WV); 0xF without it
+  void step(bool m_req, unsigned m_cmd, uint32_t m_addr, unsigned m_be, uint32_t m_wdata, unsigned m_wbe = 0xF) {
     ack = rvalid = wnext = false; rdata = 0xDEADBEEF;
     switch (st) {
       case IDLE:
@@ -69,7 +72,7 @@ struct MemAgent {
         ack = true; cmd = m_cmd; addr = m_addr; be = m_be;
         if (cmd == 0) { st = RBEATS; beat = 0; delay = first_lat(); n_fill++; }
         else if (cmd == 1) {
-          st = WBEATS; beat = 0; delay = rnd(1, 4); n_wb++;
+          st = WBEATS; beat = 0; delay = rnd(1, 4); n_wb++; wb_part = false;
           if (addr & 31) { std::printf("MEM: line write not aligned %08X\n", addr); err++; }
         } else if (cmd == 2) {
           st = SRD; delay = first_lat(); n_rd++;
@@ -90,7 +93,9 @@ struct MemAgent {
       case WBEATS:
         if (--delay > 0) break;
         wnext = true;
-        mem->wr((addr & ~31u) | (beat << 2), m_wdata, 0xF);
+        mem->wr((addr & ~31u) | (beat << 2), m_wdata, m_wbe & 0xF);
+        if ((m_wbe & 0xF) != 0xF) { if (!wb_part) n_wbp++; wb_part = true; }
+        if ((m_wbe & 0xF) == 0) n_wbeat0++;
         if (++beat == 8) st = IDLE; else delay = 1 + rnd(0, gap_max);
         break;
       case SRD:

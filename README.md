@@ -56,7 +56,7 @@ program every sample, playing or not. In the FPGA they cost about 570 ALM.
 | **System** | Step 1.0, 1.5 and 2.x from one core, chosen by the MRA: the MPC105/106, the 53C810, the Step 2 DMA device, the 315-5881 security chip, JTAG, the EEPROM, the RTC and the backup RAM. |
 | **Inputs** | Driving (wheel, pedals, the four-speed shifter, view and hand brake), fighting, light guns and fishing controls, from Model 2's input code and steering options, with Model 3's own light-gun and fishing profiles. |
 | **Sound** | SCSP DSPs in the FPGA, everything else in the Arcade Sound Server (above). Volume on the OSD. |
-| **Clock** | 120 MHz. The fit is about 3 ns short of setup at the slow corners, so this is a test clock until timing closes. |
+| **Clock** | 130 MHz. Each SDRAM's clock pin leaves a DDIO cell clocked by its own PLL output, with a phase set ahead of the core clock's 180 degrees. The fit is about 3.5-3.8 ns short of setup at the slow corners, so this is a test clock until timing closes. |
 
 ### Speed on the board, at 120 MHz
 
@@ -67,16 +67,22 @@ program every sample, playing or not. In the FPGA they cost about 570 ALM.
   second.
 - **The Lost World:** 58 in attract.
 - **Daytona USA 2:** swings between 60 and 30 in attract, and races at 30.
-  A 130 MHz test build reached 60 in attract and in VF3, but not in a Daytona
-  2 race.
-- **Sega Rally 2:** tested at 130 MHz so far.
 - **Spikeout Final Edition:** 58 in attract, at 130 MHz.
+
+### At 130 MHz, with two SDRAM modules
+
+- **Virtua Fighter 3:** 20 minutes of attract and a full round with no lockup.
+- **Scud Race:** some short drops to 30.
+- **Daytona USA 2:** 60 in attract, mostly 30 on the first track.
+- **Sega Rally 2:** 60 in attract, mostly 30 in a race.
+
+The races are held back by the CPU.
 
 ### What's left
 
-- **Timing closure**, first: every corner at 120 MHz, then speed.
-- **Daytona 2's race at 60.** The CPU on its own clock, and the second SDRAM
-  as its own memory, are the next things to try.
+- **Timing closure:** every corner at 130 MHz.
+- **The races at 60** (Daytona 2, Sega Rally 2): a faster CPU.
+- **One SDRAM module at 130 MHz:** not yet tried on my original module.
 - **Pictures:** Daytona 2's car shadow, Lost World's fog in the T-rex scene,
   Bass Fishing's water shadows and underwater tint, Scud Race's luminous
   polygons, a black shape under the fighter in Spikeout's attract.
@@ -111,9 +117,14 @@ quartus_sh --flow compile Model3
 ```
 
 The design fills the chip, so a build's timing depends on the fitter seed.
-`Model3.qsf` builds without `MISTER_DUAL_SDRAM`, so the analog I/O board
-works; one 128 MB SDRAM module is needed. `sys/` is MiSTer-devel's framework,
-unchanged.
+`Model3.qsf` builds for one 128 MB SDRAM module, without `MISTER_DUAL_SDRAM`,
+so the analog I/O board works. For two modules, swap the two `source` lines
+in the qsf (`sys/sys_dual_sdram.tcl` in, `sys/sys_analog.tcl` out). The CPU's
+work RAM then moves to the second module. A dual build on a board with one
+module says so on the OSD. For a release build, uncomment the
+`M3_RELEASE=1` line, which takes the debug blocks out. `sys/` is MiSTer-devel's
+framework, with one change: `audio_out.sv` can leave out the audio filter
+(`MISTER_DISABLE_AUDIO_FILTER`), as in my Model 2 core.
 
 ## Testing
 

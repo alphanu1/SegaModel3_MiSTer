@@ -25,6 +25,8 @@ constexpr unsigned K_CULLT = 462, LEN_CULLT = 43;
 constexpr unsigned K_SMFR = 469, LEN_SMFR = 119;
 constexpr unsigned K_SETUP4 = 493, LEN_SETUP4 = 116;
 constexpr unsigned K_SETUP2 = 575, LEN_SETUP2 = 110;
+constexpr unsigned K_SETUP44 = 630, LEN_SETUP44 = 168;
+constexpr unsigned K_SETUP22 = 780, LEN_SETUP22 = 119;
 constexpr unsigned R_MT = 0;
 constexpr unsigned R_CO = 8;
 constexpr unsigned R_PR = 12;

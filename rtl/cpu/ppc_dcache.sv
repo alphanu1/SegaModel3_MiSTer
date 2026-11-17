@@ -97,6 +97,31 @@
 // snooped write to the reservation's line clears the reservation (res_kill,
 // to ppc_core), until the next lwarx. An lwarx made while that snoop is in
 // progress, to its line, is cleared too.
+//
+// Write-validate (WV = 1; study D-60, R172). A store miss to work RAM (PA[0-8]
+// = WVA) allocates its line without reading it: the 603e's RWITM fill (table
+// 3-5) reads a line the program is about to overwrite, and VF3's display-list
+// writers cast out most such lines without reading a byte of them. Each byte
+// of the data arrays carries a ninth bit, U (unwritten: the M10Ks' 1024 x 10
+// form has the room), written with the byte. The allocation is an internal
+// fill: the fill unit's eight beats, made inside the cache with U = 1 and no
+// memory read (a dirty victim's copy still leads each beat), then the store
+// merged as after any store miss's fill. A store writes U = 0 on its lanes,
+// as do a fill's beats and dcbz's zeros. A load whose predicted way hits but
+// one of whose lanes is U = 1 (and not in the store buffer about to write it)
+// is a partial miss: the line is filled from memory into the same way, each
+// beat written only on the lanes still U = 1 (the line's own words and U bits
+// copied to the cast-out buffer ahead of the beats, as a victim's are), so
+// the bytes the program wrote stay; the line keeps its dirty bit; the load is
+// answered by its retry once the fill is done. A cast-out (eviction, dcbst,
+// dcbf, a snoop push) writes only the bytes with U = 0 (m_wbe, each beat's
+// lanes). The program sees what the RWITM gives: the bytes it did not write
+// read memory as the fill would have, the bytes it wrote are its own, and
+// memory gets the same line back. The one difference is the boundedly
+// undefined case of 3.6.4.1: a caching-inhibited store to a byte of a
+// resident line that the line has not written is kept in memory (the RWITM
+// copy would have overwritten it at the cast-out) and is what a later load of
+// that byte reads. Outside work RAM, and with WV = 0, a store miss fills.
 
 module ppc_dcache
   import ppc_cache_pkg::*;
@@ -108,7 +133,10 @@ module ppc_dcache
   parameter bit          SNOOP   = 1'b1,
   // the early word for ppc_core's load-use 2 (LU2): d_eword, the predicted way's word in the lookup cycle,
   // and d_eok; 0: both 0
-  parameter bit          EARLY   = 1'b1
+  parameter bit          EARLY   = 1'b1,
+  // write-validate (above): a store miss in work RAM (PA[31:23] == WVA) allocates without a fill; 0: as the 603e
+  parameter bit          WV      = 1'b0,
+  parameter logic [8:0]  WVA     = 9'd0
 )(
   input  logic        clk,
   input  logic        rst,
@@ -147,6 +175,7 @@ module ppc_dcache
   output logic [31:0] m_addr,
   output logic [3:0]  m_be,
   output logic [31:0] m_wdata,
+  output logic [3:0]  m_wbe,        // MC_LINE_WR: the lanes of the beat m_wdata shows (WV: a partial line's bytes)
   input  logic        m_ack,
   input  logic        m_wnext,
   input  logic        m_rvalid,
@@ -172,15 +201,22 @@ module ppc_dcache
   logic [9:0]       rd_a;                       // {set, word}
   logic [9:0]       wr_a;
   logic [31:0]      wr_d;
+  logic             wr_u;                       // WV: the U bit written with every lane of this write
   logic [3:0][3:0]  wr_en;                      // [way][lane], lane 0 = bits 31:24
   logic [3:0][31:0] dq;                         // each way's word at rd_a
+  logic [3:0][3:0]  du;                         // WV: each way's U bits at rd_a, [way][lane]; 0 without WV
+  // WV: the byte and its U bit in one M10K (1024 x 10: the ninth bit is free); the instance keeps its name
+  localparam int DW = WV ? 9 : 8;
   genvar gw, gl;
   generate
     for (gw = 0; gw < 4; gw++) begin : g_way
       for (gl = 0; gl < 4; gl++) begin : g_lane
-        ppc_cache_ram #(.W(8), .D(1024)) u_d (
-          .clk (clk), .we (wr_en[gw][gl]), .wa (wr_a), .wd (wr_d[31-8*gl -: 8]),
-          .ra (rd_a), .q (dq[gw][31-8*gl -: 8]));
+        logic [DW-1:0] lq;
+        ppc_cache_ram #(.W(DW), .D(1024)) u_d (
+          .clk (clk), .we (wr_en[gw][gl]), .wa (wr_a), .wd (DW'({wr_u, wr_d[31-8*gl -: 8]})),
+          .ra (rd_a), .q (lq));
+        assign dq[gw][31-8*gl -: 8] = lq[7:0];
+        assign du[gw][gl] = WV && lq[DW-1];
       end
     end
   endgenerate
@@ -205,12 +241,13 @@ module ppc_dcache
   logic [8:0]  st_wd;
   always_ff @(posedge clk) if (st_we) stm[st_wa] <= st_wd;
 
-  // cast-out buffer
-  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] cbm [0:7];
+  // cast-out buffer: {U bits by lane, word} (WV; the U bits are four more columns of the same two MLABs)
+  localparam int CBW = WV ? 36 : 32;
+  (* ramstyle = "MLAB, no_rw_check" *) logic [CBW-1:0] cbm [0:7];
   logic        cp_dv;
   logic [2:0]  cp_dw;
   logic [1:0]  cp_way;
-  always_ff @(posedge clk) if (cp_dv) cbm[cp_dw] <= dq[cp_way];
+  always_ff @(posedge clk) if (cp_dv) cbm[cp_dw] <= WV ? CBW'({du[cp_way], dq[cp_way]}) : CBW'(dq[cp_way]);
 
   // ================================================================ state
   // R: the request taken last (fresh: its arrays were read at the last edge)
@@ -234,7 +271,7 @@ module ppc_dcache
   (* preserve *) logic d_rdy_q;
 
   // MQ: a miss waiting for the memory port
-  logic        mq_v, mq_vdirty;
+  logic        mq_v, mq_vdirty, mq_mrg;
   logic [2:0]  mq_k;
   logic [31:2] mq_a;
   logic [3:0]  mq_be;
@@ -244,6 +281,8 @@ module ppc_dcache
 
   // FU: the fill
   logic        f_act, f_wb;
+  logic        f_int;                           // WV: a store miss's allocation, its beats made here (U = 1)
+  logic        f_mrg;                           // WV: a partial miss's fill, merged into the line's unwritten bytes
   logic [1:0]  f_ph;                            // 0 beats, 1-3 the end (merge a store, then visible)
   logic [2:0]  f_k;
   logic [31:2] f_a;
@@ -254,6 +293,7 @@ module ppc_dcache
   logic        fb_v;                            // a beat registered, written at the next edge
   logic [2:0]  fb_w;
   logic [31:0] fb_d;
+  logic        fb_u, fb_mrg;                    // WV: the beat is internal (U = 1); a merge (lanes still U = 1 only)
 
   // CU: a line copied to the cast-out buffer
   logic        cp_act, cp_wb;
@@ -460,7 +500,9 @@ module ppc_dcache
     logic ans, sb, uq, dq, rw, ph1, ph2, st, dirty;
   } lk_t;
   // (every input an argument: Quartus 17 does not read a module's signals inside a function)
-  function automatic lk_t lkf(input logic a_any, input logic a_hp, input logic a_lk, input logic [2:0] a_r_k_l,
+  // a_pm (WV): the predicted way's lanes the load reads include an unwritten byte (a partial miss, to DQ;
+  // the load stays in X and retries, blocked by its set until the fill is done)
+  function automatic lk_t lkf(input logic a_any, input logic a_hp, input logic a_pm, input logic a_lk, input logic [2:0] a_r_k_l,
                               input logic a_r_byp_l, input logic a_dq_free, input logic a_wp_free, input logic a_wt,
                               input logic a_hid_dlock, input logic a_hid_noopti, input logic a_hid_dce,
                               input logic [3:0] a_r_wimg_l, input logic a_quiet);
@@ -470,6 +512,8 @@ module ppc_dcache
         K_LD:
           if (a_r_byp_l) begin
             if (a_dq_free) begin lkf.uq = 1'b1; lkf.ph2 = 1'b1; end
+          end else if (a_any && a_hp && a_pm) begin
+            if (a_dq_free) lkf.dq = 1'b1;
           end else if (a_any) begin
             lkf.st = 1'b1;
             if (a_hp) lkf.ans = 1'b1; else lkf.rw = 1'b1;
@@ -503,16 +547,62 @@ module ppc_dcache
   endfunction
 
 
-  lk_t lk00, lk10, lk11, lko;
-  assign lk00 = lkf(1'b0, 1'b0, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet);
-  assign lk10 = lkf(1'b1, 1'b0, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet);
-  assign lk11 = lkf(1'b1, 1'b1, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet);
-  assign lko  = hp ? lk11 : any ? lk10 : lk00;
+  // ============================================================ store-buffer compares
+  // (here, ahead of their readers: the U check below and the output's byte sources)
+  // byte sources: the store just written, the store about to be, the word
+  // (both candidates compared, x_v choosing last, as for blk)
+  // laid out by hand (keep, R108), as the tag compare: three-bit groups against each candidate, five
+  // groups ANDed, then x_v's choice with the valid bit. Left to synthesis the 30-bit compare with the
+  // select in it was five levels from r_a into d_rdata (a CPU subsystem spike's r_a -> d_rdata)
+  (* keep = 1 *) wire [9:0] sbg_x, sbg_r, sblg_x, sblg_r;
+  (* keep = 1 *) wire [1:0] sba_x, sba_r, sbla_x, sbla_r;
+  genvar sbg;
+  generate
+  for (sbg = 0; sbg < 10; sbg = sbg + 1) begin : g_sb
+    assign sbg_x[sbg]  = sb_a[2 + 3*sbg +: 3]  == x_a[2 + 3*sbg +: 3];
+    assign sbg_r[sbg]  = sb_a[2 + 3*sbg +: 3]  == r_a[2 + 3*sbg +: 3];
+    assign sblg_x[sbg] = sbl_a[2 + 3*sbg +: 3] == x_a[2 + 3*sbg +: 3];
+    assign sblg_r[sbg] = sbl_a[2 + 3*sbg +: 3] == r_a[2 + 3*sbg +: 3];
+  end
+  for (sbg = 0; sbg < 2; sbg = sbg + 1) begin : g_sba
+    assign sba_x[sbg]  = &sbg_x[5*sbg +: 5];
+    assign sba_r[sbg]  = &sbg_r[5*sbg +: 5];
+    assign sbla_x[sbg] = &sblg_x[5*sbg +: 5];
+    assign sbla_r[sbg] = &sblg_r[5*sbg +: 5];
+  end
+  endgenerate
+  wire sb_m  = sb_v  && (x_v ? &sba_x  : &sba_r);
+  wire sbl_m = sbl_v && (x_v ? &sbla_x : &sbla_r);
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && (sb_m != (sb_v && (x_v ? sb_a == x_a : sb_a == r_a)) || sbl_m != (sbl_v && (x_v ? sbl_a == x_a : sbl_a == r_a))))
+      $fatal(1, "dcache store-buffer address compares laid out");
+`endif
+  // WV: the predicted way's U bits on the lanes the request reads, less the lanes the store buffer's two
+  // stores give (they are written, or about to be). From the arrays and registers beside the tag compare;
+  // vp (the lanes are written) is one level after each way's term and chooses the hit case's outcome, as
+  // hp chooses between the cases (a store or a cache operation ignores it)
+  logic [3:0]  ndl;                             // [lane]: the request reads the lane and no store gives it
+  logic [3:0]  vw;                              // [way]: no lane the request needs is unwritten
+  always_comb begin
+    for (int l = 0; l < 4; l++)
+      ndl[l] = r_be_l[3-l] && !(sb_m && sb_be[3-l]) && !(sbl_m && sbl_be[3-l]);
+    for (int w = 0; w < 4; w++)
+      vw[w] = !WV || !(|(du[w] & ndl));
+  end
+  wire         vp = vw[pw];
+
+  lk_t lk00, lk10, lk11, lk1p, lko;
+  assign lk00 = lkf(1'b0, 1'b0, 1'b0, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet);
+  assign lk10 = lkf(1'b1, 1'b0, 1'b0, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet);
+  assign lk11 = lkf(1'b1, 1'b1, 1'b0, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet);
+  assign lk1p = lkf(1'b1, 1'b1, 1'b1, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet);
+  assign lko  = hp ? (vp ? lk11 : lk1p) : any ? lk10 : lk00;
   wire l_ans = lko.ans, l_sb = lko.sb, l_uq = lko.uq, l_dq = lko.dq, l_rw = lko.rw, l_ph1 = lko.ph1,
        l_ph2 = lko.ph2, l_st = lko.st, l_dirty = lko.dirty;
 `ifdef VERILATOR
   always_ff @(posedge clk)
-    if (!rst && lko != lkf(any, hp, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet)) $fatal(1, "dcache lookup outcome by case");
+    if (!rst && lko != lkf(any, hp, !vp, lk, r_k_l, r_byp_l, dq_free, wp_free, wt, hid_dlock, hid_noopti, hid_dce, r_wimg_l, quiet)) $fatal(1, "dcache lookup outcome by case");
   always_ff @(posedge clk)
     if (!rst && l_v && rd_set_q != r_set) $fatal(1, "dcache: the registered read set against the lookup's");
 `endif
@@ -522,9 +612,18 @@ module ppc_dcache
   // lookup stage is empty), and DQ is free (the cache was quiet), so a hit
   // goes through DQ's own outputs: the cast-out (do_cp), the tag write
   // (do_tw) and the state write (d_st) of dcbst (sn_inv = 0) or dcbf (1).
-  // The set's state is read on a port of its own; nothing writes it between
-  // SN_B and SN_C.
-  wire  [8:0]  st_sn  = stm[dq_set];
+  // The set's state is DQ's (taken in SN_B with the read); nothing writes it
+  // between SN_B and SN_C.
+  // (R172) the set's state as SN_B registered it into DQ (dq_st <= st: the state read at the snoop's set, with a
+  // hit's pending write bypassed in). Between that edge and SN_C nothing writes the state: no lookup runs (the
+  // snoop held the read port), DQ is free and the sweep is not running. The second read port of stm (an MLAB copy
+  // of its own) is gone; under Verilator the two are checked against each other in every SN_C
+  wire  [8:0]  st_sn  = dq_st;
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (R1C && !rst && SNOOP && sn_st == SN_C && st_sn != stm[dq_set])
+      $fatal(1, "dcache: the snoop's state from DQ %03X against the set's %03X", st_sn, stm[dq_set]);
+`endif
   wire         sn_c   = SNOOP && sn_st == SN_C;
   (* keep = 1 *) wire sn_ok = (|sn_hv) && dq_a[31:12] != RSV_TAG;   // from registers (R108: HID0[DCE] last)
   wire         sn_hit = sn_ok && hid_dce;
@@ -537,6 +636,11 @@ module ppc_dcache
   wire         d_vdirty = dq_st[5 + d_vic] && !dq_inv[d_vic];
   wire         d_hdirty = dq_st[5 + dq_hw];
   wire         d_alloc  = dq_v && (dq_k == K_LD || dq_k == K_ST || dq_k == K_TCH);
+  // WV: a load in DQ whose line is resident is a partial miss: its fill goes into the hit way, merged, with no
+  // victim and no allocation (a load that hits otherwise never reaches DQ)
+  wire         d_mrg    = WV && dq_k == K_LD && dq_any;
+  wire  [1:0]  d_way    = d_mrg ? dq_hw : d_vic;      // the way the fill writes
+  wire         d_wbv    = d_vdirty && !d_mrg;         // a dirty victim to cast out after the fill
 
   logic        do_cp, do_z, do_tw, do_cbz, cp_from_vic, d_st;
   logic [1:0]  op_way;                          // way for CU / ZU / tag write
@@ -547,9 +651,12 @@ module ppc_dcache
     op_way = dq_hw; tw_tag = RSV_TAG; d_st_new = dq_st;
     if (dq_v) begin
       case (dq_k)
-        K_LD, K_TCH: begin
-          d_st = 1'b1; d_st_new = touch(dq_st, d_vic); d_st_new[5 + d_vic] = 1'b0;
-        end
+        K_LD, K_TCH:
+          if (d_mrg) begin                      // the hit way, its dirty bit kept
+            d_st = 1'b1; d_st_new = touch(dq_st, dq_hw);
+          end else begin
+            d_st = 1'b1; d_st_new = touch(dq_st, d_vic); d_st_new[5 + d_vic] = 1'b0;
+          end
         K_ST: begin
           d_st = 1'b1; d_st_new = touch(dq_st, d_vic); d_st_new[5 + d_vic] = 1'b1;
         end
@@ -604,23 +711,34 @@ module ppc_dcache
   wire fill_go   = fill_free && (mq_v || d_alloc);
   wire fs_mq     = mq_v;                        // the fill's source
   wire [31:2]  fs_a     = fs_mq ? mq_a     : dq_a;
-  wire [1:0]   fs_way   = fs_mq ? mq_way   : d_vic;
-  wire         fs_vd    = fs_mq ? mq_vdirty : d_vdirty;
+  wire [1:0]   fs_way   = fs_mq ? mq_way   : d_way;
+  wire         fs_vd    = fs_mq ? mq_vdirty : d_wbv;
+  wire         fs_mrg   = WV && (fs_mq ? mq_mrg : d_mrg);
   wire [19:0]  fs_vtag  = fs_mq ? mq_vtag  : dq_tg[d_vic];
-  wire [19:0]  fs_otag  = fs_mq ? mq_otag  : dq_tg[d_vic ^ 2'd1];
+  wire [19:0]  fs_otag  = fs_mq ? mq_otag  : dq_tg[d_way ^ 2'd1];
   wire [2:0]   fs_k     = fs_mq ? mq_k     : dq_k;
   wire [3:0]   fs_be    = fs_mq ? mq_be    : dq_be;
   wire [31:0]  fs_wd    = fs_mq ? mq_wd    : dq_wd;
+  // WV: a store miss in work RAM is allocated without a read; the beats are made here
+  wire         fs_int   = WV && fs_k == K_ST && fs_a[31:23] == WVA;
+  wire         fs_cp    = fs_vd || fs_mrg;      // the line in the fill's way copied to the cast-out buffer
   wire beat     = (mp == MP_FILL) && m_rvalid;
-  wire er_ans   = beat && f_cnt == 3'd0 && f_k == K_LD;      // the critical word, as it arrives
+  // an internal beat: one a cycle from the cycle after fill_go. A dirty victim's copy starts in that same cycle
+  // and has the read port first (RD_CP), so it reads word base + k in the cycle beat k is registered, and beat k
+  // is written an edge later: every word is read before its beat overwrites it, as for a fill from memory
+  wire ibeat    = WV && f_act && f_int && f_ph == 2'd0;
+  wire beat_x   = beat || ibeat;
+  wire er_ans   = beat && f_cnt == 3'd0 && f_k == K_LD && !f_mrg;   // the critical word, as it arrives
   // A load to the line being filled, held in X by the set's block, is answered from the fill's own
   // copy of the words (fbuf) as soon as its word has arrived, not when the fill ends (study R104).
   // Not for a store miss's fill (its store is merged at the end), nor with a miss, decision or single
   // access waiting, nor in a retry phase; stores to the line, and every other access to the set, still
   // wait for the fill to end. The fill wrote the tags at its start, so the line is resident.
-  logic [31:0] fbuf [8];
+  // (an MLAB, R172: written a beat at a time at the beat's word, read asynchronously at X's word, as the eight
+  // registers and their 8:1 select were; an MLAB's word is the registers' in every cycle, before and after a write)
+  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] fbuf [8];
   logic [7:0]  fav;
-  wire fh = x_v && x_k == K_LD && !x_byp && x_ph == 2'd0 && f_act && f_k != K_ST && x_a[31:5] == f_a[31:5] &&
+  wire fh = x_v && x_k == K_LD && !x_byp && x_ph == 2'd0 && f_act && f_k != K_ST && !f_mrg && x_a[31:5] == f_a[31:5] &&
             fav[x_a[4:2]] && !mq_v && !dq_v && !uq_v;
   wire srd_ans  = (mp == MP_SRD) && m_rvalid;
   wire cp_rd    = cp_act && !cp_cnt[3];
@@ -643,10 +761,15 @@ module ppc_dcache
     endcase
 
   // ============================================================ write port
+  // WV: a merge fill's beat goes only into the lanes the line has not written (the copy's U bits, read from
+  // the cast-out buffer at the beat's word: no write-back uses the buffer during that fill)
+  wire  [2:0]     cb_ra = (WV && f_mrg && f_act) ? fb_w : wb_cnt;
+  wire  [CBW-1:0] cbq   = cbm[cb_ra];
+  wire  [3:0]     cb_u  = WV ? cbq[CBW-1 -: 4] : 4'h0;    // [lane]
   always_comb begin
-    wr_a = 10'd0; wr_d = 32'd0; wr_en = '0;
+    wr_a = 10'd0; wr_d = 32'd0; wr_en = '0; wr_u = 1'b0;
     if (fb_v) begin
-      wr_a = {f_a[11:5], fb_w}; wr_d = fb_d; wr_en[f_way] = 4'hF;
+      wr_a = {f_a[11:5], fb_w}; wr_d = fb_d; wr_en[f_way] = (WV && fb_mrg) ? cb_u : 4'hF; wr_u = WV && fb_u;
     end else if (sb_v) begin
       wr_a = sb_a[11:2]; wr_d = sb_wd;
       wr_en[sb_way] = {sb_be[0], sb_be[1], sb_be[2], sb_be[3]};
@@ -666,35 +789,6 @@ module ppc_dcache
   end
 
   // ============================================================ output
-  // byte sources: the store just written, the store about to be, the word
-  // (both candidates compared, x_v choosing last, as for blk)
-  // laid out by hand (keep, R108), as the tag compare: three-bit groups against each candidate, five
-  // groups ANDed, then x_v's choice with the valid bit. Left to synthesis the 30-bit compare with the
-  // select in it was five levels from r_a into d_rdata (a CPU subsystem spike's r_a -> d_rdata)
-  (* keep = 1 *) wire [9:0] sbg_x, sbg_r, sblg_x, sblg_r;
-  (* keep = 1 *) wire [1:0] sba_x, sba_r, sbla_x, sbla_r;
-  genvar sbg;
-  generate
-  for (sbg = 0; sbg < 10; sbg = sbg + 1) begin : g_sb
-    assign sbg_x[sbg]  = sb_a[2 + 3*sbg +: 3]  == x_a[2 + 3*sbg +: 3];
-    assign sbg_r[sbg]  = sb_a[2 + 3*sbg +: 3]  == r_a[2 + 3*sbg +: 3];
-    assign sblg_x[sbg] = sbl_a[2 + 3*sbg +: 3] == x_a[2 + 3*sbg +: 3];
-    assign sblg_r[sbg] = sbl_a[2 + 3*sbg +: 3] == r_a[2 + 3*sbg +: 3];
-  end
-  for (sbg = 0; sbg < 2; sbg = sbg + 1) begin : g_sba
-    assign sba_x[sbg]  = &sbg_x[5*sbg +: 5];
-    assign sba_r[sbg]  = &sbg_r[5*sbg +: 5];
-    assign sbla_x[sbg] = &sblg_x[5*sbg +: 5];
-    assign sbla_r[sbg] = &sblg_r[5*sbg +: 5];
-  end
-  endgenerate
-  wire sb_m  = sb_v  && (x_v ? &sba_x  : &sba_r);
-  wire sbl_m = sbl_v && (x_v ? &sbla_x : &sbla_r);
-`ifdef VERILATOR
-  always_ff @(posedge clk)
-    if (!rst && (sb_m != (sb_v && (x_v ? sb_a == x_a : sb_a == r_a)) || sbl_m != (sbl_v && (x_v ? sbl_a == x_a : sbl_a == r_a))))
-      $fatal(1, "dcache store-buffer address compares laid out");
-`endif
   logic [31:0] ld_word;
   always_comb
     for (int l = 0; l < 4; l++) begin
@@ -757,7 +851,8 @@ module ppc_dcache
   (* keep = 1 *) wire xvn00 = xvn_f(lk00.ans, x_v, lx, lk, 1'b0, lr, l_post);
   (* keep = 1 *) wire xvn10 = xvn_f(lk10.ans, x_v, lx, lk, 1'b0, lr, l_post);
   (* keep = 1 *) wire xvn11 = xvn_f(lk11.ans, x_v, lx, lk, 1'b0, lr, l_post);
-  wire x_v_c   = !xvxa && (hp ? xvn11 : any ? xvn10 : xvn00);
+  wire xvn1p   = xvn_f(lk1p.ans, x_v, lx, lk, 1'b0, lr, l_post);   // (WV: a partial miss, never an answer)
+  wire x_v_c   = !xvxa && (hp ? (vp ? xvn11 : xvn1p) : any ? xvn10 : xvn00);
   // d_rdy from x_v's next value, so EX's request (d_req, in r_v_n and r_fresh_n) is one level from it:
   // formed per case beside the compare, the request was three levels deep (R108, cH's release fit:
   // op_x -> d_rdy_q, -1.55 ns), the compare one level less than this
@@ -811,6 +906,9 @@ module ppc_dcache
   assign d_rdy = d_rdy_q;
 
   // ============================================================ the rest
+  // the fill's copy of its words (fh), written as the beat is registered: the FU branch below (!rst, f_act, no
+  // fill_go: fill_free needs !f_act)
+  always_ff @(posedge clk) if (!rst && f_act && beat_x) fbuf[f_a[4:2] + f_cnt] <= m_rdata;
   always_ff @(posedge clk) begin
     t_alloc <= 1'b0;
     dcfi_ack <= 1'b0;
@@ -864,12 +962,13 @@ module ppc_dcache
       end
 
       // ---- an allocation, in program order (the fill may start later)
-      if (d_alloc || (do_tw && cp_from_vic)) begin
+      if ((d_alloc && !d_mrg) || (do_tw && cp_from_vic)) begin
         t_alloc <= 1'b1; t_alloc_set <= dq_set; t_alloc_way <= d_vic; t_alloc_tag <= dq_a[31:12];
       end
       if (d_alloc && !fill_go) begin
         mq_v <= 1'b1; mq_k <= dq_k; mq_a <= dq_a; mq_be <= dq_be; mq_wd <= dq_wd;
-        mq_way <= d_vic; mq_vtag <= dq_tg[d_vic]; mq_vdirty <= d_vdirty; mq_otag <= dq_tg[d_vic ^ 2'd1];
+        mq_way <= d_way; mq_vtag <= dq_tg[d_vic]; mq_vdirty <= d_wbv; mq_otag <= dq_tg[d_way ^ 2'd1];
+        mq_mrg <= d_mrg;
       end
 
       // ---- tag writes decided by DQ (cache operations)
@@ -883,7 +982,7 @@ module ppc_dcache
       if (do_cp) begin
         cp_act <= 1'b1; cp_wb <= 1'b1; cp_set <= dq_set; cp_way <= op_way; cp_base <= 3'd0; cp_cnt <= 4'd0;
         wb_a   <= {cp_from_vic ? dq_tg[op_way] : dq_a[31:12], dq_set};
-      end else if (fill_go && fs_vd) begin
+      end else if (fill_go && fs_cp) begin
         cp_act <= 1'b1; cp_wb <= 1'b0; cp_set <= fs_a[11:5]; cp_way <= fs_way; cp_base <= fs_a[4:2];
         cp_cnt <= 4'd0;
         wb_a   <= {fs_vtag, fs_a[11:5]};
@@ -912,13 +1011,14 @@ module ppc_dcache
         if (fs_mq) mq_v <= 1'b0;
         f_act <= 1'b1; f_ph <= 2'd0; f_cnt <= 3'd0; fav <= 8'd0;
         f_k   <= fs_k; f_a <= fs_a; f_be <= fs_be; f_wd <= fs_wd; f_way <= fs_way; f_wb <= fs_vd;
+        f_int <= fs_int; f_mrg <= fs_mrg;
         tw_en_q  <= fs_way[1] ? 2'b10 : 2'b01;
         tw_set_q <= fs_a[11:5];
         tw_d_q   <= {2{fs_way[0] ? {fs_otag, fs_a[31:12]} : {fs_a[31:12], fs_otag}}};
       end else if (f_act) begin
-        if (beat) begin
-          fb_v <= 1'b1; fb_w <= f_a[4:2] + f_cnt; fb_d <= m_rdata;
-          fbuf[f_a[4:2] + f_cnt] <= m_rdata; fav[f_a[4:2] + f_cnt] <= 1'b1;
+        if (beat_x) begin
+          fb_v <= 1'b1; fb_w <= f_a[4:2] + f_cnt; fb_d <= m_rdata; fb_u <= f_int; fb_mrg <= f_mrg;
+          fav[f_a[4:2] + f_cnt] <= 1'b1;
           f_cnt <= f_cnt + 3'd1;
           if (f_cnt == 3'd7) f_ph <= 2'd1;
         end else if (f_ph != 2'd0) begin
@@ -937,7 +1037,7 @@ module ppc_dcache
           if (wb_pend && !cp_act) begin
             mp <= MP_RQ; m_req <= 1'b1; m_cmd <= MC_LINE_WR; m_addr <= {wb_a, 5'd0}; m_be <= 4'hF;
             wb_cnt <= 3'd0;
-          end else if (fill_go) begin
+          end else if (fill_go && !fs_int) begin
             mp <= MP_RQ; m_req <= 1'b1; m_cmd <= MC_LINE_RD; m_addr <= {fs_a, 2'd0}; m_be <= 4'hF;
           end else if (uq_v && !f_act) begin
             mp <= MP_RQ; m_req <= 1'b1; m_cmd <= uq_we ? MC_WR : MC_RD; m_addr <= {uq_a, 2'd0}; m_be <= uq_be;
@@ -1005,7 +1105,9 @@ module ppc_dcache
   assign sn_ack   = sn_ack_q;
   assign res_kill = SNOOP && (rv_kill || (rsv_q && rv_new));
 
-  assign m_wdata = (m_cmd == MC_WR) ? uq_wd : cb_zero ? 32'd0 : cbm[wb_cnt];
+  assign m_wdata = (m_cmd == MC_WR) ? uq_wd : cb_zero ? 32'd0 : cbq[31:0];
+  // a cast-out's lanes: the bytes the line has written (WV), every byte for a zeroed line (dcbz locked)
+  assign m_wbe   = (!WV || cb_zero) ? 4'hF : ~{cb_u[0], cb_u[1], cb_u[2], cb_u[3]};
   // d_idle from a register (R140): its next value from the next state of each of the seventeen registers it
   // reads. Formed in the cycle, the OR of those registers was two levels in front of the core's sync wait and
   // from there EX's hold into every operand register's enable and the queue's pops (ppc_cpu spike: cp_act ->
@@ -1014,24 +1116,24 @@ module ppc_dcache
   wire wk_go    = !wk_act && wk_req && quiet && !r_v && !x_v && !sn_np;     // the sweep starts (wk_req clears)
   wire mp_wbend = mp == MP_WB && m_wnext && wb_cnt == 3'd7;
   wire mp_uqend = (mp == MP_RQ && m_ack && m_cmd == MC_WR) || (mp == MP_SRD && m_rvalid);
-  wire mpn_idle = (mp == MP_IDLE) ? !((wb_pend && !cp_act) || fill_go || (uq_v && !f_act)) :
+  wire mpn_idle = (mp == MP_IDLE) ? !((wb_pend && !cp_act) || (fill_go && !fs_int) || (uq_v && !f_act)) :
                   (mp == MP_RQ)   ? (m_ack && m_cmd == MC_WR) :
                   (mp == MP_WB)   ? mp_wbend :
                   (mp == MP_FILL) ? (m_rvalid && f_cnt == 3'd7) :
                   (mp == MP_SRD)  ? m_rvalid : 1'b1;
   wire mq_v_n   = (d_alloc && !fill_go) || (mq_v && !(fill_go && fs_mq));
-  wire f_act_n  = fill_go || (f_act && !(!beat && f_ph == 2'd3));
-  wire cp_act_n = do_cp || (fill_go && fs_vd) || (cp_act && !(!cp_rd && cp_dv));
+  wire f_act_n  = fill_go || (f_act && !(!beat_x && f_ph == 2'd3));
+  wire cp_act_n = do_cp || (fill_go && fs_cp) || (cp_act && !(!cp_rd && cp_dv));
   wire z_act_n  = do_z || (z_act && !(!z_wcp && z_cnt[3]));
-  wire wbp_set  = (!do_cp && !(fill_go && fs_vd) && cp_act && !cp_rd && cp_dv && cp_wb) || do_cbz ||
-                  (!fill_go && f_act && !beat && f_ph == 2'd3 && f_wb);
+  wire wbp_set  = (!do_cp && !(fill_go && fs_cp) && cp_act && !cp_rd && cp_dv && cp_wb) || do_cbz ||
+                  (!fill_go && f_act && !beat_x && f_ph == 2'd3 && f_wb);
   wire wb_pend_n = !mp_wbend && (wbp_set || wb_pend);
   wire uq_v_n   = !mp_uqend && (l_uq || uq_v);
   wire sb_v_n   = l_sb || (f_act && f_ph == 2'd1 && f_k == K_ST);
   wire tw_n     = wk_act || do_tw || fill_go;                                // tw_en_q's next value is nonzero
   wire wk_act_n = wk_act ? wk_cnt != 8'd127 : wk_go;
   wire wk_req_n = !wk_go && (wk_req || (hid_dcfi && !dcfi_q && hid_dce));
-  wire fb_v_n   = !fill_go && f_act && beat;
+  wire fb_v_n   = !fill_go && f_act && beat_x;
   // (d_req, late from EX's translation, joins at the last level: r_v_n is d_req || (r_v && !lr))
   (* keep = 1 *) wire idl_n = !rst && !(r_v && !lr) && !x_v_c && !l_dq && !mq_v_n && !f_act_n && !cp_act_n && !z_act_n &&
                               !wb_pend_n && !uq_v_n && mpn_idle && !sb_v_n && !tw_n && !wk_act_n && !wk_req_n && !fb_v_n;

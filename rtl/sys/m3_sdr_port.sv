@@ -56,6 +56,9 @@
 //               into the line buffer, then two eight-column write bursts: the
 //               first once beats 0-3 are in, the second after the last beat.
 //               The bus is free after the eighth beat; the bursts are posted
+//               Each beat carries its lanes (s_wbe, beside s_wdata: the D-cache's write-validate writes back
+//               a line it has written only in part), and each column is written with them (m2_sdram's
+//               DQM): a beat of no lanes writes nothing. The lanes are four more columns of the buffers' MLABs.
 // s_zero answers reads with zeros without touching SDRAM (an absent CROM
 // bank). One transaction at a time; a new one is taken only when the last
 // is done, so reads see earlier writes: a posted write is drained before the
@@ -93,6 +96,7 @@ module m3_sdr_port
   input  logic          s_zero,
   input  logic [3:0]    s_be,
   input  logic [31:0]   s_wdata,
+  input  logic [3:0]    s_wbe,         // MC_LINE_WR: the beat's lanes, with s_wdata
   output logic          s_ack,
   output logic          s_wnext,
   output logic          s_rvalid,
@@ -145,6 +149,8 @@ module m3_sdr_port
   (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] bd_e [4];
   (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] bd_o [4];
   logic [31:0]  lr0, lr4;
+  logic [3:0]   lr0m, lr4m;      // their lanes
+  logic [3:0]   lbm [8];         // without PW: a line write's beats' lanes (with PW they are wbuf's)
   logic [2:0]   ek;              // beats sent
   logic [2:0]   crit;
   logic [1:0]   grp;             // T_LR with L16: the four-word groups arrived
@@ -161,7 +167,7 @@ module m3_sdr_port
   // {half, col[2:1]}, a single write's are wd.
   // PW: the posted line write's (T_PW) from its own buffer (an MLAB, one beat written a clock), its half
   // pw_h and form pw_sw
-  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] wbuf [8];
+  (* ramstyle = "MLAB, no_rw_check" *) logic [35:0] wbuf [8];   // {lanes, word}
   logic             pw_v, pw_h, pw_sw;
   logic [AW:5]      pw_ln;
   // (with PW only T_PW writes a line, so its buffer, half and form are chosen by the parameter, not by a
@@ -184,10 +190,13 @@ module m3_sdr_port
   localparam bit LB = !(FWD && L16 && PAIR && PW) || RA;
   wire  [31:0]  bq    = !LB ? pd_lo : bra[0] ? bd_o[bra[2:1]] : bd_e[bra[2:1]];
   wire  [31:0]  lw_w0 = lwh ? lr4 : lr0;
-  wire  [31:0]  lw_wk = PW ? wbuf[{pw_h, wb_col[2:1]}] : bq;
+  wire  [3:0]   lw_m0 = lwh ? lr4m : lr0m;
+  wire  [35:0]  wbq   = wbuf[{pw_h, wb_col[2:1]}];
+  wire  [31:0]  lw_wk = PW ? wbq[31:0] : bq;
+  wire  [3:0]   lw_mk = PW ? wbq[35:32] : lbm[{wh, wb_col[2:1]}];
   wire          lw_sw = swap;            // (T_PW sets swap to the posted line's form as it begins)
-  assign {p_be, p_din}   = col16(lw ? lw_w0 : wd, lw ? 4'hF : be, lw_sw, 1'b0);
-  assign {wb_be, wb_din} = col16(lw ? lw_wk : wd, lw ? 4'hF : be, lw_sw, wb_col[0]);
+  assign {p_be, p_din}   = col16(lw ? lw_w0 : wd, lw ? lw_m0 : be, lw_sw, 1'b0);
+  assign {wb_be, wb_din} = col16(lw ? lw_wk : wd, lw ? lw_mk : be, lw_sw, wb_col[0]);
   // PW: a request that must wait for the posted write (a write, or a read of its line). The line compare
   // is registered (pw_cmp: s_sa is held with s_req), so a read that comes up while a write is posted
   // waits a clock for it (pw_wait) rather than putting a 22-bit compare in front of the accept
@@ -269,9 +278,10 @@ module m3_sdr_port
   always_ff @(posedge clk) begin
     if (LB && (bw_pair || (bw_one && !bw_a[0]))) bd_e[bw_a[2:1]] <= bw_lo;
     if (LB && (bw_pair || (bw_one &&  bw_a[0]))) bd_o[bw_a[2:1]] <= bw_pair ? pd_hi : bw_lo;
-    if (lw_beat && wbeat == 3'd0) lr0 <= s_wdata;
-    if (lw_beat && wbeat == 3'd4) lr4 <= s_wdata;
-    if (PW && lw_beat) wbuf[wbeat] <= s_wdata;
+    if (lw_beat && wbeat == 3'd0) begin lr0 <= s_wdata; lr0m <= s_wbe; end
+    if (lw_beat && wbeat == 3'd4) begin lr4 <= s_wdata; lr4m <= s_wbe; end
+    if (PW && lw_beat) wbuf[wbeat] <= {s_wbe, s_wdata};
+    if (!PW && lw_beat) lbm[wbeat] <= s_wbe;
   end
 
   // FREQ (R112): a read the port takes in T_IDLE has its request up to m2_sdram in the same clock (the

@@ -133,7 +133,7 @@ module r3d_rast_div #(
   generate for (gj = 0; gj < 3; gj++) begin : g_lane
     r3d_div_lane u_lane (
       .clk, .rst,
-      .start(go), .n(h_n[gj]), .r0(h_r[gj]), .d(h_d[gj]), .nb2(h_k[gj]),
+      .start(go), .hold(busy || o_valid), .n(h_n[gj]), .r0(h_r[gj]), .d(h_d[gj]), .nb2(h_k[gj]),
       .busy(l_busy[gj]), .q(l_q[gj]), .r(l_r[gj])
     );
   end endgenerate

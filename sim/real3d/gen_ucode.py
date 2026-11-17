@@ -124,7 +124,11 @@ def top_lane(op):
 def ready(op, t):
     return t + (DIV_W + 1 + top_lane(op) if op.div else MAC_W + 1)
 
-def schedule(ops):
+def schedule(ops, fixed=None):
+    # fixed: {op index: issue cycle} placed first (their write cycles reserved), the rest list-scheduled
+    # around them, never at a fixed op's issue cycle (study R185: a pair kernel's first group keeps the
+    # single kernel's schedule exactly)
+    fixed = fixed or {}
     n = len(ops)
     last_w, readers = {}, {}
     raw = [[] for _ in range(n)]; war = [[] for _ in range(n)]; waw = [[] for _ in range(n)]
@@ -152,9 +156,15 @@ def schedule(ops):
     def wcycles(i, t):
         # a divide holds the write port for all four lane slots
         return [t + DIV_W + kk for kk in range(4)] if ops[i].div else [t + MAC_W]
+    for i, ti in fixed.items():
+        t_issue[i] = ti
+        for c in wcycles(i, ti): wbusy.add(c)
+        done += 1
+    taken = set(fixed.values())
     while done < n:
         best = None
         for i in range(n):
+            if t in taken: break
             if t_issue[i] is not None: continue
             ok = True
             for j in raw[i]:
@@ -501,14 +511,23 @@ def k_setup3(np_):
 #   parameter i, 8 + 4 i + 3 parameter i of sorted vertex 1 (ps when flat).
 # Rounding order as k_setup3 (rtl_tri::setup's).
 SO_X, SO_DET = 32, 38   # X_v, Y_v at 32 + 2v, 33 + 2v (output words 0-5), det at 38 (word 6)
-def k_setup_so(np_):
+def k_setup_so(np_, h=0, T=None):
+    # h = 1: the second group of a pair (k_setup_pair): its staging half and its set-up output half are the
+    # other ones (address bit 6, which r3d_geo turns into the half for this class), its registers its own
     ops = []
     one = k('one')
-    X = [SO_X + 2 * v for v in range(3)]; Y = [SO_X + 2 * v + 1 for v in range(3)]
-    sX = [0, 1, 2]; sY = [3, 4, 5]
-    sP = lambda i, v: 6 + 3 * i + v
-    A = {(r, c): 40 + 3 * r + c for r in range(3) for c in range(3)}
-    U = 49; DET = SO_DET; IDET = 52; T0 = 53
+    o = 64 * h
+    X = [SO_X + o + 2 * v for v in range(3)]; Y = [SO_X + o + 2 * v + 1 for v in range(3)]
+    sX = [o + 0, o + 1, o + 2]; sY = [o + 3, o + 4, o + 5]
+    sP = lambda i, v: o + 6 + 3 * i + v
+    if h:
+        # X, Y, det at 64-70 (output words 0-6 of the other half: sdup writes the side memory at the register's
+        # address), then 71-87, 24-31: registers no kernel holds across kernels and no controller reads or
+        # loads (every kernel's live-ins: 8-23, 88-105, 124-127; the external port: 8-23, 88-105, 124-127)
+        X = [64 + 2 * v for v in range(3)]; Y = [65 + 2 * v for v in range(3)]
+    A = {(r, c): (71 if h else 40) + 3 * r + c for r in range(3) for c in range(3)}
+    U = 80 if h else 49; DET = 70 if h else SO_DET; IDET = 83 if h else 52
+    T = T if T is not None else [53 + n for n in range(3 * np_)]
     for v in range(3):
         ops.append(mac(sa(sY[v]), one, None, dst=Y[v], sdup=True))
         ops.append(mac(sa(sX[v]), one, None, dst=X[v], sdup=True))
@@ -521,15 +540,34 @@ def k_setup_so(np_):
     ops.append(mac(rf(DET), one, rf(A[(2, 2)]), dst=DET, sdup=True))
     ops.append(Op(rf(DET), one, None, dst=IDET, div=True))
     for i in range(np_):
-        ops.append(mac(sa(sP(i, 0)), one, None, side=8 + 4 * i + 3))
+        ops.append(mac(sa(sP(i, 0)), one, None, side=o + 8 + 4 * i + 3))
         for c in range(3):
-            acc = T0 + 3 * i + c
+            acc = T[3 * i + c]
             ops.append(mac(sa(sP(i, 0)), rf(A[(0, c)]), None, dst=acc))
             ops.append(mac(sa(sP(i, 1)), rf(A[(1, c)]), rf(acc), dst=acc))
             ops.append(mac(sa(sP(i, 2)), rf(A[(2, c)]), rf(acc), dst=acc))
-            ops.append(mac(rf(acc), rf(IDET), None, side=8 + 4 * i + c))
-    assert T0 + 3 * np_ <= 98 and IDET < T0
+            ops.append(mac(rf(acc), rf(IDET), None, side=o + 8 + 4 * i + c))
+    assert max(T) < 98 and IDET not in T and len(set(T)) == len(T)
     return ops
+
+# Two closed groups in one kernel (study R185): the staging half e_pbuf and the other one, both set-up output
+# halves. Each group is k_setup_so's operations on its own registers, so the two chains interleave in the list
+# schedule (a group alone waits on its latencies for a third of its cycles): SETUP44 167 cycles against 2 x 116,
+# SETUP22 116 against 2 x 110. The first group's twelfth accumulator is 39 (64 is the second group's x1).
+def k_setup_pair(np_):
+    ta = [53 + n for n in range(3 * np_)] if np_ < 4 else [53 + n for n in range(11)] + [39]
+    tb = ([84, 85, 86, 87] + list(range(24, 32)))[:3 * np_]
+    a = k_setup_so(np_, 0, ta); b = k_setup_so(np_, 1, tb)
+    # the first group's operations at the single kernel's cycles (its own schedule, the same but for the twelfth
+    # accumulator's register), the second's in the cycles and write slots left: the first half's results land
+    # when a single kernel's would, so r3d_geo hands that half to the emitter at the single's time
+    ta_t, _ = schedule(a)
+    k_setup_pair.fixed = {i: t for i, t in enumerate(ta_t)}
+    regs = lambda ops: {x[1] for op in ops for x in (op.a, op.b, op.c) if x is not None and x[0] == 'rf'} | \
+                       {op.dst for op in ops if op.dst is not None}
+    assert not (regs(a) & regs(b))
+    assert all(r in range(24, 88) for r in regs(a) | regs(b))
+    return a + b
 
 def k_face():
     # the per-polygon back-face test, one polygon a lane, four rows: the face
@@ -576,8 +614,9 @@ KERNELS = [
 def build(kernels):
     words, entries, lengths, nops = [], {}, {}, {}
     for name, fn in kernels:
+        k_setup_pair.fixed = None
         ops = fn()
-        t_issue, end = schedule(ops)
+        t_issue, end = schedule(ops, k_setup_pair.fixed)
         entries[name] = len(words)
         slot = [None] * (end + 1)
         for op, t in zip(ops, t_issue):
@@ -634,10 +673,11 @@ def main():
         # the default ROM at the same address, then the set-up kernels with port C
         R3 = True
         print('-- set-up output ROM', file=sys.stderr)
-        sw, se, sl, sn = build(base + [('SETUP4', lambda: k_setup_so(4)), ('SETUP2', lambda: k_setup_so(2))])
+        sw, se, sl, sn = build(base + [('SETUP4', lambda: k_setup_so(4)), ('SETUP2', lambda: k_setup_so(2)),
+                                       ('SETUP44', lambda: k_setup_pair(4)), ('SETUP22', lambda: k_setup_pair(2))])
         assert sw[:len(words)] == words and len(sw) <= 1024
         write_rom(os.path.join(root, 'rtl/real3d/r3d_ucode_su.sv'), 'r3d_ucode_su', sw, ' with the set-up kernels (SETUP_OUT)')
-        for n in ('SETUP4', 'SETUP2'):
+        for n in ('SETUP4', 'SETUP2', 'SETUP44', 'SETUP22'):
             entries[n], lengths[n], nops[n] = se[n], sl[n], sn[n]
     consts = [('MT', MT), ('CO', CO), ('PR', PR), ('TR', TR),
               ('GA', GA), ('GB', GB), ('GC', GC), ('GO', GO), ('CT', CT),
@@ -654,6 +694,9 @@ def main():
         for name in entries:
             note = '  (set-up output ROM, r3d_ucode_su)' if (not setup and name.startswith('SETUP')) else ''
             f.write("  localparam logic [9:0] K_%s = 10'd%d;  // %d cycles, %d ops%s\n" % (name, entries[name], lengths[name], nops[name], note))
+        for name in ('SETUP4', 'SETUP2'):
+            if name in entries and not setup:
+                f.write("  localparam int LEN_%s = %d;  // its length in clocks (r3d_geo SU_PAIR)\n" % (name, lengths[name]))
         if 'FACE' not in entries:
             f.write("  localparam logic [9:0] K_FACE = 10'd0;  // not built (--setup-kernels --3r)\n")
         for n, v in consts:

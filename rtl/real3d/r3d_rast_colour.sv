@@ -100,13 +100,15 @@ module r3d_rast_colour #(
       logic signed [18:0] l;
       sol = (i_kind == K_SOLID) || (i_kind == K_STRANS);
       mod = (i_kind == K_CMOD) || (i_kind == K_CONT) || (SMTX && i_kind == K_TALPHA && i_am[0]);
+      // (sol and mod are kinds apart, so a modulated base is always the texel: the multiplier takes it
+      // directly and the kind only selects after it, in parallel with the product)
       for (int c = 0; c < 3; c++) begin
-        logic [7:0]  a, k;
+        logic [7:0]  t, k;
         logic [15:0] m;
-        a = sol ? i_color[8 * c +: 8] : (i_texel[8 * c +: 8] ^ {8{SMTX && i_am[3]}});
+        t = i_texel[8 * c +: 8] ^ {8{SMTX && i_am[3]}};
         k = i_color[8 * c +: 8];
-        m = a * k;
-        b1[c] <= mod ? m[15:8] : a;
+        m = t * k;
+        b1[c] <= mod ? m[15:8] : sol ? k : t;
       end
       ta = i_texel[31:24];
       tr = {i_trans, 3'd0} | {5'd0, i_trans[5:2]};        // t << 3 | t >> 2; t = 32 gives 264
@@ -163,6 +165,7 @@ module r3d_rast_colour #(
   logic          v3;
   logic [TW-1:0] tag3;
   logic [7:0]    c3 [3];
+  logic signed [8:0] df3 [3];          // fog's colour less c3, chosen as c3 is (tclose3, below)
   logic          ok3, zw3, fbv3, fo3;
   logic [7:0]    fb3;
   logic [23:0]   fc3;
@@ -177,6 +180,12 @@ module r3d_rast_colour #(
         if (q[31]) c3[c] <= 8'd0;
         else if (q[30:16] != 15'd0) c3[c] <= 8'd255;
         else c3[c] <= q[15:8];
+        // fog's difference fc - c3 for each of c3's three values, from registers (q[15:8] is lo2's own bits 15:8:
+        // the add's carry only goes up), chosen as c3 is: the subtract sat after fc3 and c3, the stage-4 product's
+        // operand, the colour unit's worst path in tz3_b8_s3 (fc3 -> 3.3 ns -> subtract -> 3.5 ns -> the DSP)
+        if (q[31]) df3[c] <= $signed({1'b0, fc2[8 * c +: 8]});
+        else if (q[30:16] != 15'd0) df3[c] <= $signed({1'b0, fc2[8 * c +: 8]}) - 9'sd255;
+        else df3[c] <= $signed({1'b0, fc2[8 * c +: 8]}) - $signed({1'b0, lo2[c][15:8]});
       end
       tag3 <= tag2; zw3 <= zw2; fo3 <= fo2; fc3 <= fc2; g3 <= g2;
       if (al2) begin
@@ -192,6 +201,11 @@ module r3d_rast_colour #(
     end
   end
 
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && v3) for (int c = 0; c < 3; c++)
+      if (df3[c] != $signed({1'b0, fc3[8 * c +: 8]}) - $signed({1'b0, c3[c]})) $fatal(1, "colour: df3");
+`endif
   // ---- 4: fog's product ----------------------------------------------------------------------
   logic          v4;
   logic [TW-1:0] tag4;
@@ -204,9 +218,7 @@ module r3d_rast_colour #(
     else if (en) v4 <= v3;
     if (en) begin
       for (int c = 0; c < 3; c++) begin
-        logic signed [8:0] df;
-        df = $signed({1'b0, fc3[8 * c +: 8]}) - $signed({1'b0, c3[c]});
-        d4[c] <= df * $signed({1'b0, g3});
+        d4[c] <= df3[c] * $signed({1'b0, g3});
       end
       c4 <= c3;
       tag4 <= tag3; ok4 <= ok3; zw4 <= zw3; fbv4 <= fbv3; fb4 <= fb3; fo4 <= fo3;
