@@ -1,8 +1,47 @@
 # Handoff
 
+## Update (2026-11-17)
+
+`main` is the `--no-ff` merge of `sdram-130` (ae56d77): 130 MHz on one or two SDRAM modules. `git revert -m 1` on the
+merge undoes it. Nothing from the CPU speed pass is committed; it is all in `sm3-builds/cpuspeed/`.
+
+**Model3.rbf on the board is `cfb3_s1`** (15fab5a4), a measurement build: dual, 130 MHz, 3125 / 2885 ps, without the
+CPI items. Row 7 of the overlay times each frame against the vblank (one vblank = 227B units of 256 clocks) and
+splits the longest into Real3D DMA wait and the rest; row 6 has the DMA wait's range and total. VF3's frame count is
+wrong in it (stale 4.85 vblank); its pacing needs its own rule. `c130ddpa_s1` is the board-tested release build.
+
+Board readings (readings by the second in `sm3-builds/cpuspeed/NOTES.md`):
+
+| Game, scene | FPS | Frame (vblank) | DMA wait | Rest |
+|---|---|---|---|---|
+| Daytona 2, track 1 | 27-31 | 1.01-1.10, peaks 1.24-1.31 | 0.03-0.04 | 0.99-1.16 |
+| Sega Rally 2, racing | 57-58 | 0.6-0.9 | 0.08-0.35 | 0.57-0.70 |
+| Sega Rally 2, start line | 28-29 | 1.29-1.79 | 0.61-0.81 | 0.70-0.82 |
+| Sega Rally 2, slowdowns | 28-29 | 1.1-1.41 | 0.60-0.73 | 0.63-0.67 |
+| Sega Rally 2, single 2.0 frames | | 2.00-2.06 | 0.31-0.41 | 1.63-1.69 |
+
+- **Daytona 2's race is CPU-bound, just over a vblank.** The loop is paced by the decrementer, not the vblank (R159,
+  R160), and a frame runs from the decrementer event that starts the loop to the pacing call at 4C6FC. Holding 60
+  through the lap needs about 10% off the CPU's frame, about 25% at the worst spots. "Rest" still includes cache
+  misses, SDRAM waits and held Real3D accesses; splitting it is the next measurement.
+- **Sega Rally 2 is not CPU-bound** (my 2026-11-16 note above was wrong for it). Its CPU work stays under 0.82 vblank;
+  every slow frame is over because of waits in its Real3D DMA calls (6F468, 6F50C, polling C200000C bit 7), or, in
+  the single 2.0 frames, a hold outside them (likely a Real3D store held by r3d_cmd's sw_wait or full write FIFO).
+  Supermodel's DMA is instant, so this is our RTL. The bench investigation is in `sm3-builds/sr2dma/`.
+- **CPI items 1-2 plus b6** (`csb_s1`, d05c0942, 41,097 ALM): test_cpu 2,075,079 cycles against 2,119,480; Daytona 2's
+  attract loop 3.2-3.7% shorter (p50 0.850 to 0.820 vblank). On the board Daytona 2 still runs at 30, as the
+  readings above predict. The R188 draft is in `sm3-builds/cpuspeed/R-entry.md`.
+- The first measurement build counted no Daytona 2 race frames: it ended frames at the boot's vblank poll at 4C6CC,
+  which the race never runs. Its bench check had covered boot frames only.
+- The second SDRAM module gives Daytona 2 almost nothing (attract loop 0.868 vblank at single 120 scaled to 130,
+  against 0.850-0.884 dual).
+
+Still open: the old single module (D-73), a power-up read-phase sweep (no decision), the area pass, and the Daytona 2
+frame split.
+
 ## Update (2026-11-16)
 
-One squashed commit on branch `sdram-130` (pushed, no PR yet) takes everything since 718e9e4 that the board build
+One squashed commit on branch `sdram-130` (ae56d77, merged into `main` with `--no-ff` on 2026-11-17) takes everything since 718e9e4 that the board build
 has. That is `sm3-builds/ddio/ddio-718e9e4.patch` (md5 99698145…) at 130 MHz with 3125 / 2885 ps, plus the study's
 D-59 to D-73 and R169 to R187 (there is no R181).
 
@@ -11,7 +50,8 @@ reported in every fit (`sdram_io.txt`). SU_PAIR and fix B are in.
 - **Model3.rbf on the board: `c130ddpa_s1`** (2629cdbc), dual, 130 MHz, outclk_2 3125 / outclk_3 2885 ps. No lockup in
   VF3 (20 minutes of attract plus an in-game round), Scud Race or Daytona 2. Frame rate: Sega Rally 2 is mostly 30 in
   game and 60 in attract, Scud Race has small drops to 30, Daytona 2 is 60 in attract and mostly 30 on track 1. Those
-  are CPU-bound; the next speed step is the CPU (the cpi3 items need about 110 ALM freed).
+  are CPU-bound; the next speed step is the CPU (the cpi3 items need about 110 ALM freed). Wrong for Sega Rally 2:
+  see 2026-11-17.
 - `c130ddpp_s1` (3365 / 3125) locked up in VF3. It is the same fit as (a), so the lockup was the SDRAM read timing,
   not a clk_sys path. `c125ddpp_s1` (3500 / 3250 at 125) passed. At 125, 4000 ps does not work on the dual board
   (D-72). The plain-DDIO builds put the second SDRAM about there and were not tried.
