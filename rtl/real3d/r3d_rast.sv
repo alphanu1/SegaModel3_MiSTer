@@ -267,15 +267,16 @@ module r3d_rast #(
       if (g_valid && g_ready) begin
         if (g_tag == 5'd31) begin                     // the header's beats
           if (hk == 3'd0) th0 <= g_data[31:0];
-          // an untextured triangle's u and v planes go into table 1 as zeros: cleared here, before its
-          // planes arrive (its shade plane, plane 1, is written into slot 3, the textured shade's)
+          // (before R179 an untextured triangle's u and v planes went into table 1 as zeros, cleared here;
+          // they are read but never used: below. Its shade plane, plane 1, goes into slot 3, the textured
+          // shade's. The old form's clear is kept for the check.)
+`ifdef VERILATOR
           if (hk == 3'd0 && !g_data[4]) begin
             pe[1] <= '0; pe[2] <= '0;
-`ifdef VERILATOR
             pc[1] <= '0; pdx[1] <= '0; pdy[1] <= '0;
             pc[2] <= '0; pdx[2] <= '0; pdy[2] <= '0;
-`endif
           end
+`endif
           if (hk == 3'd1) th1 <= g_data[31:0];
           if (hk == 3'd2) th2 <= g_data[31:0];
           if (hk == 3'd3) th3 <= g_data[31:0];
@@ -339,16 +340,16 @@ module r3d_rast #(
 
   // The plane words are written into tables Z and 1 at tag_n as they arrive (area, R179), not held in
   // 426 registers until t_go: each table is split by field, so a beat writes its own block; e waits in pe
-  // for its dx beat ({dx, e} one word). An untextured triangle's u and v slots are cleared at its header's
-  // first beat (zeros, written). No beat comes while t_full (g_ready), so tag_n is the record's own tag
+  // for its dx beat ({dx, e} one word). An untextured triangle's u and v slots are not written: whatever
+  // they hold is read with its pixels and never used (the texture cache's i_use is 0 unless the pixel is
+  // textured, f2_t, and nothing else takes u, v or the level they give), so the old clear to zeros, a
+  // 40-bit select on the beat's data, is gone. No beat comes while t_full (g_ready), so tag_n is the record's own tag
   // from its first beat. The entry is written a record earlier than at t_go, so a pixel of the triangle
   // 256 back at the same tag must not be read after the next record's first plane beat: the live tag
   // span is measured below (VERILATOR), and the old tables are kept there and compared at every read
   // that is used. The block count is the same: table Z four, table 1 ten.
   wire        g_take = g_valid && g_ready;
   wire        pw  = g_take && g_tag >= 5'd8 && g_tag != 5'd31;      // a plane's beat (slot g_ps, field g_tag[1:0])
-  wire        pclr = g_take && g_tag == 5'd31 && hk == 3'd0 && !g_data[4];
-  wire [39:0] wdm = pclr ? 40'd0 : g_data;
   wire        wc = g_tag[1:0] == 2'd1, wx = g_tag[1:0] == 2'd2, wy = g_tag[1:0] == 2'd3;
 
   // table Z: {Z kind, the 1/w plane} by tag, read registered at the tag the span register will hold, so
@@ -398,17 +399,16 @@ module r3d_rast #(
   logic [T1W-1:0] t1_q;
   logic [T2W-1:0] t2_q;
   always_ff @(posedge clk) begin
-    // the shade from slot 3; u and v from slots 1 and 2, zero for an untextured triangle (cleared at
-    // its header), so no select is built here (it was 222 LUTs)
-    if ((w1 && wc) || pclr) c_m1[tag_n] <= wdm;
-    if ((w2 && wc) || pclr) c_m2[tag_n] <= wdm;
-    if (w3 && wc)           c_m3[tag_n] <= g_data;
-    if ((w1 && wx) || pclr) x_m1[tag_n] <= {wdm[30:0], pclr ? 9'd0 : pe[1]};
-    if ((w2 && wx) || pclr) x_m2[tag_n] <= {wdm[30:0], pclr ? 9'd0 : pe[2]};
-    if (w3 && wx)           x_m3[tag_n] <= {g_data[30:0], pe[3]};
-    if ((w1 && wy) || pclr) y_m1[tag_n] <= wdm[30:0];
-    if ((w2 && wy) || pclr) y_m2[tag_n] <= wdm[30:0];
-    if (w3 && wy)           y_m3[tag_n] <= g_data[30:0];
+    // the shade from slot 3; u and v from slots 1 and 2 (an untextured triangle's not written)
+    if (w1 && wc) c_m1[tag_n] <= g_data;
+    if (w2 && wc) c_m2[tag_n] <= g_data;
+    if (w3 && wc) c_m3[tag_n] <= g_data;
+    if (w1 && wx) x_m1[tag_n] <= {g_data[30:0], pe[1]};
+    if (w2 && wx) x_m2[tag_n] <= {g_data[30:0], pe[2]};
+    if (w3 && wx) x_m3[tag_n] <= {g_data[30:0], pe[3]};
+    if (w1 && wy) y_m1[tag_n] <= g_data[30:0];
+    if (w2 && wy) y_m2[tag_n] <= g_data[30:0];
+    if (w3 && wy) y_m3[tag_n] <= g_data[30:0];
     if (t_go) begin
       m_m[tag_n]  <= {pe[0], th0[4], MIP ? LW'(th4) : LW'(0)};
       tab2[tag_n] <= {th0[5], th1[25:20], th1[30:26], th0[8:6], th0[11:9], th0[16], th0[17], th0[14:12],
@@ -657,7 +657,10 @@ module r3d_rast #(
     t1_chk <= tab1[en_f ? h_tag : p_tag];
     t2_chk <= tab2[en_f ? n_tag[7:0] : r_tag];
   end
-  always_ff @(posedge clk) if (!rst && ((p_v && t1_chk != t1_q) || (r_v && t2_chk != t2_q))) $fatal(1, "rast: table read on en_f");
+  // (u and v compared only for a textured triangle: an untextured one's are not written since R179)
+  localparam logic [T1W-1:0] T1_UV = {{111{1'b0}}, {222{1'b1}}, {(T1W - 333){1'b0}}};   // slots 1 and 2 (u, v)
+  wire [T1W-1:0] t1_cm = t1_q[LW] ? '1 : ~T1_UV;
+  always_ff @(posedge clk) if (!rst && ((p_v && (t1_chk & t1_cm) != (t1_q & t1_cm)) || (r_v && t2_chk != t2_q))) $fatal(1, "rast: table read on en_f");
   // R179: tab1 above is the old table (written whole at t_go), so t1_chk also checks table 1 by field
   // against it at every pixel; table Z by field against the old one at every span the Z walk takes
   always_ff @(posedge clk) if (!rst && s_take && tz_q != tzo_q) $fatal(1, "rast: table Z by field against the old table");

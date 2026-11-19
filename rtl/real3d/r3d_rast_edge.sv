@@ -33,9 +33,11 @@
 // the adder each edge register walks with, so the three 3-input adders go. Every row after adds s << 16. The span is [round(start), round(stop)), swapped if reversed,
 // clamped to [0, SCR_W), and sent only if non-empty.
 //
-// Arithmetic is modulo 2^56. For every row that is sent the row offset is at
+// Arithmetic is modulo 2^54 (56 before the area130 pass: the same bits, by the bound below). For every row that is sent the row offset is at
 // most the edge's own height, so |offset s| <= |dx| 2^20 <= 2^52, and with
-// |x 2^20| < 2^51 the true value is under 2^53: the modular one equals it.
+// |x 2^20| < 2^51 the true value is under 2^53: the modular one, 54 bits signed, equals it. Every operation on the
+// walk's values is an add, a shift left or a product with an offset, all exact modulo 2^54, and the values are read
+// only at a row that is sent, by round36.
 // An edge that is never used may wrap harmlessly.
 //
 // The row is a two-stage pipeline for 100 MHz: the rounds, then the order,
@@ -75,7 +77,7 @@ module r3d_rast_edge #(
   output logic               busy
 );
 
-  localparam int AW = 56;
+  localparam int AW = 54;
   localparam logic signed [19:0] W20 = 20'(SCR_W);
 
   // ---- helpers -----------------------------------------------------------------
@@ -91,7 +93,7 @@ module r3d_rast_edge #(
   // the same on a 2^-36 value: 20-bit integer part, plus one if fraction > 1/2
   function automatic logic signed [19:0] round36(input logic signed [AW-1:0] v);
     logic signed [19:0] ip;
-    ip = v[AW-1:36];
+    ip = {{(56-AW){v[AW-1]}}, v[AW-1:36]};   // (AW 54: the 18-bit integer part sign-extended to 20)
     if (v[35] && (v[34:0] != 35'd0)) ip = ip + 20'sd1;
     return ip;
   endfunction
@@ -270,12 +272,12 @@ module r3d_rast_edge #(
         m_busy <= 1'b1;
         m_d1   <= d1w[31:0];
         m_d2   <= d2w[31:0];
-        m_s12  <= {{(AW-54){z_s12[53]}}, z_s12};
-        m_s13  <= {{(AW-54){z_s13[53]}}, z_s13};
-        m_s23  <= {{(AW-54){z_s23[53]}}, z_s23};
-        d12    <= {z_s12[39:0], 16'd0};
-        d13    <= {z_s13[39:0], 16'd0};
-        d23    <= {z_s23[39:0], 16'd0};
+        m_s12  <= z_s12;                    // (AW 54: the slopes as they come)
+        m_s13  <= z_s13;
+        m_s23  <= z_s23;
+        d12    <= {z_s12[AW-17:0], 16'd0};
+        d13    <= {z_s13[AW-17:0], 16'd0};
+        d23    <= {z_s23[AW-17:0], 16'd0};
         a12    <= {{(AW-52){z_x1[31]}}, z_x1, 20'd0};
         a13    <= {{(AW-52){z_x1[31]}}, z_x1, 20'd0};
         a23    <= {{(AW-52){z_x2[31]}}, z_x2, 20'd0};

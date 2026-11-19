@@ -1130,6 +1130,8 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-71 | (2026-11-15) `SU_PAIR` goes into the tree (R185): when both staging halves are closed, one SETUP44 / SETUP22 kernel sets up both, 168 / 119 clocks instead of 2 × 116 / 2 × 110, the first half handed on at the clock a single kernel would hand it on. Every triangle is unchanged over 2,378 frames; the geometry is 2.0-3.0% faster in the mean on Scud Race, Daytona 2 and VF3, with no frame slower; about 25-30 ALM. It is worth it: on the board (c125dp35_s1, dual, 125 MHz) every game loads and none locks up, but most still drop to 30 fps where they did not at 130 MHz, and Sega Rally 2 is still at 30 fps about half the time, so more speed is still needed. |
 | D-72 | (2026-11-15) The dual-SDRAM core's SDRAM clock leads clk_sys's 180° by 0.5 ns, as outclk_2 at 3500 ps did at 125 MHz. 4000 ps does not work on the board with two SDRAMs. R187's DDIO clock pins stay, but they are clocked from one PLL output with that lead (the same 0.5 ns in absolute time at 130 MHz). A pin gets a lead of its own only if one lead would take either SDRAM's read outside board-proven margins. The pure-DDIO builds (`c125dd_s1`, `c130dd_s2`) put the second SDRAM's read where 4000 ps put it, so they are reference only. Any PLL-phase fallback starts from 3500 ps. **The next day (R187):** one lead was not enough, so each pin has its own PLL output. At 125 that is 3500 / 3250 ps (`c125ddpp_s1`, passed). At 130 it is 3125 / 2885 ps (`c130ddpa_s1`, which runs VF3, Scud Race and Daytona 2 with no lockup). 3365 / 3125 locked VF3. The tree goes in at 130 MHz with 3125 / 2885. |
 | D-73 | (2026-11-16) The old single SDRAM module is not tested yet. I am not stripping the MiSTer down to swap it back for now, so the test waits until the board is next opened. The build for it is `c130sd_s1` (RBF ade245af): single SDRAM, 130 MHz, outclk_2 at 3125 ps, the first SDRAM's phase from `c130ddpa_s1`, which ran VF3, Scud Race and Daytona 2 on the new modules (R187). On the old module it reads about 1.2 ns earlier than so130_s2, which ran VF3 there, so a failure there would be on the hold side. If VF3 runs, one fixed phase covers both modules. If it locks, a power-up read-phase sweep (auto-detect) is the route; it is unpriced. Until then the single build's phase is proven only on the new modules. |
+| D-74 | (2026-11-17) Sega Rally 2's slow frames are r3d_mem's run FIFO overflowing (draft R189), and three changes go in together. (1) R189's r3d_mem fix: a re-opened 8E group joins the open run, the age flush waits for a free clock (it also closes a dropped-word fault), and the copy pauses for waiting writes; +9 ALM, no M10K, bench only so far. (2) b6, the reciprocal seed ROMs in r3d_recip and r3d_rast_recip: about −100 ALM for +2 M10K (534 to 536 of 553), zero cycles, VF3's 400 geometry census frames byte-identical, run on the board inside `csb_s1`. (3) A further zero-cycle, ALM-only area pass (no M10K, D-48) before the fit, so the core is not left at 4,188 / 4,191 LABs. No fit until the area is found. **Two days later:** all three are in `cd74_s1` (41,076 ALM, 536 M10K), which runs VF3, Scud Race, Daytona 2 and Sega Rally 2 on the board; SR2's DMA wait is gone and its remaining slow spots are the Real3D's own speed (R188-R190). They go into the tree. |
+| D-75 | (2026-11-19) The next speed work is a fair boost to the Real3D, for Daytona 2 as well as Sega Rally 2. SR2's last slow spots are the Real3D dropping or holding frames in heavy views (R189's board run), and part of Daytona 2's 1.01-1.10-vblank race frame may be held Real3D access rather than CPU work (R188). First split where the time goes (geometry, rasteriser, texture path, held host access) on SR2's and Daytona 2's heavy frames, then price the speed-ups in ALM and M10K. |
 
 ### Open
 
@@ -18240,3 +18242,492 @@ M3_RELEASE are the qsf's two switches). The old single module waits until I next
 single build's 3125 ps is proven only on the new modules. With the 130 MHz clock, m3_frame_busy's frame constant
 passed 2^31 in its int arithmetic (debug builds only; release builds leave the block out); it is now taken as
 x * 278 + x * 144 / 1000, the same figure at every clock.
+
+**R188 — CPI items 2 and 4 (R174) on the board build: ported, cycle-exact to cpi3, and they fit. With b6's
+three area changes (R179, held back then) the dual 130 MHz build `csb_s1` routes at 41,097 ALM with setup -3.528 /
+-3.391 ns and hold positive at every corner, where cpi3's 120 MHz single build did not route at all. But by the
+only race figures I have, -3% does not turn Daytona 2's race into 60: the board's "mostly 30" says the race needs
+about -8% to -12%, so I built a board measurement first (`cfb`, first): FBUSY and the overlay in a release
+build, with Sega Rally 2's pacing loop found in its code.**
+
+Work in `sm3-builds/cpuspeed/` (`tree`: worktree detached at 718e9e4 + `ddio/ddio-718e9e4.patch` (md5 99698145) +
+cpi3's items (`items.diff`) + b6 (`b6.diff`); `fbtree`: ddio's tree + the frame-busy build; notes in `NOTES.md`).
+D-48 / D-57, D-58, D-59, D-60, R104, R171, R172, R174, R179, R183, R185, R186, R187. Nothing committed, nothing on
+the board.
+
+*What I believed:*
+- R174: items 2 and 4 cost about 110 ALM I could not find, and that was why the 120 MHz fit did not route.
+- R185: on the dual board at 130 the race would run at about 49 fps (CPU p50 0.96 at 125 dual -5.5%), and cpi3's
+  items would add a few fps.
+- The system bench could tell how far over a vblank the race runs.
+
+*What I know now:*
+
+**1. The race cannot be benched; the transfer disagrees with the board.** The system bench reaches Daytona 2's game
+loop at about frame 200 from reset and the attract at about 1,100-1,300 (10-12 h a run here); the race is about 40 h
+(R185), and Sega Rally 2 in game 40-50 h with a coin script. R171's frame-1300 checkpoint cannot be carried into the
+ddio model (57 RTL files differ from the btree its converters know, and the dual model keeps the work RAM in the
+bench's second SDRAM). So the race is still R171's transfer (`tools/race130.py`). At 130 MHz dual (-3% to -5.5%) it
+puts p50 at 0.93-0.95 and 9-13% of loops over a vblank, and with the items p50 0.90-0.92. The board says "mostly
+30 on track 1" on c130ddpa_s1, and R159 showed Daytona 2 has no governor (each loop is one vblank or two). So the
+transfer is at least 5-8% optimistic on the race. If the board's p50 is 1.00-1.05, -3.13% takes it to 0.97-1.02:
+some loops flip, most stay at 30. p90 sits about 7% above p50, so a race held at 60 needs about -8% to -12% of the
+CPU's work at 130.
+
+**2. The port.** cpi3's items (`items.diff`, cpi3/tree against 718e9e4 + R172) applied with offsets only. Every
+changed file but ppc_core.sv and ppc_icache.sv is then byte-identical to cpi3's; ppc_core differs by ddio's own CPU
+changes (tclose3, R179's m_pc4 and DBAT hit, R183, R186's fix B), none of which needs RPX's m_rpe. R183's fetch fix
+was already in the ddio patch (and rpefix-on-cpi3.patch adds nothing more).
+
+| Bench | Result |
+|---|---|
+| test_cpu 200 seeds, items off / on | 2,119,480 / **2,075,079** cycles (cpi3's to the clock) |
+| test_cpu_sub, --snoop 2 | 10,187,652 / 5,273,742 (off: 10,471,182 / 5,426,277) |
+| --fpburst, --fpchain, --rdy 30, max wait 1, --dlat 1, --xpage, --mis, --alias (100 each) | PASS; cpi3's figures |
+| 3,000 seeds: --mis, --xpage, mode 1 xpage, mode 2 xpage mis, --mis --intdrop 100, mode 1 xpage mis | PASS (R183's coincidence profiles) |
+| planted faults: rpxfaults / f1faults / xlpfaults | 10 of 10 / 6 of 7 / 14 of 15, the misses cpi3's equivalent ones |
+| VF3 from reset, 60 frames, dual model at 130, base against items | every write region identical in order; one read differs, F0100018 (IRQ status) at frame 29 (0x0D / 0x01): the items reach the read before two sources are pending. Timing only, as R174's frame 1307 |
+| geometry bench, VF3's 400 frames (b6's seed ROM in r3d_recip) | geo.log byte-identical to ddio's |
+| `--analyze_file`, single and dual | the ten changed files, 0 errors, 0 warnings |
+
+**3. The area.** b6 is R179's: the two reciprocal seed tables in M10K and the untextured clear dropped from the
+intake. The three files are byte-identical to area3's snap/b6 (whose rasteriser and geometry benches passed).
+- Priced by fit, csb_s1 against c130ddpa_s1 (the same seed, clock and phases): r3d_recip -17.7 ALM, r3d_rast_recip
+  -21.8, r3d_rast's own logic -16.0 (ALUT 527 -> 459): **about -55 ALM and -130 ALUTs for +2 M10K**, half of what I
+  was asked for.
+- The items cost ppc_cpu +68.6 ALM by entity (the D-cache +74.3, the core +24.3; the FPU -23.8 and the untouched
+  I-cache -28.0 show the noise).
+- The whole design came out 345 ALM below c130ddpa_s1, and both fits route; the fitter's spread is larger than either
+  figure.
+- Not taken, priced:
+  - Synthesis for area on the 18 blocks with 2 ns or more of slack (`area_inst.qsf`): Quartus 17 ignores a
+    per-instance OPTIMIZATION_TECHNIQUE under the global HIGH PERFORMANCE EFFORT mode. `csa_s1`'s RBF is
+    byte-identical to csb_s1's. Standalone, r3d_rast_zspan's was 624 -> 620 ALUTs anyway (about 1%).
+  - The three output-registered MLABs (wdf, u_pqm, dlv) into M10K: 10-20 ALM each, with the M10K's clock-to-out on
+    their read paths.
+
+**4. The fit** (`csb_s1`, dual, 130 MHz, 3125 / 2885 ps, seed 1): 41,097 ALM, 4,187 / 4,191 LABs, 536 M10K, 82 DSP.
+- Setup -3.528 (TNS -14,233) / -3.391 (TNS -11,748), against c130ddpa_s1's -3.727 / -3.765 (TNS -12,635 / -10,074).
+- Hold +0.173 / +0.127 / +0.037 / +0.018; HDMI +0.187 / -0.033.
+- SDRAM I/O within 0.02 ns of c130ddpa_s1's on every figure.
+- RBF `csb_s1_d05c0942.rbf` (md5 d05c094281e350b83ba83bedf630643b).
+- Hold was positive, so no seeds 2-3.
+
+**5. The board measurement build (`fbtree`, `cfb_s1` / `cfb_s2`).**
+- m3_frame_busy takes ae56d77's P256. A macro, `M3_FBUSY_BUILD` (FBDBG), keeps FBUSY and the overlay in a release
+  build, rows 0 and 7 only; CPI_MON, the exception captures and the other rows stay off.
+- The windows are chosen by game from the configuration: Sega Rally 2 is step 20 with the driving profile.
+- Sega Rally 2's pacing, from its code (Supermodel, -no-idle-skip):
+  - The frame function 787EC ends in 7888C-78894, polling 0x4C2188 while it is above 0.
+  - The vblank handler 786F8 (IRQ 0x02) counts that word down.
+  - 78928-78930 is a delay of N vblanks on the same word.
+  - Work plus idle is constant in every 250-frame window of the attract, so those two loops are all of its waiting.
+- Fits, dual 130, hold positive at every corner:
+  - cfb_s1 (RBF e6504a87): setup -4.099 / -3.938; SDRAM I/O c130ddpa_s1's.
+  - cfb_s2 (6d0daa4b): -3.871 / -3.821; its eye moved by fit noise.
+
+**6. The board's first reading, and the fix (2026-11-17).**
+- **What cfb_s1 showed.**
+  - Sega Rally 2 counted properly. Racing at 57-58 fps, every frame was under 0.9 vblank. The start line read
+    1.25-1.61. Slowdowns with cars or the audience in view read 2.00-2.06 for both min and max.
+  - Daytona 2's race counted nothing (row 7 FFFF0000 00000000 00000100 3032A27C every second). Its FPS counter read
+    27-32, mostly 28-29 at 57.5 Hz, so nearly every race loop missed.
+- **The cause: R104's Daytona 2 rule waited for the 0x100030 vblank poll (4C6CC), which only the boot runs.** The
+  game loop is paced by the decrementer, as R159 / R160 have it:
+  - the vblank handler 1D74 reloads DEC, which fires 0.88 vblank later;
+  - 1C44 counts 0x100033;
+  - 4C6FC waits in 4C73C-4C744 while DEC is negative, then in 4C754-4C760 for the count;
+  - the loop starts at 4C764.
+  - In Supermodel's race (idle skip off) 4C6CC never runs, and in the bench's attract the module counted nothing
+    either. My first bench check had only boot frames.
+- **The fix.** For Daytona 2 a frame now runs from the exit at 4C764, counted from 0 there, to the first entry into
+  either wait: the study's "CPU reaches 4C6FC, deadline 1.000". The boot's poll keeps its rule.
+  - Supermodel's race replayed through the rule: 2,199 frames for 2,200 loops, each equal to the census's work for
+    its frame.
+  - The bench's attract 1301-1316, the RTL driven at the bench's clock events: 14 of 14 frames equal the replay to
+    the unit, 0.884 vblank. The old rule gives 0 frames.
+- **D's stuck 0x227C** was the last frame counted in the boot (1.0001 vblank), held since.
+- **VF3 is broken in the same way at "SEGA presents".** Its pacing branches over its vblank poll straight into a
+  decrementer wait whose first word is also the poll's exit, so the module sees exits and no entries. Not fixed here;
+  VF3 holds 60.
+- **Sega Rally 2's 2.0 frames, from the code.**
+  - Apart from the pacing poll and the delay loop, the game can wait only in its Real3D DMA calls: 6F468 and 6F50C,
+    165 a frame, polling C200000C bit 7.
+  - The frame's 0x88000000 flush goes through them too.
+  - It reads no Real3D or tile-generator status.
+  - So a frame pinned at 2.0 with min = max is the 3D side holding the DMA (r3d_cmd's swap wait is the likely
+    cause), not CPU work.
+- **The split.** The module now also counts each frame's ticks spent in the games' DMA waits (VF3 61DC4-61DD0,
+  Daytona 2 2B64-2B7C and 52A4-52C4, Sega Rally 2 its two DMA calls).
+  - It shows them on row 6 and as row 7's last value: the longest frame's {DMA wait, rest}. Rows 0-5 are off in this
+    build.
+  - The four-value form needed 4,227 LABs of 4,191 (`cfb2_s1` did not fit). The trimmed form fits as `cfb3_s1`:
+    setup -3.807 / -3.837, hold +0.250 / +0.191 / +0.099 / +0.072, SDRAM I/O c130ddpa_s1's.
+  - RBF 15fab5a4, md5 15fab5a491aefe9722851a003e34d9c4.
+- **Daytona 2's attract on the board's tree at 130 dual (the overnight runs).**
+  - Base: loop to 4C6FC p50 0.850, p90 0.879 over frames 1000-1300; 0.884 at 1301-1316, of which the DMA is 0.027.
+  - With the items: 0.820 / 0.848; 0.851 at 1301-1316, -3.2% to -3.7%.
+  - Against R171's 0.940 at 120 single (0.868 by the clock) the dual memory gives Daytona 2 about nothing here.
+- **Another wrong turn: the OOM.** The post-processing read VF3's 3.5 GB event log into memory with no cap, and the
+  OOM killer took VS Code at 09:57. Analyses now stream and run under the 7 GB cap.
+
+*Wrong turns.*
+- My first standalone synthesis left out r3d_dline (r3d_ram.sv) and failed.
+- M3WATCH on a polled word wrote a file the size of the poll count and filled the scratch quota. Two old files in
+  the scratch folder went with the clean-up.
+- I matched an experiment loop by process name once. I killed it, and waited by PID from then on.
+- The Model 2 session held all three Quartus slots for about two hours; the gate and the first fit waited.
+
+*What this changes.*
+- The items are ready, cycle-exact and fitting. On the transfer they are worth a few fps in the race; on the board's
+  evidence not the 60.
+- The decision should wait for the board's frame times from cfb: they say how far over a vblank the race really is,
+  and so whether -3% is worth having or the CPU needs -10% (D-30's branch table, the FP latencies, or the clock).
+
+*Not done.*
+- The bench check on heavy frames. So far 41 of 41 Daytona 2 game-loop frames (bench ~176-230) equal the replay to the
+  256-clock unit, but they are light boot-screen frames.
+- The rest is still running and lands in `logs/post.txt` (tools/post.sh, about 8-10 h):
+  - the attract at 1100-1316, Daytona 2 and VF3, base and items at 130 dual;
+  - the module against busy.py;
+  - the loop times;
+  - the bus traces.
+- No more area found: b6's 55 ALM is what there is. The fit routes without the rest.
+- csb_s1 on the board (items + b6): Daytona 2 still 30 on track 1, as the frame times below predict.
+
+*On the board (2026-11-17).* cfb3_s1 (15fab5a4, the fixed measurement) read once a second over a lap of Daytona 2's
+track 1: FPS 27-31, every race frame 1.01-1.10 vblank (peaks 1.24-1.31 around three corners), DMA wait 0.03-0.04
+of it. So the race misses its 1.000 deadline by 1-10%; the items' 3.2-3.7% moves only the shortest frames under.
+Holding 60 through the lap needs about -10% of the race frame, about -25% at the worst spots. "The rest" is not
+all instruction time: cache misses, SDRAM waits and held Real3D accesses are in it, and SR2 (R189) showed how much a
+held Real3D access can be. The items stay out of the tree until that split is measured; m3_frame_busy and its
+release-build switch (M3_FBUSY_BUILD, commented out in the qsf) go in.
+
+**R189 — Sega Rally 2's 30 fps at the start line and in crowded views is r3d_mem's run FIFO, not the DMA's
+speed: its 393 ten-word 8E moves a frame make about 270 deferred runs, the 256-entry FIFO fills while the geometry
+reads bank R, and r3d_mem takes nothing more until the geometry ends. Reproduced on a bench with the RTL write path
+(DMA wait 0.59-0.68 vblank a frame, frames 1.29-1.38, 27.6 fps; the board's cfb3_s1 0.61-0.81 and 1.29-1.79). Three
+small changes in r3d_mem fix it: 0.11-0.14 vblank, frames 0.82-0.84, 60 fps on the bench, no case slower.
+The same bench found a second bug in the same block: the 8E group drops a word when one arrives in the clock its age
+runs out. Desk and bench only; nothing fitted, nothing on the board.**
+
+Work in `sm3-builds/sr2dma/` (`tree`: `git archive ae56d77`, the board's 130 MHz dual tree; the fix in
+`fix/rtl/real3d/r3d_mem.sv`; my Supermodel copy with a Real3D write census in `sm/`; the bench in `sim/`; notes in
+`NOTES.md`). D-48, D-57, D-58; R100 (the Step 2 DMA device on m3_scripts), R112 / R114 (R3P and the MPC105's
+ordering), R144 and R156 (the posted-write FIFO, the 8E group), R162 (ddrload's DDR3 path checks), R168 (Sega Rally
+2), R185 (r3dspeed's SR2 frames), R188 (cpuspeed's frame-busy build, cfb3_s1).
+
+*What I believed:*
+- From cfb3_s1's rows 6 and 7 (R188): SR2's CPU work is 0.57-0.82 vblank everywhere, and its slow frames are DMA wait,
+  0.6-0.8 vblank a frame at the start line and in the crowd. So the DMA, or the Real3D behind it, was slow per word:
+  r3d_cmd's 32-entry posted-write FIFO full behind r3d_mem's drain (polygon RAM as one-word DDR3 writes, two copies,
+  through the DDR3 arbiter's turn), or sw_wait holding h_rdy at the flip.
+- The isolated 2.0-vblank frames, whose time is outside the DMA polls, were a Real3D store held by h_rdy.
+
+*What I know now:*
+
+**1. What SR2 writes (my Supermodel copy, srally2, -no-idle-skip, the cpuspeed play script).** I added `M3DMALOG`:
+per frame the Real3D words the CPU and the DMA write, by window; in a frame window every DMA with its instruction
+position in the frame, and the tile generator's 00 / 08 / 0C writes. The CPU writes nothing to the Real3D itself;
+everything is DMA from work RAM.
+
+| Supermodel frames | 8E words | polygon RAM words | DMAs a frame |
+|---|---|---|---|
+| attract (1000-1500) | 4,600-6,050 | 9,420-10,610 | ~200 |
+| start line (5520-5820) | 7,360-9,030 | 6,272 | 393-428 (393 to 8E) |
+| Desert race (6000-6030) | ~6,100-6,500 | 998 | 270-351 (224 ten-word 8E) |
+
+At the start line 393 of the 405 DMAs go to 8E, most of them ten words (8E014028, 8E014050, ... from 6D714 and
+6D668), with eleven polygon RAM moves of 424-896 words and one 88. The texture port gets three words a frame only in
+the start line's first 33 frames; no 94 in the race. The flip is at line 368 (tile register 08 = 0x170, once at boot).
+
+**2. The mechanism.** With M3_R3B, r3d_mem gathers 8E words in an aligned four-word group, flushed when full, when a
+write for another group comes, or after six clocks with none (R156). While the geometry reads bank R, the group's R
+copy is deferred as a run: it extends the open run if it starts at the run's end; otherwise the open run goes into the
+256-entry run FIFO and a new one opens. Runs are copied only while the geometry is not reading R, and with the FIFO
+full `w_ready` is low. SR2's ten-word moves: words 500A-5013, 5014-501D, 501E-5027, ... Every other move starts in the
+group the last one ended in (501C: 1C-1D, then 1E-1F), and between the moves that group ages out. Its second visit
+starts inside the open run, not at its end, so it closes the run and opens a new one: about 270 runs a frame. The
+geometry reads bank R from the flip for 0.54-0.67 vblank. The run FIFO fills partway through the frame's 8E moves,
+and from then until the geometry ends r3d_mem takes nothing. r3d_cmd's FIFO and R3P fill, the DMA engine waits on
+the bus, and the CPU waits in 6F4B0's poll, whose load (R114) waits in B_DEC for R3P to empty.
+
+**3. The bench, `sr2path` (`sim/sr2path_tb.sv`, `tb_sr2path.cpp`).** r3d_cmd, r3d_mem, m2_sdram, m3_ddr_arb (eight
+ports) and m3_ddr3p are the RTL, built as the board is (M3_DMAFAST, M3_R3B). In C++: SR2's frame-5600 DMA list at its
+census positions, scaled to 0.70 vblank of CPU work; the call as the game's (poll, three register writes, poll, each
+behind R114); m3_scripts' move (16-word FIFO, writes first, line reads 70 clocks as R144's 41 + 29, single reads 45, R3P
+beats 2 clocks); the pacing poll (a frame that ends after the next vblank waits for the one after); the flip at line
+368; the vblank interrupt (four status / I/O accesses, each behind R114). The other traffic per drawn frame comes from
+r3dspeed's SR2 start-line figures: store writes 923 KB, reads 1.84 MB, layer 762 KB, 30,165 texture fills, replay
+1.32 M clocks, geometry 1.52 M clocks. The geometry's polygon RAM and VROM reads use Scud Race's rates (2,691 / 5,442).
+Scan-out and sound run throughout, and the DDR3 uses ddrload's HPS profiles. At every swap the bench checks that both
+copies of every 8E and polygon RAM word hold the last value written (nothing is deferred at a swap). With no other
+traffic it moves a long DMA at 13.3-14.8 clocks a word, R144's 14.9.
+
+| frame 5600 (start line), 12 vblanks, seeds 1-3 | DMA wait / frame | frame | fps | run FIFO full | runs / frame | swap check |
+|---|---|---|---|---|---|---|
+| base RTL, no other traffic | 0.568 | 1.268 | 27-29 | 21% of the time | 273 | |
+| base RTL, start-line traffic, DDR3 `base` | 0.588 | 1.288 | 27.6 | 21.6% | 275 | 1 of 3 runs FAIL |
+| base RTL, start-line traffic, `hps1` | 0.676-0.678 | 1.376-1.378 | 27.6 | 21.6% | 275 | 1 of 3 FAIL |
+| board, cfb3_s1, start line | 0.61-0.81 | 1.29-1.79 | 28-29 | | | |
+| fixed (section 5), `base`, seeds 1-3 | 0.114 | 0.815 | 60 | 0 | 33 | PASS |
+| fixed (section 5), `hps1`, seeds 1-3 | 0.139 | 0.840 | 60 | 0 | 33 | PASS |
+
+The wait is there with no other DDR3 traffic at all, so neither the drain rate, the arbiter nor the texture path
+causes it. They add 0.02-0.11 vblank on top. The drain is the run FIFO, and nothing else. sw_wait held h_rdy for one
+clock at every swap: nothing is pending at the flip, because the geometry has long finished by then and the copies
+are done.
+
+**4. The second bug: the 8E group drops a word.** The swap check failed on the base RTL in 2 of 6 runs (2 and 4
+words) and never with the fix. I traced one (word 05BF2): it was pushed into r3d_cmd, and every burst after it masked
+its lanes in both copies, which kept the previous frame's value. `g_flush` includes `g_age == G_AGE`, and `w_ready`
+takes a hit for the open group (`!g_v || g_hit`) without looking at the flush. A hit offered in the clock the age runs
+out is acknowledged (r3d_cmd pops it), and the same clock goes to S_GW without it (`g_we` has `!g_flush`). It needs the
+next word of a group exactly six clocks after the last. SR2's single-word 8E writes (its moves are not line-aligned)
+give that now and then; Scud Race's trace (below) never did. On the board it would be a
+culling RAM word one frame stale. That is not established as visible, but it is wrong either way.
+
+**5. The fix (`fix2/rtl/real3d/r3d_mem.sv`, all under M3_R3B).**
+- A group whose words are already in the open run needs no run of its own. The copy reads W, which has the new words,
+  and copies the whole run. `g_same` is set as a group opens: it is the group just flushed (`g_grp` still holds that
+  group, and the compare is g_hit's). `o_lgv` is set when a group goes into the open run as its last, and cleared by a
+  one-word run or a group written straight to R. `x_in = x_g && o_v && o_lgv && g_same` leaves the runs as they are,
+  and rf_push excludes it.
+- The age flush only when no hit is offered: `(g_age == G_AGE && !g_hit)`, which is the rule the comment already states
+  ("or when no write is waiting").
+- A copy pauses for a waiting write. *Wrong turn:* with the first two changes alone, race frame 6000 got slower,
+  DMA wait 0.063 -> 0.073 vblank, though still at 60. S_CP copies a whole run before it goes back to S_IDLE, and the
+  merged ten-word stream is one run of about 2,240 words, so its copy held every write for tens of thousands of
+  clocks (base's runs of about 20 words let the writes in between). Now the copy has its own position `pa`, `cp_v`
+  marks a copy begun, and between pieces (a pair of 8E words, or a polygon RAM burst) S_CP returns to S_IDLE if a
+  write waits and the run FIFO is not full. S_IDLE resumes the copy when none waits. `pending` includes cp_v, so the
+  swap waits for it and writes defer, as during any copy. A write into the paused range is copied again by its own run.
+
+| bench, 12 vblanks, hps1 unless noted | base: DMA, frame | first two changes | all three (fix2) |
+|---|---|---|---|
+| start line 5600, DDR3 `base` | 0.587, 1.289 | 0.139, 0.839 | 0.114, 0.815 |
+| start line 5600 | 0.673, 1.375 | 0.173, 0.874 | 0.139, 0.840 |
+| race 6000 (224 ten-word 8E moves, CPU 0.62) | 0.063, 0.684 | 0.073, 0.694 | 0.062, 0.683 |
+| race 6030 (351 DMAs) | 0.229, 0.850 | 0.093, 0.713 | 0.078, 0.699 |
+| Daytona 2 attract 1305 (my census, CPU 0.85) | 0.091, 0.942 | 0.091, 0.942 | 0.091, 0.942 |
+| run FIFO full | 11-22% of the time | 0 | 0 |
+| swap check | 2 of 8 runs FAIL | PASS | PASS |
+
+Race 6030 on base (DMA 0.229, frame 0.85) sits inside the board's racing figures (DMA 0.08-0.35, frames 0.6-0.9).
+Heavier views have more ten-word moves, so the run FIFO fills earlier; that is the car and crowd slowdowns. fix2 is
+never slower than base in any case I ran. sw_wait held h_rdy one clock at every swap, base and fix alike.
+
+Scud Race's 10,770-frame trace through ddrload's host bench (R162's check, 141 draws against Supermodel's dumps):
+base and the first two changes give identical logs (3,753,600,132 cycles, 28,470 runs, 59,735 copy transfers, 0 words
+differ). fix2 gives the same again, to the cycle. So on Scud Race's DMA none of the three changes ever acts.
+
+Cost, Quartus 17 map of r3d_mem alone (AW 26, M3_R3B, virtual pins): the first two changes 594 ALMs needed and 582
+ALUTs, the same as base, +2 registers, M10K unchanged (2). A first form that kept the open run's last group in an
+18-bit register cost +14 ALM. The resumable copy's own 21-bit position brings fix2 to 603 ALMs needed (+9), 593 ALUTs (+11), 281
+registers (+21), M10K unchanged. `--analyze_file` of fix2's r3d_mem: 0 errors, 0 warnings.
+
+D-58: every word is still written to both copies, and every deferred word is copied before the swap. The swap check
+passes on every run.
+
+**6. The isolated 2.0-vblank frames: not reproduced.** In every bench run the vblank handler's longest hold is
+0.001-0.002 vblank, at CPU work 0.70, 0.80 and 0.90 alike. The vblank comes at the frame's start, and the stall runs
+from the flip (line 368) to the geometry's end, so the two never overlap in steady running. The likely form is
+desk-only: an interrupt taken inside a stalled DMA call. Its status and I/O accesses then wait behind R3P (R114) while
+the DMA engine holds the bus waiting for room, and that time retires in the handler, so the module counts it as
+"rest". It needs the same stall the fix removes, but it stays a hypothesis until a board build shows the 2.0 frames
+gone.
+
+**7. What the reference says about the real board's DMA and Real3D write rate.** Nothing in the study, Supermodel or
+MAME times it. Supermodel's DMACopy and MAME's real3d_dma move the whole block at the length write, so "instant" is
+an emulator convenience, not a measurement. The bounds I have are R144's. The PCI is 33 MHz and 32 bits, at most
+132 MB/s; a bursting master's memory-to-memory move tops out near 55 MB/s. The Step 2.x DMA device (0x178611DB) has
+no datasheet I can find. At 55 MB/s, SR2's 57.7 KB start-line frame would take about 1.05 ms, 0.06 vblank; at
+132 MB/s about 0.025. Our fixed path inside the calls is 21-26 clocks a word at 130 MHz, 20-25 MB/s, so 0.14-0.17
+vblank with 405 calls' overhead. That is slower than any bursting PCI master, but inside SR2's frame. Unknown: whether
+the real Real3D ever holds a DMA (its update buffers, whose sizes the 9C registers set, have no documented behaviour
+when full), and the real device's per-call overhead.
+
+**8. The combined tree for D-74 (`comb/`, `comb-ae56d77.patch`).** It is cpuspeed's cfb3_s1 sources (frame-busy rows
+6-7; fitted with `fit.sh --dual --mhz 130 --ph2 3125 --ph3 2885`), plus b6 (`cpuspeed/b6.diff`: r3d_rast_recip, r3d_rast
+and r3d_recip, byte-identical to snap/b6items's, without the CPI items), plus section 5's r3d_mem.
+- `--analyze_file` on all six changed files (r3d_mem, the three b6 files, m3_frame_busy, m3_system), with release +
+  M3_FBUSY_BUILD single and dual: 12 of 12 had 0 errors and 0 warnings. Verilator lint of m3_system (release + FB,
+  release, debug, -Wall): every message identical to cfb3's tree; the 11 warnings are all in untouched files.
+- Benches, each against the base RTL:
+
+| bench | set | result |
+|---|---|---|
+| geometry (b6, SU_PAIR) | VF3, 400 census frames | 400 / 400 match the model; geo.log byte-identical to cpuspeed's and ddio's |
+| geometry | Daytona 2 attract, 676 frames | 676 / 676; byte-identical to ddio's d2att20x |
+| rasteriser (MIP 1) | VF3 and Daytona 2, 400 frames each | logs byte-identical to cfb3's tree, 0 pixels wrong |
+| host (ddrload) | Scud Race, 10,770 frames, DDR3 `base` / `hps1` | identical to base (141 / 155 draws, 0 words differ) |
+| sr2path | SR2 5600 / 6000 / 6030, `base` and `hps1`, seeds 1-3 | 18 / 18 PASS, the figures of section 5 |
+| sr2path | Daytona 2 attract 1301-1316 and race 5001-5016 | logs identical to base, PASS (19 and 9 swaps checked) |
+| sr2path | VF3 1801-1816 (its 53C810 moves from my census) | logs identical to base, PASS (9 swaps, 426,924 words) |
+
+The base RTL failed the dropped-word check again on SR2's race frames (2-8 words); the combined tree passes every
+run. On every set other than SR2 the merge changes nothing, to the clock. The sr2path bench uses SR2's traffic for
+every game, so its Daytona 2 race figures (DMA 0.14-0.29 vblank) say nothing about that game's speed; the board
+reads 0.03-0.04.
+
+*Still open:*
+- The fix is desk and bench only. A board build would show it: cfb3's rows 6-7 with the fixed r3d_mem, SR2's start
+  line and crowd scenes.
+- The bench's other traffic is r3dspeed's SR2 figures by volume, with Scud Race's shapes and its geometry rates, not
+  the rasteriser and geometry RTL. The start-line CPU work (0.70) is the board's "rest" figure, which may itself hold
+  stall time.
+- Whether the dropped 8E word has ever been visible on the board.
+
+*On the board (2026-11-19).* `cd74_s1` (743bfb4c: this fix, b6 and R190's area, with the frame-busy rows; dual,
+130 MHz, 3125 / 2885 ps). VF3, Scud Race and Daytona 2 run with no lockup. Over a full lap of Sega Rally 2 the
+longest frame's DMA wait is 0.00-0.22 vblank everywhere, against 0.61-0.81 on cfb3_s1, and most of the lap holds
+57-58 fps where cfb3_s1 had three long stretches at 28-29. Three slow spots remain, and they are not this fault:
+- At the start line (29-30 s) every frame is exactly 2.00 vblank with 0.13 of DMA wait and 1.87 held elsewhere.
+- In two stretches (56-62 s and 92-95 s) every frame the CPU runs is under one vblank (0.88-0.95 at most) while the
+  FPS counter reads 19-43: the game loop runs at 60 and the Real3D drops frames. r3d_cmd drops a frame when the
+  previous draw is still running at the flip, and does not hold the host then.
+- At 60 s, frames near 2.0 with the host held, as at the start line. The likely hold is sw_wait waiting for
+  m_can_swap, which waits for r3d_mem's deferred copy, which waits for the geometry to stop reading.
+All three are the Real3D's own speed in heavy views (geometry, rasteriser or texture path, not yet split), which
+the sr2path bench could not show: its geometry and rasteriser are stand-ins. The isolated 2.0 frames of the first
+board run were this kind, not an interrupt inside a stalled DMA call as I first guessed.
+
+**R190 — D-74's third item: a zero-cycle, ALM-only pass on the 130 MHz dual-SDRAM tree (ae56d77). The room
+was the second SDRAM: it carries the first SDRAM's general controller and port for traffic that is only ever the
+CPU's work RAM, on its second chip, in word form. Told so at compile time it loses 146 ALUTs and 125 registers in
+the fit. With the edge walker at 54 bits and the FP divider's remainder at 54 (area4's priced rows 1 and 2) and the
+DDR3 arbiter's fields as an AND-OR (row 4), the five changed blocks give −131 ALMs needed and −127 placed by entity,
+−220 ALUTs, −181 registers, for no M10K, no DSP and no MLAB, and every bench is identical to the base, clock for
+clock. The fit (`ar130_s1`) is 0.06 / 0.26 ns better on worst setup and 12% / 10% on TNS than c130ddpa_s1, hold
+positive at every corner. The LAB count barely moves (4,190 -> 4,189): the fitter spreads, as R179 found.**
+
+Work in `sm3-builds/area130/` (`tree`: ae56d77 by `git archive`; `work` = `snap/s3`: the kept changes; notes in
+`NOTES.md`; the patch `area130-ae56d77.patch`, md5 fef77cff, which applied to ae56d77's rtl gives `snap/s3`
+exactly). Rests on §8.4, D-48 / D-57 (no cycle anywhere, the CPU's least of all), D-58 (full behaviour), D-62 /
+D-64 / D-68 (one core; sys/ stock but the audio filter patch), D-66 (the work RAM on the second SDRAM), D-74, R157 /
+R179 (fit by entity, not "ALMs needed"), R163, R164, and area4's priced rows (R157's draft). Desk only: nothing on
+the board, nothing committed. b6 and R189's r3d_mem fix are not in it and not counted.
+
+*What I believed:*
+- After R110-R179 nothing cycle-free above about 50 ALM was left outside the CPU (R128, R157), so 100 ALM would be
+  five or six items of 10-20 each.
+- Quartus would already fold whatever the second SDRAM never sees (the byte form, zero reads, the first chip), since
+  its only client is the bus's work-RAM path.
+- Taking the reset off m2_sdram's request latches would at least save the clear's LUT inputs.
+
+*What I know now:*
+
+**1. The changes kept** (each with its old form's invariant checked under VERILATOR; maps are full-design `quartus_map`,
+dual, release, against the base's map):
+
+| # | Change (file) | Why it costs no cycle and keeps the behaviour | map ALUT | map registers |
+|---|---|---|---|---|
+| A | m3_system: u_sdr2 gets s_swap 0, s_zero 0, s_sa {SDR_RAM[26:24], s_sa[23:0]} | m3_bus sets s_w2 only in its decode's first case (addr[31:23] = 0) and FAST's early work-RAM read: word form, never zero, SDR_RAM + 23 bits = 0x6400000-0x6BFFFFF (bits 26:24 always 110) | −40 (u_sdr2's port) | −29 |
+| A2 | m2_sdram: parameter DCHIP1 (default 0, unchanged); m3_sdr2 sets it (W2_C1) | every address the second controller is given (the work RAM, the probe's words) is on the module's chip 1 (byte bit 26): the row state's index takes the chip bit as 1, so chip 0's bank_open / bank_row / ras_cnt / ras_ok / rd_ok / rd_bank_cnt fold. Bring-up and refresh still go to both chips; every command is the same | −106 (the second m2_sdram) | −97 |
+| E | r3d_rast_edge at 54 bits (was 56) | the header's bound: every value read (round36, at a row that is sent) is under 2^53 in magnitude, and every operation on the walk's values (add, shift left, product with an offset) is exact modulo 2^AW. round36's integer part sign-extended by concatenation | −34 | −20 |
+| D | ppc_fpu_div: remainder kept in RW = 54 bits when RSQRT = 0 and R4 = 0 (the core's) | the remainder (held at twice its value) starts as A < 2^53 <= 2B and each radix-2 step leaves 2R − 2B or 2R below 2B < 2^54; read zero-extended into the old 60-bit expressions | −9 | −6 |
+| F | m3_ddr_arb: the owner's fields as an AND-OR under own1, a one-hot copy of owner | own1 is loaded with owner and is its one-hot at every clock; the read-only ports' constant-zero din / we drop out of the OR, and m3_ddr3p's port-L selects merge with it | +50 arb, −93 ddr3p (−43) | +8 |
+
+**2. The proof.**
+- *The second SDRAM whole* (m3_sdr2: port, controller, probe), in a copy of the port bench (`bench/tb_sdr2_eq.cpp`)
+  with a work-RAM-only mode (`--w2`: as m3_bus feeds u_sdr2) and an FNV hash of every pin and port output at every
+  clock; the base with the tree's wrapper, the new with m3_system's constants: six runs of 200,000 transactions
+  (test_sdr2's seeds 41-44, one with the read stream, one with 300-clock gaps for refresh; 5.9-19.0 M clocks each)
+  give the same lines and hashes, on A + A2 alone (the kept form) and with N, and test_sdr2's five planted faults fail the same way. Built with
+  `--x-initial unique` and run with random register starts, the same again.
+- *The first SDRAM* (m3_sdr_port on m2_sdram with a contending reader, both chips, the build's option set and the
+  read-ahead set): 6 x 200,000 transactions, plain and random-start: the same hashes. That run was on s1 (with N);
+  in the kept set the first controller is the old RTL with DCHIP1 0 (the index ORed with 0), and the system runs
+  below are on the kept set itself.
+- *The DDR3 arbiter*: old against new (`miter/arb`, NP 8, every field random every clock, requests held to their
+  ack, random bridge strobes), 3 x 2,000,000 clocks, about 250,000 grants each: no clock differs.
+- *The edge walker's* unit bench (the Makefile's edge100: VF3 and Bass Fishing's 400 frames at bands 16 and 0, 200,000
+  synthetic triangles at band 7, 20% gaps and stalls): logs identical, cycles per frame included.
+- *The FPU* (test_fpu_fast's form: ppc_fpu_fast with MISC_PIPE and the estimate, MPFR reference): four seeds of
+  3 M + 1 M ops (674,000 fdiv and 226,000 fres a seed, the denormal path included): logs identical, the divide's
+  start-to-result cycles included (fdiv 9 / 56.7 / 124).
+- *The system bench*, dual at 130 MHz (cpuspeed's model options): VF3 60 frames from reset, base against s3: bus
+  trace, both profiles byte-identical, run.log identical but for the host's speed (133,122,090 clocks; the CPU
+  port's mean first beat 12.284 clocks; the second SDRAM's 25,908 reads / 1,040,300 writes at the pins). Daytona 2,
+  40 frames (still in its boot ROM, 90,183,610 clocks): the same.
+- *Planted faults*, each caught: DCHIP1 forcing the chip bit to 0 (every sdr2 run: the probe's words land on chip 0);
+  s_sa's top bits tied to 111 (10-17 data mismatches a run); round36 zero-extended (VF3 9 of 400 frames match);
+  the remainder at 53 bits (the FPU bench fails at once); the arbiter's own1 loaded from `last` (differs from clock
+  11). The edge walker at 48 bits passes VF3's and Bass Fishing's lists (the games' walk values stay near 2^45) and
+  fails the synthetic set: the games do not reach the bound, so E rests on the header's algebra, the benches showing
+  only that the change is the one intended.
+- Rule 12: `quartus_map --analyze_file` of all six changed files, 0 errors, 0 warnings; the new idioms
+  constant-folded by Quartus 17 (`cf/cf_area130.sv`: round36 at 54 bits on four values near ±1.5 and ±2^53, the
+  DCHIP1 index, W2_C1, RW and the truncating loads, m3_system's s_sa, the arbiter's one-hot for every win): every
+  value as intended. No new array index (the row state's index is narrower, never wider).
+
+**3. The fit** (`sm3-builds/ar130_s1`, RBF 6aa2ba4d: snap/s3, dual, 130 MHz, seed 1, release; c130ddpa_s1's qsf,
+PLL, top and sdc; against c130ddpa_s1, the same seed and phases):
+
+| | c130ddpa_s1 | ar130_s1 |
+|---|---|---|
+| ALMs needed / placed | 41,442.1 / 41,314.6 | 40,728.0 / 40,828.0 |
+| LABs | 4,190 / 4,191 | 4,189 / 4,191 |
+| ALUT / registers | 60,487 / 50,901 | 59,554 / 50,816 |
+| M10K / DSP | 534 / 82 | 534 / 82 |
+| setup s100 / sn40 (TNS) | −3.727 (−12,635) / −3.765 (−10,074) | −3.663 (−11,065) / −3.501 (−9,086) |
+| hold, least: s100 / sn40 / f100 / fn40 | +0.102 / +0.088 / +0.042 / +0.021 | +0.228 / +0.223 / +0.134 / +0.118 |
+| HDMI setup s100 / sn40 | −0.804 / −0.494 | +0.063 / −0.018 |
+
+By entity:
+
+| Block | ALMs needed | placed | ALUT | registers |
+|---|---|---|---|---|
+| u_sdr2 (A + A2) | 675.2 -> 597.5 (−77.7) | 678.1 -> 596.2 (−81.9) | 1,008 -> 862 (−146) | 1,053 -> 928 (−125) |
+| of it m2_sdram (A2) | 459.4 -> 392.2 (−67.2) | 463.9 -> 392.0 (−71.9) | 680 -> 568 (−112) | 713 -> 623 (−90) |
+| of it m3_sdr_port (A) | 166.4 -> 154.7 (−11.7) | 166.2 -> 153.9 (−12.3) | 222 -> 186 (−36) | 283 -> 246 (−37) |
+| r3d_rast_edge (E) | 811.2 -> 778.4 (−32.8) | 799.0 -> 769.9 (−29.1) | 1,108 -> 1,078 (−30) | 1,119 -> 1,100 (−19) |
+| ppc_fpu_div (D) | 292.5 -> 313.8 (+21.3) | 289.1 -> 311.4 (+22.3) | 603 -> 593 (−10) | 360 -> 340 (−20) |
+| m3_ddr_arb (F) | 50.3 -> 68.1 (+17.8) | 51.8 -> 67.3 (+15.5) | 97 -> 143 (+46) | 22 -> 23 (+1) |
+| m3_ddr3p (F) | 417.0 -> 357.7 (−59.3) | 414.9 -> 361.0 (−53.9) | 632 -> 552 (−80) | 225 -> 207 (−18) |
+| **the five changed blocks** | **−130.7** | **−127.1** | **−220** | **−181** |
+
+MLAB, M10K and DSP unchanged in every one. D's +21 ALM on −10 ALUTs and −20 registers is packing. The first
+m2_sdram, whose logic is as it was (DCHIP1 0), moved +29.7 / +28.3 ALM on −10 ALUTs, and untouched blocks moved
+by tens to −157 (r3d_geo −156.6 needed, −203 ALUTs): the whole design's −714 needed / −487 placed / −933 ALUTs is
+mostly the fitter, so the five blocks' figure is the measurement.
+
+Timing in the changed blocks (failing setup paths with an end in the block, s100 / sn40): u_sdr2's worst is the same
+path in both fits, ras_ok -> sd_a[5] (the refresh's precharge-all decision into the address pins), −2.256 / −1.834
+-> −2.541 / −2.444; its logic is narrower (ras_any over chip 1's four counters, chip 0's are constant), and the
+first controller's identical path moved −1.972 / −1.774 -> −2.492 / −2.186 in the same fit, so it is placement.
+r3d_rast_edge −1.877 / −2.018 -> −1.573 / −1.358 (no walk adder among the failing); ppc_fpu_div −1.127 / −1.002 ->
+−1.198 / −1.103 on the same untouched path both times (the operand into o_sign at the start), no remainder path
+failing; m3_ddr_arb −3.181 / −3.014 -> −0.959 / −0.667; m3_ddr3p −3.654 / −3.367 -> −2.321 / −2.266. The SDRAM I/O
+is within 0.02 ns of c130ddpa_s1's on every read figure.
+
+**4. Tried and not kept.**
+- **m2_sdram's request latches without their reset (N).** Their values are never read before the clock their pend
+  rises (random-start runs identical), and the controllers lost 23 and 40 ALUTs, but both m3_sdr_ports grew 37-41
+  ALUTs each, +56 in the whole map. N2 (the address latch keeping its clear) the same, +11 in those blocks: the
+  growth is on the ports' column data side (p_din / p_be from col16). Why Quartus does better with the clear I have
+  not established. Not kept.
+- **The probe's writes through port 0**, so the second controller's dedicated write port could be tied off: that
+  port costs 24 ALUTs and 28 registers there (priced with a broken probe), and a working probe needs a 16-bit select
+  on c_din and an 18-bit one on wb_din / wb_be (the column data path, R107's worst once), or a 32-bit select on the
+  port's s_wdata. About even. Not built.
+- **The second SDRAM's OSD-message counter (29 bits) from the one-second tick**: that counter is held in the game's
+  reset, which is where a missing module holds the game. Not built.
+- **The first SDRAM's 77 µs bring-up made the second's 110 µs**, so Quartus could merge the two init counters: a
+  power-up change for about 10 ALM. Not built.
+- **Telemetry counters** (m3_bus's n_*, r3d_rast's n_pix / f_cycles, the VPU's issue counts): already gone in a
+  release (unconnected, removed by map).
+
+*Wrong turns:*
+- My first map waited behind three Model 2 fits, because my run script kept cpuspeed's "fewer than three Quartus jobs
+  machine-wide"; with the other project's three fits running I allowed mine as a fourth (one of mine at a time),
+  memory permitting.
+- The first `sdr2` comparison was built before N was in the tree; the s1 runs repeat it with N.
+- My first bench copy hashed sd_dq_oe, which the first SDRAM's wrapper does not have: every build failed until the
+  hash took it only for the second SDRAM's.
+- I chained a map on `ps | grep '[g]ate.sh'`, which matched its own command line, and the N2 map never started.
+- My expected value for one DCHIP1 constant-fold case was wrong (101 for 110); Quartus was right.
+- A `git apply --check` with no file waited on its input; nothing was changed (the main checkout's status is as it was).
+
+*On the board (2026-11-19).* In `cd74_s1` with b6 and R189's fix (41,076 ALM against cfb3_s1's 41,238, the fitter's
+spread taking some of the −131): VF3, Scud Race, Daytona 2 and Sega Rally 2 run with no lockup on the dual board.

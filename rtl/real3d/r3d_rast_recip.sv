@@ -161,6 +161,10 @@ module r3d_rast_recip (
       default: seed = 12'd0;
     endcase
   endfunction
+  // the seed table in an M10K (area, R179): read where seed() was registered (t0 <= rom[a], the block's
+  // address register in t0's place), the same word in the same clock; checked against seed() below
+  (* romstyle = "M10K" *) logic [11:0] seed_rom [128];
+  initial for (int i = 0; i < 128; i++) seed_rom[i] = seed(7'(i));
 
   logic [23:0] m0, m3, m7, m8;
   // m at stages 3 and 7 from r3d_dline delay lines (area pass), the words the enabled chain m1 .. m7 held there
@@ -188,7 +192,7 @@ module r3d_rast_recip (
     logic [29:0] d10, dlo, dhi;
     logic [24:0] q;
     // 0: seed
-    m0 <= m; p0 <= (m[22:0] == 23'd0); t0 <= seed(m[22:16]);
+    m0 <= m; p0 <= (m[22:0] == 23'd0); t0 <= seed_rom[m[22:16]];
     // 1: m t (Q2.34)
     p1q <= p0; t1 <= t0; pr1 <= m0 * t0;
     // 2: e1s = (2^35 - m t) >> 16
@@ -217,4 +221,15 @@ module r3d_rast_recip (
     r <= q;
   end
 
+`ifdef VERILATOR
+  logic [11:0] t0_chk;
+  always_ff @(posedge clk) if (en) t0_chk <= seed(m[22:16]);
+  /* verilator lint_off PROCASSINIT */
+  logic t0_v = 1'b0;                        // t0 loaded at least once
+  /* verilator lint_on PROCASSINIT */
+  always_ff @(posedge clk) begin
+    if (en) t0_v <= 1'b1;
+    if (t0_v && t0 != t0_chk) $fatal(1, "r3d_rast_recip: the seed M10K against seed()");
+  end
+`endif
 endmodule

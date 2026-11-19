@@ -363,3 +363,6 @@ set_global_assignment -name VERILOG_MACRO "M3_R3B=1"
 # The cabinet's driving block without Model 2's "Steering", "Steering smoothing" and "Analog control"
 # (m3_cab_inputs). Off: the full block is built, with its OSD lines.
 #set_global_assignment -name VERILOG_MACRO "M3_INP_LEAN=1"
+# The frame-time measurement in a release build (m3_frame_busy and overlay rows 6-7: each frame against the vblank,
+# split into Real3D DMA wait and the rest; study R188). Board measurement builds only.
+#set_global_assignment -name VERILOG_MACRO "M3_FBUSY_BUILD=1"

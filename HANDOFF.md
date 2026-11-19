@@ -1,5 +1,31 @@
 # Handoff
 
+## Update (2026-11-19)
+
+`main` takes branch `sr2-r3dmem` with a `--no-ff` merge: D-74's three changes and the frame-time measurement.
+- **R189, r3d_mem:** a re-opened 8E group joins the open run, the age flush waits for a free clock (it also closes a
+  word dropped from both copies), and the deferred copy pauses for waiting writes. +9 ALM.
+- **b6 (R188, R179):** the reciprocal seed tables in M10K. About -100 ALM, +2 M10K (536 / 553).
+- **R190, area:** the second SDRAM told it carries only work RAM, the edge walker and FP divider remainder at 54 bits,
+  the DDR3 arbiter's one-hot select. -131 ALM by entity, no M10K.
+- **m3_frame_busy** with Daytona 2's decrementer-paced frame and the DMA-wait split, and the qsf switch
+  `M3_FBUSY_BUILD` (commented out) for a release build with overlay rows 6-7.
+
+Board: `cd74_s1` (743bfb4c) is Model3.rbf: this tree with M3_FBUSY_BUILD, dual, 130 MHz, 3125 / 2885 ps. 41,076 ALM,
+setup -3.828 / -3.803, hold positive, HDMI +0.09 / +0.17. VF3, Scud Race, Daytona 2 and Sega Rally 2 run with no
+lockup. No release RBF of this tree is fitted yet (u_sdr2's refresh path moved 0.3-0.6 ns in R190's fit: two seeds).
+
+Sega Rally 2 over a lap (`sm3-builds/d74/NOTES.md`): DMA wait 0.00-0.22 vblank (was 0.61-0.81), most of the lap
+57-58 fps. Left: the start line (frames pinned at 2.00, the host held outside the DMA calls) and two stretches
+(the game loop at 60, the Real3D dropping frames, FPS 19-43). Daytona 2 unchanged: CPU-bound at 1.01-1.10 vblank.
+
+Next (D-75): a fair boost to the Real3D, for Daytona 2 as well as SR2. First split where SR2's and Daytona 2's heavy
+frames go (geometry, rasteriser, texture path, held host access), then price the speed-ups. The CPI items (R188)
+stay in `sm3-builds/cpuspeed/` until that split says how much of Daytona 2's frame is the CPU.
+
+Before the 2026-11-19 power outage the session's scratch files went to `sm3-builds/session-save-2026-11-19/`; the
+board script is now `sm3-builds/board-tools/b.sh`.
+
 ## Update (2026-11-17)
 
 `main` is the `--no-ff` merge of `sdram-130` (ae56d77): 130 MHz on one or two SDRAM modules. `git revert -m 1` on the
