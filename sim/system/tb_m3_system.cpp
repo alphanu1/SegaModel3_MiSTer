@@ -594,6 +594,36 @@ int main(int argc, char **argv) {
     if (t->frame != inp_frame) { inp_frame = t->frame; inp_apply(); }
     tick();
     if (max_cycles && cyc >= max_cycles) { std::printf("--max-cycles: stopped at cycle %" PRIu64 ", frame %u\n", cyc, t->frame); break; }
+    // (bench only, as tc/cpu/d2's round 3) the frame pacing's event log: M3_EVLOG=FILE, M3_PCLOG=pc,pc,.. (hex):
+    // P cycle pc (each retire at a listed PC), V cycle frame
+    {
+      static std::FILE *evf = nullptr; static bool ev_init = false; static std::vector<uint32_t> ev_pcs; static uint32_t ev_fr = 0;
+      if (!ev_init) {
+        ev_init = true; ev_fr = t->frame;
+        if (const char *e = std::getenv("M3_EVLOG")) evf = std::fopen(e, "a");
+        if (const char *e = std::getenv("M3_PCLOG")) { std::string w(e); size_t p0 = 0;
+          while (p0 < w.size()) { size_t c = w.find(',', p0); if (c == std::string::npos) c = w.size();
+            ev_pcs.push_back(uint32_t(std::stoul(w.substr(p0, c - p0), nullptr, 16))); p0 = c + 1; } }
+      }
+      if (evf) {
+        if (t->rt_valid_o) for (uint32_t pc : ev_pcs) if (t->rt_pc_o == pc) { std::fprintf(evf, "P %llu %X\n", (unsigned long long)cyc, pc); break; }
+        // M3_WLOG=lo-hi,lo-hi (hex): W cycle pc for a retirement inside a range whose previous retirement was outside it
+        // (a wait loop entered; its spins are not logged), X cycle pc for the first retirement outside after one inside
+        {
+          static std::vector<std::pair<uint32_t, uint32_t>> wr; static bool w_init = false; static int w_in = -1;
+          if (!w_init) { w_init = true; if (const char *e = std::getenv("M3_WLOG")) { std::string w(e); size_t p0 = 0;
+            while (p0 < w.size()) { size_t c = w.find(',', p0); if (c == std::string::npos) c = w.size(); std::string it = w.substr(p0, c - p0);
+              size_t d = it.find('-'); wr.emplace_back(uint32_t(std::stoul(it.substr(0, d), nullptr, 16)), uint32_t(std::stoul(it.substr(d + 1), nullptr, 16))); p0 = c + 1; } } }
+          if (t->rt_valid_o && !wr.empty()) {
+            int k = -1; for (size_t i = 0; i < wr.size(); i++) if (t->rt_pc_o >= wr[i].first && t->rt_pc_o <= wr[i].second) { k = int(i); break; }
+            if (k >= 0 && k != w_in) std::fprintf(evf, "W %llu %X\n", (unsigned long long)cyc, unsigned(t->rt_pc_o));
+            else if (k < 0 && w_in >= 0) std::fprintf(evf, "X %llu %X\n", (unsigned long long)cyc, unsigned(t->rt_pc_o));   // left it
+            w_in = k;
+          }
+        }
+        if (t->frame != ev_fr) { ev_fr = t->frame; std::fprintf(evf, "V %llu %u\n", (unsigned long long)cyc, ev_fr); }
+      }
+    }
     {
       auto *q = t->rootp;
       bool const mreq = q->m3_system__DOT__m_req & 1, mack = q->m3_system__DOT__m_ack & 1, mrv = q->m3_system__DOT__m_rvalid & 1;

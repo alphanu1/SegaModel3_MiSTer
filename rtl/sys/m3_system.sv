@@ -92,6 +92,14 @@ module m3_system
 `else
   parameter bit          RELEASE  = 1'b0,
 `endif
+  // FBDBG = 1 (macro M3_FBUSY_BUILD) keeps FBUSY and the overlay in a RELEASE build, for reading the CPU's frame
+  // times on the board: the overlay shows rows 6 and 7 only (FBUSY and its DMA-wait split) (the PC, IRQs, frame, step; FBUSY's row), every other
+  // debug block stays off (CPI_MON and its UART, the exception captures, the other rows' counters)
+`ifdef M3_FBUSY_BUILD
+  parameter bit          FBDBG    = 1'b1,
+`else
+  parameter bit          FBDBG    = 1'b0,
+`endif
   // XCAP = 0 (macro M3_NO_XCAP) leaves the overlay's exception rows 8-11 at zero, so their capture logic
   // is not built: a smaller test build (study R105)
 `ifdef M3_NO_XCAP
@@ -456,10 +464,11 @@ module m3_system
   logic [31:0]      rt_pc;
 
   // the debug blocks as built (RELEASE turns them all off)
-  localparam bit OV_ON  = OVERLAY && !RELEASE;
+  localparam bit OV_ON  = OVERLAY && (!RELEASE || FBDBG);
+  localparam bit OV_MIN = RELEASE && FBDBG;            // the frame-busy build: overlay rows 6 and 7 only
   localparam bit MON_ON = CPI_MON && !RELEASE;
-  localparam bit FB_ON  = FBUSY   && !RELEASE;
-  localparam bit XC_ON  = XCAP    && OV_ON;
+  localparam bit FB_ON  = FBUSY   && (!RELEASE || FBDBG);
+  localparam bit XC_ON  = XCAP    && OV_ON && !RELEASE;
 
   ppc_cpu #(.PVR(PVR), .PVR2(PVR2), .ISB(ISB), .WV(CPU_WV), .RPE(CPU_RPE)) u_cpu (
     .clk, .rst(rst_cpu), .pvr_alt(step2),
@@ -678,11 +687,18 @@ module m3_system
               .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ),
               .PW_DLY(SDR_PW_DLY), .BXOR(SDR_BXOR), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdr2 (
       .clk, .mem_rst_n, .ra_clr(rst), .en(sd2_en), .ok(sd2_ok_q), .missing(sd2_missing), .info_req(sd2_info_req),
-      .s_req(s_req && s_w2), .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_wbe,
+      // (area130 A) the bus sends only work RAM here (m3_bus: s_w2 is its decode's first case): word form,
+      // never a zero read, at SDR_RAM + the low 23 bits, so bits AW:24 are SDR_RAM's; tied as constants
+      .s_req(s_req && s_w2), .s_cmd, .s_sa({SDR_RAM[AW:24], s_sa[23:0]}), .s_swap(1'b0), .s_zero(1'b0), .s_be, .s_wdata, .s_wbe,
       .s_ack(w2_ack), .s_wnext(w2_wnext), .s_rvalid(w2_rvalid), .s_rdata(w2_rdata),
       .rd_lat_sel(sd2_rd_lat_sel), .sd_cs_n(sd2_cs_n), .sd_ras_n(sd2_ras_n), .sd_cas_n(sd2_cas_n), .sd_we_n(sd2_we_n),
       .sd_ba(sd2_ba), .sd_a(sd2_a), .sd_dq_o(sd2_dq_o), .sd_dq_oe(sd2_dq_oe), .sd_dq_i(sd2_dq_i));
     assign sd2_ok = sd2_ok_q;
+`ifdef VERILATOR
+    always_ff @(posedge clk)
+      if (!rst && s_req && s_w2 && (s_swap || s_zero || s_sa[AW:24] != SDR_RAM[AW:24]))
+        $fatal(1, "m3_system: a work-RAM transaction for the second SDRAM outside its constants");
+`endif
   end else begin : g_now2
     assign sd2_ok = 1'b1; assign sd2_missing = 1'b0; assign sd2_info_req = 1'b0;
     assign w2_ack = 1'b0; assign w2_wnext = 1'b0; assign w2_rvalid = 1'b0; assign w2_rdata = '0;
@@ -1189,12 +1205,18 @@ module m3_system
   assign d_we[0] = 1'b0; assign d_din[0] = '0; assign d_be[0] = 8'hFF;
 
   // the CPU's busy time per frame (R104): vblank to the first retirement in a wait loop
-  logic [31:0] fb_mm, fb_lo, fb_hi, fb_last;
+  logic [31:0] fb_mm, fb_lo, fb_hi, fb_last, fb3_mm, fb3_long, fb3_sum;
   generate if (FB_ON) begin : g_fbusy
-    m3_frame_busy #(.CLK_HZ(CLK_HZ)) u_fbusy (.clk, .rst, .vblank_start, .step2, .rt_valid, .rt_pc,
-      .o_minmax(fb_mm), .o_bins_lo(fb_lo), .o_bins_hi(fb_hi), .o_last(fb_last));
+    // the windows by game: Sega Rally 2 is the driving profile's Step 2.0 set (configuration step 20, input profile
+    // 1, m3_mra.py), Daytona 2 (and every other Step 2.x set) step2, the rest VF3's
+    logic [1:0] fb_game;
+    always_ff @(posedge clk) fb_game <= (cfg_step == 8'h20 && cfg_prof == 8'd1) ? 2'd2 : step2 ? 2'd1 : 2'd0;
+    m3_frame_busy #(.CLK_HZ(CLK_HZ)) u_fbusy (.clk, .rst, .vblank_start, .game(fb_game), .rt_valid, .rt_pc,
+      .o_minmax(fb_mm), .o_bins_lo(fb_lo), .o_bins_hi(fb_hi), .o_last(fb_last),
+      .o3_mm(fb3_mm), .o3_long(fb3_long), .o3_sum(fb3_sum));
   end else begin : g_nofbusy
     assign fb_mm = '0; assign fb_lo = '0; assign fb_hi = '0; assign fb_last = '0;
+    assign fb3_mm = '0; assign fb3_long = '0; assign fb3_sum = '0;
   end endgenerate
 
   logic [5:0]  ov_idx;
@@ -1214,7 +1236,11 @@ module m3_system
       endcase
     end
     always_ff @(posedge clk) begin
-      case (ov_idx)
+      // (the frame-busy build, R188: row 7 FBUSY's {min, max}, bands and, last, the longest frame's {DMA wait, the
+      // rest}; row 6 {min, max} of the DMA wait and the DMA wait over the second; every other row 0)
+      if (OV_MIN) ov_v <= (ov_idx == 6'd28) ? fb_mm : (ov_idx == 6'd29) ? fb_lo : (ov_idx == 6'd30) ? fb_hi :
+                          (ov_idx == 6'd31) ? fb3_long : (ov_idx == 6'd24) ? fb3_mm : (ov_idx == 6'd25) ? fb3_sum : 32'd0;
+      else case (ov_idx)
         // row 0: CPU PC (at vblank), IRQ state/enable and CROM bank, frames, the 53C810 interrupts
         6'd0:  ov_v <= pc_v;
         6'd1:  ov_v <= {irq_state, irq_enable, crom_bank, 7'd0, pingpong};
@@ -1283,7 +1309,7 @@ module m3_system
         default: ov_v <= 32'h3B00_0001;   // stage B, build 1
       endcase
     end
-    m3v_overlay #(.NR(12)) u_ov (.clk, .en(overlay_en), .x(x_d), .y(y_d), .idx(ov_idx), .val(ov_v), .box(ov_box), .ink(ov_ink));
+    m3v_overlay #(.NR(OV_MIN ? 8 : 12)) u_ov (.clk, .en(overlay_en), .x(x_d), .y(y_d), .idx(ov_idx), .val(ov_v), .box(ov_box), .ink(ov_ink));
   end else begin : g_noov
     assign ov_box = 1'b0; assign ov_ink = 1'b0; assign ov_idx = '0; assign ov_v = '0;
   end endgenerate

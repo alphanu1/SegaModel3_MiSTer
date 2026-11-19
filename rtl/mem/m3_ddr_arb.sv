@@ -98,12 +98,24 @@ module m3_ddr_arb #(
     $fatal(1, "m3_ddr_arb: win against the turn's loop");
 `endif
 
-  assign m_req  = busy && req[owner];
-  assign m_we   = we[owner];
-  assign m_addr = addr[owner];
-  assign m_blen = blen[owner];
-  assign m_din  = din[owner];
-  assign m_be   = be[owner];
+  // (area130, area4's row 4) the owner's fields as an AND-OR under a one-hot copy of owner, loaded with it, in
+  // place of an NP:1 select by the binary owner: the same word whenever own1 is owner's one-hot (checked below);
+  // a port whose fields are constant zero (the read-only ports' din, we) drops out of the OR
+  logic [NP-1:0] own1;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && own1 != (NP'(1) << owner)) $fatal(1, "m3_ddr_arb: own1 is not owner's one-hot");
+`endif
+  always_comb begin
+    m_req = 1'b0; m_we = 1'b0; m_addr = '0; m_blen = '0; m_din = '0; m_be = '0;
+    for (int k = 0; k < NP; k++) begin
+      m_req  = m_req  | (own1[k] & busy & req[k]);
+      m_we   = m_we   | (own1[k] & we[k]);
+      m_addr = m_addr | ({25{own1[k]}} & addr[k]);
+      m_blen = m_blen | ({8{own1[k]}} & blen[k]);
+      m_din  = m_din  | ({64{own1[k]}} & din[k]);
+      m_be   = m_be   | ({8{own1[k]}} & be[k]);
+    end
+  end
 
   always_comb begin
     wacc = '0; rvalid = '0; ack = '0;
@@ -114,12 +126,12 @@ module m3_ddr_arb #(
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      busy <= 1'b0; cool <= 1'b0; owner <= '0; last <= '0; hm <= above('0);
+      busy <= 1'b0; cool <= 1'b0; owner <= '0; own1 <= NP'(1); last <= '0; hm <= above('0);
     end else begin
       cool <= 1'b0;
       if (!busy) begin
         if (!cool && any) begin
-          busy <= 1'b1; owner <= win;
+          busy <= 1'b1; owner <= win; own1 <= NP'(1) << win;
           if (win != '0) begin last <= win; hm <= above(win); end
         end
       end else if (m_ack) begin

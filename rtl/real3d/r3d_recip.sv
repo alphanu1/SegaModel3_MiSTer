@@ -175,6 +175,10 @@ module r3d_recip (
       default: seed = 12'd0;
     endcase
   endfunction
+  // the seed table in an M10K (area, R179): read where seed() was registered (t0 <= rom[a], the block's
+  // address register in t0's place), the same word in the same clock; checked against seed() below
+  (* romstyle = "M10K" *) logic [11:0] seed_rom [128];
+  initial for (int i = 0; i < 128; i++) seed_rom[i] = seed(7'(i));
 
   // pipeline payload
   typedef struct packed {
@@ -239,7 +243,7 @@ module r3d_recip (
     else if (ai || xz) c0.special <= 2'd1;
     else if (az || xi) c0.special <= 2'd2;
     else c0.special <= 2'd0;
-    t0 <= seed(f[22:16]);
+    t0 <= seed_rom[f[22:16]];
   end
   // stage 1: p1 = M * t (Q2.34)
   logic [35:0] p1;
@@ -361,4 +365,15 @@ module r3d_recip (
     endcase
   end
 
+`ifdef VERILATOR
+  logic [11:0] t0_chk;
+  always_ff @(posedge clk) t0_chk <= seed(x[22:16]);   // f = x[22:0]
+  /* verilator lint_off PROCASSINIT */
+  logic t0_v = 1'b0;                        // t0 loaded at least once
+  /* verilator lint_on PROCASSINIT */
+  always_ff @(posedge clk) begin
+    if (1'b1) t0_v <= 1'b1;
+    if (t0_v && t0 != t0_chk) $fatal(1, "r3d_recip: the seed M10K against seed()");
+  end
+`endif
 endmodule

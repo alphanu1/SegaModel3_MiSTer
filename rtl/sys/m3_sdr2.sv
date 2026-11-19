@@ -187,13 +187,17 @@ module m3_sdr2
   assign c_long = {1'b0, sp_long && !pr_act};
   assign sp_ack = c_ack[0]; assign sp_lo = c_lo[0]; assign sp_dout = c_dout[0];
   localparam logic [NP-1:0] P0 = NP'(1);
+  // (area130) every address here is the work RAM's (8 MiB from PROBE_SA, SDR_RAM) or the probe's, so on the
+  // 128 MB module all on the second chip (byte address bit 26): m2_sdram keeps row state for that chip alone
+  // (DCHIP1). Port 1's clients (D-63) would end it.
+  localparam bit W2_C1 = (PROBE_SA >= 27'h400_0000) && ({1'b0, PROBE_SA} + 28'h80_0000 <= 28'h800_0000);
   logic [1:0] sd_dqm_unused;
   logic       sd_cke_unused;
   m2_sdram #(.COL_BITS(10), .NP(NP), .T_REFI(T_REFI), .T_RC(T_RC), .T_RAS(T_RAS), .ACK_HOLD(1),
              .INIT_NOP(CLK_MHZ * 110), .DUAL(1'b1), .MASK_ON_A(1'b1),
              .PRI(P0), .PRI_TOP(P0), .BXOR(BXOR),
              .WB(P0), .L16(L16 ? P0 : NP'(0)), .PAIR(PAIR ? P0 : NP'(0)), .FDSP(FDSP), .HITRD(HITRD),
-             .SHD(P0)) u_sdram (
+             .SHD(P0), .DCHIP1(W2_C1)) u_sdram (
     .clk, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
     .sd_cke(sd_cke_unused), .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm(sd_dqm_unused),
     .sd_dq_o, .sd_dq_oe, .sd_dq_i,

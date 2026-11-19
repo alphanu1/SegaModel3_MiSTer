@@ -119,7 +119,9 @@ module r3d_mem #(
   } st_t;
   st_t          st;
   logic [1:0]   cw;                       // the write's window
-  logic [20:0]  ca;                       // its word; the copy's position
+  logic [20:0]  ca;                       // its word
+  logic [20:0]  pa;                       // the copy's position
+  logic         cp_v;                     // a copy started and not finished (it pauses for a waiting write)
 `ifndef M3_R3B
   logic [31:0]  cd;                       // its data (with M3_R3B: g_d's word 0, below)
 `endif
@@ -187,7 +189,9 @@ module r3d_mem #(
   wire          g_hit   = w_valid && w_reg == 2'd1 && g_v && g_grp == w_addr[19:2] && !g_m[w_addr[1:0]];
   // (the next word of a line comes a few clocks behind the last: a group waits up to G_AGE clocks for it)
   localparam logic [2:0] G_AGE = 3'd6;
-  wire          g_flush = g_v && (g_m == 4'hF || (w_valid && !g_hit) || swap || g_age == G_AGE);
+  // (the age flush only when no write for the group is offered: w_ready takes a hit, so a hit in the clock the age
+  // ran out was acknowledged and then dropped by the flush; sm3-builds/sr2dma)
+  wire          g_flush = g_v && (g_m == 4'hF || (w_valid && !g_hit) || swap || (g_age == G_AGE && !g_hit));
   // S_RUN (a word) and S_GRUN (a group's four) extend the open run or close it in one form: one sum, one
   // comparison and one adder for both
   wire          x_g     = st == S_GRUN;
@@ -195,6 +199,15 @@ module r3d_mem #(
   wire [RL-1:0] x_n     = x_g ? RL'(4) : RL'(1);
   wire          x_ext   = o_v && o_win == (!x_g && cw[1]) && x_st == o_st + 20'(o_n) &&
                           (x_g ? o_n <= {RL{1'b1}} - RL'(4) : o_n != {RL{1'b1}});
+  // A group written again after it was flushed, while it is still the open run's last group, is inside that run
+  // already: the copy reads W, which has its new words, so it needs no run of its own. Sega Rally 2 moves 8E in
+  // ten-word DMAs, one after another: every other one starts in the group the last one ended in, which flushed
+  // in the gap between them. Without this each such group closed the run and opened a new one, about 270 a
+  // frame; with the geometry on bank R the 256-entry run FIFO filled, w_ready fell until the geometry finished,
+  // and the DMA and the CPU's poll of it waited that long (sm3-builds/sr2dma). g_same: the group opened is the
+  // last one (g_grp still holds it; the compare is g_hit's); o_lgv: that group went into the open run last.
+  logic         g_same, o_lgv;
+  wire          x_in    = x_g && o_v && o_lgv && g_same;
   // (in reset too: a word is only read after it is taken, and the burst's lanes mask the rest)
   wire          g_we    = st == S_IDLE && !g_flush && w_valid && w_ready;
 `ifdef M3_R3B_FAULT3
@@ -215,7 +228,7 @@ module r3d_mem #(
     g_ra = s_req ? s_wbc[2:1] : 2'd0;
 `endif
   end
-  assign        rf_push = (st == S_RUN || st == S_GRUN) && !x_ext && o_v;
+  assign        rf_push = (st == S_RUN || st == S_GRUN) && !x_ext && !x_in && o_v;
 `endif
   wire          wbank   = !bank;
   wire          bk      = to_r ? bank : wbank;
@@ -223,7 +236,7 @@ module r3d_mem #(
   wire [26:0]   sbase   = (cw == 2'd0) ? SDR_8C : bk ? SDR_8E1 : SDR_8E0;
 `endif
   wire [24:0]   pbase   = bk ? DDR_P1 : DDR_P0;
-  wire          pending = o_v || !rf_empty;
+  wire          pending = o_v || !rf_empty || cp_v;
   wire          copy_go = !r_busy && pending;
 
 `ifdef M3_R3B
@@ -256,7 +269,7 @@ module r3d_mem #(
     gap <= 1'b0;
     if (rst) begin
       st <= S_IDLE; bank <= 1'b0; s_req <= 1'b0; d_req <= 1'b0;
-      rf_wp <= '0; rf_rp <= '0; o_v <= 1'b0; n_runs <= '0; n_copy <= '0;
+      rf_wp <= '0; rf_rp <= '0; o_v <= 1'b0; cp_v <= 1'b0; n_runs <= '0; n_copy <= '0;
 `ifdef M3_R3B
       g_v <= 1'b0; s_long <= 1'b0;
 `endif
@@ -272,7 +285,7 @@ module r3d_mem #(
           if (g_flush) begin
             st <= S_GW;
           end else if (w_valid && w_ready && w_reg == 2'd1) begin
-            if (!g_v) begin g_v <= 1'b1; g_grp <= w_addr[19:2]; g_m <= 4'd1 << w_addr[1:0]; end
+            if (!g_v) begin g_v <= 1'b1; g_grp <= w_addr[19:2]; g_m <= 4'd1 << w_addr[1:0]; g_same <= g_grp == w_addr[19:2]; end
             else g_m <= g_m | (4'd1 << w_addr[1:0]);
             g_age <= 3'd0;
           end else if (g_v) begin
@@ -287,7 +300,7 @@ module r3d_mem #(
             dfr <= r_busy || pending;
             st <= (w_reg == 2'd2) ? S_DW : S_SW;
           end else if (copy_go && !swap && (!w_valid || rf_full)) begin   // a full FIFO must drain, or the bus waits for ever
-            st <= S_POP;
+            st <= cp_v ? S_CP : S_POP;
           end
         end
 
@@ -337,12 +350,14 @@ module r3d_mem #(
         // ---- a deferred write: extend the open run, or close it and open one
 `ifdef M3_R3B
         S_RUN, S_GRUN: begin
-          if (x_ext) o_n <= o_n + x_n;
+          if (x_in) ;                                // (the group is the open run's last: nothing to add)
+          else if (x_ext) o_n <= o_n + x_n;
           else begin
             if (o_v) rf_wp <= rf_wp + 1'b1;
             o_v <= 1'b1; o_win <= !x_g && cw[1]; o_st <= x_st; o_n <= x_n;
             n_runs <= n_runs + 16'd1;
           end
+          o_lgv <= x_g;
           if (x_g) g_v <= 1'b0;
           st <= S_IDLE;
         end
@@ -369,20 +384,23 @@ module r3d_mem #(
           end else begin
             win = o_win; s0 = o_st; n0 = o_n; o_v <= 1'b0;
           end
-          cwin <= win;
+          cwin <= win; cp_v <= 1'b1;
           cend <= {1'b0, s0} + 21'(n0) - 21'd1;
-          ca <= {1'b0, s0[19:1], 1'b0};
+          pa <= {1'b0, s0[19:1], 1'b0};
           st <= S_CP;
         end
         // the next piece of the run, or the run is done
         S_CP: begin
-          if (ca > cend) st <= S_IDLE;
+          if (pa > cend) begin st <= S_IDLE; cp_v <= 1'b0; end
+          // (between pieces a waiting write goes first: a long run's copy no longer holds the bus's writes for its
+          // whole length; the rest of it resumes from S_IDLE, and pending holds the swap and defers writes meanwhile)
+          else if (w_valid && !rf_full) st <= S_IDLE;
           else begin
             n_copy <= n_copy + 16'd1;
             if (cwin) begin
               // polygon RAM: up to 2^CB beats, not past the run's last beat
               logic [19:0] left;
-              left = cend[20:1] - ca[20:1];
+              left = cend[20:1] - pa[20:1];
               cn <= (left >= 20'((1 << CB) - 1)) ? (CB+1)'(1 << CB) : (CB+1)'(left) + 1'b1;
               ci <= '0;
               st <= S_DR;
@@ -392,11 +410,11 @@ module r3d_mem #(
             end
           end
         end
-        // 8E: read the pair {ca, ca + 1} from W, then write its four halves to R
+        // 8E: read the pair {pa, pa + 1} from W, then write its four halves to R
         S_SR: begin
           if (!s_req && !gap && !s_ack) begin
             s_req <= 1'b1; s_we <= 1'b0;
-            s_addr <= AW'((wbank ? SDR_8E1 : SDR_8E0) >> 1) + AW'({ca[19:0], 1'b0});
+            s_addr <= AW'((wbank ? SDR_8E1 : SDR_8E0) >> 1) + AW'({pa[19:0], 1'b0});
           end
           if (s_ack) begin
             s_req <= 1'b0; gap <= 1'b1;
@@ -406,7 +424,7 @@ module r3d_mem #(
         S_SW2: begin
           if (!s_req && !gap && !s_ack) begin
             s_req <= 1'b1; s_we <= 1'b1;
-            s_addr <= AW'((bank ? SDR_8E1 : SDR_8E0) >> 1) + AW'({ca[19:1], sk});
+            s_addr <= AW'((bank ? SDR_8E1 : SDR_8E0) >> 1) + AW'({pa[19:1], sk});
             s_be <= 2'b11;
             case (sk)
               2'd0: s_din <= s_dout[15:0];
@@ -419,10 +437,10 @@ module r3d_mem #(
             s_req <= 1'b0; gap <= 1'b1;
 `ifdef M3_R3B
             sk <= sk + 2'd2;                         // (two halves a two-column burst)
-            if (sk == 2'd2) begin ca <= ca + 21'd2; st <= S_CP; end
+            if (sk == 2'd2) begin pa <= pa + 21'd2; st <= S_CP; end
 `else
             sk <= sk + 2'd1;
-            if (sk == 2'd3) begin ca <= ca + 21'd2; st <= S_CP; end
+            if (sk == 2'd3) begin pa <= pa + 21'd2; st <= S_CP; end
 `endif
           end
         end
@@ -436,7 +454,7 @@ module r3d_mem #(
           end
           if (s_ack) begin
             s_req <= 1'b0; gap <= 1'b1; s_long <= 1'b0;
-            if (st == S_GR) begin g_v <= 1'b0; st <= S_IDLE; end
+            if (st == S_GR) begin g_v <= 1'b0; o_lgv <= 1'b0; st <= S_IDLE; end
             else if (r_busy || pending) st <= S_GRUN;
             else st <= S_GR;
           end
@@ -446,7 +464,7 @@ module r3d_mem #(
         S_DR: begin
           if (!d_req) begin
             d_req <= 1'b1; d_we <= 1'b0; d_blen <= 8'(cn);
-            d_addr <= (wbank ? DDR_P1 : DDR_P0) + 25'(ca[19:1]);
+            d_addr <= (wbank ? DDR_P1 : DDR_P0) + 25'(pa[19:1]);
           end
           if (d_rvalid) ci <= ci + 1'b1;
           if (d_ack) begin
@@ -457,12 +475,12 @@ module r3d_mem #(
         S_DST: begin
           if (!d_req) begin
             d_req <= 1'b1; d_we <= 1'b1; d_blen <= 8'(cn); d_be <= 8'hFF;
-            d_addr <= (bank ? DDR_P1 : DDR_P0) + 25'(ca[19:1]);
+            d_addr <= (bank ? DDR_P1 : DDR_P0) + 25'(pa[19:1]);
           end
           if (d_wacc) ci <= ci + 1'b1;
           if (d_ack) begin
             d_req <= 1'b0;
-            ca <= ca + {15'd0, cn, 1'b0};
+            pa <= pa + {15'd0, cn, 1'b0};
             st <= S_CP;
           end
         end

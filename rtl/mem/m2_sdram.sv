@@ -142,6 +142,12 @@ module m2_sdram #(
   // 64 MB module (one chip; the chip-1 commands are deselects to it) runs as
   // before. 0: the controller exactly as it was.
   parameter bit            DUAL      = 1'b0,
+  // (Model 3, area130) WITH DUAL: EVERY ADDRESS ON THE SECOND CHIP. 1 when every port's and the write port's
+  // addresses are in the upper 64 MB (the chip bit always set, as the second SDRAM's work RAM is): the chip bit of
+  // the row state's index is taken as 1, so only chip 1's four banks keep row state and chip 0's are not built.
+  // Both chips are still brought up and refreshed as above; the commands are the same, clock for clock, for every
+  // such address (checked in simulation). 0: the controller exactly as it was.
+  parameter bit            DCHIP1    = 1'b0,
   // R891: THE BYTE MASK ON A12:A11 DURING THE COLUMN PHASE. On these modules
   // the chips' DQML/DQMH are wired to A11/A12, not to the connector's DQM pins
   // (R82, R871: the board dropped every byte enable). A WRITE carries ~be on
@@ -848,7 +854,8 @@ module m2_sdram #(
 
   logic [BW-1:0]  tbank;               // {chip, bank} (R891)
   logic [ROW_BITS-1:0] trow;
-  assign tbank = xfer_addr[AW:AW-BW+1];
+  // DCHIP1: the chip bit taken as set (every transaction's is: checked below)
+  assign tbank = xfer_addr[AW:AW-BW+1] | ((DUAL && DCHIP1) ? BW'(1 << (BW - 1)) : BW'(0));
   assign trow  = xfer_addr[AW-BW:COL_BITS+1];
   // R891: the bank pins: the two bits under the chip bit
   wire  [1:0]  tba  = xfer_addr[AW-CHB:AW-CHB-1];
@@ -1755,5 +1762,14 @@ module m2_sdram #(
       end
     end
   end
+
+`ifdef VERILATOR
+  // DCHIP1: in every state that reads the row state's index, the transaction's chip bit is set
+  always_ff @(posedge clk)
+    if (rst_n && DUAL && DCHIP1 && !xfer_addr[AW] &&
+        (state == S_DISPATCH || state == S_MISS || state == S_PRE_XFER || state == S_ACT || state == S_RCD ||
+         state == S_RD || state == S_WR || state == S_WRRC))
+      $fatal(1, "m2_sdram: DCHIP1, a transaction on chip 0");
+`endif
 
 endmodule

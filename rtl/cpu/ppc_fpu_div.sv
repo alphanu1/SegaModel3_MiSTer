@@ -113,7 +113,12 @@ module ppc_fpu_div
   exp_t            o_e, ea, eb;
   fpu_exc_t        o_exc;
 
-  logic [59:0] rs;      // partial remainder (divide: twice it; root: at most 2Q < 2^57)
+  // partial remainder (divide: twice it; root: at most 2Q < 2^57). RW (area130): with neither the root nor
+  // radix 4 the remainder is below 2B < 2^54 at every step (it starts as A < 2^53 <= 2B, and 2R - 2B or 2R
+  // stays below 2B), so it is kept in 54 bits and read zero-extended: the same values (checked below)
+  localparam int RW = (RSQRT || R4) ? 60 : 54;
+  logic [RW-1:0] rs_q;
+  wire  [59:0]   rs = 60'(rs_q);
   logic [55:0] q;       // quotient / root bits; a special's payload
   logic [53:0] bx;      // divisor, or the radicand still to bring in
   logic [54:0] b3;      // 3 * divisor
@@ -245,7 +250,7 @@ module ppc_fpu_div
           o_pa <= (op == DIV_DIV) & a_nan;
           o_pb <= b_nan & ~((op == DIV_DIV) & a_nan);
           o_den <= ((op == DIV_DIV) && a_e == 11'd0) || b_e == 11'd0;
-          rs <= {7'd0, a_e != 0, a_f};
+          rs_q <= RW'({7'd0, a_e != 0, a_f});
           ea <= (op == DIV_DIV) ? xe(a_e) : exp_t'(0);
           bx <= {1'b0, b_e != 0, b_f};
           eb <= xe(b_e);
@@ -255,7 +260,7 @@ module ppc_fpu_div
         // shift denormal significands up to a leading one (the dividend only
         // for fdiv)
         S_NORM: begin
-          if (r_op == DIV_DIV && !rs[52]) begin rs <= {rs[58:0], 1'b0}; ea <= ea - exp_t'(1); end
+          if (r_op == DIV_DIV && !rs[52]) begin rs_q <= RW'({rs[58:0], 1'b0}); ea <= ea - exp_t'(1); end
           if (!bx[52]) begin bx <= {bx[52:0], 1'b0}; eb <= eb - exp_t'(1); end
           if ((r_op != DIV_DIV || rs[52] || rs[51]) && (bx[52] || bx[51])) st <= S_LOAD;
         end
@@ -273,7 +278,7 @@ module ppc_fpu_div
           end else if (st == S_CHK && o_den) begin
             st <= S_NORM;
           end else begin
-            if (r_op == DIV_RES) rs <= {7'd0, 53'h10_0000_0000_0000};
+            if (r_op == DIV_RES) rs_q <= RW'({7'd0, 53'h10_0000_0000_0000});
             b3    <= {1'b0, bx} + {bx, 1'b0};
             st    <= S_ITER;
             if (r_sqrt) begin
@@ -283,11 +288,11 @@ module ppc_fpu_div
               q   <= 56'd1;
               cnt <= 6'd1;
               if (eb[0]) begin
-                rs  <= {58'd0, bx[52:51]} - 60'd1;
+                rs_q  <= RW'({58'd0, bx[52:51]} - 60'd1);
                 bx  <= {bx[50:0], 3'b000};
                 o_e <= (eb - exp_t'(1)) >>> 1;
               end else begin
-                rs  <= {59'd0, bx[52]} - 60'd1;
+                rs_q  <= RW'({59'd0, bx[52]} - 60'd1);
                 bx  <= {bx[51:0], 2'b00};
                 o_e <= eb >>> 1;
               end
@@ -300,7 +305,7 @@ module ppc_fpu_div
         end
 
         S_ITER: begin
-          rs    <= rnext;
+          rs_q    <= RW'(rnext);
           if (r_sqrt) begin
             q  <= {q[54:0], dig[0]};
             bx <= {bx[51:0], 2'd0};
@@ -327,7 +332,7 @@ module ppc_fpu_div
 
         S_RND: begin
           r_sqrt <= 1'b0;
-          rs     <= {7'd0, 53'h10_0000_0000_0000};
+          rs_q     <= RW'({7'd0, 53'h10_0000_0000_0000});
           if (root_r[53]) begin
             bx  <= {1'b0, 53'h10_0000_0000_0000};
             o_e <= exp_t'(0) - (o_e + exp_t'(1));
@@ -353,6 +358,14 @@ module ppc_fpu_div
   end
 
   assign busy = (st != S_IDLE);
+`ifdef VERILATOR
+  // RW: nothing written into the remainder needs more than its RW bits
+  generate if (RW < 60) begin : g_rwchk
+    always_ff @(posedge clk)
+      if (!rst && ((st == S_ITER && rnext[59:RW] != '0) || (st == S_NORM && r_op == DIV_DIV && !rs[52] && rs[58:RW-1] != '0)))
+        $fatal(1, "ppc_fpu_div: the remainder past its %0d bits", RW);
+  end endgenerate
+`endif
 
   // The back end's denormal cap for the quotient (doubles, UE=0), formed from
   // o_e two cycles ahead: o_e is last written at least 14 cycles before S_INJ,
