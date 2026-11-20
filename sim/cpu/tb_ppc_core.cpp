@@ -1327,6 +1327,7 @@ struct Cov {
   uint64_t fpc = 0, fprec = 0, fpdel = 0, fpsupp = 0, fpld = 0, fpst = 0, fpops[ppcfpu::NUM_OPS] = {};
   uint64_t mis[18] = {};                      // misaligned accesses done (PpcIss::mis_n)
   uint64_t xrf = 0;                           // ev_xrf: a split's first word made again after its second replayed
+  uint64_t xlp = 0, xgo = 0, xcan = 0;        // RPX: requests made with the page pending; given their page; dropped
   // update forms completed with overlapping registers: integer load rD = rB,
   // load rA = rB (FP too), integer store rS = rB, rS = rA, store rA = rB (FP
   // too); and the reproducer's values checked (--alias)
@@ -1348,6 +1349,7 @@ struct Cov {
     for (int i = 0; i < 5; i++) alias[i] += c.alias[i];
     alias_chk += c.alias_chk;
     ext += c.ext; dec += c.dec; sh_writes += c.sh_writes; replays += c.replays; fslow += c.fslow;
+    xlp += c.xlp; xgo += c.xgo; xcan += c.xcan;
     for (int i = 0; i < 4; i++) btb[i] += c.btb[i];
     for (int i = 0; i < 4; i++) { insns[i] += c.insns[i]; cycles[i] += c.cycles[i]; }
     for (int i = 0; i < 4; i++) seeds[i] += c.seeds[i];
@@ -1444,6 +1446,10 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
   std::mt19937 e_rng(seed ^ 0x5A5A1717u);              // its own stream: the others' are as without LU2
 #endif
   bool d_rdy = true;
+  // RPX (ppc_core, ppc_dcache XLP): a request made with its page pending (d_xlp) is made at its d_xgo, with the
+  // page given there, or never (d_xcan); nothing else is requested in between
+  struct XPend { bool on = false, we = false, rsv = false, cnd = false; uint32_t lo = 0, wd = 0; int be = 0, op = 0; } xpend;
+  const uint64_t T_PEND = ~0ull;
 
 #ifdef PPC_CPU
   Memory cmem;
@@ -1609,7 +1615,24 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
     static uint32_t last_fs = 0;
     if (fptrace && top.rt_fpscr != last_fs) { printf("    rtl   fpscr %08X (cycle %llu)\n", top.rt_fpscr, (unsigned long long)cycles); last_fs = top.rt_fpscr; }
 #ifdef PPC_CPU
-    if (top.t_dreq && top.t_dwe && top.t_daddr == ACK) int_drv = false;  // the handler's acknowledge
+    // the request made this cycle as the memory sees it (RPX: a pending one at its d_xgo, with its page)
+    bool er_v = false, er_we = false; uint32_t er_a = 0, er_wd = 0; int er_be = 0, er_op = 0, er_wimg = 0;
+    if (top.t_dxgo || top.t_dxcan) {
+      if (!xpend.on || (top.t_dxgo && top.t_dxcan)) { printf("seed %u: d_xgo / d_xcan with nothing pending at cycle %llu\n", seed, (unsigned long long)cycles); return false; }
+      if (top.t_dxgo) { er_v = true; er_we = xpend.we; er_a = (uint32_t(top.t_dxpa) << 12) | xpend.lo; er_wd = xpend.wd; er_be = xpend.be;
+                        er_op = xpend.op; er_wimg = top.t_dxwimg; cov.xgo++; }
+      else cov.xcan++;
+      xpend.on = false;
+    }
+    if (top.t_dreq) {
+      if (er_v || xpend.on) { printf("seed %u: a data request while one waits for its page, cycle %llu\n", seed, (unsigned long long)cycles); return false; }
+      if (top.t_dxlp) {
+        if (top.t_dop != 0 || top.t_drsv || top.t_dcnd) { printf("seed %u: d_xlp on a cache operation, lwarx or stwcx.\n", seed); return false; }
+        xpend.on = true; xpend.we = top.t_dwe; xpend.lo = top.t_daddr & 0xFFFu; xpend.wd = top.t_dwdata; xpend.be = top.t_dbe;
+        xpend.op = top.t_dop; cov.xlp++;
+      } else { er_v = true; er_we = top.t_dwe; er_a = top.t_daddr; er_wd = top.t_dwdata; er_be = top.t_dbe; er_op = top.t_dop; er_wimg = top.t_dwimg; }
+    }
+    if (er_v && er_we && er_a == ACK) int_drv = false;  // the handler's acknowledge
     if (g_snoop) {
       // the reservation rule this cycle (ppc_dcache.sv, "the snoop")
       bool exp_kill = m_rvkill || (m_rsvq && sn_inw && m_rsvline == sn.line);
@@ -1630,19 +1653,19 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
                (unsigned long long)n_lw_ret, int(sn.act), int(sn.inv), sn.line);
       // answers, then this cycle's request into the shadow
       if (top.t_dvalid) n_ans++;
-      if (top.t_dreq) {
-        uint32_t a = top.t_daddr & ~3u, line = a & ~31u;
+      if (er_v) {
+        uint32_t a = er_a & ~3u, line = a & ~31u;
         auto put = [&](uint32_t x, uint8_t v) {
           blog.push_back({n_seq, x, smem.rd8(x), v}); if (blog.size() > 1024) blog.pop_front();
           smem.wr8(x, v);
           if (sn.act && (x & ~31u) == sn.line) sn.maybe.push_back({int(x & 31), v});
         };
-        if (top.t_dop == 0 && top.t_dwe) {
-          for (int b = 0; b < 4; b++) if (top.t_dbe & (8 >> b)) put(a + b, uint8_t(top.t_dwdata >> (24 - 8 * b)));
+        if (er_op == 0 && er_we) {
+          for (int b = 0; b < 4; b++) if (er_be & (8 >> b)) put(a + b, uint8_t(er_wd >> (24 - 8 * b)));
           last_st_line = line; last_st_cyc = cycles;
-        } else if (top.t_dop == 2 && !(top.t_dwimg & 0xC))
+        } else if (er_op == 2 && !(er_wimg & 0xC))
           for (int b = 0; b < 32; b++) put(line + b, 0);
-        if (top.t_dwimg & 4) line_inh.insert(line);
+        if (er_wimg & 4) line_inh.insert(line);
         line_req[line] = cycles;
         rq_lines.push_back(line); if (rq_lines.size() > 16) rq_lines.pop_front();
         n_seq++;
@@ -1658,6 +1681,8 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
     bool ireq = top.i_req, dreq = top.d_req, dwe = top.d_we;
     uint32_t ia = top.i_addr, da = top.d_addr, dwd = top.d_wdata;
     int dbe = top.d_be;
+    bool dxlp = top.d_xlp, dxgo = top.d_xgo, dxcan = top.d_xcan;
+    uint32_t dxpa = top.d_xpa;
     bool i_took = top.i_valid, d_took = top.d_valid, dtook_ok = !dq.empty();
 
     if (dtrace && (dreq || top.d_valid))
@@ -1692,7 +1717,32 @@ bool run(uint32_t seed, int len, int max_wait, int mode, uint64_t &insns, uint64
     i_two = (rrng() & 3) != 0;                          // the memory side's offer for the next cycle
     d_rdy = !(g_rdy && int(rrng() % 100) < g_rdy);     // next cycle's, registered
     uint32_t d_word = 0;
-    if (dreq) {
+    // RPX: the pending request is made now with its page (its answer then waits as any other's), or dropped
+    if (dxgo || dxcan) {
+      if (!xpend.on || dq.empty() || dq.back().t != T_PEND || (dxgo && dxcan)) {
+        printf("seed %u: d_xgo / d_xcan with nothing pending at cycle %llu\n", seed, (unsigned long long)cycles); return false; }
+      if (dxcan) { dq.pop_back(); cov.xcan++; }
+      else {
+        uint32_t pa = (dxpa << 12) | xpend.lo, w = 0;
+        if (xpend.we) {
+          for (int b = 0; b < 4; b++) if (xpend.be & (8 >> b)) { rtl_mem.wr8(pa + b, uint8_t(xpend.wd >> (24 - 8 * b))); acc_rtl.push_back(acc_st(pa + b, uint8_t(xpend.wd >> (24 - 8 * b)))); }
+          if (pa == ACK) int_drv = false;
+        } else { w = rtl_mem.rd32(pa); acc_rtl.push_back(acc_ld(pa)); }
+        uint64_t t = cycles + uint64_t(g_dlat ? g_dlat : wait_for());
+        if (t <= d_last) t = d_last + 1;
+        d_last = t;
+        dq.back() = {t, w};
+        cov.xgo++;
+      }
+      xpend.on = false;
+    }
+    if (dreq && (xpend.on || dxgo)) { printf("seed %u: a data request while one waits for its page, cycle %llu\n", seed, (unsigned long long)cycles); return false; }
+    if (dreq && dxlp) {
+      if (top.d_op != 0 || top.d_resv || top.d_cond) { printf("seed %u: d_xlp on a cache operation, lwarx or stwcx.\n", seed); return false; }
+      xpend.on = true; xpend.we = dwe; xpend.lo = da & 0xFFFu; xpend.wd = dwd; xpend.be = dbe; xpend.op = 0;
+      dq.push_back({T_PEND, 0});
+      cov.xlp++;
+    } else if (dreq) {
       size_t acc_n0 = acc_rtl.size();
       struct Mark { std::vector<uint64_t> &v; size_t n0; size_t &n; ~Mark() { n = v.size() - n0; } } mark{acc_rtl, acc_n0, acc_last_n};
       uint64_t t = cycles + uint64_t(g_dlat ? g_dlat : wait_for());
@@ -2003,6 +2053,8 @@ int main(int argc, char **argv) {
 #endif
   printf("  TGPR shadow writes %llu, data micro-TLB replays %llu, fetch translation slow cycles %llu\n",
          (unsigned long long)c.sh_writes, (unsigned long long)c.replays, (unsigned long long)c.fslow);
+  printf("  RPX: requests with the page pending %llu, given their page %llu, dropped on a fault %llu\n",
+         (unsigned long long)c.xlp, (unsigned long long)c.xgo, (unsigned long long)c.xcan);
   printf("  BTB: targets predicted %llu, failed word checks %llu, register targets refetched %llu, entries written %llu\n",
          (unsigned long long)c.btb[0], (unsigned long long)c.btb[1], (unsigned long long)c.btb[2], (unsigned long long)c.btb[3]);
   static const char *kn[] = {"integer", "translated", "translated+interrupts", "interrupts"};

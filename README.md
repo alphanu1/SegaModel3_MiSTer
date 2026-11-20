@@ -73,18 +73,21 @@ program every sample, playing or not. In the FPGA they cost about 570 ALM.
 
 - **Virtua Fighter 3:** 20 minutes of attract and a full round with no lockup.
 - **Scud Race:** some short drops to 30.
-- **Daytona USA 2:** 60 in attract, mostly 30 on the first track.
+- **Daytona USA 2:** 60 in attract; on the first track about a tenth of the lap
+  holds 60, the rest runs at 30.
 - **Sega Rally 2:** 60 in attract and over most of a lap; the start line and two
   busy stretches still drop.
 
-Daytona 2's race is held back by the CPU, just over a frame's time. Sega
-Rally 2's remaining drops are the Real3D's own speed in heavy views.
+Daytona 2's race is held back by the CPU, a few percent over a frame's time.
+Sega Rally 2's start line is its own frame pacing after a timing it measures at
+boot, which comes out short on the board; its other drops are the Real3D's speed
+in heavy views.
 
 ### What's left
 
 - **Timing closure:** every corner at 130 MHz.
-- **The races at 60** (Daytona 2, Sega Rally 2): a faster Real3D, and about 10%
-  more from the CPU for Daytona 2.
+- **The races at 60:** Daytona 2 needs its CPU a few percent faster still;
+  Sega Rally 2 needs its boot timing found and a faster Real3D in heavy views.
 - **One SDRAM module at 130 MHz:** not yet tried on my original module.
 - **Pictures:** Daytona 2's car shadow, Lost World's fog in the T-rex scene,
   Bass Fishing's water shadows and underwater tint, Scud Race's luminous

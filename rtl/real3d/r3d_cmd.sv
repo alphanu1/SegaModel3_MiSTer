@@ -124,7 +124,8 @@ module r3d_cmd #(
   output logic          pingpong,
   output logic          flip,
   output logic [15:0]   n_draw,         // frames drawn (begun)
-  output logic [15:0]   n_drop          // frames submitted but dropped
+  output logic [15:0]   n_drop,         // frames submitted but dropped
+  output logic          o_swait         // (r3d75, the frame-busy build's row 6) a draw waits for the swap: the host is held
 );
 
   // ===========================================================================
@@ -345,5 +346,6 @@ module r3d_cmd #(
     end
   end
   assign show_3d = show_v && !hide[show_buf];
+  assign o_swait = sw_wait;
 
 endmodule

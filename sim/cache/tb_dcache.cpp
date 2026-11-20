@@ -55,6 +55,13 @@
 // cast-out, dcbz, dcbst, dcbf, dcbi and an lwarx; the counts at the end say how
 // often the random traffic met each case.
 //
+// Translation pending (the cache built with -GXLP=1; ppc_core RPX, study R174). XLP_P=p (percent): that share
+// of plain loads and stores (not lwarx) is made with d_xlp, a random page and WIMG on d_addr / d_wimg, and
+// 1-6 cycles later the true page and WIMG with d_xgo, or (one in four) d_xcan, which drops it: such a request
+// is never applied to the reference and must never be answered. Nothing is requested while one waits; in the
+// cycle of its d_xgo a new request is made half the time. A directed section (XLP_P > 0) makes them hit, miss,
+// allocate without a fill, go inhibited and to the bypass page, park in R behind an older miss, and drop.
+//
 // usage: Vppc_dcache [ops] [seed] [lat_lo lat_hi] [stream] [snoop]
 
 #include "Vppc_dcache.h"
@@ -244,7 +251,8 @@ static std::mt19937 rng;
 static int rnd(int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); }
 
 enum { OP_LD, OP_ST, OP_TCH, OP_DCBZ, OP_DCBST, OP_DCBF, OP_DCBI };
-struct Op { int k; uint32_t a; unsigned be; uint32_t d; unsigned wimg; uint32_t exp; uint64_t t0; bool ref_hit; bool rsv = false; };
+struct Op { int k; uint32_t a; unsigned be; uint32_t d; unsigned wimg; uint32_t exp; uint64_t t0; bool ref_hit; bool rsv = false;
+            int xl = 0, xd = 0; };   // XLP: 1 the page given xd cycles later (d_xgo), 2 dropped (d_xcan); 0 none
 
 // pages: cacheable, write-through, inhibited, the bypass page
 static const uint32_t PG_C[]  = { 0x00000, 0x00001, 0x00002, 0x00003, 0x00004, 0x00005, 0x00006, 0x00007,
@@ -311,6 +319,10 @@ int main(int argc, char **argv) {
   t->rst = 1; t->d_req = 0; t->hid_dce = 1; t->hid_dlock = 0; t->hid_dcfi = 0; t->hid_noopti = 0;
   t->m_ack = 0; t->m_wnext = 0; t->m_rvalid = 0; t->m_rdata = 0;
   t->sn_req = 0; t->sn_addr = 0; t->sn_inv = 0; t->d_rsv = 0;
+  t->d_xlp = 0; t->d_xgo = 0; t->d_xcan = 0; t->d_xpa = 0; t->d_xwimg = 0;
+  const int xlp_p = getenv("XLP_P") ? atoi(getenv("XLP_P")) : 0;
+  int xl_cnt = 0, xl_kind = 0; uint32_t xl_pa = 0; unsigned xl_wimg = 0;   // the request waiting for its page
+  uint64_t n_xgo = 0, n_xcan = 0, n_xgo_req = 0, n_xpark = 0;
   for (int i = 0; i < 4; i++) tick();
   t->rst = 0;
 
@@ -358,6 +370,17 @@ int main(int argc, char **argv) {
     L(I + 16); L(I + 28);
     S(J, 0x4A4A, 12); L(J, 12); L(J + 2, 3); L(J);                      // halfwords: written, then unwritten
     S(J + 8, 0x4A4A, 12); S(J + 10, 0x4B4B, 3); L(J + 8);                // a word in two halves
+    if (xlp_p) {                                                        // XLP, directed (sets 20-27)
+      auto XL = [&](uint32_t x, int kind, int d, unsigned wimg = 0) { Op o{OP_LD, x, 15, 0, wimg, 0, 0, false}; o.xl = kind; o.xd = d; script.push_back(o); };
+      auto XS = [&](uint32_t x, uint32_t v, int kind, int d, unsigned wimg = 0) { Op o{OP_ST, x, 15, v, wimg, 0, 0, false}; o.xl = kind; o.xd = d; script.push_back(o); };
+      S(0x3280, 0x32803280); XL(0x3280, 1, 1); XL(0x3280, 1, 6); XS(0x3284, 0x32843284, 1, 2); L(0x3284);   // hits
+      XL(0x122A0, 1, 3); XS(0x72C0, 0x72C072C0, 1, 2); L(0x72C4); L(0x72C0);                     // misses; WV's allocation
+      XL(0x3288, 1, 2, 4); XS(0x328C, 0x328C328C, 1, 1, 4); L(0x328C);                          // inhibited, by the page's WIMG
+      XL((RSV << 12) | 0x2E0, 1, 2); XS(0x212E4, 0x212E4, 1, 2, 8);                            // the bypass page; write-through
+      L(0x11300); XL(0x3280, 1, 1); L(0x10300); XL(0x3284, 1, 5);                                // parked behind an older miss
+      L(0x13320); XL(0x3280, 2, 2); L(0x12320); XS(0x3280, 0xDEAD, 2, 5); L(0x3280);           // dropped, in R and in X
+      XS(0x3288, 0xBAD, 2, 1); XS(0x6340, 0x63406340, 2, 3); L(0x3288); L(0x6340);             // dropped stores change nothing
+    }
   }
   size_t script_i = 0;
 
@@ -417,7 +440,17 @@ int main(int argc, char **argv) {
     }
     if (snoop_mode && ref.last_evict != last_evict_seen) { last_evict_seen = ref.last_evict; last_evict_cyc = cyc; }
 
-    t->d_req = 0; t->d_rsv = 0;
+    t->d_req = 0; t->d_rsv = 0; t->d_xlp = 0; t->d_xgo = 0; t->d_xcan = 0;
+    // XLP: the waiting request's page, or its drop; until then nothing is requested
+    bool xl_wait = false;
+    if (xl_kind) {
+      if (--xl_cnt > 0) xl_wait = true;
+      else {
+        if (xl_kind == 1) { t->d_xgo = 1; t->d_xpa = xl_pa; t->d_xwimg = xl_wimg; n_xgo++; xl_wait = rnd(0, 1); n_xgo_req += !xl_wait; }
+        else { t->d_xcan = 1; t->d_xpa = rng(); t->d_xwimg = rng(); n_xcan++; xl_wait = true; }
+        xl_kind = 0;
+      }
+    }
     if (dv && !outq.empty()) {
       cur = outq.front(); outq.pop_front(); n_ans++;
       unsigned lat = cyc - cur.t0;
@@ -440,10 +473,12 @@ int main(int argc, char **argv) {
     // a HID0 change or the end waits for every answer
     bool quiet_cpu = outq.empty();
     {
-      if (phase == RUN && script_i >= script.size() && issued >= nops) { phase = FLUSH; }
-      if (phase == RUN && script_i >= script.size() && !stream_only && rnd(0, 999) < 3) { phase = HID_WAIT; hid_kind = rnd(0, 9); }
-      if (stream_only && script_i >= script.size() && phase == RUN) phase = FLUSH;
-      if (phase == HID_WAIT && dcfi_pend > 0) dcfi_pend--;
+      if (xl_wait) ;                            // (XLP: a request waits for its page)
+      else if (phase == RUN && script_i >= script.size() && issued >= nops) { phase = FLUSH; }
+      if (!xl_wait && phase == RUN && script_i >= script.size() && !stream_only && rnd(0, 999) < 3) { phase = HID_WAIT; hid_kind = rnd(0, 9); }
+      if (!xl_wait && stream_only && script_i >= script.size() && phase == RUN) phase = FLUSH;
+      if (xl_wait) ;
+      else if (phase == HID_WAIT && dcfi_pend > 0) dcfi_pend--;
       else if (phase == HID_WAIT && dcfi_pend == 0) {
         t->hid_dcfi = 1; dcfi_hold = 0; phase = DCFI_WAIT; ref.flash(); n_dcfi++; dcfi_pend = -1;
       } else if (phase == HID_WAIT) {
@@ -509,10 +544,20 @@ int main(int argc, char **argv) {
           else if (o.k == OP_LD || o.k == OP_ST) pick_size(o.a, o.be); else o.be = 15;
           o.d = rng();
           if (snoop_mode && o.k == OP_LD && o.be == 15 && (rsv_in || srnd(0, 99) < 10)) o.rsv = true;   // an lwarx
+          if (xlp_p && (o.k == OP_LD || o.k == OP_ST) && !o.rsv && rnd(0, 99) < xlp_p) { o.xl = rnd(0, 3) ? 1 : 2; o.xd = rnd(1, 6); }
           issued++;
         }
         o.t0 = cyc;
         uint32_t wa = o.a & ~3u;
+        if (o.xl) { xl_kind = o.xl; xl_cnt = o.xd; xl_pa = wa >> 12; xl_wimg = o.wimg; n_xpark += !outq.empty(); }
+        if (o.xl == 2) {                        // XLP: to be dropped; the reference never sees it
+          uint32_t sd = o.d;
+          if (o.k == OP_ST) sd = o.be == 15 ? o.d : (o.be == 3 || o.be == 12) ? (o.d & 0xFFFF) * 0x10001u : (o.d & 0xFF) * 0x01010101u;
+          t->d_req = 1; t->d_xlp = 1; t->d_we = (o.k == OP_ST); t->d_addr = (rng() & ~0xFFFu) | (wa & 0xFFFu); t->d_be = o.be;
+          t->d_wdata = sd; t->d_wimg = rng() & 15; t->d_op = 0;
+          gap = 0;
+          goto cpu_done;
+        }
         // (NO_IPAR: and a store made with the cache disabled over a resident line, 3.2.3.2's "potential coherency
         // errors": it bypasses the line as an inhibited store does; made a load instead)
         if (no_ipar && o.k == OP_ST && ((wa >> 12) != RSV) && ref.find(wa) >= 0) {
@@ -559,10 +604,15 @@ int main(int argc, char **argv) {
         t->d_wimg = o.wimg;
         t->d_op = (o.k == OP_LD || o.k == OP_ST) ? 0 : (o.k == OP_TCH) ? 1 : (o.k == OP_DCBZ) ? 2 :
                   (o.k == OP_DCBST) ? 3 : (o.k == OP_DCBF) ? 4 : 5;
+        if (o.xl == 1) {                        // its page pending; the page and WIMG (as NO_IPAR left them) come later
+          xl_pa = wa >> 12; xl_wimg = o.wimg;
+          t->d_xlp = 1; t->d_addr = (rng() & ~0xFFFu) | (wa & 0xFFFu); t->d_wimg = rng() & 15;
+        }
         outq.push_back(o);
         gap = (script_i < script.size()) ? 0 : (rnd(0, 3) == 0 ? rnd(1, 3) : 0);
       }
     }
+    cpu_done:
 
     if (getenv("DC_TRACE") && cyc < 400)
       std::printf("  cyc %lu: rdy %d req %d %s %08X | valid %d %08X | q %zu\n", (unsigned long)cyc, int(t->d_rdy), int(t->d_req),
@@ -764,6 +814,8 @@ int main(int argc, char **argv) {
               (unsigned long)ref.wv_wbp, (unsigned long)ma.n_wbp, (unsigned long)ma.n_wbeat0, (unsigned long)ref.wv_snp,
               (unsigned long)ref.wv_dcbz, (unsigned long)ref.wv_dcbi, (unsigned long)ref.wv_rsv);
   if (no_ipar) std::printf("  inhibited stores to resident lines made cacheable: %lu\n", (unsigned long)n_ipar_off);
+  if (xlp_p) std::printf("  translation pending (XLP_P %d): pages given %lu (a new request in that cycle %lu), dropped %lu, made behind an unanswered request %lu\n",
+                         xlp_p, (unsigned long)n_xgo, (unsigned long)n_xgo_req, (unsigned long)n_xcan, (unsigned long)n_xpark);
   const char *cn[4] = {"load hit", "load miss", "store hit", "store miss"};
   for (int c = 0; c < 4; c++) if (lat_n[c])
     std::printf("  %-10s request to d_valid: min %lu mean %.2f max %lu cycles (%lu)\n", cn[c], (unsigned long)lat_min[c],

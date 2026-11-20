@@ -140,6 +140,20 @@ module ppc_core
   // after it: the refetch's fetch overlaps the TLB lookup. A fault found then redirects again, to its vector;
   // a dcbt / dcbtst (a fault there is a no-op) keeps the refetch after the lookup. 0: as before
   parameter bit RPE = 1'b1,
+  // RPX (study D-60, R174): a plain load or store that misses the data micro-TLB is not refetched. Its request
+  // goes out from EX with its page pending (d_xlp, ppc_dcache XLP); MEM translates it from the TLB as for any
+  // replay, and gives the page and WIMG to the D-cache (d_xgo) as it fills the micro-TLB, or drops the request
+  // (d_xcan) and takes the fault. The uop then completes as if it had hit. lwarx, stwcx., cache operations and
+  // the words of a misaligned split keep the refetch. 0: every replay refetches (d_xlp, d_xgo, d_xcan stay 0)
+  parameter bit RPX = 1'b1,
+  // F1S (study R174, CPI item 4): stfs in one EX cycle. The conversion's first half (the class and the shift, ppc_fpu_ldst
+  // PIPE) is registered from the store operand register's own input as that register loads, so the single word is
+  // there in the operand's first EX cycle; the 603e's stfs is 2:1 pipelined (table 6-6). 0: two EX cycles
+  parameter bit F1S = 1'b1,
+  // F1C (study R174, CPI item 4): fcmpu / fcmpo in one EX cycle. The compare's CR field and FPSCR flags are taken from
+  // the small unit's operand tests before its register (ppc_fpu_misc cr_c / flags_c) into MEM's fields as EX is left,
+  // as an integer compare's are; the 603e's compare is 1-1-1 (table 6-5). 0: two EX cycles
+  parameter bit F1C = 1'b1,
   parameter bit LU2 = 1'b1,
   // LU2's alignment: LU2_AL = 1 any load's bytes are put in place (a 4:1 per byte after the way's word);
   // 0 only a load whose bytes end the word (lwz, lhz at 2, lbz at 3) takes the early word, unshifted
@@ -224,6 +238,11 @@ module ppc_core
   input  logic [1:0]  d_epw,        // EWL: the predicted way
   output logic        d_resv,       // with d_req: lwarx (the D-cache snoops its line, D-41)
   output logic        d_cond,       // with d_req: stwcx. (verification)
+  output logic        d_xlp,        // RPX, with d_req: the page is pending (ppc_dcache XLP)
+  output logic        d_xgo,        // RPX: the pending request's page and WIMG, from registers
+  output logic        d_xcan,       // RPX: the pending request is dropped (its translation faulted)
+  output logic [19:0] d_xpa,
+  output logic [3:0]  d_xwimg,
   input  logic        res_kill,     // the reservation is lost to a snooped write (ppc_dcache)
 
   // HID0's cache bits (603e table 2-2); ICFI and DCFI are one-cycle pulses as
@@ -408,6 +427,9 @@ module ppc_core
   // redirect already share, so MEM's redirect has no adder of its own (area, R179)
   logic [31:0] m_pc4;
   (* preserve *) logic m_rpq;                          // = m.rp, for the queue's hold (below)
+  // RPX: MEM's replay made its request from EX with the page pending (with m.rp); its page or its drop has gone
+  // to the D-cache (m_xs). Registers of their own beside m, as m_xpg
+  logic        m_rpx, m_xs;
   wire         m_c1w = m.valid && m.fcr1 && !m_fsok;    // MEM holds an Rc = 1 arithmetic op: CR1 follows
 
   // WB
@@ -1195,11 +1217,11 @@ module ppc_core
   // five LUT levels of the decoder in front of an EX register (R23 timing).
   logic [31:0] q1_hi;                                  // queue entry 1: the head after a pop
   // the predecode (ppc_pdw.sv): the arriving word's fields for the queue
-  ppc_pdw u_pdw (.clk (clk), .rst (rst), .w (i_data), .tg (f_tg), .mark (f_fpend), .pd (pd_w));
+  ppc_pdw #(.F1S (F1S), .F1C (F1C)) u_pdw (.clk (clk), .rst (rst), .w (i_data), .tg (f_tg), .mark (f_fpend), .pd (pd_w));
   // the second word of a two-word answer (never a fault marker)
   generate
     if (FETCH2) begin : g_pdw2
-      ppc_pdw u_pdw2 (.clk (clk), .rst (rst), .w (i_data2), .tg (f_tg), .mark (1'b0), .pd (pd_w2));
+      ppc_pdw #(.F1S (F1S), .F1C (F1C)) u_pdw2 (.clk (clk), .rst (rst), .w (i_data2), .tg (f_tg), .mark (1'b0), .pd (pd_w2));
     end else begin : g_nopdw2
       assign pd_w2 = '0;
     end
@@ -2617,9 +2639,10 @@ module ppc_core
   // the access's WIMG: real mode 0011 (603e 3.5), the DBAT's, the micro-TLB's
   wire  [3:0]  d_wimg_x = !msr_q[MSR_DR] ? 4'b0011 : db_wimg | du_wimg_s;
 `ifdef VERILATOR
-  // against the selected form from the permitted entries (du_use)
+  // against the selected form from the permitted entries (du_use); not for a request made with its page pending
+  // (RPX: d_xlp, whose page and WIMG are not used)
   always_ff @(posedge clk)
-    if (!rst && d_req && msr_q[MSR_DR]) begin
+    if (!rst && d_req && !d_xlp && msr_q[MSR_DR]) begin
       automatic logic [19:0] up = 20'd0;
       automatic logic [3:0]  uw = 4'd0;
       for (int k = 0; k < DUN; k++) begin
@@ -2665,9 +2688,10 @@ module ppc_core
   // RPE: the early refetch (m_kpe, once a replay: rpe_q) as MEM holds the replay for its lookup; after it only a
   // fault kills (its exception)
   logic        rpe_q;
-  wire         m_kpe = RPE && m.valid && m.rp && !m.tch && !sl_done && !rpe_q;
+  // (RPX: a replay whose request went out pending, m_rpx, is not refetched: only its fault kills)
+  wire         m_kpe = RPE && m.valid && m.rp && !m_rpx && !m.tch && !sl_done && !rpe_q;
   (* keep = 1 *) wire m_kp1 = m.valid && m.rp && ((sl_done && !(m.tch && (sl_dsi_q || sl_tm_q)) &&
-                                                   !(rpe_q && !sl_dsi_q && !sl_tm_q)) || m_kpe);
+                                                   !((rpe_q || m_rpx) && !sl_dsi_q && !sl_tm_q)) || m_kpe);
   (* keep = 1 *) wire m_kp2 = m.valid && (m.resync || m.rtm || m_fpxr || m_algc);
   wire         m_kp     = m_kp1 || m_kp2;
   wire         m_kill   = m_kp && !wb_hold;
@@ -2712,14 +2736,18 @@ module ppc_core
   (* keep = 1 *) wire m_vdw   = m.valid && mh_dw;                     // MEM waits on WB's unanswered request
   (* keep = 1 *) wire lsf_wo  = ex_lsf && wb_out;                     // lu2_cf but for d_valid and d_eok
   // ex_hold's copy
-  (* keep = 1 *) wire hx_r = mh_e || fp_wait || (ex_vsy && (wb_mayh || (m.valid && m_iss)));   // (from registers)
+  // RPX: MEM's replay has its page: a load or store in EX waits the cycle until MEM fills the micro-TLB, so it does
+  // not miss it and translate the same page again (m_rph, from registers)
+  (* keep = 1 *) wire m_rph = RPX && m.valid && m.rp && m_rpx && sl_done;
+  (* keep = 1 *) wire hx_r = mh_e || fp_wait || (ex_vsy && (wb_mayh || (m.valid && m_iss))) || (ex_vls && m_rph);   // (from registers)
   (* keep = 1 *) wire hx_a = (ex_vls && !d_rdy) || (ex_vsy && !d_idle);
   (* keep = 1 *) wire hx_b = (m_vdw && !d_valid) || (LU2 && ex_lsw && !(lsf_wo && d_valid && d_eok));
   wire   ex_hold_o = hx_r || md_wait || ser_wait || hx_a || hx_b;
   assign ex_hold = ex_hold_o || mis_hold;
 `ifdef VERILATOR
   always_ff @(posedge clk)
-    if (R1C && !rst && ex_hold_o != (mem_hold || md_wait || fp_wait || ser_wait || sync_wait || (ex_valid && ex_ls && !d_rdy) || lsh))
+    if (R1C && !rst && ex_hold_o != (mem_hold || md_wait || fp_wait || ser_wait || sync_wait || (ex_valid && ex_ls && !d_rdy) || lsh ||
+                                     (ex_valid && ex_ls && m_rph)))
       $fatal(1, "ex_hold_o by parts against its terms");
 `endif
   // the queue's copy (q_take above): the same terms, kept apart
@@ -2730,18 +2758,18 @@ module ppc_core
   // (the queue's copies of ser_wait and sync_wait take MEM's request from
   // m_rpq, a copy of m.rp of their own: m.rp drives some 65 loads, and led
   // the queue pop's paths in the R63 batch-7 full builds)
-  wire  m_issq      = m.req && !m_rpq;
+  wire  m_issq      = m.req && (!m_rpq || (m_rpx && !(sl_done && sl_bad)));
   wire  ser_wait_q  = ex_valid && ex_serz && (wb_mayh || (m.valid && (m_issq || m.fld)));
   wire  sync_wait_q = ex_valid && ex_u.sync && (wb_mayh || (m.valid && m_issq) || !d_idle);
   // (the terms from registers in one part, qh_r; the deeper ones, mis_hold, ser_wait_q and md_wait, beside
   // it in the last LUT)
-  (* keep = 1 *) wire qh_r = qh_1 || qh_2 || qh_3 || qh_4 || fp_wait || (ex_vsy && (wb_mayh || (m.valid && m_issq)));
+  (* keep = 1 *) wire qh_r = qh_1 || qh_2 || qh_3 || qh_4 || fp_wait || (ex_vsy && (wb_mayh || (m.valid && m_issq))) || (ex_vls && m_rph);
   (* keep = 1 *) wire qh_a = (ex_vls && !d_rdy) || (ex_vsy && !d_idle);
   (* keep = 1 *) wire qh_b = (m_vdw && !d_valid) || (LU2 && ex_lsw && !(lsf_wo && d_valid && d_eok));
   assign q_hold = qh_r || mis_hold || ser_wait_q || md_wait || qh_a || qh_b;
   // a third copy for the FP operand registers' 194 enables (R63 batch 3:
   // EX's hold into fa_q / fb_q / fc_q)
-  (* keep = 1 *) wire fh_r = qh_1 || qh_2 || qh_3 || qh_4 || fp_wait || (ex_vsy && (wb_mayh || (m.valid && m_issq)));
+  (* keep = 1 *) wire fh_r = qh_1 || qh_2 || qh_3 || qh_4 || fp_wait || (ex_vsy && (wb_mayh || (m.valid && m_issq))) || (ex_vls && m_rph);
   (* keep = 1 *) wire fh_a = (ex_vls && !d_rdy) || (ex_vsy && !d_idle);
   (* keep = 1 *) wire fh_b = (m_vdw && !d_valid) || (LU2 && ex_lsw && !(lsf_wo && d_valid && d_eok));
   (* keep = 1 *) wire f_hold = fh_r || mis_hold || ser_wait_q || md_wait || fh_a || fh_b;
@@ -2749,7 +2777,8 @@ module ppc_core
   always_ff @(posedge clk) if (R1C && !rst && f_hold != ex_hold) $fatal(1, "f_hold");
   always_ff @(posedge clk)
     if (R1C && !rst && q_hold != (qh_1 || qh_2 || qh_3 || qh_4 || md_wait || fp_wait || ser_wait_q || sync_wait_q ||
-                           (ex_valid && ex_ls && !d_rdy) || mis_hold || lsh || (m.valid && mh_dw && !d_valid)))
+                           (ex_valid && ex_ls && !d_rdy) || mis_hold || lsh || (m.valid && mh_dw && !d_valid) ||
+                           (ex_valid && ex_ls && m_rph)))
       $fatal(1, "q_hold by parts against its terms");
 `endif
 `ifdef VERILATOR
@@ -2783,7 +2812,7 @@ module ppc_core
 
   // the early forward selects' write bits (qe_hk / qe_hf, qf_m, qf_w above)
   wire        qf_mx = ex_u.rd_we && !ex_xcm && !is_ld && !mis_hold && !algn;   // mx.rd_we && !mx.is_load
-  wire        qf_wm = m.rd_we && !m.rp;                  // wb_rd_we as WB takes MEM's uop
+  wire        qf_wm = m.rd_we && !m_rpe;                 // wb_rd_we as WB takes MEM's uop
   always_ff @(posedge clk) begin
     qf_m <= mem_hold ? qe_hk[2] & {4{m.rd_we && !m.is_load}} : (ex_hold ? qe_hk[1] : qe_hf[1]) & {4{qf_mx}};
     qf_w <= wb_hold  ? (ex_hold ? qe_hk[3] : qe_hf[3]) & {4{wb_rd_we}} : (ex_hold ? qe_hk[2] : qe_hf[2]) & {4{qf_wm}};
@@ -2792,12 +2821,15 @@ module ppc_core
   // (R140) as three parts and the D-cache's own registers' hold terms (hx_a, hx_b) at the last LUT: EX's own
   // state (dq_e), the translation (dq_t, late from EX's sum) and the core's holds (dq_h)
   (* keep = 1 *) wire dq_e = ex_valid && (is_ld || (is_st && st_ok)) && !ex_xcm && !m_kp;
-  (* keep = 1 *) wire dq_t = !xl_rp && !algn;
+  // RPX: a plain load or store, not lwarx / stwcx., not a misaligned split's word (from registers and the sum's
+  // low bits), goes out with its page pending where the micro-TLB misses (d_xlp = xl_rp)
+  wire ex_rpx = RPX && ex_u.cop == 3'd0 && !ex_u.reserve && !ex_u.cond && !mis_x && !ex_sp1 && !ex_s0ok;
+  (* keep = 1 *) wire dq_t = !(xl_rp && !ex_rpx) && !algn;
   (* keep = 1 *) wire dq_h = !(hx_r || md_wait || ser_wait);
   assign d_req   = dq_e && dq_t && dq_h && !hx_a && !hx_b;
 `ifdef VERILATOR
   always_ff @(posedge clk)
-    if (R1C && !rst && d_req != (ex_valid && !ex_hold_o && (is_ld || (is_st && st_ok)) && !xl_rp && !ex_xcm && !m_kp && !algn))
+    if (R1C && !rst && d_req != (ex_valid && !ex_hold_o && (is_ld || (is_st && st_ok)) && !(xl_rp && !ex_rpx) && !ex_xcm && !m_kp && !algn))
       $fatal(1, "d_req by parts");
 `endif
   // a split's first word goes into MEM as a uop of its own (m.sp0) when it
@@ -2821,6 +2853,7 @@ module ppc_core
   assign d_op    = ex_u.cop;
   assign d_resv  = ex_u.reserve;
   assign d_cond  = ex_u.cond;
+  assign d_xlp   = RPX && xl_rp;
 
   // ============================================================ floating point
   // 603e chapter 2.3.4.2 and 6.4.3; the units are ppc_fpu*.sv.
@@ -3097,7 +3130,7 @@ module ppc_core
   always_comb
     for (int i = 0; i < 32; i++)
       pend_h[i] = pend[i] && !(fo_clr && fo_tag == 5'(i)) && !(fw_wv && fw_wr == 5'(i)) &&
-                  !(mem_adv && m.fpw && (m.rp || m.algn) && m.rd == 5'(i));
+                  !(mem_adv && m.fpw && (m_rpe || m.algn) && m.rd == 5'(i));
   always_ff @(posedge clk)
     for (int i = 0; i < 32; i++)
       if (rst) pend[i] <= 1'b0;
@@ -3251,11 +3284,11 @@ module ppc_core
   // is taken in a second EX cycle instead, so its CR field and flags go to MEM
   // registered
   logic [63:0] ms_res;
-  logic [3:0]  ms_cr;
-  fpu_flags_t  ms_flags;
+  logic [3:0]  ms_cr, ms_cr_c;
+  fpu_flags_t  ms_flags, ms_flags_c;
   ppc_fpu_misc #(.PIPE (1'b1)) u_fmisc (
     .clk (clk), .op (misc_op_t'(ex_u.fop[2:0])), .ctl (fpscr_q[7:0]), .a (fa_x), .b (fb_x), .c (fc_x),
-    .fpscr (fpscr_q), .res (ms_res), .cr (ms_cr), .flags (ms_flags)
+    .fpscr (fpscr_q), .res (ms_res), .cr (ms_cr), .flags (ms_flags), .cr_c (ms_cr_c), .flags_c (ms_flags_c)
   );
 
   // lfs: WB's word as it arrives (or as held), converted over that cycle and
@@ -3263,10 +3296,20 @@ module ppc_core
   logic        m_got;                                  // MEM's answer arrived in an earlier cycle
   logic [31:0] m_dq;
   wire  [31:0] ldw = wb_got ? wb_dq : d_rdata;
-  ppc_fpu_ldst #(.PIPE (1'b1)) u_lfs (.clk (clk), .lfs_word (ldw), .lfs_dbl (lfs_dbl), .stfs_dbl (64'd0), .stfs_word ());
-  // stfs: from the store operand, a second EX cycle
+  ppc_fpu_ldst #(.PIPE (1'b1)) u_lfs (.clk (clk), .lfs_word (ldw), .lfs_dbl (lfs_dbl), .stfs_dbl (64'd0), .stfs_en (1'b1),
+                                      .stfs_word ());
+  // stfs: from the store operand, a second EX cycle; F1S: its registers load as fc_q does, from fc_q's input
+  // (f_en[4], the same enable and select), so stfs_w is fc_q's word in every EX cycle, the first included
   logic [31:0] stfs_w;
-  ppc_fpu_ldst #(.PIPE (1'b1)) u_stfs (.clk (clk), .lfs_word (32'd0), .lfs_dbl (), .stfs_dbl (fc_q), .stfs_word (stfs_w));
+  wire  [63:0] stfs_in = F1S ? (fd_l[2] ? fo_res : fc_cap) : fc_q;
+  ppc_fpu_ldst #(.PIPE (1'b1)) u_stfs (.clk (clk), .lfs_word (32'd0), .lfs_dbl (), .stfs_dbl (stfs_in),
+                                       .stfs_en (F1S ? f_en[4] : 1'b1), .stfs_word (stfs_w));
+`ifdef VERILATOR
+  // F1S: the stfs registers hold fc_q's conversion
+  always_ff @(posedge clk)
+    if (!rst && F1S && ex_valid && ex_fst && !ex_u.fiw && !ex_u.fdbl && u_stfs.sd != fc_q)
+      $fatal(1, "F1S: the stfs registers against the store operand");
+`endif
   always_comb
     fsv = ex_u.fiw ? fc_q[31:0] : ex_u.fdbl ? (ex_first ? fc_q[63:32] : fc_q[31:0]) : stfs_w;
 
@@ -3488,7 +3531,7 @@ module ppc_core
         $fatal(1, "FPR single-value bit against the value read");
       if (id_valid && {q_pd.ffma, q_pd.fdiv, q_pd.fmsc, q_pd.fmw, q_pd.ffsx, q_pd.ff2c} !=
           ({6{!q_pd.ifault}} & {id_u.funit == 2'd1, id_u.funit == 2'd2, id_u.funit == 2'd3,
-                                id_u.funit == 2'd3 && id_u.fpw, id_u.fsop != 3'd0, id_u.fcmp || (id_u.fst && id_u.fsl)}))
+                                id_u.funit == 2'd3 && id_u.fpw, id_u.fsop != 3'd0, (!F1C && id_u.fcmp) || (!F1S && id_u.fst && id_u.fsl)}))
         $fatal(1, "FP predecode of %08X against the decoder", q_hi);
       if (id_valid && !q_pd.ifault && id_u.funit == 2'd1 &&
           (q_pd.frq || q_pd.frs) != (id_u.fop == 4'(FMA_RSQRTE) ||
@@ -3691,7 +3734,13 @@ module ppc_core
     mx.fsl    = ex_u.fsl;
     mx.fhi    = ex_u.fhi && ex_fd0;
     mx.fscmp  = ex_fcmp;
-    mx.fflags = ms_flags;
+    // (F1C: a compare's flags from the early form; the other small-unit ops set only wr, so their flags are that bit,
+    // and the unit's registered compare outcome has no reader left)
+    mx.fflags = (F1C && ex_fcmp) ? ms_flags_c : ms_flags;
+    if (F1C && !ex_fcmp) begin
+      mx.fflags    = '0;
+      mx.fflags.wr = ms_flags.wr;
+    end
     mx.fpser  = ex_fpser;
     mx.fcr1   = ex_frc && (ex_fma || ex_div);
     mx.fsx    = fs_ex;
@@ -3700,7 +3749,7 @@ module ppc_core
     // the integer ones: cr_n's CR-logic bit and cmp's field are behind EX's
     // zero detect and compare (R27)
     mx.cmp_we = mx.cmp_we || ex_fcmp;
-    mx.cmpv   = mx.cmpv | ({4{ex_fcmp}} & ms_cr);
+    mx.cmpv   = mx.cmpv | ({4{ex_fcmp}} & (F1C ? ms_cr_c : ms_cr));
     mx.crf    = ex_u.crf;
     mx.crm    = mx.crm | fp_crm;
     mx.cr_we  = mx.cr_we || fp_crm != 32'd0;
@@ -4230,7 +4279,8 @@ module ppc_core
   //
   // Answers, in request order: d_valid is WB's while WB waits for one, else
   // MEM's (an answer a cycle after the request, or behind a WB that held).
-  assign m_iss = m.req && !m.rp;                        // MEM's uop made a request
+  // MEM's uop made a request (RPX: a replay's request made pending counts until its translation faults)
+  assign m_iss = m.req && (!m.rp || (m_rpx && !(sl_done && sl_bad)));
   wire wb_out = wb_valid && wb_iss && !wb_got;
   wire m_out  = m.valid && m_iss && !m_got;
   wire ans_wb = d_valid && wb_out;
@@ -4485,12 +4535,14 @@ module ppc_core
       for (int r = 0; r < 4; r++) mbx_q[r] <= mg_ix(r[1:0], mx.msize, mx.boff, mx.brev);
       for (int r = 0; r < 4; r++) e_jq[r] <= la_ix(r[1:0], mx.msize, mx.boff, mx.brev);
       for (int r = 0; r < 4; r++) e_dq[r] <= mg_isd(r[1:0], mx.msize);
-      m_lsp_q <= LU2 && d_req && !d_we && d_op == 3'd0 && mx.is_load && mx.rd_we && !mx.fpw && !mx.sp0 && !mx.sp1 &&
+      m_lsp_q <= LU2 && d_req && !xl_rp && !d_we && d_op == 3'd0 && mx.is_load && mx.rd_we && !mx.fpw && !mx.sp0 && !mx.sp1 &&
                  !(mx.msize == 2'd1 && mx.msigned) &&
                  (LU2_AL || (!mx.brev && (mx.msize == 2'd2 || (mx.msize == 2'd1 && mx.boff == 2'd2) || (mx.msize == 2'd0 && mx.boff == 2'd3))));
       m.valid <= mv_a || (mv_b && !xl_rp);              // ((ex_adv || mis_go) && !m_kp, R140)
     end
     if (!mem_hold) m_rpq <= mx.rp;
+    if (rst) m_rpx <= 1'b0;
+    else if (!mem_hold) m_rpx <= ex_rpx && mx.rp && mx.req;   // (= d_xlp with the request, where m.valid is loaded)
     // CR1 as the FPSCR settles, for an arithmetic op with Rc = 1 held in MEM:
     // chosen by registers (the op is held until m_fsok), not by mem_hold
     if (m_c1w) begin
@@ -4605,12 +4657,35 @@ module ppc_core
       sl_vsid_q <= sl_sr[23:0];
     end
   end
+  wire        sl_bad  = sl_dsi_q || sl_tm_q;           // (registers; with sl_done, the lookup's outcome)
   wire        sl_flt  = m.rp && sl_done && (sl_dsi_q || sl_tm_q) && !m.tch;
+  // RPX: a replay whose pending request is let go (its page given, sl_done) has no replay's effects: it is the
+  // uop it was, completing (m_rpe: a replay until then); the page goes to the D-cache once
+  // the lookup is done, or the request is dropped with the fault (once, m_xs)
+  wire        m_rpe   = m.rp && !(m_rpx && sl_done && !sl_bad);
+  assign      d_xgo   = RPX && m.valid && m.rp && m_rpx && sl_done && !sl_bad && !m_xs;
+  assign      d_xcan  = RPX && m.valid && m.rp && m_rpx && sl_done && sl_bad && !m_xs;
+  assign      d_xpa   = sl_h0_q ? sl_pa0_q : sl_pa1_q;
+  assign      d_xwimg = sl_h0_q ? sl_wimg0_q : sl_wimg1_q;
+  always_ff @(posedge clk)
+    if (rst || mem_adv) m_xs <= 1'b0;
+    else if (d_xgo || d_xcan) m_xs <= 1'b1;
+`ifdef VERILATOR
+  // RPX: a pending replay in MEM made its request with d_xlp as it left EX, and leaves MEM only once its page
+  // or its drop has gone
+  logic rpx_rq;
+  always_ff @(posedge clk) begin
+    if (!mem_hold) rpx_rq <= d_req && d_xlp;
+    if (!rst && m.valid && (m.rp && m_rpx) != rpx_rq) $fatal(1, "RPX: MEM's pending replay against the request made");
+    if (!rst && mem_adv && m.rp && m_rpx && !m_xs && !d_xgo && !d_xcan) $fatal(1, "RPX: a pending replay leaves MEM unresolved");
+    if (!rst && d_req && d_xlp && !(ex_adv && mx.rp && mx.req && ex_rpx && !m_kp)) $fatal(1, "RPX: d_xlp without the replay going to MEM");
+  end
+`endif
   // dcbt / dcbtst whose translation faults: a no-op (603e 3.7.2)
   assign      tnop    = m.rp && sl_done && (sl_dsi_q || sl_tm_q) && m.tch;
 
   // what commits for an exception, from EX or from MEM's translation
-  wire        m_noef  = m.xc || m.rp || m_algc;        // in place of the uop: none of its own effects
+  wire        m_noef  = m.xc || m_rpe || m_algc;       // in place of the uop: none of its own effects
   wire        m_fpxk  = m.valid && m_fpxr;
   wire        m_alg   = m.valid && m_algc;             // alignment (dcbz), 4.5.6
   wire        m_xcp   = m_exc || m.xc || sl_flt || m_fpxk || m_alg;
@@ -4635,7 +4710,7 @@ module ppc_core
   // (R140: m_dvok last; and from MEM's terms directly, not through mh_e and m_advb: with m.rp clear,
   // mh_3 is the small unit's term alone. m.rp -> mh_3 -> mh_e -> m_advb -> m_okb was four levels in front of
   // the BAT and micro-TLB enables, -1.78 ns in a ppc_cpu spike)
-  (* keep = 1 *) wire m_ok1 = m.valid && !m.rp && !m.xc && !m_algc;
+  (* keep = 1 *) wire m_ok1 = m.valid && !m_rpe && !m.xc && !m_algc;
   (* keep = 1 *) wire m_ok2 = !mh_1 && !mh_2 && !mh_4 && !(m.fsm && (fr_at[1] || wb_blk));
   (* keep = 1 *) wire m_okb = m_ok1 && m_ok2;
 `ifdef VERILATOR
@@ -4981,8 +5056,8 @@ module ppc_core
       wb_c2 <= wb_hold;
       if (!wb_hold) begin
         wb_valid  <= mem_adv;
-        wb_last   <= m.rp ? sl_flt || tnop : m.last;    // a replay is not the instruction's end
-        wb_rd_we  <= m.rd_we && !m.rp;
+        wb_last   <= m_rpe ? sl_flt || tnop : m.last;   // a replay is not the instruction's end
+        wb_rd_we  <= m.rd_we && !m_rpe;
         wb_rd     <= m.rd;
         wb_rd_sh  <= m_sh;
         wb_irq    <= mem_adv ? m.irq : 2'd0;
@@ -4993,9 +5068,9 @@ module ppc_core
         wb_live_q <= m.is_load && !(m_got || ans_m);
         wb_dq     <= m_got ? m_dq : d_rdata;
         wb_isld   <= m.is_load;
-        wb_fhi    <= m.fhi && !m.rp && !m.algn;
-        wb_sp0    <= m.sp0 && !m.rp;
-        wb_sp1    <= m.sp1 && !m.rp;
+        wb_fhi    <= m.fhi && !m_rpe && !m.algn;
+        wb_sp0    <= m.sp0 && !m_rpe;
+        wb_sp1    <= m.sp1 && !m_rpe;
         wb_msize  <= m.msize;
         wb_boff   <= m.boff;
         wb_msigned <= m.msigned;
@@ -5006,8 +5081,8 @@ module ppc_core
           wbx_q[r] <= mg_ix(r[1:0], m.msize, m.boff, m.brev);
         end
         la_sq     <= m.msize == 2'd1 && m.msigned;
-        wb_fpw    <= mem_adv && m.fpw && !m.rp && !m.algn;
-        wb_fl     <= mem_adv && m.fld && !m.rp && !m.algn;
+        wb_fpw    <= mem_adv && m.fpw && !m_rpe && !m.algn;
+        wb_fl     <= mem_adv && m.fld && !m_rpe && !m.algn;
         wb_fsl    <= m.is_load && m.fsl;
         wb_frd    <= m.rd;
         wb_fdat_q <= ms_res_m;
@@ -5015,6 +5090,7 @@ module ppc_core
         wb_insn   <= m.insn;
         wb_dly    <= m_dly;
       end else begin
+        wb_evm <= 5'd0;                                // (an event once: RPX's replay is a request that may wait here)
         if (ans_wb) begin
           wb_got    <= 1'b1;
           wb_live_q <= 1'b0;

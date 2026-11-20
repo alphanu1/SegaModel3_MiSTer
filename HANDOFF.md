@@ -1,5 +1,33 @@
 # Handoff
 
+## Update (2026-11-20)
+
+`main` takes branch `cpu-r3d-130` with a `--no-ff` merge: the RTL of `cxp130_s1` (ac2e1b55), board-tested.
+- **R191:** r3d_mem's 8E copies by four-word group (v3) and polygon RAM writes gathered into DDR3 bursts; row 6 of the
+  frame-time overlay now reads DD SS WWWW (frames dropped at a flip, swaps, longest swap wait) and the DMA total.
+  v5 (posted store writes) stays out: with the bursts it still made five polygon-RAM-heavy frames slower (D-48).
+- **R188 / R192:** the CPI items. **R193:** PRX (an RPX access pre-reads its set while its page is pending).
+- Model3.qsf: UNFORCE_MERGE_PLL_OUTPUT_COUNTER on pll_0002, so the two SDRAM clocks stay separate counters.
+
+Board (cxp130_s1, dual, 130 MHz, 3125 / 2885 ps, with M3_FBUSY_BUILD): VF3 full 60, no lockup; Scud Race good (its
+usual short 30 at the start of track 1); Daytona 2's course-guide attract correct, and about 8-10% of track 1 now
+holds 60. 41,128 ALM, setup -3.494 / -3.600, hold positive, HDMI -0.20. Model3.rbf on the board is cxp130_s1.
+
+Findings (study D-76 to D-79, R191-R193):
+- Daytona 2's race is the CPU's: real race frames (749 k instructions a loop) run 1.098-1.117 vblank on the bench,
+  the board 1.01-1.10; the Real3D holds it only 0.005-0.013. Late loops are slow motion (4C76C counts overruns, no
+  catch-up). Nothing affordable reaches -10%: dual dispatch could take at most 2.8-4.9% for 1,500+ ALM.
+- Sega Rally 2's start line is not speed. The game measures vblank-to-flip once at boot (6AC20-6AD00) and uses it as
+  the decrementer reload (4C21A8); a short value gives exactly the board's 2.00-vblank frames. A clean boot on the
+  bench measures 0x43711 (right). Next: show the live mtdec value on the overlay (build `cmdec_s1` under way).
+- 135 MHz is dropped (D-79): at 135 the first SDRAM reads only at 2778 ps, and there Daytona 2's course-guide attract
+  goes wrong (c135p, c135z). Builds and notes in `sm3-builds/c135/`. The course guide is the check for wrong results
+  at any new clock.
+- No second geometry engine (D-77).
+
+Still open: the board's short SR2 calibration, Daytona 2's last few percent, Real3D speed in SR2's heavy views, timing
+slack at 130, the old single SDRAM module (D-73). No releases until the speed is right.
+
 ## Update (2026-11-19)
 
 `main` takes branch `sr2-r3dmem` with a `--no-ff` merge: D-74's three changes and the frame-time measurement.

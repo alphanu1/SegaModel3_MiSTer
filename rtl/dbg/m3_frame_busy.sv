@@ -73,7 +73,13 @@ module m3_frame_busy #(
   output logic [31:0] o_last,         // the last frame's busy time, units of 256 clocks
   output logic [31:0] o3_mm,          // {min, max} of the DMA wait, units of 256 clocks
   output logic [31:0] o3_long,        // the longest frame's {DMA wait, the rest}
-  output logic [31:0] o3_sum          // the DMA wait over the second
+  output logic [31:0] o3_sum,         // the DMA wait over the second
+  // r3d75 (D-75): the Real3D's side of the second, for row 6's third value: {frames dropped at the flip, frames
+  // drawn (swaps), the longest swap wait (r3d_cmd's sw_wait, the host held, flip to swap), units of 256 clocks}
+  input  logic        r3_drop,        // a pulse: r3d_cmd dropped a submitted frame at a flip
+  input  logic        r3_swap,        // a pulse: a draw began (the swap)
+  input  logic        r3_swait,       // r3d_cmd's sw_wait
+  output logic [31:0] o3_r3d
 );
 
   // one video frame in units of 256 clocks, and the bins' edges
@@ -147,6 +153,24 @@ module m3_frame_busy #(
   logic [7:0]  nf;
   logic [26:0] sec;
   logic        tick;
+  // the Real3D's: drops and draws this second (saturating at FF), the swap wait in hand and the second's longest
+  logic [7:0]  rdn, rsn, rpre;
+  logic [15:0] rsw, rswx;
+  always_ff @(posedge clk) begin
+    if (rst) begin rdn <= 8'd0; rsn <= 8'd0; rpre <= 8'd0; rsw <= 16'd0; rswx <= 16'd0; o3_r3d <= 32'd0; end
+    else begin
+      if (r3_drop && rdn != 8'hFF) rdn <= rdn + 8'd1;
+      if (r3_swap && rsn != 8'hFF) rsn <= rsn + 8'd1;
+      rpre <= r3_swait ? rpre + 8'd1 : 8'd0;
+      if (!r3_swait) rsw <= 16'd0;
+      else if (rpre == 8'hFF && rsw != 16'hFFFF) rsw <= rsw + 16'd1;
+      if (rsw > rswx) rswx <= rsw;
+      if (tick) begin
+        o3_r3d <= {rdn, rsn, (rsw > rswx) ? rsw : rswx};
+        rdn <= 8'd0; rsn <= 8'd0; rswx <= 16'd0;
+      end
+    end
+  end
   always_ff @(posedge clk) begin
     tick <= (sec == 27'(CLK_HZ - 1));
     sec  <= tick ? 27'd0 : sec + 27'd1;

@@ -122,6 +122,24 @@
 // resident line that the line has not written is kept in memory (the RWITM
 // copy would have overwritten it at the cast-out) and is what a later load of
 // that byte reads. Outside work RAM, and with WV = 0, a store miss fills.
+//
+// Translation pending (XLP = 1; study D-60, R174). A load or store whose page the core's data micro-TLB
+// could not translate in EX is still made from EX, with d_xlp: its page offset (EA[20-31], the set and the
+// word) is the request's, its page and WIMG are not yet known. R takes it as any request; its lookup does
+// nothing (no answer, no store buffer, no miss, no state), and it moves to X in the phase that waits for the
+// page (x_ph = 3), which reads nothing. The core's MEM translates it from the TLB and gives the page and WIMG
+// with d_xgo (from its registers), then X retries it as any other, from the page given: the bypass and
+// reserved-page bits are formed again from it. d_xcan instead drops it with no answer (the access faulted:
+// the core takes the exception, 603e 5.4.3). Either comes once for each such request, while it is in R or in
+// X (a request parked in R behind an older X takes the page there), and no other request is made between it
+// and its d_xgo or d_xcan; one may be made in the cycle of d_xgo. Nothing in the cache looks at a pending
+// request's own page, so it changes no state until its page is given: a snoop, a fill or a sweep may run while
+// it waits, and the access is made after them, as the 603e makes an access only once it is translated.
+//   PRX = 1 (study R193, cpu79): while X waits for its page it holds the read port at its own index (the copy and a
+// snoop still come first), so the arrays out in the cycle after d_xgo are its set's, read at the edge that gave it
+// its page, and that cycle is its lookup: one cycle sooner than a retry that reads again. A request made in the
+// cycle of d_xgo is parked in R, as behind any X. Only the port's choice changes: no lookup is made in phase 3,
+// and the lookup after d_xgo is an X lookup like any other (its set's blocks, the store buffer, the fill).
 
 module ppc_dcache
   import ppc_cache_pkg::*;
@@ -136,7 +154,11 @@ module ppc_dcache
   parameter bit          EARLY   = 1'b1,
   // write-validate (above): a store miss in work RAM (PA[31:23] == WVA) allocates without a fill; 0: as the 603e
   parameter bit          WV      = 1'b0,
-  parameter logic [8:0]  WVA     = 9'd0
+  parameter logic [8:0]  WVA     = 9'd0,
+  // PRX: X waiting for its page holds the read port at its index (above)
+  parameter bit          PRX     = 1'b1,
+  // the translation-pending protocol (above); 0: d_xlp, d_xgo and d_xcan are ignored (tie them low)
+  parameter bit          XLP     = 1'b0
 )(
   input  logic        clk,
   input  logic        rst,
@@ -164,6 +186,11 @@ module ppc_dcache
   output logic        d_idle,       // nothing posted, buffered or in flight
 
   input  logic        d_rsv,        // with d_req: the request is an lwarx's
+  input  logic        d_xlp,        // XLP, with d_req: the request's page and WIMG are not yet known
+  input  logic        d_xgo,        // XLP: the pending request's page (d_xpa) and WIMG (d_xwimg), from registers
+  input  logic        d_xcan,       // XLP: the pending request is dropped, never answered (from registers)
+  input  logic [19:0] d_xpa,
+  input  logic [3:0]  d_xwimg,
   output logic        res_kill,     // the reservation is lost (ppc_core)
   input  logic        sn_req,       // snoop (above): held until sn_ack
   input  logic [31:5] sn_addr,      // the physical line, stable with sn_req (from a register)
@@ -252,13 +279,16 @@ module ppc_dcache
   // ================================================================ state
   // R: the request taken last (fresh: its arrays were read at the last edge)
   logic        r_v, r_fresh, r_post, r_dce;
+  logic        r_xlp;                           // XLP: R's request waits for its page
   logic [2:0]  r_k;
   logic [31:2] r_a;
   logic [3:0]  r_be, r_wimg;
   logic [31:0] r_wd;
   // X: the oldest request, whose lookup did not end it
   logic        x_v, x_byp, x_rsv;
-  logic [1:0]  x_ph;                            // 0 look up, 1 wait for the fill's word, 2 wait for a single read
+  logic        x_dce;                           // XLP: R's r_dce, for the bypass bit formed again with the page
+  logic [1:0]  x_ph;                            // 0 look up, 1 wait for the fill's word, 2 wait for a single read,
+                                                // 3 (XLP) wait for the page
   logic [2:0]  x_k;
   logic [31:2] x_a;
   logic [3:0]  x_be, x_wimg;
@@ -490,7 +520,13 @@ module ppc_dcache
                          (tw_en_q != 2'd0 && tw_set_q == r_set) || (tw_last && tw_lset == r_set))))
       $fatal(1, "blk per candidate against the plain form");
 `endif
-  wire lk      = l_v && r_ph_l == 2'd0 && !blk;
+  // XLP: a fresh R whose page is pending is looked up for nothing (it goes to X, x_ph = 3); from registers
+  wire lk      = l_v && r_ph_l == 2'd0 && !blk && !(XLP && lr && r_xlp);
+  // XLP: the page given (d_xgo) to R's request or X's, or the request dropped (d_xcan); X's in phase 3
+  wire xg_x    = XLP && d_xgo && x_v && x_ph == 2'd3;
+  wire xg_r    = XLP && d_xgo && r_v && r_xlp;
+  wire xk_x    = XLP && d_xcan && x_v && x_ph == 2'd3;
+  wire xk_r    = XLP && d_xcan && r_v && r_xlp;
 
   // The lookup's outcome as a function of the compare's two late bits, any and hp (the predicted
   // way hits), so that the next state of x_v, d_valid and d_rdy can be formed for each of the three
@@ -703,7 +739,7 @@ module ppc_dcache
   // lookup must come the next cycle and find what base_ok saw)
   wire base_ok  = !wk_act && !wk_req && !dq_v && !mq_v && !f_act && !cp_act && !z_act && !uq_v &&
                   tw_en_q == 2'd0 && !sn_np && !rst;
-  wire post     = d_req && d_we && d_op == 3'd0 && base_ok && !x_v && (!r_v || r_to_sb);
+  wire post     = d_req && d_we && d_op == 3'd0 && base_ok && !x_v && (!r_v || r_to_sb) && !(XLP && d_xlp);
 
   // ============================================================ the fill
   // from MQ (older), or straight from DQ when the port is free
@@ -750,7 +786,9 @@ module ppc_dcache
   // answered), else the core's new address. A snoop takes the port as the
   // copy does (RD_CP, the copy first): no lookup follows a cycle it reads.
   localparam logic [1:0] RD_NEW = 2'd0, RD_X = 2'd1, RD_R = 2'd2, RD_CP = 2'd3;
-  wire  [1:0]  rd_sel = (cp_rd || sn_rd) ? RD_CP : (x_v && x_ph == 2'd0) ? RD_X : (r_v && !(r_fresh && !x_v)) ? RD_R : RD_NEW;
+  // (PRX: phase 3 too; x_ph is 0 or 3 is one LUT of x_ph's two bits, as x_ph == 0 was)
+  wire         x_rdp  = (XLP && PRX) ? (x_ph[1] == x_ph[0]) : (x_ph == 2'd0);
+  wire  [1:0]  rd_sel = (cp_rd || sn_rd) ? RD_CP : (x_v && x_rdp) ? RD_X : (r_v && !(r_fresh && !x_v)) ? RD_R : RD_NEW;
   wire  [9:0]  rd_cp  = (!SNOOP || cp_rd) ? {cp_set, cp_base + cp_cnt[2:0]} : {sn_addr[11:5], 3'd0};
   always_comb
     case (rd_sel)
@@ -829,9 +867,9 @@ module ppc_dcache
   wire l_end  = (lk && l_ans) || l_post;        // the lookup ends its request
   wire x_end  = x_v && ((lx && lk && l_ans) || er_ans || srd_ans || fh);
   wire x_take = lr && !l_end;                   // R's lookup did not end it: to X
-  wire r_v_n     = d_req || (r_v && !lr);
+  wire r_v_n     = d_req || (r_v && !lr && !xk_r);
   wire r_fresh_n = d_req ? rd_sel == RD_NEW : rd_sel == RD_R;
-  wire x_v_n     = x_v ? !x_end : x_take;
+  wire x_v_n     = x_v ? !x_end && !xk_x : x_take && !xk_r;
   // x_v's next value, and d_rdy's, for each of the lookup's three cases, from registers and the
   // request (d_req); the compare (any, hp) chooses last, one level after the tags' hit (the
   // 100 MHz builds' tag RAM and r_a into x_v: the compare, any, the outcome and x_v's next value
@@ -852,11 +890,11 @@ module ppc_dcache
   (* keep = 1 *) wire xvn10 = xvn_f(lk10.ans, x_v, lx, lk, 1'b0, lr, l_post);
   (* keep = 1 *) wire xvn11 = xvn_f(lk11.ans, x_v, lx, lk, 1'b0, lr, l_post);
   wire xvn1p   = xvn_f(lk1p.ans, x_v, lx, lk, 1'b0, lr, l_post);   // (WV: a partial miss, never an answer)
-  wire x_v_c   = !xvxa && (hp ? (vp ? xvn11 : xvn1p) : any ? xvn10 : xvn00);
+  wire x_v_c   = !xvxa && (hp ? (vp ? xvn11 : xvn1p) : any ? xvn10 : xvn00) && !xk_x && !(!x_v && xk_r);
   // d_rdy from x_v's next value, so EX's request (d_req, in r_v_n and r_fresh_n) is one level from it:
   // formed per case beside the compare, the request was three levels deep (R108, cH's release fit:
   // op_x -> d_rdy_q, -1.55 ns), the compare one level less than this
-  (* keep = 1 *) wire r_hold = r_v && !lr;              // R stays (with no request)
+  (* keep = 1 *) wire r_hold = r_v && !lr && !xk_r;     // R stays (with no request)
   wire rdy_c   = !(d_req || r_hold) || ((d_req ? rd_sel == RD_NEW : rd_sel == RD_R) && !x_v_c);
 `ifdef VERILATOR
   always_ff @(posedge clk)
@@ -890,12 +928,27 @@ module ppc_dcache
       r_wd   <= d_wdata;
       r_wimg <= d_wimg;
       r_dce  <= hid_dce;
+      r_xlp  <= XLP && d_xlp;
+    end else if (xg_r) begin                    // a parked R takes its page (XLP)
+      r_a[31:12] <= d_xpa;
+      r_wimg <= d_xwimg;
+      r_xlp  <= 1'b0;
     end
     if (!x_v) begin                             // X copies R while free
       x_k <= r_k; x_a <= r_a; x_be <= r_be; x_wd <= r_wd; x_wimg <= r_wimg; x_rsv <= r_rsv; x_byp <= r_byp;
-      x_ph  <= l_ph1 ? 2'd1 : l_ph2 ? 2'd2 : 2'd0;
+      x_dce <= r_dce;
+      x_ph  <= (XLP && r_xlp) ? 2'd3 : l_ph1 ? 2'd1 : l_ph2 ? 2'd2 : 2'd0;
+      if (xg_r) begin                           // R's pending request, going to X as its page comes
+        x_a[31:12] <= d_xpa; x_wimg <= d_xwimg; x_rsv <= d_xpa == RSV_TAG;
+        x_byp <= d_xwimg[2] || !r_dce || d_xpa == RSV_TAG;
+        x_ph  <= 2'd0;
+      end
       x_rwv <= l_rw;
       x_rw  <= hw;
+    end else if (xg_x) begin                    // X's pending request takes its page and is looked up
+      x_a[31:12] <= d_xpa; x_wimg <= d_xwimg; x_rsv <= d_xpa == RSV_TAG;
+      x_byp <= d_xwimg[2] || !x_dce || d_xpa == RSV_TAG;
+      x_ph  <= 2'd0;
     end else if (lx) begin
       if (l_ph1) x_ph <= 2'd1;
       if (l_ph2) x_ph <= 2'd2;
@@ -1134,8 +1187,8 @@ module ppc_dcache
   wire wk_act_n = wk_act ? wk_cnt != 8'd127 : wk_go;
   wire wk_req_n = !wk_go && (wk_req || (hid_dcfi && !dcfi_q && hid_dce));
   wire fb_v_n   = !fill_go && f_act && beat_x;
-  // (d_req, late from EX's translation, joins at the last level: r_v_n is d_req || (r_v && !lr))
-  (* keep = 1 *) wire idl_n = !rst && !(r_v && !lr) && !x_v_c && !l_dq && !mq_v_n && !f_act_n && !cp_act_n && !z_act_n &&
+  // (d_req, late from EX's translation, joins at the last level: r_v_n is d_req || r_hold)
+  (* keep = 1 *) wire idl_n = !rst && !r_hold && !x_v_c && !l_dq && !mq_v_n && !f_act_n && !cp_act_n && !z_act_n &&
                               !wb_pend_n && !uq_v_n && mpn_idle && !sb_v_n && !tw_n && !wk_act_n && !wk_req_n && !fb_v_n;
   (* preserve *) logic d_idle_q;
   always_ff @(posedge clk) d_idle_q <= idl_n && !d_req;
@@ -1146,6 +1199,28 @@ module ppc_dcache
       $fatal(1, "dcache: d_idle's register %b against its terms %b", d_idle_q, !r_v && !x_v && quiet && !wk_act && !wk_req && !fb_v);
 `endif
 
+`ifdef VERILATOR
+`ifndef XLP_NOCHK
+  // (XLP_NOCHK: off in the planted-fault runs, which the bench's reference must catch)
+  // XLP: a pending request is never answered, and the memory answers that end X never meet it; its page and its
+  // drop come once, while it waits; no request while one waits, but in the cycle of its page
+  logic xl_w;                                   // a request whose page is pending is in R or X
+  always_ff @(posedge clk) begin
+    if (rst) xl_w <= 1'b0;
+    else if (d_req && XLP && d_xlp) xl_w <= 1'b1;
+    else if (d_xgo || d_xcan) xl_w <= 1'b0;
+    if (!rst && XLP) begin
+      if (x_v && x_ph == 2'd3 && (er_ans || srd_ans || fh)) $fatal(1, "dcache: a memory answer for X while its page is pending");
+      if ((d_xgo || d_xcan) && !(xg_x || xg_r || xk_x || xk_r)) $fatal(1, "dcache: d_xgo / d_xcan with no request pending");
+      if (d_xgo && d_xcan) $fatal(1, "dcache: d_xgo and d_xcan together");
+      if (d_req && xl_w && !d_xgo) $fatal(1, "dcache: a request while one waits for its page");
+      if (d_req && d_xlp && (d_op != 3'd0 || d_rsv)) $fatal(1, "dcache: a cache operation or lwarx with its page pending");
+      if (x_v && x_ph == 2'd3 && r_v && r_xlp) $fatal(1, "dcache: two requests pending");
+      if (lr && r_xlp && (l_ans || l_sb || l_uq || l_dq || l_st)) $fatal(1, "dcache: a pending request's lookup acted");
+    end
+  end
+`endif
+`endif
 `ifdef PPC_CACHE_SIM
   // the protocol and the single write port, as the design relies on them
   logic [31:0] sim_cyc = 0;

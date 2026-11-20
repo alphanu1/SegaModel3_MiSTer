@@ -18,6 +18,12 @@
 
 module ppc_pdw
   import ppc_pkg::*;
+#(
+  // F1S (ppc_core): stfs is a one-cycle EX op; ff2c marks the compares alone
+  parameter bit F1S = 1'b0,
+  // F1C (ppc_core): fcmpu / fcmpo are one-cycle EX ops
+  parameter bit F1C = 1'b0
+)
 (
   input  logic        clk,
   input  logic        rst,
@@ -304,8 +310,8 @@ module ppc_pdw
     pd.fmw     = pa_op && pa_d && (pa5 == 5'd23 || pa_mov || pd_x == 10'd583) && !mark;
     pd.ffsx    = pa_op && pa_d && (pd_x == 10'd711 || pd_x == 10'd134 || pd_x == 10'd70 || pd_x == 10'd38 ||
                                      pa_mcrfs) && !mark;
-    pd.ff2c    = ((pa_op && pa_d && pa_cmp) ||
-                    pd_op == 6'd52 || pd_op == 6'd53 || (pd_op == 6'd31 && (pd_x == 10'd663 || pd_x == 10'd695))) &&
+    pd.ff2c    = ((!F1C && pa_op && pa_d && pa_cmp) ||
+                    (!F1S && (pd_op == 6'd52 || pd_op == 6'd53 || (pd_op == 6'd31 && (pd_x == 10'd663 || pd_x == 10'd695))))) &&
                    !mark;
     pd.frq     = pa_op && pa_d && pa5 == 5'd26 && !mark;
     pd.frs     = pa_op && !pa_d && pa_fs && !mark;
