@@ -27,6 +27,9 @@
 // The compare is a magnitude compare of the two images with the signs
 // applied, so no subtractor is spent on it.
 //
+// cr_c / flags_c (study R174, ppc_core F1C): a compare's CR field and FPSCR flags from the operand tests before
+// PIPE's register, for a compare that leaves EX in one cycle; they are what cr / flags give a cycle later.
+//
 // PIPE = 0: combinational. From registered operands to a registered result
 // it measured 8.85 ns standalone (the NaN test steering a 64-bit select, and
 // the 63-bit compare), 0.52 ns over 120 MHz. PIPE = 1 registers the operand
@@ -46,7 +49,9 @@ module ppc_fpu_misc
   input  logic [31:0] fpscr,   // mffs
   output logic [63:0] res,
   output logic [3:0]  cr,      // compares: LT GT EQ UN
-  output fpu_flags_t  flags
+  output fpu_flags_t  flags,
+  output logic [3:0]  cr_c,    // compares: cr and flags before the PIPE register (from a, b and op this cycle)
+  output fpu_flags_t  flags_c
 );
 
   // ----------------------------------------------- operand tests, compare
@@ -87,6 +92,30 @@ module ppc_fpu_misc
   end else begin : g_comb
     assign t = t0;
   end endgenerate
+
+  // compare outcome from a test record (t0 before the register, t after)
+  function automatic logic [3:0] cmp_cr(input t_t x);
+    logic m_lt, m_eq, l, e;
+    m_lt = x.hi_lt | (x.hi_eq & x.lo_lt);
+    m_eq = x.hi_eq & x.lo_eq;
+    e = m_eq & (x.a_s == x.b_s) | (x.a_zero & x.b_zero);
+    if (x.a_zero & x.b_zero)  l = 1'b0;
+    else if (x.a_s != x.b_s)  l = x.a_s;
+    else                      l = x.a_s ? (~m_lt & ~m_eq) : m_lt;
+    cmp_cr = (x.a_nan | x.b_nan) ? 4'b0001 : {l, ~l & ~e, e, 1'b0};
+  endfunction
+  always_comb begin
+    cr_c    = cmp_cr(t0);
+    flags_c = '0;
+    flags_c.fpcc_we    = 1'b1;
+    flags_c.fprf       = {1'b0, cr_c};
+    flags_c.exc.vxsnan = t0.a_snan | t0.b_snan;
+    if (t0.op == MSC_FCMPO)
+      flags_c.exc.vxvc = (t0.a_snan | t0.b_snan) ? ~t0.ve : (t0.a_nan | t0.b_nan);
+  end
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (cmp_cr(t) != crv) $fatal(1, "ppc_fpu_misc: the compare function against crv");
+`endif
 
   // ----------------------------------------------------- result, flags
   wire a_nan = t.a_nan, b_nan = t.b_nan, a_snan = t.a_snan, b_snan = t.b_snan;

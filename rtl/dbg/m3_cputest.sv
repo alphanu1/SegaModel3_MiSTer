@@ -88,7 +88,8 @@ module m3_cputest
   logic        rl_we;
 
   generate if (!CACHED) begin : g_core
-  ppc_core u_cpu (
+  // (RPX = 0: this data port answers at once and has no pending-translation protocol, ppc_core RPX)
+  ppc_core #(.RPX (1'b0)) u_cpu (
     .clk (clk), .rst (cpu_rst), .pvr_alt (1'b0),
     .i_req (i_req), .i_addr (i_addr), .i_wimg (), .i_seq (), .i_valid (i_valid), .i_data (i_data),
     .i_way (2'd0), .i_arr (1'b0), .i_pa (20'd0), .i_pv (), .i_pidx (), .i_pway (), .i_ppa (), .i_pre (), .ev_btb (),

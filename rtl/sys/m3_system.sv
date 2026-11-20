@@ -482,7 +482,7 @@ module m3_system
     .rt_cr(), .rt_xer(), .rt_lr(rt_lr), .rt_ctr(), .rt_msr(rt_msr), .rt_srr0(rt_srr0), .rt_srr1(rt_srr1), .rt_fpscr(), .rt_fpq(),
     .rt_fw_en(), .rt_fw_idx(), .rt_fw_val(), .rt_dly(),
     .t_dreq(), .t_dwe(), .t_daddr(), .t_dwimg(), .t_dop(), .t_dvalid(), .t_drdata(),
-    .t_dbe(), .t_dwdata(), .t_drsv(), .t_dcnd());
+    .t_dbe(), .t_dwdata(), .t_drsv(), .t_dcnd(), .t_dxlp(), .t_dxgo(), .t_dxcan(), .t_dxpa(), .t_dxwimg());
   assign rt_valid_o = rt_valid;
   assign rt_gpr_we_o = rt_gpr_we; assign rt_gpr_o = rt_gpr; assign rt_gpr_sh_o = rt_gpr_sh; assign rt_gpr_val_o = rt_gpr_val;
 
@@ -832,7 +832,11 @@ module m3_system
     .t_valid(t3_valid), .t_ready(t3_ready), .t_vrom(t3_vrom), .t_data(t3_data), .t_flush(t3_flush), .t_pend(t3_pend),
     .t_mark(t3_mark), .t_mpend(t3_mpend), .t_go(t3_go), .t_busy(t3_busy),
     .g_start, .g_busy, .f_ready, .f_begin, .f_end, .f_buf, .r_done, .r_busy,
-    .show_buf, .show_3d, .pingpong(r3_pingpong), .flip(r3_flip), .n_draw, .n_drop);
+    .show_buf, .show_3d, .pingpong(r3_pingpong), .flip(r3_flip), .n_draw, .n_drop, .o_swait(r3_swait));
+  // (r3d75) a drop at the flip as a pulse, for the frame-busy build's row 6
+  logic [15:0] n_drop_q;
+  logic        r3_dropp;
+  always_ff @(posedge clk) begin n_drop_q <= n_drop; r3_dropp <= n_drop != n_drop_q; end
 
   // ---- culling and polygon RAM windows
   r3d_mem #(.AW(AW), .SDR_8C(SDR_8C), .SDR_8E0(SDR_8E0), .SDR_8E1(SDR_8E1), .DDR_P0(D_POLY0), .DDR_P1(D_POLY1)) u_r3mem (
@@ -842,7 +846,7 @@ module m3_system
     .d_req(d_req[4]), .d_we(d_we[4]), .d_addr(d_addr[4]), .d_blen(d_blen[4]), .d_din(d_din[4]), .d_be(d_be[4]),
     .d_wacc(d_wacc[4]), .d_rvalid(d_rvalid[4]), .d_ack(d_ack[4]), .d_dout(dm_dout),
 `ifdef M3_R3B
-    .s_long(p_long[4]), .s_wbc(wb_col), .s_wbd(r3_wbd), .s_wbb(r3_wbb),
+    .s_long(p_long[4]), .s_lo(p_lo[4]), .s_wbc(wb_col), .s_wbd(r3_wbd), .s_wbb(r3_wbb),
 `endif
     .n_runs, .n_copy);
 `ifndef M3_R3B
@@ -1205,7 +1209,8 @@ module m3_system
   assign d_we[0] = 1'b0; assign d_din[0] = '0; assign d_be[0] = 8'hFF;
 
   // the CPU's busy time per frame (R104): vblank to the first retirement in a wait loop
-  logic [31:0] fb_mm, fb_lo, fb_hi, fb_last, fb3_mm, fb3_long, fb3_sum;
+  logic [31:0] fb_mm, fb_lo, fb_hi, fb_last, fb3_mm, fb3_long, fb3_sum, fb3_r3d;
+  logic        r3_swait;
   generate if (FB_ON) begin : g_fbusy
     // the windows by game: Sega Rally 2 is the driving profile's Step 2.0 set (configuration step 20, input profile
     // 1, m3_mra.py), Daytona 2 (and every other Step 2.x set) step2, the rest VF3's
@@ -1213,10 +1218,11 @@ module m3_system
     always_ff @(posedge clk) fb_game <= (cfg_step == 8'h20 && cfg_prof == 8'd1) ? 2'd2 : step2 ? 2'd1 : 2'd0;
     m3_frame_busy #(.CLK_HZ(CLK_HZ)) u_fbusy (.clk, .rst, .vblank_start, .game(fb_game), .rt_valid, .rt_pc,
       .o_minmax(fb_mm), .o_bins_lo(fb_lo), .o_bins_hi(fb_hi), .o_last(fb_last),
-      .o3_mm(fb3_mm), .o3_long(fb3_long), .o3_sum(fb3_sum));
+      .o3_mm(fb3_mm), .o3_long(fb3_long), .o3_sum(fb3_sum),
+      .r3_drop(r3_dropp), .r3_swap(m3_swap), .r3_swait, .o3_r3d(fb3_r3d));
   end else begin : g_nofbusy
     assign fb_mm = '0; assign fb_lo = '0; assign fb_hi = '0; assign fb_last = '0;
-    assign fb3_mm = '0; assign fb3_long = '0; assign fb3_sum = '0;
+    assign fb3_mm = '0; assign fb3_long = '0; assign fb3_sum = '0; assign fb3_r3d = '0;
   end endgenerate
 
   logic [5:0]  ov_idx;
@@ -1239,7 +1245,9 @@ module m3_system
       // (the frame-busy build, R188: row 7 FBUSY's {min, max}, bands and, last, the longest frame's {DMA wait, the
       // rest}; row 6 {min, max} of the DMA wait and the DMA wait over the second; every other row 0)
       if (OV_MIN) ov_v <= (ov_idx == 6'd28) ? fb_mm : (ov_idx == 6'd29) ? fb_lo : (ov_idx == 6'd30) ? fb_hi :
-                          (ov_idx == 6'd31) ? fb3_long : (ov_idx == 6'd24) ? fb3_mm : (ov_idx == 6'd25) ? fb3_sum : 32'd0;
+                          (ov_idx == 6'd31) ? fb3_long : (ov_idx == 6'd24) ? fb3_r3d : (ov_idx == 6'd25) ? fb3_sum : 32'd0;
+      // (r3d75: row 6's first value is now the Real3D's {drops, swaps, longest swap wait}; the DMA wait's {min, max},
+      // which it replaces, is left unread and so not built, which pays for most of it)
       else case (ov_idx)
         // row 0: CPU PC (at vblank), IRQ state/enable and CROM bank, frames, the 53C810 interrupts
         6'd0:  ov_v <= pc_v;

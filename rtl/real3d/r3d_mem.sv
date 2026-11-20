@@ -88,6 +88,7 @@ module r3d_mem #(
   // write is two columns, or eight with s_long; column k's word and lanes are s_wbd / s_wbb while the controller
   // asks for k (s_wbc)
   output logic          s_long,
+  input  logic          s_lo,            // (r3d75) a long read's first four columns are on s_dout
   input  logic [3:0]    s_wbc,
   output logic [15:0]   s_wbd,
   output logic [1:0]    s_wbb,
@@ -115,7 +116,7 @@ module r3d_mem #(
   // the sequence
   // ===========================================================================
   typedef enum logic [3:0] {
-    S_IDLE, S_SW, S_DW, S_RUN, S_POP, S_CP, S_SR, S_SW2, S_DR, S_DST, S_GW, S_GR, S_GRUN
+    S_IDLE, S_SW, S_DW, S_RUN, S_POP, S_CP, S_SR, S_SW2, S_DR, S_DST, S_GW, S_GR, S_GRUN, S_PW, S_PR
   } st_t;
   st_t          st;
   logic [1:0]   cw;                       // the write's window
@@ -131,6 +132,13 @@ module r3d_mem #(
   logic         sh;                       // SDRAM half (0 low, 1 high)
 `endif
   logic [1:0]   sk;                       // copy: the half of the pair's four
+`ifdef M3_R3B
+  // r3d75 (D-75): an 8E copy moves an aligned four-word group, one eight-column read (its first four columns on
+  // s_lo, kept here; the last four on s_ack, which m2_sdram holds) and one eight-column write, where it took a
+  // two-word pair, one read and two two-column writes. Outside the pending runs W and R are equal, so the
+  // group's other words copy as they are (the pair already rounded so).
+  logic [63:0]  cq;
+`endif
   // copy: the SDRAM pair read is s_dout itself, which m2_sdram holds until this port's next read (S_SW2 only writes)
   logic         cwin;                     // copy: 0 8E, 1 98
   logic [20:0]  cend;                     // copy: last word
@@ -182,11 +190,18 @@ module r3d_mem #(
   // the group's words, in an MLAB with one read: the column the controller asks for (s_wbc) during the burst, and
   // word 0 while the request is formed (column 0 is s_din, latched with the request). A single 8C or 98 write
   // keeps its word in word 0 too (no group is open then, nor is one opened before the write is done).
-  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] g_d [4];
+  // r3d75 (D-75): polygon RAM's words are gathered the same way: an aligned four-word group (two DDR3 beats) is one
+  // two-beat burst to W, then to R or deferred as a four-word run, where each word was two one-beat writes. g_win:
+  // the group's window (0 8E, 1 polygon RAM). The words are kept by parity (g_e even, g_o odd, two MLABs) so a
+  // beat's two words read together; word w is g_e / g_o [w[1]] by w[0].
+  logic         g_win;
+  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] g_e [2];
+  (* ramstyle = "MLAB, no_rw_check" *) logic [31:0] g_o [2];
   logic [1:0]   g_ra;
-  wire  [31:0]  g_q = g_d[g_ra];
+  wire  [31:0]  g_q = g_ra[0] ? g_o[g_ra[1]] : g_e[g_ra[1]];
+  logic         pb;                       // the polygon RAM group's beat being written
   logic [2:0]   g_age;                    // cycles the group has waited with no write offered
-  wire          g_hit   = w_valid && w_reg == 2'd1 && g_v && g_grp == w_addr[19:2] && !g_m[w_addr[1:0]];
+  wire          g_hit   = w_valid && w_reg == {g_win, !g_win} && g_v && g_grp == w_addr[19:2] && !g_m[w_addr[1:0]];
   // (the next word of a line comes a few clocks behind the last: a group waits up to G_AGE clocks for it)
   localparam logic [2:0] G_AGE = 3'd6;
   // (the age flush only when no write for the group is offered: w_ready takes a hit, so a hit in the clock the age
@@ -197,7 +212,8 @@ module r3d_mem #(
   wire          x_g     = st == S_GRUN;
   wire [19:0]   x_st    = x_g ? {g_grp, 2'b00} : ca[19:0];
   wire [RL-1:0] x_n     = x_g ? RL'(4) : RL'(1);
-  wire          x_ext   = o_v && o_win == (!x_g && cw[1]) && x_st == o_st + 20'(o_n) &&
+  wire          x_win   = x_g ? g_win : cw[1];
+  wire          x_ext   = o_v && o_win == x_win && x_st == o_st + 20'(o_n) &&
                           (x_g ? o_n <= {RL{1'b1}} - RL'(4) : o_n != {RL{1'b1}});
   // A group written again after it was flushed, while it is still the open run's last group, is inside that run
   // already: the copy reads W, which has its new words, so it needs no run of its own. Sega Rally 2 moves 8E in
@@ -212,11 +228,11 @@ module r3d_mem #(
   wire          g_we    = st == S_IDLE && !g_flush && w_valid && w_ready;
 `ifdef M3_R3B_FAULT3
   // (a planted fault: a single 8C / 98 write's word kept in word 1, where the request does not read it)
-  wire  [1:0]   g_wa    = (w_reg == 2'd1) ? w_addr[1:0] : 2'd1;
+  wire  [1:0]   g_wa    = (w_reg != 2'd0) ? w_addr[1:0] : 2'd1;
 `else
-  wire  [1:0]   g_wa    = (w_reg == 2'd1) ? w_addr[1:0] : 2'd0;
+  wire  [1:0]   g_wa    = (w_reg != 2'd0) ? w_addr[1:0] : 2'd0;
 `endif
-  always_ff @(posedge clk) if (g_we) g_d[g_wa] <= w_data;
+  always_ff @(posedge clk) if (g_we) begin if (g_wa[0]) g_o[g_wa[1]] <= w_data; else g_e[g_wa[1]] <= w_data; end
   always_comb begin
 `ifdef M3_R3B_FAULT
     // (a planted fault: the group's columns 2-7 one word late, so the burst writes words out of order)
@@ -248,7 +264,15 @@ module r3d_mem #(
   always_comb begin
     case (st)
       S_SW:  begin s_wbd = g_q[31:16]; s_wbb = 2'b11; end
-      S_SW2: begin s_wbd = sk[1] ? s_dout[63:48] : s_dout[31:16]; s_wbb = 2'b11; end
+      // (r3d75: the group's columns, 0-3 in cq, 4-7 in s_dout, which m2_sdram holds until this port's next read)
+      S_SW2: begin
+        case (s_wbc[2:0])
+          3'd1: s_wbd = cq[31:16];     3'd2: s_wbd = cq[47:32];     3'd3: s_wbd = cq[63:48];
+          3'd4: s_wbd = s_dout[15:0];  3'd5: s_wbd = s_dout[31:16]; 3'd6: s_wbd = s_dout[47:32];
+          3'd7: s_wbd = s_dout[63:48]; default: s_wbd = cq[15:0];
+        endcase
+        s_wbb = 2'b11;
+      end
       default: begin
         s_wbd = s_wbc[0] ? g_q[31:16] : g_q[15:0];
         s_wbb = g_m[s_wbc[2:1]] ? 2'b11 : 2'b00;
@@ -260,7 +284,9 @@ module r3d_mem #(
   assign can_swap = (st == S_IDLE) && !pending;
 `endif
 `ifdef M3_R3B
-  assign d_din    = (st == S_DST) ? cb_q : {g_q, g_q};    // (word 0: no request is out in S_DW)
+  // (a copy's burst from the copy buffer; a polygon RAM group's beat pb, its words' lanes)
+  assign d_din    = (st == S_DST) ? cb_q : {g_o[pb], g_e[pb]};
+  assign d_be     = (st == S_DST) ? 8'hFF : {{4{g_m[{pb, 1'b1}]}}, {4{g_m[{pb, 1'b0}]}}};
 `else
   assign d_din    = (st == S_DST) ? cb_q : {cd, cd};
 `endif
@@ -283,9 +309,12 @@ module r3d_mem #(
 `endif
 `ifdef M3_R3B
           if (g_flush) begin
-            st <= S_GW;
-          end else if (w_valid && w_ready && w_reg == 2'd1) begin
-            if (!g_v) begin g_v <= 1'b1; g_grp <= w_addr[19:2]; g_m <= 4'd1 << w_addr[1:0]; g_same <= g_grp == w_addr[19:2]; end
+            st <= g_win ? S_PW : S_GW; pb <= 1'b0;
+          end else if (w_valid && w_ready && w_reg != 2'd0) begin
+            if (!g_v) begin
+              g_v <= 1'b1; g_grp <= w_addr[19:2]; g_m <= 4'd1 << w_addr[1:0]; g_win <= w_reg[1];
+              g_same <= g_grp == w_addr[19:2] && g_win == w_reg[1];
+            end
             else g_m <= g_m | (4'd1 << w_addr[1:0]);
             g_age <= 3'd0;
           end else if (g_v) begin
@@ -337,7 +366,9 @@ module r3d_mem #(
           if (!d_req) begin
             d_req <= 1'b1; d_we <= 1'b1; d_blen <= 8'd1;
             d_addr <= pbase + 25'(ca[19:1]);
+`ifndef M3_R3B
             d_be <= ca[0] ? 8'hF0 : 8'h0F;
+`endif
           end
           if (d_ack) begin
             d_req <= 1'b0;
@@ -354,7 +385,7 @@ module r3d_mem #(
           else if (x_ext) o_n <= o_n + x_n;
           else begin
             if (o_v) rf_wp <= rf_wp + 1'b1;
-            o_v <= 1'b1; o_win <= !x_g && cw[1]; o_st <= x_st; o_n <= x_n;
+            o_v <= 1'b1; o_win <= x_win; o_st <= x_st; o_n <= x_n;
             n_runs <= n_runs + 16'd1;
           end
           o_lgv <= x_g;
@@ -386,7 +417,11 @@ module r3d_mem #(
           end
           cwin <= win; cp_v <= 1'b1;
           cend <= {1'b0, s0} + 21'(n0) - 21'd1;
+`ifdef M3_R3B
+          pa <= win ? {1'b0, s0[19:1], 1'b0} : {1'b0, s0[19:2], 2'b00};
+`else
           pa <= {1'b0, s0[19:1], 1'b0};
+`endif
           st <= S_CP;
         end
         // the next piece of the run, or the run is done
@@ -414,30 +449,47 @@ module r3d_mem #(
         S_SR: begin
           if (!s_req && !gap && !s_ack) begin
             s_req <= 1'b1; s_we <= 1'b0;
+`ifdef M3_R3B
+            s_long <= 1'b1;
+            s_addr <= AW'((wbank ? SDR_8E1 : SDR_8E0) >> 1) + AW'({pa[19:2], 3'b000});
+`else
             s_addr <= AW'((wbank ? SDR_8E1 : SDR_8E0) >> 1) + AW'({pa[19:0], 1'b0});
+`endif
           end
+`ifdef M3_R3B
+          if (s_lo) cq <= s_dout;
+`endif
           if (s_ack) begin
             s_req <= 1'b0; gap <= 1'b1;
+`ifdef M3_R3B
+            s_long <= 1'b0;
+`endif
             st <= S_SW2;
           end
         end
         S_SW2: begin
           if (!s_req && !gap && !s_ack) begin
             s_req <= 1'b1; s_we <= 1'b1;
+`ifdef M3_R3B
+            s_long <= 1'b1;                          // (the group's eight columns; column 0 here, 1-7 from s_wbd)
+            s_addr <= AW'((bank ? SDR_8E1 : SDR_8E0) >> 1) + AW'({pa[19:2], 3'b000});
+            s_din <= cq[15:0];
+`else
             s_addr <= AW'((bank ? SDR_8E1 : SDR_8E0) >> 1) + AW'({pa[19:1], sk});
-            s_be <= 2'b11;
             case (sk)
               2'd0: s_din <= s_dout[15:0];
               2'd1: s_din <= s_dout[31:16];
               2'd2: s_din <= s_dout[47:32];
               default: s_din <= s_dout[63:48];
             endcase
+`endif
+            s_be <= 2'b11;
           end
           if (s_ack) begin
             s_req <= 1'b0; gap <= 1'b1;
 `ifdef M3_R3B
-            sk <= sk + 2'd2;                         // (two halves a two-column burst)
-            if (sk == 2'd2) begin pa <= pa + 21'd2; st <= S_CP; end
+            s_long <= 1'b0;
+            pa <= pa + 21'd4; st <= S_CP;
 `else
             sk <= sk + 2'd1;
             if (sk == 2'd3) begin pa <= pa + 21'd2; st <= S_CP; end
@@ -459,6 +511,20 @@ module r3d_mem #(
             else st <= S_GR;
           end
         end
+        // ---- the polygon RAM group: one two-beat burst to W, then to R or deferred as a four-word run
+        S_PW, S_PR: begin
+          if (!d_req) begin
+            d_req <= 1'b1; d_we <= 1'b1; d_blen <= 8'd2;
+            d_addr <= (((st == S_PR) ? bank : wbank) ? DDR_P1 : DDR_P0) + 25'({g_grp, 1'b0});
+          end
+          if (d_wacc) pb <= 1'b1;
+          if (d_ack) begin
+            d_req <= 1'b0; pb <= 1'b0;
+            if (st == S_PR) begin g_v <= 1'b0; o_lgv <= 1'b0; st <= S_IDLE; end
+            else if (r_busy || pending) st <= S_GRUN;
+            else st <= S_PR;
+          end
+        end
 `endif
         // polygon RAM: read the burst from W, then write it to R
         S_DR: begin
@@ -474,7 +540,10 @@ module r3d_mem #(
         end
         S_DST: begin
           if (!d_req) begin
-            d_req <= 1'b1; d_we <= 1'b1; d_blen <= 8'(cn); d_be <= 8'hFF;
+            d_req <= 1'b1; d_we <= 1'b1; d_blen <= 8'(cn);
+`ifndef M3_R3B
+            d_be <= 8'hFF;
+`endif
             d_addr <= (bank ? DDR_P1 : DDR_P0) + 25'(pa[19:1]);
           end
           if (d_wacc) ci <= ci + 1'b1;

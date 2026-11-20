@@ -25,6 +25,9 @@
 // host's round-to-nearest -- the smallest denormal for a value strictly
 // between 2^-150 and 2^-149 (biased 873, fraction nonzero), else zero.
 //
+// stfs_en (PIPE = 1): the stfs registers load only where it is high, so the core can load them as it loads the
+// store's operand register (from that register's input) and have the word in the operand's first cycle.
+//
 // The 603e may take up to 24 cycles for a single denormal [603e 2.3.4.2].
 // PIPE = 0: one cycle of logic. lfs (count, shift, pack) measured 8.89 ns
 // from a register to a register, 0.56 ns over 120 MHz; PIPE = 1 registers the
@@ -37,6 +40,7 @@ module ppc_fpu_ldst #(
   input  logic [31:0] lfs_word,
   output logic [63:0] lfs_dbl,
   input  logic [63:0] stfs_dbl,
+  input  logic        stfs_en,     // PIPE: the stfs registers' load enable
   output logic [31:0] stfs_word
 );
 
@@ -62,7 +66,7 @@ module ppc_fpu_ldst #(
   generate if (PIPE) begin : g_pipe
     always_ff @(posedge clk) begin
       lw <= lfs_word;  llz <= llz0;  lden <= lden0;  lspc <= lspc0;
-      sd <= stfs_dbl;  scase <= scase0;  dsh <= dsh0;  sn873 <= s873;
+      if (stfs_en) begin sd <= stfs_dbl;  scase <= scase0;  dsh <= dsh0;  sn873 <= s873; end
     end
   end else begin : g_comb
     always_comb begin

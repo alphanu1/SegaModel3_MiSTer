@@ -50,7 +50,17 @@ module ppc_cpu
   parameter bit          FAST     = 1'b1,             // the single-precision unit (ppc_core FAST; 0: one FMA)
   parameter bit          EWL      = 1'b0,             // the early word as four ways and the way (ppc_core EWL, R140; 1: +119 ALUTs)
   parameter bit          WV       = 1'b1,             // the data cache's write-validate (ppc_dcache WV, study D-60): m_wbe carries a cast-out's lanes
-  parameter bit          RPE      = 1'b1              // a data micro-TLB miss refetched as its translation starts (ppc_core RPE, D-60)
+  parameter bit          RPE      = 1'b1,             // a data micro-TLB miss refetched as its translation starts (ppc_core RPE, D-60)
+  parameter bit          F1S      = 1'b1,             // stfs in one EX cycle (ppc_core F1S, R174)
+  parameter bit          F1C      = 1'b1,             // fcmpu / fcmpo in one EX cycle (ppc_core F1C, R174)
+  // a data micro-TLB miss's load or store not refetched: made with its page pending (ppc_core RPX, ppc_dcache XLP;
+  // D-60, R174). PPC_NO_RPX (a bench define) builds without it, the system bench's comparison
+  parameter bit          RPX      =
+`ifdef PPC_NO_RPX
+                                      1'b0
+`else
+                                      1'b1
+`endif
 )(
   input  logic        clk,
   input  logic        rst,
@@ -113,7 +123,12 @@ module ppc_cpu
   output logic [3:0]  t_dbe,
   output logic [31:0] t_dwdata,
   output logic        t_drsv,
-  output logic        t_dcnd
+  output logic        t_dcnd,
+  output logic        t_dxlp,        // RPX: the request's page is pending; its page or its drop (verification)
+  output logic        t_dxgo,
+  output logic        t_dxcan,
+  output logic [19:0] t_dxpa,
+  output logic [3:0]  t_dxwimg
 );
 
   // ------------------------------------------------------------ the core
@@ -138,8 +153,11 @@ module ppc_cpu
   logic        icbi_req, icbi_ack;
   logic [6:0]  icbi_set;
   logic        d_resv, d_cond, res_kill;
+  logic        d_xlp, d_xgo, d_xcan;
+  logic [19:0] d_xpa;
+  logic [3:0]  d_xwimg;
 
-  ppc_core #(.RPE (RPE), .RESET_PC (RESET_PC), .PVR (PVR), .PVR2 (PVR2), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA), .LU2 (LU2), .FAST (FAST), .EWL (EWL)) u_core (
+  ppc_core #(.RPE (RPE), .RPX (RPX), .F1S (F1S), .F1C (F1C), .RESET_PC (RESET_PC), .PVR (PVR), .PVR2 (PVR2), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA), .LU2 (LU2), .FAST (FAST), .EWL (EWL)) u_core (
     .clk (clk), .rst (rst), .pvr_alt (pvr_alt),
     .i_req (i_req), .i_addr (i_addr), .i_wimg (i_wimg), .i_seq (i_seq), .i_valid (i_valid), .i_data (i_data),
     .i_way (i_way), .i_arr (i_arr), .i_pa (i_pa), .i_pv (i_pv), .i_pidx (i_pidx), .i_pway (i_pway), .i_ppa (i_ppa),
@@ -148,6 +166,7 @@ module ppc_cpu
     .d_wimg (d_wimg), .d_op (d_op), .d_rdy (d_rdy), .d_idle (d_idle), .d_valid (d_valid), .d_rdata (d_rdata),
     .d_eword (d_eword), .d_eok (d_eok), .d_ew4 (d_ew4), .d_epw (d_epw),
     .d_resv (d_resv), .d_cond (d_cond), .res_kill (res_kill),
+    .d_xlp (d_xlp), .d_xgo (d_xgo), .d_xcan (d_xcan), .d_xpa (d_xpa), .d_xwimg (d_xwimg),
     .hid_ice (hid_ice), .hid_dce (hid_dce), .hid_ilock (hid_ilock), .hid_dlock (hid_dlock),
     .hid_icfi (hid_icfi), .hid_dcfi (hid_dcfi), .hid_noopti (hid_noopti),
     .icbi_req (icbi_req), .icbi_set (icbi_set), .icbi_ack (icbi_ack),
@@ -169,6 +188,11 @@ module ppc_cpu
   assign t_dwdata = d_wdata;
   assign t_drsv   = d_resv;
   assign t_dcnd   = d_cond;
+  assign t_dxlp   = d_xlp;
+  assign t_dxgo   = d_xgo;
+  assign t_dxcan  = d_xcan;
+  assign t_dxpa   = d_xpa;
+  assign t_dxwimg = d_xwimg;
 
   // ------------------------------------------------------------ the caches
   logic        im_req, im_ack, im_rvalid;
@@ -192,13 +216,14 @@ module ppc_cpu
     .t_alloc (), .t_alloc_set (), .t_alloc_way (), .t_alloc_tag ()
   );
 
-  ppc_dcache #(.SNOOP (SNOOP), .EARLY (LU2), .WV (WV)) u_dc (
+  ppc_dcache #(.SNOOP (SNOOP), .EARLY (LU2), .WV (WV), .XLP (RPX)) u_dc (
     .clk (clk), .rst (rst),
     .d_req (d_req), .d_we (d_we), .d_addr (d_addr), .d_be (d_be), .d_wdata (d_wdata), .d_wimg (d_wimg),
     .d_op (d_op), .d_rdy (d_rdy), .d_valid (d_valid), .d_rdata (d_rdata), .d_eword (d_eword), .d_eok (d_eok), .d_ew4 (d_ew4), .d_epw (d_epw),
     .hid_dce (hid_dce), .hid_dlock (hid_dlock), .hid_dcfi (hid_dcfi), .hid_noopti (hid_noopti),
     .dcfi_ack (), .d_idle (d_idle),
-    .d_rsv (d_resv), .res_kill (res_kill), .sn_req (sn_req), .sn_addr (sn_addr), .sn_inv (sn_inv), .sn_ack (sn_ack),
+    .d_rsv (d_resv), .d_xlp (d_xlp), .d_xgo (d_xgo), .d_xcan (d_xcan), .d_xpa (d_xpa), .d_xwimg (d_xwimg),
+    .res_kill (res_kill), .sn_req (sn_req), .sn_addr (sn_addr), .sn_inv (sn_inv), .sn_ack (sn_ack),
     .m_req (dm_req), .m_cmd (dm_cmd), .m_addr (dm_addr), .m_be (dm_be), .m_wdata (dm_wdata), .m_wbe (dm_wbe),
     .m_ack (dm_ack), .m_wnext (dm_wnext), .m_rvalid (dm_rvalid), .m_rdata (m_rdata),
     .t_alloc (), .t_alloc_set (), .t_alloc_way (), .t_alloc_tag ()
