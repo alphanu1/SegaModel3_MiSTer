@@ -254,6 +254,10 @@ module ppc_core
 
   input  logic        tb_tick,      // timebase / decrementer enable (bus clock / 4)
   input  logic        ext_int,      // external interrupt, level, active high (603e INT, 4.5.5)
+  // cpu78 (the frame-busy build's overlay): dec_wr is high the clock after an mtdec, while dec_val (DEC itself)
+  // holds the value written. Unconnected outside the frame-busy build, where synthesis removes the flop
+  output logic        dec_wr,
+  output logic [31:0] dec_val,
 
   // performance events, one bit each per cycle, for rtl/dbg/m3_cpu_mon.sv:
   //   0 instruction retired   1 uop retired     2 decode starved (fetch)
@@ -4718,6 +4722,8 @@ module ppc_core
 `endif
   wire        m_ok   = m_okb && m_dvok;
   wire [31:0] dec_nx = (m_ok && m.dec_we) ? m.sprv : tb_tick ? dec_q - 32'd1 : dec_q;
+  always_ff @(posedge clk) dec_wr <= !rst && m_ok && m.dec_we;
+  assign dec_val = dec_q;
   always_ff @(posedge clk) begin
     if (rst) begin
       cr_q  <= 32'd0;
