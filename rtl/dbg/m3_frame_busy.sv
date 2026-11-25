@@ -79,7 +79,13 @@ module m3_frame_busy #(
   input  logic        r3_drop,        // a pulse: r3d_cmd dropped a submitted frame at a flip
   input  logic        r3_swap,        // a pulse: a draw began (the swap)
   input  logic        r3_swait,       // r3d_cmd's sw_wait
-  output logic [31:0] o3_r3d
+  output logic [31:0] o3_r3d,
+  // cpu78: the decrementer reload, for row 6's third value: the first value the CPU wrote to DEC (mtdec) after each
+  // second's latch, held until the next second has one (Sega Rally 2's frame pacing rests on the reload it measures
+  // at boot, 6AC20-6AD00, and its vblank handler writes it every frame at 78714)
+  input  logic        dec_wr,         // ppc_core: high the clock after an mtdec
+  input  logic [31:0] dec_val,        // DEC, the value written while dec_wr is high
+  output logic [31:0] o_dec
 );
 
   // one video frame in units of 256 clocks, and the bins' edges
@@ -170,6 +176,12 @@ module m3_frame_busy #(
         rdn <= 8'd0; rsn <= 8'd0; rswx <= 16'd0;
       end
     end
+  end
+  logic        dec_arm;                // no DEC write taken yet this second
+  always_ff @(posedge clk) begin
+    if (rst) begin dec_arm <= 1'b1; o_dec <= 32'd0; end
+    else if (dec_wr && dec_arm) begin dec_arm <= 1'b0; o_dec <= dec_val; end
+    else if (tick) dec_arm <= 1'b1;
   end
   always_ff @(posedge clk) begin
     tick <= (sec == 27'(CLK_HZ - 1));

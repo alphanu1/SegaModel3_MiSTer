@@ -1,5 +1,20 @@
 # Handoff
 
+## Update (2026-11-25)
+
+`main` takes branch `sr2-dec-readout`: the frame-time overlay (M3_FBUSY_BUILD only) shows the last value the CPU
+wrote to DEC, row 6's third value, latched once a second (`cmdec_s1`, eeec1604; one flop in ppc_core, 33 in
+m3_frame_busy). Release builds are unchanged.
+
+Board (cmdec_s1, Sega Rally 2, a full lap): the game writes 0x00043711 every frame, the same as a clean boot on the
+bench, so the board does not calibrate short (D-78 corrected). With the CPI items and PRX the start line holds
+51-58 fps but for one second at 38; its long frames (up to 1.6 vblank outside the DMA calls) are unexplained, with no
+Real3D drop or hold. The two race slowdowns (FPS 29-50) are the Real3D dropping 7-28 frames a second while every CPU
+frame is under 0.9 vblank. Readings in `sm3-builds/c135/NOTES.md`.
+
+Under way (D-80): closing the setup slack at 130 MHz in `sm3-builds/tc130/` (about -3.8 ns over some 15,500
+endpoints), then 135 and 140 again. Model3.rbf on the board is cmdec_s1.
+
 ## Update (2026-11-20)
 
 `main` takes branch `cpu-r3d-130` with a `--no-ff` merge: the RTL of `cxp130_s1` (ac2e1b55), board-tested.

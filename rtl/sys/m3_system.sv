@@ -470,13 +470,15 @@ module m3_system
   localparam bit FB_ON  = FBUSY   && (!RELEASE || FBDBG);
   localparam bit XC_ON  = XCAP    && OV_ON && !RELEASE;
 
+  logic             cpu_dec_wr;           // cpu78: an mtdec (a clock late) and DEC, for the frame-busy overlay
+  logic [31:0]      cpu_dec_val;
   ppc_cpu #(.PVR(PVR), .PVR2(PVR2), .ISB(ISB), .WV(CPU_WV), .RPE(CPU_RPE)) u_cpu (
     .clk, .rst(rst_cpu), .pvr_alt(step2),
     .m_req(m_req[0]), .m_cmd(m_cmd[0]), .m_addr(m_addr[0]), .m_be(m_be[0]), .m_wdata(m_wdata[0]), .m_wbe(m_wbe[0]),
     .m_ack(m_ack[0]), .m_wnext(m_wnext[0]), .m_rvalid(m_rvalid[0]), .m_rdata,
     // the D-cache snoop (D-41): the 53C810's RAM accesses, from m3_bus
     .sn_req, .sn_addr, .sn_inv, .sn_ack,
-    .tb_tick, .ext_int, .ev(cpu_ev), .ev_mmu(cpu_ev_mmu), .ev_btb(),
+    .tb_tick, .ext_int, .dec_wr(cpu_dec_wr), .dec_val(cpu_dec_val), .ev(cpu_ev), .ev_mmu(cpu_ev_mmu), .ev_btb(),
     .rt_valid, .rt_last(), .rt_pc, .rt_insn(rt_insn_o), .rt_gpr_we, .rt_gpr, .rt_gpr_sh,
     .rt_irq(rt_irq), .rt_gpr_val,
     .rt_cr(), .rt_xer(), .rt_lr(rt_lr), .rt_ctr(), .rt_msr(rt_msr), .rt_srr0(rt_srr0), .rt_srr1(rt_srr1), .rt_fpscr(), .rt_fpq(),
@@ -1209,7 +1211,7 @@ module m3_system
   assign d_we[0] = 1'b0; assign d_din[0] = '0; assign d_be[0] = 8'hFF;
 
   // the CPU's busy time per frame (R104): vblank to the first retirement in a wait loop
-  logic [31:0] fb_mm, fb_lo, fb_hi, fb_last, fb3_mm, fb3_long, fb3_sum, fb3_r3d;
+  logic [31:0] fb_mm, fb_lo, fb_hi, fb_last, fb3_mm, fb3_long, fb3_sum, fb3_r3d, fb_dec;
   logic        r3_swait;
   generate if (FB_ON) begin : g_fbusy
     // the windows by game: Sega Rally 2 is the driving profile's Step 2.0 set (configuration step 20, input profile
@@ -1219,10 +1221,11 @@ module m3_system
     m3_frame_busy #(.CLK_HZ(CLK_HZ)) u_fbusy (.clk, .rst, .vblank_start, .game(fb_game), .rt_valid, .rt_pc,
       .o_minmax(fb_mm), .o_bins_lo(fb_lo), .o_bins_hi(fb_hi), .o_last(fb_last),
       .o3_mm(fb3_mm), .o3_long(fb3_long), .o3_sum(fb3_sum),
-      .r3_drop(r3_dropp), .r3_swap(m3_swap), .r3_swait, .o3_r3d(fb3_r3d));
+      .r3_drop(r3_dropp), .r3_swap(m3_swap), .r3_swait, .o3_r3d(fb3_r3d),
+      .dec_wr(cpu_dec_wr), .dec_val(cpu_dec_val), .o_dec(fb_dec));
   end else begin : g_nofbusy
     assign fb_mm = '0; assign fb_lo = '0; assign fb_hi = '0; assign fb_last = '0;
-    assign fb3_mm = '0; assign fb3_long = '0; assign fb3_sum = '0; assign fb3_r3d = '0;
+    assign fb3_mm = '0; assign fb3_long = '0; assign fb3_sum = '0; assign fb3_r3d = '0; assign fb_dec = '0;
   end endgenerate
 
   logic [5:0]  ov_idx;
@@ -1245,7 +1248,9 @@ module m3_system
       // (the frame-busy build, R188: row 7 FBUSY's {min, max}, bands and, last, the longest frame's {DMA wait, the
       // rest}; row 6 {min, max} of the DMA wait and the DMA wait over the second; every other row 0)
       if (OV_MIN) ov_v <= (ov_idx == 6'd28) ? fb_mm : (ov_idx == 6'd29) ? fb_lo : (ov_idx == 6'd30) ? fb_hi :
-                          (ov_idx == 6'd31) ? fb3_long : (ov_idx == 6'd24) ? fb3_r3d : (ov_idx == 6'd25) ? fb3_sum : 32'd0;
+                          (ov_idx == 6'd31) ? fb3_long : (ov_idx == 6'd24) ? fb3_r3d : (ov_idx == 6'd25) ? fb3_sum :
+                          (ov_idx == 6'd26) ? fb_dec : 32'd0;
+      // (cpu78: row 6's third value is the first value the CPU wrote to DEC in the last second, held while none is)
       // (r3d75: row 6's first value is now the Real3D's {drops, swaps, longest swap wait}; the DMA wait's {min, max},
       // which it replaces, is left unread and so not built, which pays for most of it)
       else case (ov_idx)

@@ -86,6 +86,8 @@ module ppc_cpu
 
   input  logic        tb_tick,
   input  logic        ext_int,
+  output logic        dec_wr,       // cpu78: an mtdec, a clock late, and DEC (ppc_core)
+  output logic [31:0] dec_val,
   output logic [7:0]  ev,
   output logic [5:0]  ev_mmu,
   output logic [3:0]  ev_btb,
@@ -170,7 +172,7 @@ module ppc_cpu
     .hid_ice (hid_ice), .hid_dce (hid_dce), .hid_ilock (hid_ilock), .hid_dlock (hid_dlock),
     .hid_icfi (hid_icfi), .hid_dcfi (hid_dcfi), .hid_noopti (hid_noopti),
     .icbi_req (icbi_req), .icbi_set (icbi_set), .icbi_ack (icbi_ack),
-    .tb_tick (tb_tick), .ext_int (ext_int), .ev (ev), .ev_mmu (ev_mmu), .ev_btb (ev_btb),
+    .tb_tick (tb_tick), .ext_int (ext_int), .dec_wr (dec_wr), .dec_val (dec_val), .ev (ev), .ev_mmu (ev_mmu), .ev_btb (ev_btb),
     .rt_valid (rt_valid), .rt_last (rt_last), .rt_pc (rt_pc), .rt_insn (rt_insn),
     .rt_gpr_we (rt_gpr_we), .rt_gpr (rt_gpr), .rt_gpr_sh (rt_gpr_sh), .rt_irq (rt_irq), .rt_gpr_val (rt_gpr_val),
     .rt_cr (rt_cr), .rt_xer (rt_xer), .rt_lr (rt_lr), .rt_ctr (rt_ctr), .rt_msr (rt_msr),
