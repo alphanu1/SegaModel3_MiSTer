@@ -205,7 +205,7 @@ module r3d_recip (
     logic [1:0]  special;
     logic        tin;
   } out_t;
-  out_t        c1o, c10;
+  out_t        c1o, c9, c10;
   logic [23:0] m3, m8, m9, am7;
   logic        ge8, ge9;
   logic [5:0]  am8lo, am9lo;
@@ -213,7 +213,18 @@ module r3d_recip (
   r3d_dline #(.W(24), .D(3))  u_m3  (.clk, .en(1'b1), .d(c0.m), .q(m3));
   r3d_dline #(.W(25), .D(8))  u_m8  (.clk, .en(1'b1), .d({c0.m, c0.ge}), .q({m8, ge8}));
   r3d_dline #(.W(24), .D(7))  u_am7 (.clk, .en(1'b1), .d(c0.am), .q(am7));
-  r3d_dline #(.W(15), .D(9))  u_out (.clk, .en(1'b1), .d(c1o), .q(c10));
+  // r3d140: {v, s, re, special, tin} a stage shorter in the line and registered once more in ALMs with the
+  // exponent's tests for stage 11 (re and re + 1 below 1 or above 254): the block's output through re + 1, its
+  // compares and the result's select was the reciprocal's worst path at 140 MHz (u_out -> result, -0.60 ns)
+  r3d_dline #(.W(15), .D(8))  u_out (.clk, .en(1'b1), .d(c1o), .q(c9));
+  logic        r0_lo, r0_hi, r1_lo, r1_hi;      // re, re + 1: below 1 (flushed), 255 or more
+  always_ff @(posedge clk) begin
+    logic [9:0] r1;
+    r1 = c9.re + 10'd1;
+    c10 <= c9;
+    r0_lo <= c9.re[9] || c9.re == 10'd0; r0_hi <= !c9.re[9] && c9.re >= 10'd255;
+    r1_lo <= r1[9] || r1 == 10'd0;       r1_hi <= !r1[9] && r1 >= 10'd255;
+  end
   always_ff @(posedge clk) begin
     m9 <= m8; ge9 <= ge8;
     am8lo <= am7[5:0]; am9lo <= am8lo;
@@ -325,6 +336,13 @@ module r3d_recip (
     mq <= m8 * q0;
   end
 
+  // (r3d140) whether stage 11's pick carries into bit 24, for each pick, from Q0 here
+  logic        qc_up, qc_eq, qc_dn;
+  always_ff @(posedge clk) begin
+    logic [24:0] qa, qb;
+    qa = q09 + 25'd1; qb = q09 - 25'd1;
+    qc_up <= qa[24]; qc_eq <= q09[24]; qc_dn <= qb[24];
+  end
   // stage 10: compare M (2 Q0 +- 1) against T = A 2^(s+1), as the sign of
   // d -+ M with d = T - 2 M Q0. Q0 is within [-1, 0] of the rounded quotient,
   // so |d| <= 3 M < 2^26 and d is exact in 30 bits (the 51-bit sums and
@@ -343,24 +361,35 @@ module r3d_recip (
     dn10 <= dhi[29];
   end
 
-  // stage 11: pick Q0 - 1, Q0 or Q0 + 1, pack
+  // stage 11: pick Q0 - 1, Q0 or Q0 + 1, pack (r3d140: the carry into bit 24 and the exponent's tests from
+  // registers, chosen by the pick)
   always_ff @(posedge clk) begin
     logic [24:0] q;
     logic [9:0]  re;
+    logic        c, lo, hi;
     if (up10) q = q10 + 25'd1;
     else if (dn10) q = q10 - 25'd1;
     else q = q10;
+    c = up10 ? qc_up : dn10 ? qc_dn : qc_eq;
+`ifdef VERILATOR
+    if (c10.v && c != q[24]) $fatal(1, "r3d_recip: the pick's carry");
+`endif
     re = c10.re;
-    if (q[24]) begin q = q >> 1; re = re + 10'd1; end           // rounded up to 2^24
+    lo = c ? r1_lo : r0_lo; hi = c ? r1_hi : r0_hi;
+    if (c) begin q = q >> 1; re = re + 10'd1; end               // rounded up to 2^24
+`ifdef VERILATOR
+    if (c10.v && c10.special == 2'd0 && (lo != (re[9] || re == 10'd0) || (!lo && hi != (re >= 10'd255))))
+      $fatal(1, "r3d_recip: the exponent's tests registered");
+`endif
     out_valid <= c10.v;
-    tiny <= c10.v && (c10.tin || (c10.special == 2'd0 && (re[9] || re == 10'd0)));
+    tiny <= c10.v && (c10.tin || (c10.special == 2'd0 && lo));
     case (c10.special)
       2'd1: result <= {c10.s, 8'hff, 23'd0};
       2'd2: result <= {c10.s, 31'd0};
       2'd3: result <= 32'h7fc0_0000;
       default:
-        if (re[9] || re == 10'd0) result <= {c10.s, 31'd0};      // below 2^-126: flushed
-        else if (re >= 10'd255) result <= {c10.s, 8'hff, 23'd0};
+        if (lo) result <= {c10.s, 31'd0};                         // below 2^-126: flushed
+        else if (hi) result <= {c10.s, 8'hff, 23'd0};
         else result <= {c10.s, re[7:0], q[22:0]};
     endcase
   end

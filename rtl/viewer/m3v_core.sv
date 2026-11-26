@@ -113,7 +113,7 @@ module m3v_core #(
   logic [1:0][63:0] p_dout;
 
   m2_sdram #(.COL_BITS(COL_BITS), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL)) u_sdram (
-    .clk, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
+    .clk, .clk_cap(clk), .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm,
     .sd_dq_o, .sd_dq_oe, .sd_dq_i,
     .wr_req(ld_wr_req), .wr_addr(ld_wr_addr), .wr_din(ld_wr_din), .wr_be(ld_wr_be), .wr_ack(ld_wr_ack),

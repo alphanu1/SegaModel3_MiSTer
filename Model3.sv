@@ -121,8 +121,16 @@ localparam CONF_STR = {
 	// the SDRAM read capture (m2_sdram rd_lat_sel, n = CL + n), per controller, for the board's margin above 120 MHz
 	// (R184): change, then Reset
 	"O[74:73],SDRAM read capture,CL+2,CL+1,CL+3;",
+	// sys140: the DQ capture clock's phase in PLL steps of 149 ps (outclk_4 / outclk_5 stepped at run time: the
+	// read eye moved without moving the pin clock); change, then Reset
+	// sys140: the read capture's phase: Auto (each SDRAM calibrated at power-up) or a fixed offset in PLL steps of
+	// 149 ps from the generated phase, single steps over the band the timing covers (-8 to +14); change, then
+	// Reset. "SDRAM calibration: Show" puts the result in the FPS box. (t6 had O[79:77] in steps of 2.)
+	"O[88:84],SDRAM capture phase,Auto,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"O[83],SDRAM calibration,Hide,Show;",
 `ifdef M3_CPU_SDR2
 	"O[76:75],SDRAM2 read capture,CL+2,CL+1,CL+3;",
+	"O[93:89],SDRAM2 capture phase,Auto,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,-8,-7,-6,-5,-4,-3,-2,-1;",
 `endif
 `ifndef M3_NO_INPUTS
 	// the driving profile's lines (Scud Race, Daytona USA 2), shown only for it
@@ -178,9 +186,17 @@ wire [12:0] sd2_a;
 wire [15:0] sd2_dq_o;
 
 // WIDE: 16-bit ioctl words, the address rising by 2 (m3_loader)
+// sys140: hps_io runs on clk_hps (outclk_6, 70 MHz: clk_sys / 2 from the same VCO, rising with every other edge of
+// clk_sys), so the framework's command side (sys_top's configuration, both OSDs' HPS side, video_calc) runs there,
+// as it does in cores whose clk_sys is slower: at 140 MHz those paths failed by up to 2.7 ns, and sys/ stays stock.
+// Every path between clk_hps and clk_sys is timed (one PLL, a whole ratio); the download's words are taken into
+// clk_sys below.
+wire        hio_download, hio_wr;
+wire [15:0] hio_index, hio_dout;
+wire [26:0] hio_addr;
 hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 (
-	.clk_sys(clk_sys),
+	.clk_sys(clk_hps),
 	.HPS_BUS(HPS_BUS),
 	.EXT_BUS(),
 	.gamma_bus(),
@@ -202,21 +218,54 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	// the force feedback request (Template 76dd8f5; FFB 0): no drive board yet
 	.joystick_0_ffb(56'd0), .joystick_1_ffb(56'd0), .joystick_2_ffb(56'd0),
 	.joystick_3_ffb(56'd0), .joystick_4_ffb(56'd0), .joystick_5_ffb(56'd0),
-	.ioctl_download(ioctl_download),
-	.ioctl_index(ioctl_index),
-	.ioctl_wr(ioctl_wr),
-	.ioctl_addr(ioctl_addr),
-	.ioctl_dout(ioctl_dout),
+	.ioctl_download(hio_download),
+	.ioctl_index(hio_index),
+	.ioctl_wr(hio_wr),
+	.ioctl_addr(hio_addr),
+	.ioctl_dout(hio_dout),
 	.ioctl_wait(ioctl_wait)
 );
+
+// the download into clk_sys: each word's fields registered beside its strobe, and the strobe (one clk_hps cycle, so
+// two of clk_sys) taken as one clk_sys pulse at its first clock; hps_io's strobes are far apart (a word every few
+// HPS register writes), and its fields hold from before the strobe to the next. ioctl_wait goes back unregistered
+// (m3_loader gates it on ioctl_download, a clock later than hps_io's own)
+reg        io_wr_q = 1'b0, io_wr_d = 1'b0;
+reg        io_dl_q = 1'b0;
+reg [15:0] io_ix_q, io_do_q;
+reg [26:0] io_a_q;
+always @(posedge clk_sys) begin
+	io_wr_q <= hio_wr; io_wr_d <= io_wr_q;
+	io_dl_q <= hio_download; io_ix_q <= hio_index; io_a_q <= hio_addr; io_do_q <= hio_dout;
+end
+assign ioctl_wr       = io_wr_q & ~io_wr_d;
+assign ioctl_download = io_dl_q;
+assign ioctl_index    = io_ix_q;
+assign ioctl_addr     = io_a_q;
+assign ioctl_dout     = io_do_q;
 
 ///////////////////////   CLOCKS   ///////////////////////////////
 
 // The PLL is named `pll`: sys_top.sdc's clock groups match it by that name.
-wire clk_sys;        // 125 MHz (D-69), everything (outclk_1; outclk_0 is the CPU test's 20 MHz)
-wire clk_sdr;        // outclk_2: clk_sys's rate, 0.5 ns before its 180 degrees (3500 ps at 125 MHz): SDRAM_CLK's DDIO
-wire clk_sdr2;       // outclk_3: 0.75 ns before (3250 ps at 125 MHz): SDRAM2_CLK's DDIO (m3_sdr_clk below; R187)
+// sys140 (D-81): every output from one VCO at 840 MHz (the phase step 148.8 ps, 48 to a 140 MHz period). The IP
+// tool's physical parameters are on (M 84, N 5, C 42 / 6 x5 / 12) to hold it there: with them off the tool picks the
+// VCO from the phases asked for, and 1488 / 1190 / 3273 ps (all multiples of 297.6 ps) gave 420 MHz, steps of
+// 297.6 ps and a period of 24 of them, which m3_sdr_cal's NSTEP 48 does not describe (the board's 99 / 18, R198).
+// The calibration's NSTEP / BAND and the stepper's modulo below follow this VCO: change them together.
+wire clk_sys;        // outclk_1: 140 MHz, everything (outclk_0 is the CPU test's 20 MHz)
+wire clk_sdr;        // outclk_2: 140 MHz at 3273 ps: SDRAM_CLK's DDIO, set for the commands and writes
+wire clk_sdr2;       // outclk_3: 140 MHz at 3273 ps: SDRAM2_CLK's DDIO, likewise (m3_sdr_clk below; R187)
+wire clk_cap1;       // outclk_4: 140 MHz at 1488 ps: the first SDRAM's DQ input registers (m2_sdram CAPCLK)
+wire clk_cap2;       // outclk_5: 140 MHz at 1190 ps: the second's
+wire clk_hps;        // outclk_6: 70 MHz: hps_io and the framework's command side, and CLK_VIDEO
 wire pll_locked;
+wire       ps_done;
+reg        ps_en = 1'b0, ps_up = 1'b0;
+reg  [4:0] ps_cnt = 5'd4;
+reg  [5:0] ps_off1 = 6'd0, ps_off2 = 6'd0;      // the offsets applied, modulo 48
+reg  [1:0] ps_st = 2'd0;
+reg  [2:0] ps_lk = 3'b000;
+reg  [5:0] ps_to = 6'd0;                        // a step's time-out (phase_done never seen low)
 pll pll
 (
 	.refclk(CLK_50M),
@@ -225,8 +274,50 @@ pll pll
 	.outclk_1(clk_sys),
 	.outclk_2(clk_sdr),
 	.outclk_3(clk_sdr2),
-	.locked(pll_locked)
+	.outclk_4(clk_cap1),
+	.outclk_5(clk_cap2),
+	.outclk_6(clk_hps),
+	.locked(pll_locked),
+	.phase_en(ps_en), .scanclk(clk_hps), .updn(ps_up), .cntsel(ps_cnt), .phase_done(ps_done)
 );
+
+// sys140: the capture clocks' phases, one PLL step at a time through the dynamic phase port (altera_pll: cntsel the
+// counter, updn 1 later, phase_en a pulse, phase_done low until the step is done), on clk_hps (70 MHz, under
+// scanclk's 100 MHz). The targets are m3_system's (cap1_off / cap2_off: 0-47 steps from the generated phase, a
+// period being 48 steps of 148.8 ps at 140 MHz from 840 MHz): the calibration's sweep and choice, or the OSD's
+// manual offset. Each counter's applied offset is kept modulo 48 and reset to 0 when the PLL locks (a relock
+// restores the generated phases); each step goes the shorter way round. capN_settled: the counter is at its target
+// and the stepper is idle (registered on clk_hps; m3_system waits 16 clocks after a change before it reads it).
+wire [5:0] ps_t1, ps_t2;                         // m3_system's targets (clk_sys registers)
+reg        ps_set1 = 1'b0, ps_set2 = 1'b0;
+// the shorter way from o to t, modulo 48: up when (t - o) mod 48 is 1-24
+function automatic logic ps_upw(input logic [5:0] t, input logic [5:0] o);
+	logic [6:0] d;
+	d = (t >= o) ? {1'b0, t - o} : 7'({1'b0, t} + 7'd48 - {1'b0, o});
+	ps_upw = d <= 7'd24;
+endfunction
+function automatic logic [5:0] ps_inc(input logic [5:0] o, input logic up);
+	ps_inc = up ? ((o == 6'd47) ? 6'd0 : o + 6'd1) : ((o == 6'd0) ? 6'd47 : o - 6'd1);
+endfunction
+always @(posedge clk_hps) begin
+	ps_lk <= {ps_lk[1:0], pll_locked};
+	ps_en <= 1'b0;
+	ps_set1 <= (ps_st == 2'd0) && (ps_off1 == ps_t1);
+	ps_set2 <= (ps_st == 2'd0) && (ps_off2 == ps_t2);
+	if (!ps_lk[2]) begin ps_st <= 2'd0; ps_off1 <= 6'd0; ps_off2 <= 6'd0; ps_set1 <= 1'b0; ps_set2 <= 1'b0; end
+	else case (ps_st)
+		2'd0: if (ps_off1 != ps_t1) begin
+				ps_cnt <= 5'd4; ps_up <= ps_upw(ps_t1, ps_off1); ps_en <= 1'b1; ps_st <= 2'd1;
+				ps_off1 <= ps_inc(ps_off1, ps_upw(ps_t1, ps_off1)); ps_set1 <= 1'b0;
+			end else if (ps_off2 != ps_t2) begin
+				ps_cnt <= 5'd5; ps_up <= ps_upw(ps_t2, ps_off2); ps_en <= 1'b1; ps_st <= 2'd1;
+				ps_off2 <= ps_inc(ps_off2, ps_upw(ps_t2, ps_off2)); ps_set2 <= 1'b0;
+			end
+		2'd1: begin ps_en <= 1'b1; ps_st <= 2'd2; ps_to <= 6'd0; end   // phase_en two scanclk cycles
+		2'd2: begin ps_to <= ps_to + 6'd1; if (!ps_done || &ps_to) ps_st <= 2'd3; end   // the step under way
+		2'd3: if (ps_done) ps_st <= 2'd0;                           // done
+	endcase
+end
 
 // The system clock (outclk_1). A diagnostic build at another rate changes this
 // and the PLL's outclk_1 / outclk_2 / outclk_3 together; m3_system derives every
@@ -238,7 +329,13 @@ pll pll
 // (R187: the second SDRAM's read setup wants its clock earlier than the first's
 // fast-corner read hold allows).
 // D-69 as decided on 2026-11-14: 125 MHz everywhere, c125's clock (outclk_1 125 MHz).
-localparam int SYS_HZ = 130_000_000;
+// sys140 (D-81): 140 MHz everywhere. The pin clocks are no longer set for the reads: each SDRAM's DQ is taken in
+// by a clock of its own (clk_cap1 / clk_cap2), so the pin clock is set for the commands and writes alone (their
+// setup at least c130ddpa_s1's, the board build at 130) and the capture clock puts the read eye where the board
+// builds at 130 and 135 read (sm3-builds/sys140/NOTES.md). tRCD / tRP 3 clocks (15 ns), one more register after
+// each DQ input register, one register stage on the DDR3 port's commands (m3_system SDR_CAPCLK, SDR_CAPPIPE,
+// DDR_OREG).
+localparam int SYS_HZ = 140_000_000;
 
 // memory: out of reset on PLL lock, and stays out (study rules)
 reg [2:0] mem_rst_s = 3'b000;
@@ -294,9 +391,10 @@ wire [2:0] sdr_cap2 = 3'd2;
 m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN), .SDR_BXOR(1'b1), .SDR_L16(1'b1), .SDR_LW1(1'b1),
             .SDR_PAIR(1'b1), .SDR_PW(1'b1),
             .BUS_FAST(1'b1), .BUS_R3P(1'b1), .SDR_FREQ(1'b1), .SDR_FWD(1'b1), .SDR_FDSP(1'b1),
-            .SDR_PW_DLY(8), .ISB(1'b1), .W2(CPU_SDR2)) sys3
+            .SDR_PW_DLY(8), .ISB(1'b1), .W2(CPU_SDR2), .SDR_CAPCLK(1'b1), .SDR_CAPPIPE(1'b1), .DDR_OREG(1'b1), .SDR_OPIPE(1'b1), .SDR2_CAPX(1),
+            .SDR_CAL(1'b1)) sys3
 (
-	.clk(clk_sys), .mem_rst_n(mem_rst_n), .reset(RESET | status[0] | buttons[1]),
+	.clk(clk_sys), .clk_cap1(clk_cap1), .clk_cap2(clk_cap2), .mem_rst_n(mem_rst_n), .reset(RESET | status[0] | buttons[1]),
 	.ioctl_download(ioctl_download), .ioctl_index(ioctl_index), .ioctl_wr(ioctl_wr),
 	.ioctl_addr(ioctl_addr), .ioctl_dout(ioctl_dout), .ioctl_wait(ioctl_wait),
 	.rd_lat_sel(sdr_cap1),                   // OSD: CL+2 (the default: Model 2's board value, its R411), CL+1, CL+3
@@ -317,6 +415,13 @@ m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN
 	.st_wheel(status[71:70]), .inp_drive(inp_drive),
 	.audio_l(snd_l), .audio_r(snd_r), .snd_vol(status[7:6]),
 	.led(run_led), .uart_tx(UART_TXD), .tb_fast(1'b0),
+	.cap1_off(ps_t1), .cap2_off(ps_t2), .cap1_settled(ps_set1), .cap2_settled(ps_set2), .cap1_osd(status[88:84]),
+`ifdef M3_CPU_SDR2
+	.cap2_osd(status[93:89]),
+`else
+	.cap2_osd(5'd0),
+`endif
+	.cal_show(status[83]),
 	.rom_loaded(), .frame(), .tr_v(), .tr_master(), .tr_we(), .tr_addr(), .tr_be(), .tr_data(),
 	.ev_v(), .ev_kind(), .ev_data(),
 	.rt_valid_o(), .rt_pc_o(), .rt_insn_o(), .rt_gpr_we_o(), .rt_gpr_o(), .rt_gpr_sh_o(), .rt_gpr_val_o()
@@ -344,14 +449,26 @@ assign SDRAM2_nWE  = sd2_we_n;
 m3_sdr_clk #(.INV(1'b0)) u_sdclk2 (.clk(clk_sdr2), .pin(SDRAM2_CLK));
 `endif
 
-assign CLK_VIDEO = clk_sys;
-assign CE_PIXEL  = ce_pix;
-assign VGA_R  = v_r;
-assign VGA_G  = v_g;
-assign VGA_B  = v_b;
-assign VGA_HS = v_hs;
-assign VGA_VS = v_vs;
-assign VGA_DE = ~(v_hb | v_vb);
+// sys140: the video into clk_hps (70 MHz), so the framework's video side (ascal's input, both OSDs, the scanlines,
+// video_calc) runs there: at 140 MHz ascal's input side alone failed by 2.1 ns. Each pixel's fields are taken at
+// its ce_pix (pixels are 8.75 clk_sys clocks apart at 16 MHz) and its enable stretched over the next two clk_sys
+// clocks, of which exactly one ends at an edge of clk_hps, so clk_hps sees each pixel once, with its fields held.
+// 1.5 to 2.5 clk_sys clocks (11-18 ns) more on the way out, no frame.
+reg  [27:0] vq;
+reg  [1:0]  vce = 2'b00;
+always @(posedge clk_sys) begin
+	vce <= {vce[0], ce_pix};
+	if (ce_pix) vq <= {v_r, v_g, v_b, v_hs, v_vs, ~(v_hb | v_vb), 1'b0};
+end
+reg  [27:0] vh;
+reg         vh_ce = 1'b0;
+always @(posedge clk_hps) begin
+	vh_ce <= |vce;
+	vh    <= vq;
+end
+assign CLK_VIDEO = clk_hps;
+assign CE_PIXEL  = vh_ce;
+assign {VGA_R, VGA_G, VGA_B, VGA_HS, VGA_VS, VGA_DE} = vh[27:1];
 
 assign LED_USER = run_led;
 
@@ -405,6 +522,9 @@ pll pll
 	.outclk_1(clk_cpu),
 	.outclk_2(),
 	.outclk_3(),
+	.outclk_4(),
+	.outclk_5(),
+	.outclk_6(),
 	.locked(pll_locked)
 );
 

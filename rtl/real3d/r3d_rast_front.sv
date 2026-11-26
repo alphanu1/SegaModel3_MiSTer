@@ -23,7 +23,8 @@
 
 module r3d_rast_front #(
   parameter bit PRE_DIV = 1'b0,   // r3d_rast_div's PRE: the triangle holds a cycle before t_valid
-  parameter int TGW     = 8
+  parameter int TGW     = 8,
+  parameter int PB      = 2       // r3d_rast_edge's PB: product bits a cycle (1: on the walk's adders, study R131)
 ) (
   input  logic               clk,
   input  logic               rst,
@@ -76,7 +77,7 @@ module r3d_rast_front #(
     .o_s12(d_s12), .o_s13(d_s13), .o_s23(d_s23)
   );
 
-  r3d_rast_edge #(.TGW(TGW)) u_edge (
+  r3d_rast_edge #(.TGW(TGW), .PB(PB)) u_edge (
     .clk, .rst,
     .t_valid(d_valid), .t_ready(d_ready),
     .t_x1(d_x1), .t_y1(d_y1), .t_x2(d_x2), .t_y2(d_y2), .t_x3(d_x3), .t_y3(d_y3),

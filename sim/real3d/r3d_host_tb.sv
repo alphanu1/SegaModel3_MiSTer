@@ -104,7 +104,7 @@ module r3d_host_tb #(
   logic [1:0][1:0]  p_be;
   logic [1:0][63:0] p_dout;
   m2_sdram #(.COL_BITS(COL_BITS), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(1'b1), .MASK_ON_A(1'b1), .BXOR(BXOR)) u_sdram (
-    .clk, .rst_n(mem_rst_n), .ready(sd_ready), .rd_lat_sel,
+    .clk, .clk_cap(clk), .rst_n(mem_rst_n), .ready(sd_ready), .rd_lat_sel,
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm, .sd_dq_o, .sd_dq_oe, .sd_dq_i,
     .wr_req(1'b0), .wr_addr('0), .wr_din('0), .wr_be('0), .wr_ack(),
     .p_req, .p_we, .p_addr, .p_din, .p_be, .p_dout, .p_ack, .p_long(2'b00), .p_lo,

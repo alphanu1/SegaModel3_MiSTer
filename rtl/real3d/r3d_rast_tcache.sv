@@ -259,14 +259,21 @@ module r3d_rast_tcache #(
   logic [RW-1:0] a_row [4];
 
   // the first missing bank, one-hot
+  // (r3d140: the missing banks as a register from their next value, a_use && !a_ok && !a_hit as A will stand: C's
+  // pixel's on a_go, the allocation's line marked done on alloc. The terms ran through mneed into a_done and a_go,
+  // which fan out into A's 176 row bits and every A enable, a_hit -> a_row 141 endpoints at -2.24 ns in the 140 MHz
+  // full fit, and through the first bank's select into the fill queue's word.)
   logic [3:0]    miss, mbh;
   logic [1:0]    mb;
   always_comb begin
-    for (int b = 0; b < 4; b++) miss[b] = a_use[b] && !a_ok[b] && !a_hit[b];
     mbh = miss & (~miss + 4'd1);
     mb = mbh[0] ? 2'd0 : mbh[1] ? 2'd1 : mbh[2] ? 2'd2 : 2'd3;
   end
   wire mneed = miss != 4'd0;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && a_v) for (int b = 0; b < 4; b++)
+    if (miss[b] != (a_use[b] && !a_ok[b] && !a_hit[b])) $fatal(1, "tcache: the misses registered");
+`endif
   logic [WB-1:0] way_e [4];
   always_comb for (int b = 0; b < 4; b++) way_e[b] = a_ok[b] ? a_way[b] : a_hway[b];
   logic [WB-1:0] rr, vic;
@@ -357,10 +364,23 @@ module r3d_rast_tcache #(
   (* ramstyle = "MLAB, no_rw_check" *) logic [63:0] bb [4 * F];
   logic [FB+2:0] bb_wp, bb_rp;             // beats in, beats written (mod 8F: the buffer can be full)
   logic [1:0]    wk;
-  wire  [QW-1:0] fq_i = fq[iss_n[FB-1:0]];
-  wire  [QW-1:0] fq_r = fq[done_n[FB-1:0]];
-  assign f_req  = alloc_n != iss_n;
-  assign f_addr = fq_i[QW-1 -: 18];
+  // r3d140: the fill request from registers. f_a is the queue's word at the next clock's iss_n, read every clock, and
+  // the request is alloc_n a clock late against iss_n, so an entry is asked for once its word has been in the queue a
+  // clock: the queue's MLAB read was the request's address straight into the DDR3 port (fq -> f2sdram and iss_n ->
+  // the DDR3 controller's c_a, -2.49 / -2.10 ns in the 130 MHz full fits). A fill allocated into an empty queue is
+  // asked for a clock later than before; back-to-back fills go as before.
+  logic [NB-1:0] alloc_q;                  // alloc_n a clock late
+  logic [17:0]   f_a;
+  wire  [NB-1:0] iss_nx = iss_n + NB'(f_req && f_ack);
+  // (the reads declared in this order, fq_i first, fq_r's below: with fq_r's declared first Quartus 17's synthesis
+  // stops with an internal error, VRFX operators.cpp 2349, whatever reads them)
+  wire  [QW-1:0] fq_i = fq[iss_nx[FB-1:0]];
+  always_ff @(posedge clk) f_a <= fq_i[QW-1 -: 18];
+  assign f_req  = alloc_q != iss_n;
+  assign f_addr = f_a;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && f_req && f_a != fq[iss_n[FB-1:0]][QW-1 -: 18]) $fatal(1, "tcache: the request register");
+`endif
   always_ff @(posedge clk) if (f_rvalid) bb[bb_wp[FB+1:0]] <= f_rdata;
   // (fq_ne = alloc_n != done_n and bb_c = bb_wp - bb_rp as registers, kept with the counts they stand for:
   // the compare and the subtract ran through wr_go into done_n and the MLABs' read address it drives, the
@@ -371,6 +391,20 @@ module r3d_rast_tcache #(
   logic        gate_ok;
   wire         wr_go = fq_ne && (wk != 2'd0 || (beats4 && gate_ok));
   wire         fq_dn = wr_go && wk == 2'd3;     // a fill written: done_n moves
+  // (r3d140: the head fill's word registered too, read at the next clock's done_n: a fill is done on wk == 3, whose
+  // write is fq_ne alone, so the next index is registers only; the head's MLAB read was the data RAMs' write address
+  // and the gate's pixel compare, u_tc MLAB -> RAM, 222 endpoints at -2.64 ns in the 140 MHz full fit. A head's word
+  // is in the queue long before its fill's data is.)
+  wire  [NB-1:0] done_nx = done_n + NB'(fq_ne && wk == 2'd3);
+  wire  [QW-1:0] fq_rn = fq[done_nx[FB-1:0]];
+  logic [QW-1:0] fq_r;
+  always_ff @(posedge clk) fq_r <= fq_rn;
+`ifdef VERILATOR
+  // (a fill allocated into the head's place leaves fq_r a clock stale: the queue was empty, so every issued fill is
+  // written and the beat buffer is empty, and wr_go waits for four beats; so the word is right whenever it is used)
+  always_ff @(posedge clk) if (!rst && fq_ne && (wk != 2'd0 || beats4) && fq_r != fq[done_n[FB-1:0]])
+    $fatal(1, "tcache: the head's word registered");
+`endif
 `ifdef VERILATOR
   always_ff @(posedge clk) if (!rst && (fq_ne != (alloc_n != done_n) || bb_c != bb_wp - bb_rp)) $fatal(1, "tcache: fq_ne / bb_c");
 `endif
@@ -492,7 +526,7 @@ module r3d_rast_tcache #(
       l0_v <= 1'b0; c_v <= 1'b0; a_v <= 1'b0; o_valid <= 1'b0; r_v <= 1'b0; ph_v <= 1'b0; sk_v <= 1'b0;
       sw_nz <= 1'b1; hold_q <= 1'b1;
       w_v <= 1'b0; wq_v <= 1'b0; sw_q <= 1'b0; c_mw <= '0; c_mq <= '0;
-      alloc_n <= '0; iss_n <= '0; done_n <= '0; pix_n <= '0; rd_n <= '0; rd_n1 <= (DB+1)'(1);
+      alloc_n <= '0; iss_n <= '0; done_n <= '0; pix_n <= '0; rd_n <= '0; rd_n1 <= (DB+1)'(1); alloc_q <= '0;
       fq_full <= 1'b0; pf_full <= 1'b0; fq_ne <= 1'b0; bb_c <= '0;
       sw_n <= (SB+1)'(SETS); rr <= '0; bb_wp <= '0; bb_rp <= '0; wk <= 2'd0;
     end else begin
@@ -547,6 +581,10 @@ module r3d_rast_tcache #(
             a_ok[b] <= 1'b1; a_way[b] <= vic_c[b]; a_qb[b] <= 1'b1; a_wo[b] <= WAYS'(1) << vic_c[b];
           end
       end
+      // the misses' next value (A's banks as A will stand)
+      if (a_go) miss <= c_use & ~c_hit;
+      else if (sw_nz) ;
+      else if (alloc) miss <= miss & ~dup;
       // W, Wq
       w_v <= alloc; w_set <= a_set_mb; w_way <= vic; w_tg <= a_tag_mb; w_base <= a_rowe[mb];
       for (int b = 0; b < 4; b++) a_wm[b] <= a_go ? (set_of(c_ln[b]) == a_set_mb) : a_ss[b][mb];
@@ -564,6 +602,7 @@ module r3d_rast_tcache #(
       if (a_done) pix_n <= pix_n + 1'b1;
       // fills
       if (f_req && f_ack) iss_n <= iss_n + 1'b1;
+      alloc_q <= alloc_n;
       if (f_rvalid) bb_wp <= bb_wp + 1'b1;
       if (wr_go) begin
         bb_rp <= bb_rp + 1'b1;

@@ -102,7 +102,7 @@ module r3d_walker #(
     S_VPC_RD, S_VPC_GOT, S_VP_NEXT, S_VP_SEL, S_VP_W22, S_VP_W2, S_VP_EMIT,
     S_LINK, S_BLK_RD, S_BLK_RD2, S_BLK_GOT, S_BLK_XF, S_BLK_FRAME, S_BLK_L4, S_BLK_CQ, S_BLK_CW, S_BLK_SKIP,
     S_LST_START, S_LST_SCAN, S_LST_SCAN_GOT, S_LST_PUSH, S_LST_ENT,
-    S_RET, S_RET_POP, S_END
+    S_RET, S_RET_POP, S_END, S_RDQ
   } state_t;
 
   // ---- read helper -------------------------------------------------------
@@ -123,6 +123,16 @@ module r3d_walker #(
     rd_lo   = (rd_addr[31:20] == 12'h000);
     rd_past = (rd_hi ? &rd_addr[17:3] : &rd_addr[19:3]) && ({1'b0, rd_addr[2:0]} + {1'b0, rd_beat} >= 4'd8);
   end
+  // r3d140: a read's tests as registers, made in S_RD (a clock more a read, which then goes on in S_RDQ): the region
+  // test, the last-eight test, and each beat's past-the-end bit a beat ahead, with rbuf's index as a counter. The
+  // address's compares and the beat's add were in front of all 256 of rbuf's enables and data selects (rd_addr ->
+  // rbuf: 246 endpoints, -2.91 ns in the 140 MHz full fit)
+  logic        rd_okq, rd_l8q, rd_pq;
+  logic [2:0]  rd_idx;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && st == S_RD_DATA && (rd_pq != rd_past || rd_idx != rd_base + rd_beat))
+    $fatal(1, "walker: the read's tests registered");
+`endif
 
   // ---- walker state -------------------------------------------------------
   logic [1:0]  pass;
@@ -206,7 +216,7 @@ module r3d_walker #(
   assign {rs_tz, rs_top} = rs_mem[rs_spm1[RS_LOG2-1:0]];
 `ifdef VERILATOR
   always_ff @(posedge clk) if (!rst && rs_spm1 != rs_sp - 1'b1) $fatal(1, "walker: rs_spm1");
-  always_ff @(posedge clk) if (!rst && rs_sp != '0 && rs_tz != (rs_top[19:0] == 20'd0)) $fatal(1, "walker: rs_tz");
+  always_ff @(posedge clk) if (!rst && rs_sp != '0 && rs_tz != (rs_top[19:0] == (rs_top[45] ? 20'hF_FFFF : 20'd0))) $fatal(1, "walker: rs_tz");
 `endif
 
   // the FSM's three writes: push a block frame, push a list frame, step a list
@@ -219,14 +229,17 @@ module r3d_walker #(
       S_BLK_FRAME, S_BLK_SKIP: rs_we = 1'b1;
       S_LST_PUSH: begin
         rs_we = 1'b1;
-        rs_wd = {1'b1, 1'b0, lbase, lidx};
+        // (r3d140) a list frame holds its index less one, so S_RET's read address is the base plus the stored field
+        // (the decrement after the stack's MLAB was in front of the add and rd_addr: rs_mem -> rd_addr -0.60 /
+        // -0.72 ns standalone at 140 MHz); the flag is still index == 0
+        rs_wd = {1'b1, 1'b0, lbase, lidx - 20'd1};
         rs_wz = lidx == 20'd0;
       end
       S_RET: if (rs_sp != '0 && rs_top[45] && !rs_tz) begin
         rs_we = 1'b1;
         rs_wa = rs_spm1[RS_LOG2-1:0];
         rs_wd = {rs_top[45:20], rs_top[19:0] - 20'd1};
-        rs_wz = rs_top[19:0] == 20'd1;
+        rs_wz = rs_top[19:0] == 20'd0;
       end
       default: ;
     endcase
@@ -269,7 +282,14 @@ module r3d_walker #(
 
         // ---- read rd_len+1 words at rd_addr into rbuf, then go to rd_ret
         S_RD: begin
-          if (!(rd_hi || rd_lo)) begin
+          rd_okq <= rd_hi || rd_lo;
+          rd_l8q <= rd_hi ? &rd_addr[17:3] : &rd_addr[19:3];
+          rd_pq  <= 1'b0;                                  // beat 0 is never past the end (offset + 0 < 8)
+          rd_idx <= rd_base;
+          st <= S_RDQ;
+        end
+        S_RDQ: begin
+          if (!rd_okq) begin
             for (int k = 0; k < 8; k++) rbuf[k] <= 32'd0;
             rd_base <= 3'd0;
             st <= rd_ret;
@@ -285,7 +305,9 @@ module r3d_walker #(
         end
         S_RD_DATA: if (mem_rvalid) begin
           // a word past the end of its region reads as zero
-          rbuf[rd_base + rd_beat] <= rd_past ? 32'd0 : mem_rdata;
+          rbuf[rd_idx] <= rd_pq ? 32'd0 : mem_rdata;
+          rd_idx <= rd_idx + 3'd1;
+          rd_pq <= rd_l8q && ({1'b0, rd_addr[2:0]} + {1'b0, rd_beat} + 4'd1 >= 4'd8);
           rd_beat <= rd_beat + 3'd1;
           if (rd_beat == rd_len) begin st <= rd_ret; rd_base <= 3'd0; end
         end
@@ -462,7 +484,7 @@ module r3d_walker #(
             rs_sp <= rs_sp - 1'b1; rs_spm1 <= rs_spm1 - 1'b1;
             ldepth <= ldepth - 2'd1;
           end else begin                               // the port above steps the index
-            rd_addr <= {8'd0, rs_top[43:20]} + {12'd0, rs_top[19:0] - 20'd1};
+            rd_addr <= {8'd0, rs_top[43:20]} + {12'd0, rs_top[19:0]};
             rd_len <= 3'd0; rd_ret <= S_LST_ENT; st <= S_RD;
           end
         end

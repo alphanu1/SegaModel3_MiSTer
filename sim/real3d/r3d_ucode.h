@@ -7,26 +7,26 @@
 
 #pragma once
 namespace r3d_uc {
-constexpr unsigned K_MM = 0, LEN_MM = 60;
-constexpr unsigned K_MODEL = 21, LEN_MODEL = 116;
-constexpr unsigned K_TL = 62, LEN_TL = 150;
-constexpr unsigned K_PROJ = 200, LEN_PROJ = 75;
-constexpr unsigned K_TL3 = 254, LEN_TL3 = 118;
-constexpr unsigned K_PROJ1 = 359, LEN_PROJ1 = 63;
-constexpr unsigned K_PROJ3 = 377, LEN_PROJ3 = 71;
-constexpr unsigned K_CLIP = 423, LEN_CLIP = 60;
-constexpr unsigned K_ADD = 435, LEN_ADD = 15;
-constexpr unsigned K_SUB = 438, LEN_SUB = 15;
-constexpr unsigned K_MUL = 441, LEN_MUL = 15;
-constexpr unsigned K_DIV = 444, LEN_DIV = 20;
-constexpr unsigned K_COPYB = 447, LEN_COPYB = 18;
-constexpr unsigned K_CULLU = 453, LEN_CULLU = 57;
-constexpr unsigned K_CULLT = 462, LEN_CULLT = 43;
-constexpr unsigned K_SMFR = 469, LEN_SMFR = 119;
-constexpr unsigned K_SETUP4 = 493, LEN_SETUP4 = 116;
-constexpr unsigned K_SETUP2 = 575, LEN_SETUP2 = 110;
-constexpr unsigned K_SETUP44 = 630, LEN_SETUP44 = 168;
-constexpr unsigned K_SETUP22 = 780, LEN_SETUP22 = 119;
+constexpr unsigned K_MM = 0, LEN_MM = 64;
+constexpr unsigned K_MODEL = 21, LEN_MODEL = 124;
+constexpr unsigned K_TL = 62, LEN_TL = 151;
+constexpr unsigned K_PROJ = 200, LEN_PROJ = 79;
+constexpr unsigned K_TL3 = 256, LEN_TL3 = 126;
+constexpr unsigned K_PROJ1 = 361, LEN_PROJ1 = 67;
+constexpr unsigned K_PROJ3 = 379, LEN_PROJ3 = 75;
+constexpr unsigned K_CLIP = 426, LEN_CLIP = 64;
+constexpr unsigned K_ADD = 438, LEN_ADD = 16;
+constexpr unsigned K_SUB = 441, LEN_SUB = 16;
+constexpr unsigned K_MUL = 444, LEN_MUL = 16;
+constexpr unsigned K_DIV = 447, LEN_DIV = 21;
+constexpr unsigned K_COPYB = 450, LEN_COPYB = 19;
+constexpr unsigned K_CULLU = 456, LEN_CULLU = 61;
+constexpr unsigned K_CULLT = 465, LEN_CULLT = 46;
+constexpr unsigned K_SMFR = 472, LEN_SMFR = 126;
+constexpr unsigned K_SETUP4 = 496, LEN_SETUP4 = 123;
+constexpr unsigned K_SETUP2 = 578, LEN_SETUP2 = 117;
+constexpr unsigned K_SETUP44 = 633, LEN_SETUP44 = 169;
+constexpr unsigned K_SETUP22 = 783, LEN_SETUP22 = 126;
 constexpr unsigned R_MT = 0;
 constexpr unsigned R_CO = 8;
 constexpr unsigned R_PR = 12;

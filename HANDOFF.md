@@ -1,5 +1,24 @@
 # Handoff
 
+## Update (2026-11-26): where everything is
+
+`main` now carries the 140 MHz work that has run on my board: the system side with automatic SDRAM read calibration
+(R198, D-83) and the Real3D rework (R197), merged from `work-140`. The tree builds at 140 MHz (PLL at 840 MHz). Its
+RTL is the combo7 tree that ran VF3, Daytona 2 and Sega Rally 2 on Auto calibration (combo7b_s2; SDRAM1 +3 / 36,
+SDRAM2 +2 / 35). Timing is not closed (about -4.3 ns, CPU first, then Real3D): no release until it is (D-81).
+
+| Work | Where | State |
+|---|---|---|
+| 140 system side + calibration, Real3D rework | `main` | board-run at 140 |
+| CPU conversion port + iterative double front + step-1 guard (df4, R200, D-86) | branch `cpu-kit` (on `main`) | bench-proven; board test at 130 pending (df4_s1) |
+| CPU kit items 1b-1e | sm3-builds/kit (in progress) | |
+| 140 single-precision FPU | sm3-builds/sfpu (in progress) | |
+| The contributor's changes (D-84, D-85) | sm3-builds/picks (in progress) | |
+| Findings only: 130 closure (R194), ISA census (R195), CPU at 140 (R196), fork review, independent review | study + sm3-builds/{tc130,isa,cpu140,fork-review,review140} | |
+
+Rule from here: every agent's work is rebased onto `main` before it is tested on the board, and goes in on its own
+branch with a `--no-ff` merge once the board passes it. Nothing lives only in sm3-builds once it has passed.
+
 ## Update (2026-11-25)
 
 `main` takes branch `sr2-dec-readout`: the frame-time overlay (M3_FBUSY_BUILD only) shows the last value the CPU

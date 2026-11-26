@@ -194,9 +194,27 @@ module m2_sdram #(
   // that takes p_dout in the cycles its p_lo or p_ack is high and never after (the delivery and its strobe
   // leave the stage together, one delivery a clock), and with ACK_HOLD 1, so p_ack is one clock. Between
   // its strobes such a port's p_dout shows other ports' words. Default none: the controller as it was.
-  parameter logic [NP-1:0] SHD       = '0
+  parameter logic [NP-1:0] SHD       = '0,
+  // sys140 (D-81): CAPCLK 1 clocks dq_r, the DQ pins' input register, from clk_cap: clk_sys's rate at a phase of its
+  // own, so the read capture moves without moving the pin clock that times the commands and the write data. The
+  // capture logic still reads dq_r at clk's next edge (cap, dl_data), so no clock is added: from dq_r's edge
+  // (clk_cap, at d after clk's) to that edge is T - d, a timed path between two outputs of one PLL. 0: clk.
+  parameter bit            CAPCLK    = 1'b0,
+  // sys140: CAPPIPE 1 puts one more register (clk_cap) after dq_r, so the word crosses from the I/O cells to the
+  // capture logic in two hops (at 140 MHz dq_r -> cap / dl_data was -1.1 to -2.2 ns with the I/O cell's clock
+  // arriving 1.6 ns late), and every capture depth one clock deeper: rd_lat_sel's CL + n is then CL + n + 1
+  // inside, the same pin timing (the bench's device answers when it did)
+  parameter bit            CAPPIPE   = 1'b0,
+  // sys140: XLAT clocks of register stage outside this module between its pin outputs and the pins (m3_sdr_opipe):
+  // every command and write reaches the device that much later, so the read capture is that much deeper too
+  parameter int unsigned   XLAT      = 0,
+  // sys140: with CAPCLK and CAPPIPE, CAPX more registers on clk_cap between the I/O cells and dq_r (each a clock of
+  // read latency, counted in the capture depth): the word crosses from the pins to the capture logic in CAPX + 2
+  // hops (t3_s1: the second SDRAM's two hops were 0.3 ns short between them, its controller 10 ns from its pins)
+  parameter int unsigned   CAPX      = 0
 ) (
   input  logic                 clk,
+  input  logic                 clk_cap,      // CAPCLK: dq_r's clock (unused without it)
   input  logic                 rst_n,
   output logic                 ready,
 
@@ -425,8 +443,9 @@ module m2_sdram #(
   // pipeline is always the longest of those and the tag is injected at the
   // chosen depth. Simulation ties it to 1 and keeps CL+3, so every existing
   // harness measures what it always measured.
-  localparam int unsigned RD_LAT     = CL + 5;   // pipeline depth, the maximum
-  localparam int unsigned RD_LAT_DEF = CL + 4;   // what the board wants
+  localparam int unsigned XP         = (CAPPIPE ? 1 : 0) + XLAT + CAPX;   // sys140: the extra capture registers, the output stages
+  localparam int unsigned RD_LAT     = CL + 5 + XP;   // pipeline depth, the maximum
+  localparam int unsigned RD_LAT_DEF = CL + 4 + XP;   // what the board wants
 
   // Which stage the tag is injected at, so it reaches slot 0 after that many
   // cycles. Registered off the selector to keep a slow OSD bit out of the
@@ -448,12 +467,12 @@ module m2_sdram #(
       // back between them.
       //
       // The default now comes from the calibration rather than from index 0.
-      3'd0:    cap_depth <= 4'(CL + 0);
-      3'd1:    cap_depth <= 4'(CL + 1);
-      3'd2:    cap_depth <= 4'(CL + 2);
-      3'd3:    cap_depth <= 4'(CL + 3);
-      3'd4:    cap_depth <= 4'(CL + 4);
-      default: cap_depth <= 4'(CL + 5);
+      3'd0:    cap_depth <= 4'(CL + 0 + XP);
+      3'd1:    cap_depth <= 4'(CL + 1 + XP);
+      3'd2:    cap_depth <= 4'(CL + 2 + XP);
+      3'd3:    cap_depth <= 4'(CL + 3 + XP);
+      3'd4:    cap_depth <= 4'(CL + 4 + XP);
+      default: cap_depth <= 4'(CL + 5 + XP);
     endcase
   end
 
@@ -912,6 +931,38 @@ module m2_sdram #(
   logic                     ref_pend;
   logic [3:0]               wait_cnt;
   logic [15:0]              dq_r;
+  // the DQ pins' input register (FAST_INPUT_REGISTER: in the I/O cells), on clk_cap with CAPCLK (sys140). Its reset
+  // to zero is kept without CAPCLK: the controller as it was
+  genvar gx;                             // (an explicit genvar: Quartus 17 rejects the inline form)
+  generate if (CAPCLK && CAPPIPE) begin : g_dqcp
+    logic [15:0] dq_c;                   // the I/O cells' register
+    logic [15:0] dq_x [CAPX + 1];        // dq_x[0] = dq_c, then CAPX more
+    always_ff @(posedge clk_cap) dq_c <= sd_dq_i;
+    assign dq_x[0] = dq_c;
+    for (gx = 1; gx <= CAPX; gx = gx + 1) begin : g_x
+      always_ff @(posedge clk_cap) dq_x[gx] <= dq_x[gx - 1];
+    end
+    always_ff @(posedge clk_cap) dq_r <= dq_x[CAPX];
+  end else if (CAPCLK) begin : g_dqcap
+    always_ff @(posedge clk_cap) dq_r <= sd_dq_i;
+  end else if (CAPPIPE) begin : g_dqp
+    logic [15:0] dq_c;
+    logic [15:0] dq_x [CAPX + 1];
+    always_ff @(posedge clk) dq_c <= sd_dq_i;
+    assign dq_x[0] = dq_c;
+    for (gx = 1; gx <= CAPX; gx = gx + 1) begin : g_x
+      always_ff @(posedge clk) dq_x[gx] <= dq_x[gx - 1];
+    end
+    always_ff @(posedge clk) dq_r <= !rst_n ? 16'd0 : dq_x[CAPX];
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire _unused_cap = clk_cap;
+    /* verilator lint_on UNUSEDSIGNAL */
+  end else begin : g_dqclk
+    always_ff @(posedge clk) dq_r <= !rst_n ? 16'd0 : sd_dq_i;
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire _unused_cap = clk_cap;
+    /* verilator lint_on UNUSEDSIGNAL */
+  end endgenerate
 
   // TAGGED READ CAPTURE
   //
@@ -1150,14 +1201,13 @@ module m2_sdram #(
       pri_run <= '0;                                                    // R574
       rd_total <= 4'd1; rd_issued <= '0; wb_col <= 4'd1; rd_captured <= '0;
       is_write <= 1'b0; xfer_addr <= '0; din_r <= '0; be_r <= '0;
-      wait_cnt <= '0; dq_r <= '0;
+      wait_cnt <= '0;
       nxt_valid <= 1'b0; pf_sel <= 1'b0; nxt_grant <= '0; nxt_addr <= '0;
       nxt_din <= '0; nxt_be <= '0; nxt_total <= 4'd1; nxt_is_write <= 1'b0;
       wr_wait <= '0;
     end else begin
       cmd      <= C_NOP;
       sd_dq_oe <= 1'b0;
-      dq_r     <= sd_dq_i;
 
       for (int q = 0; q < NP; q++) begin
         if (ack_cnt[q] != 0) ack_cnt[q] <= ack_cnt[q] - 1'b1;

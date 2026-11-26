@@ -89,6 +89,15 @@ module r3d_rast_zspan (
   logic        [6:0]  q_n0, q_n1;   // leading one; 64 when none
   logic signed [8:0]  q_e;
   logic signed [10:0] q_e86, q_tl, q_th;   // e + 86, and the bounds on n: n <= -(e + 86) gives 0, n >= 255 - (e + 86) all ones
+  // R (r3d140): the Z words' bounds, exponent and shift a stage before the output, which only selects: the bounds'
+  // compares and the 42-bit shift ran into p_z0 / p_z1 behind the output's enable, u_za q_th -> p_z1 -3.17 ns in the
+  // 140 MHz full fit. A stage more in the walk (latency, not rate).
+  logic               r_valid, r_last;
+  logic        [8:0]  r_y, r_x;
+  logic        [1:0]  r_on;
+  logic signed [41:0] r_v0, r_v1;
+  logic        [23:0] r_w0, r_w1;           // {ex, the 16 bits below the leading one}
+  logic        [1:0]  r_k0, r_k1;           // 0 the word, 1 zero, 2 all ones
   wire w_lastp  = ({1'b0, w_x} + 10'd2 >= {1'b0, w_x1});
   wire w_take   = n_rdy && (!w_act || (w_adv && w_lastp));
 
@@ -104,6 +113,7 @@ module r3d_rast_zspan (
       mu_v2   <= 1'b0;
       p_valid <= 1'b0;
       q_valid <= 1'b0;
+      r_valid <= 1'b0;
     end else begin
       // A
       if (s_valid && s_ready) begin
@@ -134,16 +144,25 @@ module r3d_rast_zspan (
       // W, then Q (the leading ones), then the output (the Z words)
       if (p_valid && p_ready) p_valid <= 1'b0;
       if (out_free) begin
-        p_valid <= q_valid;
-        p_y  <= q_y;  p_x <= q_x;  p_on <= q_on;  p_last <= q_last;
-        p_z0 <= zw3(q_v0, q_n0, q_e86, q_tl, q_th);
-        p_z1 <= zw3(q_v1, q_n1, q_e86, q_tl, q_th);
+        p_valid <= r_valid;
+        p_y  <= r_y;  p_x <= r_x;  p_on <= r_on;  p_last <= r_last;
+        p_z0 <= (r_k0 == 2'd1) ? 24'd0 : (r_k0 == 2'd2) ? 24'hffffff : r_w0;
+        p_z1 <= (r_k1 == 2'd1) ? 24'd0 : (r_k1 == 2'd2) ? 24'hffffff : r_w1;
+        p_v0 <= r_v0;
+        p_v1 <= r_v1;
+        r_valid <= q_valid;
+        r_y  <= q_y;  r_x <= q_x;  r_on <= q_on;  r_last <= q_last;
+        {r_k0, r_w0} <= zw4(q_v0, q_n0, q_e86, q_tl, q_th);
+        {r_k1, r_w1} <= zw4(q_v1, q_n1, q_e86, q_tl, q_th);
 `ifdef VERILATOR
         if (q_valid && (zw3(q_v0, q_n0, q_e86, q_tl, q_th) != zw2(q_v0, q_n0, q_e) || zw3(q_v1, q_n1, q_e86, q_tl, q_th) != zw2(q_v1, q_n1, q_e)))
           $fatal(1, "zspan: the Z word's bounds as compares of n");
+        if (q_valid && (zw3(q_v0, q_n0, q_e86, q_tl, q_th) != zw5(zw4(q_v0, q_n0, q_e86, q_tl, q_th)) ||
+                        zw3(q_v1, q_n1, q_e86, q_tl, q_th) != zw5(zw4(q_v1, q_n1, q_e86, q_tl, q_th))))
+          $fatal(1, "zspan: the Z word in two stages");
 `endif
-        p_v0 <= q_v0;
-        p_v1 <= q_v1;
+        r_v0 <= q_v0;
+        r_v1 <= q_v1;
         q_valid <= w_act;
       end
       if (w_adv) begin
@@ -207,6 +226,22 @@ module r3d_rast_zspan (
     else if ($signed({5'd0, n[5:0]}) <= tl) zw3 = 24'd0;
     else if ($signed({5'd0, n[5:0]}) >= th) zw3 = 24'hffffff;
     else zw3 = {ex, sh[40:25]};
+  endfunction
+  // (r3d140) zw3 as {kind, word}: kind 1 zero, 2 all ones, else 0 and the word; zw5 the select after it
+  function automatic logic [25:0] zw4(input logic signed [41:0] v, input logic [6:0] n, input logic signed [10:0] e86,
+                                      input logic signed [10:0] tl, input logic signed [10:0] th);
+    logic [7:0]  ex;
+    logic [63:0] sh;
+    ex = 8'({2'd0, n[5:0]} + e86[7:0]);
+    // (r3d140) the leading one to bit 63 by a shift of 63 - n = ~n, not to bit 41 by 41 - n: no subtract in front of
+    // the shifter (q_n0 -> r_w0 -0.53 / -0.60 ns standalone at 140 MHz); n <= 40 whenever the word is used
+    sh = {22'd0, 42'(v)} << ~n[5:0];
+    if (n[6] || $signed({5'd0, n[5:0]}) <= tl) zw4 = {2'd1, 24'd0};
+    else if ($signed({5'd0, n[5:0]}) >= th) zw4 = {2'd2, 24'd0};
+    else zw4 = {2'd0, ex, sh[62:47]};
+  endfunction
+  function automatic logic [23:0] zw5(input logic [25:0] k);
+    zw5 = (k[25:24] == 2'd1) ? 24'd0 : (k[25:24] == 2'd2) ? 24'hffffff : k[23:0];
   endfunction
   /* verilator lint_on UNUSEDSIGNAL */
 

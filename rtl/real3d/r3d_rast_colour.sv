@@ -48,7 +48,10 @@
 /* verilator lint_off UNUSEDSIGNAL */
 module r3d_rast_colour #(
   parameter int TW = 8,
-  parameter bit SMTX = 1'b1        // Supermodel's contour and texture alpha (study R135); 0: MAME's kinds
+  parameter bit SMTX = 1'b1,       // Supermodel's contour and texture alpha (study R135); 0: MAME's kinds
+  // MODIN (r3d140): the modulation's products come in, i_mod, formed by the caller a stage before (texel x colour per
+  // channel, with i_am[3]'s inversion already in the texel); 0 forms them here
+  parameter bit MODIN = 1'b0
 ) (
   input  logic               clk,
   input  logic               rst,
@@ -66,6 +69,7 @@ module r3d_rast_colour #(
   input  logic signed [17:0] i_fs,      // fog start, 1/1024
   input  logic        [12:0] i_fp,      // fog depth term P
   input  logic        [3:0]  i_am,      // SMTX: {inversion, alpha test, texture alpha, colour modulation}
+  input  logic        [47:0] i_mod,     // MODIN: the three products, 16 bits each, channel 0 lowest
 
   output logic               o_valid,
   output logic      [TW-1:0] o_tag,
@@ -107,7 +111,10 @@ module r3d_rast_colour #(
         logic [15:0] m;
         t = i_texel[8 * c +: 8] ^ {8{SMTX && i_am[3]}};
         k = i_color[8 * c +: 8];
-        m = t * k;
+        m = MODIN ? i_mod[16 * c +: 16] : t * k;
+`ifdef VERILATOR
+        if (MODIN && rst == 1'b0 && i_valid && m != t * k) $fatal(1, "colour: the products from the caller");
+`endif
         b1[c] <= mod ? m[15:8] : sol ? k : t;
       end
       ta = i_texel[31:24];

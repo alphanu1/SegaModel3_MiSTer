@@ -34,7 +34,7 @@ R3D_SYS = rtl/real3d/r3d_ucode_pkg.sv rtl/real3d/r3d_fp_add.sv rtl/real3d/r3d_fp
           rtl/real3d/r3d_rast_colour.sv rtl/real3d/r3d_rast_band.sv rtl/real3d/r3d_rast_fogvp.sv \
           rtl/real3d/r3d_rast_store.sv rtl/real3d/r3d_rast_zq.sv rtl/real3d/r3d_rast.sv \
           rtl/real3d/r3d_cmd.sv rtl/real3d/r3d_mem.sv $(TEXUP_RTL) rtl/real3d/r3d_vrom_rd.sv \
-          rtl/mem/m3_ddr_arb.sv rtl/mem/m3_ddr3p.sv rtl/video/m2_fb_read.sv rtl/video/m3_compose.sv \
+          rtl/mem/m3_ddr_arb.sv rtl/mem/m3_ddr3p.sv rtl/mem/m3_avl_reg.sv rtl/mem/m3_sdr_opipe.sv rtl/mem/m3_sdr_cal.sv rtl/video/m2_fb_read.sv rtl/video/m3_compose.sv \
           rtl/viewer/m3v_sdr_rd.sv rtl/viewer/m3v_ddr_rd.sv
 # R100: BUS_RTL lets a bench build take a patched m3_bus (Daytona 2's Step 2 map,
 # sm3-builds/dt2/m3_bus_step2.patch) with SYS_DEFS = +define+M3_STEP2_BUS

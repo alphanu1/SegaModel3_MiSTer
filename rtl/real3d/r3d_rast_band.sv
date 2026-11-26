@@ -117,8 +117,19 @@ module r3d_rast_band #(
   wire eob_go = p0_v && p0_eob && !inflight && cst == C_IDLE;
   logic cl_own;   // the frame clear's last write still landing
   wire px_go  = p0_v && !p0_eob && !haz && cst != C_CLR && !cl_own;
-  wire p0_go  = px_go || eob_go;
-  assign p_ready = !p0_v || p0_go;
+  wire p0_go  /* verilator public_flat_rd */ = px_go || eob_go;   // (r3d140: public, the bench reads it; no longer in p_ready)
+  // r3d140: a skid in front of P0, so p_ready is a register (!ps_v) and not P0's go: the hazard's compares through
+  // px_go and p_ready were in front of r3d_rast's band FIFO pop and its head's MLAB read (p0_x / w_a -> bq_h, 52
+  // endpoints at -1.33 ns standalone at 140 MHz). The skid takes a pixel only while P0 is held; P0 takes the skid's
+  // first, so the pixels enter P0 in order and each no later than before.
+  logic        ps_v, ps_eob, ps_bl;
+  logic [5:0]  ps_band;
+  logic [8:0]  ps_x;
+  logic [2:0]  ps_row;
+  logic [23:0] ps_c;
+  logic [7:0]  ps_f;
+  wire         p0_free = !p0_v || p0_go;
+  assign p_ready = !ps_v;
 
   // the flush engine's state
   logic        fbuf;                   // the buffer being written out
@@ -154,12 +165,20 @@ module r3d_rast_band #(
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      p0_v <= 1'b0; p1_v <= 1'b0; p2_v <= 1'b0; p3_v <= 1'b0; w_v <= 1'b0;
+      p0_v <= 1'b0; p1_v <= 1'b0; p2_v <= 1'b0; p3_v <= 1'b0; w_v <= 1'b0; ps_v <= 1'b0;
     end else begin
-      if (p_valid && p_ready) begin
-        p0_v <= 1'b1; p0_eob <= p_eob; p0_band <= p_band; p0_x <= p_x; p0_row <= p_row; p0_c <= p_rgb;
-        p0_bl <= p_bl && !p_eob; p0_f <= p_f;
-      end else if (p0_go) p0_v <= 1'b0;
+      if (p0_free) begin
+        if (ps_v) begin
+          p0_v <= 1'b1; p0_eob <= ps_eob; p0_band <= ps_band; p0_x <= ps_x; p0_row <= ps_row; p0_c <= ps_c;
+          p0_bl <= ps_bl; p0_f <= ps_f; ps_v <= 1'b0;
+        end else if (p_valid) begin
+          p0_v <= 1'b1; p0_eob <= p_eob; p0_band <= p_band; p0_x <= p_x; p0_row <= p_row; p0_c <= p_rgb;
+          p0_bl <= p_bl && !p_eob; p0_f <= p_f;
+        end else p0_v <= 1'b0;
+      end else if (p_valid && p_ready) begin
+        ps_v <= 1'b1; ps_eob <= p_eob; ps_band <= p_band; ps_x <= p_x; ps_row <= p_row; ps_c <= p_rgb;
+        ps_bl <= p_bl && !p_eob; ps_f <= p_f;
+      end
       // P1
       p1_v <= px_go; p1_bl <= p0_bl; p1_k <= p0_x[0]; p1_a <= p0_a; p1_c <= p0_c; p1_f <= p0_f;
       // P2
@@ -274,6 +293,6 @@ module r3d_rast_band #(
     end
   end
 
-  assign busy = (cst != C_IDLE) || p0_v || inflight || cm_cw || rd_v;
+  assign busy = (cst != C_IDLE) || p0_v || ps_v || inflight || cm_cw || rd_v;
 
 endmodule

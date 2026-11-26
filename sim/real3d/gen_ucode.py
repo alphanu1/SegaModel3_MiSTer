@@ -48,10 +48,10 @@
 import os
 import sys
 
-MAC_W = 13         # write cycle after issue (r3d_fp_add PIPE_B2 in the engine: study D-50)
+MAC_W = 14         # write cycle after issue (r3d140: r3d_fp_mul PRE in the engine, r3d_vpu MUL_PRE)
 R3 = '--3r' in sys.argv   # (set True for the set-up output ROM)
 # a third lane-register read (port C, r3d_vpu SETUP_3R): c from any register
-DIV_W = 15         # lane 0 write cycle after issue; lane k at +k
+DIV_W = 16         # lane 0 write cycle after issue; lane k at +k (r3d140 variant: the divide's operands registered)
 
 K = {'zero': 0, 'one': 1, 'half': 2, 'k255': 3, 'k99999': 4, 'mone': 5, 'two': 6, 'wplane': 7}
 

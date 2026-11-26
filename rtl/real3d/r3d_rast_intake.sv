@@ -155,18 +155,9 @@ module r3d_rast_intake #(
   logic [38:0] r_mag;
 
   always_ff @(posedge clk) begin
-    if (rst) begin
-      wc      <= 5'd0;
-      em_act  <= 1'b0;
-      emx     <= 9'd0;
-      emx_e   <= 9'sd2;
-      emx_l9  <= 1'b1;
-      pk      <= 2'd0;
-      f_v     <= 1'b0;
-      s_v     <= 1'b0;
-      r_v     <= 1'b0;
-      o_valid <= 1'b0;
-    end else if (adv) begin
+    // (r3d140) the reset last, over the flags and counts only: the record's words (pw, em_*, the stages' data) no
+    // longer have it in their enables (rst_rast -> u_in pw / np_left / em_e, to -2.2 ns in the 140 MHz full fit)
+    if (adv) begin
       // ---- F: the record's next field
       f_v <= 1'b0;
       if (em_act) begin
@@ -216,10 +207,10 @@ module r3d_rast_intake #(
           mx = gt ? ea : emx;
           ee = gt ? (gr ? $signed(9'({1'b0, e} - 9'd115)) : $signed(9'({1'b0, e} - 9'd124))) : emx_e;
 `ifdef VERILATOR
-          if (gt != (ea > emx) || (gt && ee != $signed(9'(ea - 9'd124)))) $fatal(1, "intake: the max's compare without the add");
+          if (!rst && (gt != (ea > emx) || (gt && ee != $signed(9'(ea - 9'd124))))) $fatal(1, "intake: the max's compare without the add");
 `endif
 `ifdef VERILATOR
-          if (ee != ((mx == 9'd0) ? 9'sd2 : $signed(9'(mx - 9'd124)))) $fatal(1, "intake: em_e chosen");
+          if (!rst && ee != ((mx == 9'd0) ? 9'sd2 : $signed(9'(mx - 9'd124)))) $fatal(1, "intake: em_e chosen");
 `endif
           pw[pk] <= i_data;
           if (pk == 2'd2) begin
@@ -265,6 +256,18 @@ module r3d_rast_intake #(
       else if (r_kind == K_VTX && r_nan) o_data <= 40'h00_8000_0000;
       else if (r_kind == K_VTX && r_sat) o_data <= r_sgn ? 40'h00_8000_0000 : 40'h00_7fff_ffff;
       else o_data <= r_sgn ? (40'd0 - {1'b0, r_mag}) : {1'b0, r_mag};
+    end
+    if (rst) begin
+      wc      <= 5'd0;
+      em_act  <= 1'b0;
+      emx     <= 9'd0;
+      emx_e   <= 9'sd2;
+      emx_l9  <= 1'b1;
+      pk      <= 2'd0;
+      f_v     <= 1'b0;
+      s_v     <= 1'b0;
+      r_v     <= 1'b0;
+      o_valid <= 1'b0;
     end
   end
 

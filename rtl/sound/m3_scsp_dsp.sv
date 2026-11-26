@@ -243,6 +243,21 @@ module m3_scsp_dsp #(
     pk_e = 4'd12;
     for (int i = 11; i >= 0; i--) if (t[23 - i]) pk_e = 4'(i);
   end
+  // sys140: PACK's multiplier, 2^min(e, 11), straight from the leading sign bits as a one-hot (each bit the first
+  // set bit of t at its place, the last also when none is), in place of 13'sd1 <<< e: the encoder and the decoder
+  // in one, the same value (checked below); shifted -> sh_b was the sound bridge's worst path at 130 MHz
+  logic [12:0] pk_oh;
+  always_comb begin
+    logic [23:0] t;
+    logic        seen;
+    t = shifted ^ {shifted[22:0], 1'b0};
+    seen = 1'b0; pk_oh = '0;
+    for (int i = 0; i <= 11; i++) begin pk_oh[i] = t[23 - i] && !seen; seen = seen || t[23 - i]; end
+    if (!seen) pk_oh[11] = 1'b1;
+  end
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (pk_oh != 13'(13'sd1 <<< ((pk_e == 4'd12) ? 4'd11 : pk_e))) $fatal(1, "m3_scsp_dsp: pk_oh");
+`endif
   // UNPACK's operand: {sign, ~sign (or sign past exponent 11), mantissa << 11}, shifted by
   // x 2^(11 - e) then >> 11
   wire  [3:0] up_e0 = rg_q[14:11];
@@ -375,7 +390,7 @@ module m3_scsp_dsp #(
         3'd2: begin
           tempv <= {hi_q, lo_q};
           addr_h <= RW'(addr_n & rblmask);
-          sh_a <= shifted; sh_b <= 13'sd1 <<< ((pk_e == 4'd12) ? 4'd11 : pk_e);       // PACK: x 2^e
+          sh_a <= shifted; sh_b <= pk_oh;                                             // PACK: x 2^e
         end
         3'd3: begin
           mul_a <= XSEL ? inputs : tempv;

@@ -32,6 +32,9 @@ module m3_fps #(
   input  logic       draw,            // one clock per frame begun
   input  logic [9:0] x,
   input  logic [9:0] y,
+  // sys140: cal_show replaces the count by cal_v's eight values (0-99), a second each after a blank second
+  input  logic       cal_show,
+  input  logic [7:0][6:0] cal_v,
   output logic       box,
   output logic       ink
 );
@@ -82,6 +85,24 @@ module m3_fps #(
     end
   end
 
+  // sys140: the calibration's values, one a second (sec_tick, or the window's wrap), as two BCD digits
+  logic [3:0] ci;                       // 0 blank, 1-8 cal_v[0-7]
+  logic [3:0] e1, e0;
+  wire  [6:0] cv = cal_v[3'(ci - 4'd1)];
+  always_ff @(posedge clk) begin
+    if (rst || !cal_show) ci <= 4'd0;
+    else if (wrap) ci <= (ci == 4'd8) ? 4'd0 : ci + 4'd1;
+    e1 <= (cv >= 7'd90) ? 4'd9 : (cv >= 7'd80) ? 4'd8 : (cv >= 7'd70) ? 4'd7 : (cv >= 7'd60) ? 4'd6 : (cv >= 7'd50) ? 4'd5 :
+          (cv >= 7'd40) ? 4'd4 : (cv >= 7'd30) ? 4'd3 : (cv >= 7'd20) ? 4'd2 : (cv >= 7'd10) ? 4'd1 : 4'd0;
+  end
+  always_comb begin
+    logic [6:0] u;
+    u = cv - 7'(e1) * 7'd10;
+    e0 = u[3:0];
+  end
+  wire        blank = cal_show && ci == 4'd0;
+  wire  [3:0] s1 = cal_show ? e1 : d1, s0 = cal_show ? e0 : d0;
+
   function automatic logic [4:0] glyph(input logic [3:0] d, input logic [2:0] r);
     logic [34:0] g;
     case (d)
@@ -108,8 +129,8 @@ module m3_fps #(
   wire [9:0] gx0 = rx - 10'd16;         // units
   wire [9:0] gy  = ry - 10'd2;
   wire       on_y = (ry >= 10'd2) && (gy < 10'd14);
-  wire       on1  = (rx >= 10'd2)  && (gx1 < 10'd10) && on_y && (d1 != 4'd0);
-  wire       on0  = (rx >= 10'd16) && (gx0 < 10'd10) && on_y;
+  wire       on1  = (rx >= 10'd2)  && (gx1 < 10'd10) && on_y && (s1 != 4'd0) && !blank;
+  wire       on0  = (rx >= 10'd16) && (gx0 < 10'd10) && on_y && !blank;
 
   logic       box_p, on_p;
   logic [3:0] dig_p;
@@ -117,7 +138,7 @@ module m3_fps #(
   always_ff @(posedge clk) begin
     box_p <= en && in_b;
     on_p  <= en && in_b && (on1 || on0);
-    dig_p <= on1 ? d1 : d0;
+    dig_p <= on1 ? s1 : s0;
     col_p <= on1 ? gx1[3:1] : gx0[3:1];
     row_p <= gy[3:1];
   end

@@ -53,7 +53,11 @@ module r3d_rast_zband #(
   parameter int TRANS = 0,        // 0 MAME blend, 1 stipple
   parameter int PW    = 42,       // payload a lane (the 1/w plane value)
   parameter int TW    = 8,        // triangle tag
-  parameter int CD    = 32        // pending contour pairs
+  parameter int CD    = 32,       // pending contour pairs
+  // SBY (r3d140, Z8): the pair coming in is offered as both of its sources, the caller's skid (s_*_k) and the walk's
+  // output (s_*_w), with the select (s_sk): the scoreboard test runs on each side by side and the select comes last,
+  // so no 2:1 data select sits in front of the compares. 0: the test reads s_y / s_x / s_on.
+  parameter bit SBY   = 1'b0
 ) (
   input  logic               clk,
   input  logic               rst,
@@ -71,6 +75,9 @@ module r3d_rast_zband #(
   input  logic               s_stip,   // TRANS = 1: screen door on
   input  logic        [4:0]  s_trans,
   input  logic               s_pinv,   // header[6] bit 17
+  input  logic               s_sk,     // SBY: s_* is the skid's (s_*_k), else the walk's (s_*_w)
+  input  logic        [8:0]  s_y_k, s_x_k, s_y_w, s_x_w,
+  input  logic        [1:0]  s_on_k, s_on_w,
 
   output logic               o_valid,
   input  logic               o_ready,
@@ -199,20 +206,28 @@ module r3d_rast_zband #(
   wire [2:0] a_row = a_y[2:0];
   // the scoreboard test's row as a one-hot and A's last x, registered as A loads (study R109): the add
   // and the row's decode were in front of the compares, and the test is in a_go
-  logic [7:0] a_r1;
+  // (r3d140: the row as a one-hot, a_r1, is gone with the side-by-side test)
   logic [8:0] a_xh;
   // each row's test side by side, the row chosen last (the select before the compares was the z band's
   // slowest path once the add and decode had gone)
-  logic [7:0] sbr;
-  always_comb for (int r = 0; r < 8; r++) sbr[r] = sb_nz[r] && !(a_xh < sb_lo[r] || a_x > sb_hi[r]);
-  wire       sb_hit = |(a_r1 & sbr);
+  // r3d140: the test as a register, sb_q, made a clock ahead for the pair A will hold: against the scoreboard as it
+  // stands then (sb_lo / sb_hi / sb_nz, the last push included) and against P's push, which the scoreboard takes at
+  // that edge, side by side for A's own pair and for the one coming in, chosen by a_ld last. A decrement at that
+  // edge is not seen, so a pair can wait a clock longer than before; a pair between two pending ranges of one row
+  // (inside their hull, on none of their pixels) no longer waits. Either way no pair goes onto a pending pixel
+  // (asserted below on the FIFO's pixels). The compares and their reduction were in front of a_go, which fans
+  // out into A's and B's enables and s_ready: a_x -> a_z0 / a_z1 / the M10K, the rasteriser's worst family at
+  // 140 MHz standalone (-1.03 ns).
+  // (Off a_go's path, A's row is chosen first and compared once. The pair coming in is not compared: its x and y
+  // come through r3d_rast's skid select from the Z walk, and their compares into sb_q were the rasteriser's worst
+  // standalone path in a first form, -1.82 ns. It waits a clock when anything is pending (a row's count, or P),
+  // and is then tested as A's own; with nothing pending it cannot hit.)
+  logic       sb_q;
+  wire        hit_c = sb_nz[a_row] && !(a_xh < sb_lo[a_row] || a_x > sb_hi[a_row]);
+  wire        hp_c = p_v && p_row == a_row && !(a_xh < p_lo_q || a_x > p_hi_q);
+  wire        sb_hit = sb_q;
 `ifdef VERILATOR
   always_ff @(posedge clk) if (!rst) for (int r = 0; r < 8; r++) if (sb_nz[r] != (sb_n[r] != 7'd0)) $fatal(1, "zband: sb_nz");
-`endif
-`ifdef VERILATOR
-  always_ff @(posedge clk)
-    if (!rst && a_v && sb_hit != ((sb_n[a_row] != 7'd0) && !(a_x + {8'd0, a_on[1]} < sb_lo[a_row] || a_x > sb_hi[a_row])))
-      $fatal(1, "zband: the scoreboard test registered");
 `endif
   // A's tag against B's, C's and P's, kept as three registered flags (study R109): the 8-bit compares
   // were in front of a_go, and a_go fans out into every A, B, C and O enable. Each flag is the compare of
@@ -231,6 +246,46 @@ module r3d_rast_zband #(
   wire       a_go   = a_v && adv && !sw_on && !sb_hit && !ctr_bc && !pf_full && !a_gen_wait;
   assign s_ready = !a_v || a_go;
   wire       a_ld = s_valid && s_ready;
+  // (r3d140, Z7) the pair coming in waits a clock only when its own row has something pending (that row's count,
+  // or P on that row): the row's bit and P's row compare, not the hull compares. Sound as Z1: what is pending at
+  // the next clock on row r is in the scoreboard's row r now or in P now. (Z4's form waited on anything pending
+  // anywhere: Daytona 2's f004080 replay +8.4%, 788,863 -> 855,500 clocks, the Z band's stall +68k.)
+  // (Z8: and then not Z7: on Daytona 2's f004080 the row test alone gave back 4k of the 67k; the pairs coming in
+  // fall on rows with something pending but outside its hull. So the incoming pair has the hull test again, as Z1,
+  // but on both of its sources side by side (SBY): Z1's form had r3d_rast's skid select in front of it, -1.82 ns.)
+  // (written out per source, no function over the scoreboard's arrays)
+  wire [2:0] rk = s_y_k[2:0], rw = s_y_w[2:0], rs = s_y[2:0];
+  wire [8:0] xhk = s_x_k + {8'd0, s_on_k[1]}, xhw = s_x_w + {8'd0, s_on_w[1]}, xhs = s_x + {8'd0, s_on[1]};
+  wire hit_k = (sb_nz[rk] && !(xhk < sb_lo[rk] || s_x_k > sb_hi[rk])) || (p_v && p_row == rk && !(xhk < p_lo_q || s_x_k > p_hi_q));
+  wire hit_w = (sb_nz[rw] && !(xhw < sb_lo[rw] || s_x_w > sb_hi[rw])) || (p_v && p_row == rw && !(xhw < p_lo_q || s_x_w > p_hi_q));
+  wire hit_s = (sb_nz[rs] && !(xhs < sb_lo[rs] || s_x   > sb_hi[rs])) || (p_v && p_row == rs && !(xhs < p_lo_q || s_x   > p_hi_q));
+  wire hit_i = SBY ? (s_sk ? hit_k : hit_w) : hit_s;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && SBY && s_valid && {s_y, s_x, s_on} != (s_sk ? {s_y_k, s_x_k, s_on_k} : {s_y_w, s_x_w, s_on_w}))
+    $fatal(1, "zband: the incoming pair's two sources");
+`endif
+  always_ff @(posedge clk) sb_q <= a_ld ? hit_i : (hit_c || hp_c);
+`ifdef VERILATOR
+  // no pair goes onto a pixel still pending: the FIFO's entries (the head's lane 0 done when pf_lane), P, and the
+  // verdict register's write
+  always_ff @(posedge clk) if (!rst && a_go) begin
+    logic [1:0] am;
+    am = a_on & a_door;
+    for (int k = 0; k < CD; k++) if ((CA+1)'(CA'(CA'(k) - pf_rp)) < pf_n) begin
+      logic [EW-1:0] e;
+      logic [1:0]    m;
+      e = pf[CA'(k)]; m = e[49:48];
+      if (CA'(k) == pf_rp && pf_lane) m[0] = 1'b0;
+      for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++)
+        if (am[i] && m[j] && e[61:59] == a_row && a_x + 9'(i) == e[58:50] + 9'(j)) $fatal(1, "zband: a pair onto a pending pixel");
+    end
+    if (p_v) for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++)
+      if (am[i] && p_m[j] && p_row == a_row && a_x + 9'(i) == p_px + 9'(j)) $fatal(1, "zband: a pair onto P's pixel");
+    // (the verdict's pixel is {v_a[7:0], v_bank} on row v_row)
+    if (v_full && v_wr) for (int i = 0; i < 2; i++)
+      if (am[i] && v_row == a_row && a_x + 9'(i) == {v_a[7:0], v_bank}) $fatal(1, "zband: a pair onto the verdict's pixel");
+  end
+`endif
   wire       sa = s_tag == a_tag, sb = s_tag == b_tag, sc = s_tag == c_tag;
   always_ff @(posedge clk) begin
     // B takes A's tag on a_go, C B's on adv, P C's every cycle
@@ -323,6 +378,11 @@ module r3d_rast_zband #(
   wire v_take = c_valid;   // the verdict register is always free: it commits every cycle it is full
   wire sb_dec = v_full;
 
+  // (r3d140: the reset only on the flags, counts and pointers; the words load in a block of their own, so the reset
+  // is in none of their enables: rst_rast -> cz_b0 / cz_b1 / b_z0 / b_z1 and the rest, ~150 endpoints at -1.1 to
+  // -1.3 ns in the 140 MHz full fit. A word loaded while the flags are held in reset is not read before it is loaded
+  // again: B and C's through b_v / c_v, O's through o_valid, P's through p_v, the verdict's through v_full, a row's
+  // range through its count.)
   always_ff @(posedge clk) begin
     if (rst) begin
       a_v <= 1'b0; b_v <= 1'b0; c_v <= 1'b0; o_valid <= 1'b0;
@@ -336,15 +396,7 @@ module r3d_rast_zband #(
       // the generation's first pair holds in A (a_gen_wait) until this is done
       // A
       if (s_valid && s_ready) begin
-        a_v <= 1'b1; a_new <= s_new;
-        a_y <= s_y; a_x <= s_x; a_on <= s_on; a_zk <= s_zk;
-        a_z0 <= s_z0; a_z1 <= s_z1; a_tag <= s_tag;
-        a_i <= pw_i; pw_i <= pw_i + 3'd1;
-`ifdef VERILATOR
-        a_p0 <= s_p0; a_p1 <= s_p1;
-`endif
-        a_stip <= s_stip; a_pinv <= s_pinv; a_tr <= s_trans;
-        a_r1 <= 8'(1) << s_y[2:0]; a_xh <= s_x + {8'd0, s_on[1]};
+        a_v <= 1'b1;
         gen_ok <= 1'b0;
       end else if (a_go) a_v <= 1'b0;
       // the generation step: drain, sweep, step
@@ -361,71 +413,96 @@ module r3d_rast_zband #(
       end
       // B, C, O
       if (adv) begin
-        // B's words load on every advance, b_v saying whether A went: a_go (the scoreboard's compares)
-        // is in b_v's enable alone, not in the ~200 of B's words. B's old words have gone to C at this
-        // edge, and B's words are read only through b_v (ctr_bc, a_gen_wait) or by C as c_v
         b_v <= a_go;
-        b_y <= a_y; b_x <= a_x; b_on <= a_on & a_door; b_zk <= a_zk;
-        b_z0 <= a_z0; b_z1 <= a_z1; b_i <= a_i; b_tag <= a_tag;
-`ifdef VERILATOR
-        b_p0 <= a_p0; b_p1 <= a_p1;
-`endif
-        b_a0 <= ba0(a_y, a_x); b_a1 <= ba1(a_y, a_x);
         c_v <= b_v;
-        c_y <= b_y; c_x <= b_x; c_on <= b_on; c_zk <= b_zk;
-        c_z0 <= b_z0; c_z1 <= b_z1; c_tag <= b_tag;
-`ifdef VERILATOR
-        co_p0 <= b_p0; co_p1 <= b_p1;
-`endif
-        cz_b0 <= b_x[0] ? b_z1 : b_z0;    cz_b1 <= b_x[0] ? b_z0 : b_z1;
-        con_b0 <= b_x[0] ? b_on[1] : b_on[0]; con_b1 <= b_x[0] ? b_on[0] : b_on[1];
-        c_a0 <= b_a0; c_a1 <= b_a1; c_q0 <= q0[23:0]; c_q1 <= q1[23:0];
-        c_qv0 <= q0[29:24] == gen; c_qv1 <= q1[29:24] == gen;
-        c_m10 <= b_a0 == c_a0; c_m20 <= b_a0 == w1a0;
-        c_m11 <= b_a1 == c_a1; c_m21 <= b_a1 == w1a1;
-        c_x1 <= b_x + 9'd1;
         // the writes C made, for the next two
-        w2v0 <= w1v0; w2d0 <= w1d0;
-        w2v1 <= w1v1; w2d1 <= w1d1;
-        w1v0 <= cw0;  w1a0 <= c_a0; w1d0 <= cz_b0;
-        w1v1 <= cw1;  w1a1 <= c_a1; w1d1 <= cz_b1;
+        w2v0 <= w1v0; w2v1 <= w1v1;
+        w1v0 <= cw0;  w1v1 <= cw1;
         o_valid <= c_v && (c_pass != 2'b00);
-        o_y <= c_y; o_x <= c_x; o_on <= c_pass; o_p0 <= c_p0; o_p1 <= c_p1; o_tag <= c_tag;
-        o_ctr <= c_zk == 2'd2;
       end else if (o_ready) o_valid <= 1'b0;
       // a new generation forwards nothing from the old one
       if (sw_go && sw_left == 12'd1) begin w1v0 <= 1'b0; w1v1 <= 1'b0; w2v0 <= 1'b0; w2v1 <= 1'b0; end
       // P, then the pending FIFO
       p_v <= c_push;
-      p_tag <= c_tag; p_e <= {gen, c_y[2:0], c_x, c_pass, c_z1, c_z0}; p_x1 <= c_x1;
       if (p_v) pf_wp <= pf_wp + CA'(1);
       if (v_take) begin
         v_full <= 1'b1;
-        v_wr   <= c_zw && (h_gen == gen);
-        v_gen  <= h_gen;
-        v_bank <= h_px[0];
-        v_a    <= {h_row, h_px[8:1]};
-        v_z    <= h_l ? h_z1 : h_z0;
-        v_row  <= h_row;
         if (h_last) begin pf_rp <= pf_rp + CA'(1); pf_lane <= 1'b0; end
         else pf_lane <= 1'b1;
       end else v_full <= 1'b0;
       pf_n <= pf_n + (p_v ? (CA+1)'(1) : '0) - ((v_take && h_last) ? (CA+1)'(1) : '0);
-      // scoreboard: up on a push, down on a committed verdict; the range
-      // restarts when the row's count is (or this cycle becomes) zero
+      // scoreboard: up on a push, down on a committed verdict
       for (int r = 0; r < 8; r++) begin
         logic [6:0] n;
-        logic       z;
         n = sb_n[r];
-        z = (sb_n[r] == 7'd0) || (sb_dec && v_row == 3'(r) && sb_n[r] == 7'd1);
-        if (p_v && p_row == 3'(r)) begin
-          n = n + {6'd0, p_m[0]} + {6'd0, p_m[1]};
-          sb_lo[r] <= (z || p_lo_q < sb_lo[r]) ? p_lo_q : sb_lo[r];
-          sb_hi[r] <= (z || p_hi_q > sb_hi[r]) ? p_hi_q : sb_hi[r];
-        end
+        if (p_v && p_row == 3'(r)) n = n + {6'd0, p_m[0]} + {6'd0, p_m[1]};
         if (sb_dec && v_row == 3'(r)) n = n - 7'd1;
         sb_n[r] <= n;
         sb_nz[r] <= n != 7'd0;
+      end
+    end
+  end
+  always_ff @(posedge clk) begin
+    // A
+    if (s_valid && s_ready) begin
+      a_new <= s_new;
+      a_y <= s_y; a_x <= s_x; a_on <= s_on; a_zk <= s_zk;
+      a_z0 <= s_z0; a_z1 <= s_z1; a_tag <= s_tag;
+      a_i <= pw_i; pw_i <= pw_i + 3'd1;
+`ifdef VERILATOR
+      a_p0 <= s_p0; a_p1 <= s_p1;
+`endif
+      a_stip <= s_stip; a_pinv <= s_pinv; a_tr <= s_trans;
+      a_xh <= s_x + {8'd0, s_on[1]};
+    end
+    // B, C, O
+    if (adv) begin
+      // B's words load on every advance, b_v saying whether A went: a_go (the scoreboard's compares)
+      // is in b_v's enable alone, not in the ~200 of B's words. B's old words have gone to C at this
+      // edge, and B's words are read only through b_v (ctr_bc, a_gen_wait) or by C as c_v
+      b_y <= a_y; b_x <= a_x; b_on <= a_on & a_door; b_zk <= a_zk;
+      b_z0 <= a_z0; b_z1 <= a_z1; b_i <= a_i; b_tag <= a_tag;
+`ifdef VERILATOR
+      b_p0 <= a_p0; b_p1 <= a_p1;
+`endif
+      b_a0 <= ba0(a_y, a_x); b_a1 <= ba1(a_y, a_x);
+      c_y <= b_y; c_x <= b_x; c_on <= b_on; c_zk <= b_zk;
+      c_z0 <= b_z0; c_z1 <= b_z1; c_tag <= b_tag;
+`ifdef VERILATOR
+      co_p0 <= b_p0; co_p1 <= b_p1;
+`endif
+      cz_b0 <= b_x[0] ? b_z1 : b_z0;    cz_b1 <= b_x[0] ? b_z0 : b_z1;
+      con_b0 <= b_x[0] ? b_on[1] : b_on[0]; con_b1 <= b_x[0] ? b_on[0] : b_on[1];
+      c_a0 <= b_a0; c_a1 <= b_a1; c_q0 <= q0[23:0]; c_q1 <= q1[23:0];
+      c_qv0 <= q0[29:24] == gen; c_qv1 <= q1[29:24] == gen;
+      c_m10 <= b_a0 == c_a0; c_m20 <= b_a0 == w1a0;
+      c_m11 <= b_a1 == c_a1; c_m21 <= b_a1 == w1a1;
+      c_x1 <= b_x + 9'd1;
+      // the writes C made, for the next two
+      w2d0 <= w1d0; w2d1 <= w1d1;
+      w1a0 <= c_a0; w1d0 <= cz_b0;
+      w1a1 <= c_a1; w1d1 <= cz_b1;
+      o_y <= c_y; o_x <= c_x; o_on <= c_pass; o_p0 <= c_p0; o_p1 <= c_p1; o_tag <= c_tag;
+      o_ctr <= c_zk == 2'd2;
+    end
+    // P
+    p_tag <= c_tag; p_e <= {gen, c_y[2:0], c_x, c_pass, c_z1, c_z0}; p_x1 <= c_x1;
+    if (v_take) begin
+      v_wr   <= c_zw && (h_gen == gen);
+      v_gen  <= h_gen;
+      v_bank <= h_px[0];
+      v_a    <= {h_row, h_px[8:1]};
+      v_z    <= h_l ? h_z1 : h_z0;
+      v_row  <= h_row;
+    end
+    // the scoreboard's ranges: they restart when the row's count is (or this cycle becomes) zero; a range is read
+    // only through its count (sb_nz), which the reset clears
+    for (int r = 0; r < 8; r++) begin
+      logic z;
+      z = (sb_n[r] == 7'd0) || (sb_dec && v_row == 3'(r) && sb_n[r] == 7'd1);
+      if (p_v && p_row == 3'(r)) begin
+        sb_lo[r] <= (z || p_lo_q < sb_lo[r]) ? p_lo_q : sb_lo[r];
+        sb_hi[r] <= (z || p_hi_q > sb_hi[r]) ? p_hi_q : sb_hi[r];
       end
     end
   end

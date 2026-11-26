@@ -188,7 +188,24 @@ module m3_tilegen_fetch #(
   end
 
   // --------------------------------------------------------- the chunk rule
-  wire [8:0] mapx    = x[8:0] + off;
+  // sys140: the map x kept in a register beside x (loaded with x + off in S_SETUP, stepped with x by n_ch in
+  // S_CHUNK; 9 bits, so it is x + off modulo 512 at every clock it is read: checked below), so S_CHUNK's chain
+  // starts after the adder (x -> mapx -> srcx -> p_addr was the tile generator's worst at 140 MHz, -3.05 ns)
+  logic [8:0] mapx_q;
+  logic [8:0] off_n;                     // off as S_SETUP loads it
+  always_comb begin
+`ifdef TG_FAULT_SCROLL
+    off_n = su_off + 9'd1;
+`elsif TG_FAULT_ROWSCROLL
+    off_n = SCROLL_SM ? rreg[8:0] : rreg[8:0];
+`else
+    off_n = su_off;
+`endif
+  end
+  wire [8:0] mapx    = mapx_q;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (rst_n && st == S_CHUNK && mapx_q != x[8:0] + off) $fatal(1, "m3_tilegen_fetch: mapx_q");
+`endif
   wire [3:0] n_tile  = 4'd8 - {1'b0, mapx[2:0]};
   wire [5:0] n_span  = 6'd32 - {1'b0, x[4:0]};
   wire [9:0] n_end   = xhi - x + 10'd1;
@@ -363,15 +380,10 @@ module m3_tilegen_fetch #(
           end
 
           S_SETUP: begin
-`ifdef TG_FAULT_SCROLL
-            off   <= su_off + 9'd1;
-`elsif TG_FAULT_ROWSCROLL
-            off   <= SCROLL_SM ? rreg[8:0] : rreg[8:0];
-`else
-            off   <= su_off;
-`endif
+            off   <= off_n;
             xhi   <= su_xhi;
             x     <= su_xlo;
+            mapx_q <= su_xlo[8:0] + off_n;
             my    <= ly + rreg[24:16];
             pmask <= ll[1] ? mask32[15:0] : mask32[31:16];
             odd   <= ll[0];
@@ -400,6 +412,7 @@ module m3_tilegen_fetch #(
               cn   <= n_ch;
               csrc <= srcx;
               x    <= x + {6'd0, n_ch};
+              mapx_q <= mapx_q + {5'd0, n_ch};
               if (ch_en) begin
                 // the row buffer is read at {ll, srcx[8:5]} this clock (nra), so a held name is in nbuf in S_PATA
                 if ((rtag[ll] == my[8:3]) && gv[ll][srcx[8:6]] && !inv) st <= S_PATA;

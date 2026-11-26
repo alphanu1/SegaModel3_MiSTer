@@ -45,7 +45,12 @@ module r3d_fp_mul #(
   // result below 2^-126 right into a subnormal before rounding (stage 3).
   // Virtua Fighter 2's TGP program multiplies subnormals on purpose (integers
   // carried as subnormal floats; 152 of 28,787 outputs in a 31-frame window).
-  parameter bit SUBNORM          = 1'b0
+  parameter bit SUBNORM          = 1'b0,
+  // PRE (r3d140): a register stage in front of the multiply, LATENCY 5, not 4: the significands with their hidden
+  // bits, the product's sign and exponent and the special flags are registered, so the DSP block's inputs are
+  // registers and nothing else (the operand registers through the hidden bit's test into the DSP were the
+  // engine's opA / b_op -> s1_prod, 192 endpoints at -1.8 ns in the 140 MHz full fit). Same results.
+  parameter bit PRE              = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst_n,
@@ -118,27 +123,48 @@ module r3d_fp_mul #(
   logic [5:0]         s1_lsh;         // s1_exp, clamped to 0..47 (a subnormal result's left shift)
   logic [5:0]         s1_rsh;         // -s1_exp, clamped to 0..48 (... or its right shift)
 
+  // stage 1's inputs: as formed above, or (PRE) registered a stage first
+  logic               q_valid, q_sign, q_nan, q_inf, q_zero;
+  logic [23:0]        q_as, q_bs;
+  logic signed [10:0] q_exp;
+  logic [5:0]         q_lz;
+  wire  f_nan  = (a_is_nan | b_is_nan) | (a_is_inf & b_is_zero) | (b_is_inf & a_is_zero);
+  wire  f_inf  = (a_is_inf | b_is_inf) & ~(a_is_zero | b_is_zero);
+  wire  f_zero = (a_is_zero | b_is_zero) & ~(a_is_inf | b_is_inf);
+  generate if (PRE) begin : g_pre
+    always_ff @(posedge clk or negedge rst_n) begin
+      if (!rst_n) q_valid <= 1'b0;
+      else begin
+        q_valid <= in_valid; q_sign <= a_sign ^ b_sign; q_as <= a_sig; q_bs <= b_sig; q_exp <= in_exp; q_lz <= in_lz;
+        q_nan <= f_nan; q_inf <= f_inf; q_zero <= f_zero;
+      end
+    end
+  end else begin : g_nopre
+    always_comb begin
+      q_valid = in_valid; q_sign = a_sign ^ b_sign; q_as = a_sig; q_bs = b_sig; q_exp = in_exp; q_lz = in_lz;
+      q_nan = f_nan; q_inf = f_inf; q_zero = f_zero;
+    end
+  end endgenerate
+
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       s1_valid <= 1'b0;
     end else begin
-      s1_valid   <= in_valid;
-      s1_sign    <= a_sign ^ b_sign;
-      s1_exp     <= in_exp;
-      s1_lz      <= in_lz;
-      s1_explz   <= in_exp + 11'sd1 - $signed({5'd0, in_lz});
-      s1_xle0    <= (in_exp + 11'sd1 - $signed({5'd0, in_lz})) <= 11'sd0;
-      s1_xeq1    <= (in_exp + 11'sd1 - $signed({5'd0, in_lz})) == 11'sd1;
-      s1_epos    <= in_exp > 11'sd0;
-      s1_lsh     <= (in_exp > 11'sd47) ? 6'd47 : (in_exp > 11'sd0) ? in_exp[5:0] : 6'd0;
-      s1_rsh     <= (in_exp < -11'sd47) ? 6'd48 : (in_exp < 11'sd0) ? 6'(-in_exp) : 6'd0;
-      s1_prod    <= a_sig * b_sig;
-      s1_invalid <= (a_is_nan | b_is_nan)
-                  | (a_is_inf & b_is_zero) | (b_is_inf & a_is_zero);
-      s1_nan     <= (a_is_nan | b_is_nan)
-                  | (a_is_inf & b_is_zero) | (b_is_inf & a_is_zero);
-      s1_inf     <= (a_is_inf | b_is_inf) & ~(a_is_zero | b_is_zero);
-      s1_zero    <= (a_is_zero | b_is_zero) & ~(a_is_inf | b_is_inf);
+      s1_valid   <= q_valid;
+      s1_sign    <= q_sign;
+      s1_exp     <= q_exp;
+      s1_lz      <= q_lz;
+      s1_explz   <= q_exp + 11'sd1 - $signed({5'd0, q_lz});
+      s1_xle0    <= (q_exp + 11'sd1 - $signed({5'd0, q_lz})) <= 11'sd0;
+      s1_xeq1    <= (q_exp + 11'sd1 - $signed({5'd0, q_lz})) == 11'sd1;
+      s1_epos    <= q_exp > 11'sd0;
+      s1_lsh     <= (q_exp > 11'sd47) ? 6'd47 : (q_exp > 11'sd0) ? q_exp[5:0] : 6'd0;
+      s1_rsh     <= (q_exp < -11'sd47) ? 6'd48 : (q_exp < 11'sd0) ? 6'(-q_exp) : 6'd0;
+      s1_prod    <= q_as * q_bs;
+      s1_invalid <= q_nan;
+      s1_nan     <= q_nan;
+      s1_inf     <= q_inf;
+      s1_zero    <= q_zero;
     end
   end
 
@@ -230,8 +256,18 @@ module r3d_fp_mul #(
   assign frac_final = frac_rnd[23] ? 23'd0 : frac_rnd[22:0];
 
   logic ovf, unf;
-  assign ovf = (exp_rnd >= 11'sd255);
-  assign unf = SUBNORM ? 1'b0 : (exp_rnd <= 11'sd0);   // SUBNORM: exponent 0 packs as subnormal
+  // r3d140 (SUBNORM = 0): the round's carry as an AND of the fraction (it carries out only from all ones), and the
+  // exponent's tests for either carry made on the register beside it, chosen by the carry last: the round's 24-bit
+  // carry, the exponent's add and its compares were in series into s3_ovf / s3_unf (s2_prod -> s3_ovf, -1.12 ns at
+  // -40 C at 140 MHz)
+  wire rc = round_up && (&frac_pre);
+  assign ovf = SUBNORM ? (exp_rnd >= 11'sd255) : (rc ? (dn_exp >= 11'sd254) : (dn_exp >= 11'sd255));
+  assign unf = SUBNORM ? 1'b0 : (rc ? (dn_exp <= -11'sd1) : (dn_exp <= 11'sd0));   // SUBNORM: exponent 0 packs as subnormal
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!SUBNORM && s2_valid && (rc != frac_rnd[23] || ovf != (exp_rnd >= 11'sd255) || unf != (exp_rnd <= 11'sd0)))
+      $fatal(1, "fp_mul: the exponent's tests a stage early");
+`endif
 
   // Registered between the round adder and the pack, so the carry chain and
   // the special-case mux are not on one path.

@@ -130,6 +130,7 @@ module r3d_rast_texel #(
   logic [TW-1:0] tag1;
   logic [12:0]   u1a, u1b, v1a, v1b;   // u1, u2, v1, v2
   logic [12:0]   pw1, ph1;             // 32 << w
+  logic [12:0]   pm1, phm1;            // (r3d140) 2 pw1 - 1, 2 ph1 - 1: the mirror's mask, a thermometer made in stage 1
   logic          mu1, mv1;
   logic [7:0]    fu1, fv1;
   logic [10:0]   x01;                  // the texture's first column at the level
@@ -146,7 +147,7 @@ module r3d_rast_texel #(
     end
     // stage 1's fields are not used (tied off)
     always_comb begin
-      u1a = '0; u1b = '0; v1a = '0; v1b = '0; pw1 = '0; ph1 = '0; mu1 = 1'b0; mv1 = 1'b0;
+      u1a = '0; u1b = '0; v1a = '0; v1b = '0; pw1 = '0; ph1 = '0; pm1 = '0; phm1 = '0; mu1 = 1'b0; mv1 = 1'b0;
       fu1 = '0; fv1 = '0; x01 = '0; y01 = '0; fmt1 = '0;
     end
   end else if (MIP) begin : g_s1m
@@ -182,6 +183,7 @@ module r3d_rast_texel #(
           $fatal(1, "texel: the masks as thermometers");
 `endif
         pw1 <= pw; ph1 <= ph;
+        for (int k = 0; k < 13; k++) begin pm1[k] <= 5'(k) <= su; phm1[k] <= 5'(k) <= sv; end
         mu1 <= i_mu; mv1 <= i_mv;
         fu1 <= ul[7:0]; fv1 <= vl[7:0];
         // the level's base: (2^L - 1) above the texture's place, both >> L
@@ -207,6 +209,7 @@ module r3d_rast_texel #(
         u1a <= a; u1b <= (a + 13'd1) & um;
         v1a <= b; v1b <= (b + 13'd1) & vm;
         pw1 <= 13'd32 << i_tw; ph1 <= 13'd32 << i_th;
+        for (int k = 0; k < 13; k++) begin pm1[k] <= 4'(k) <= 4'd5 + {1'b0, i_tw}; phm1[k] <= 4'(k) <= 4'd5 + {1'b0, i_th}; end
         mu1 <= i_mu; mv1 <= i_mv;
         fu1 <= i_u[7:0]; fv1 <= i_v[7:0];
         x01 <= {i_tx, 5'd0}; y01 <= {i_page, i_ty, 5'd0}; fmt1 <= i_fmt;
@@ -225,6 +228,11 @@ module r3d_rast_texel #(
   function automatic logic [12:0] mirx(input logic [12:0] c, input logic [12:0] p);
     mirx = ((c & p) != 13'd0) ? (c ^ ({p[11:0], 1'b0} - 13'd1)) : c;
   endfunction
+  // (r3d140) the same with 2p - 1 from stage 1's register (the subtract was in stage 2 in front of the corner words'
+  // three-input adds: v1a -> aw -0.57 / -0.84 ns standalone at 140 MHz)
+  function automatic logic [12:0] mirm(input logic [12:0] c, input logic [12:0] p, input logic [12:0] m);
+    mirm = ((c & p) != 13'd0) ? (c ^ m) : c;
+  endfunction
 
   logic          v2;
   logic [TW-1:0] tag2;
@@ -242,8 +250,8 @@ module r3d_rast_texel #(
       // y01 2^11 + x01 (the row's add and the column's ran into a third add in series: 113 / 107 MHz)
       logic [12:0] mua, mub;
       logic [10:0] mva, mvb;
-      mua = mirx(u1a, pw1); mub = mirx(u1b, pw1);
-      mva = 11'(mirx(v1a, ph1)); mvb = 11'(mirx(v1b, ph1));
+      mua = mirm(u1a, pw1, pm1); mub = mirm(u1b, pw1, pm1);
+      mva = 11'(mirm(v1a, ph1, phm1)); mvb = 11'(mirm(v1b, ph1, phm1));
       aw[0] <= {y01, x01} + {mva, 11'd0} + 22'(mua);
       aw[1] <= {y01, x01} + {mva, 11'd0} + 22'(mub);
       aw[2] <= {y01, x01} + {mvb, 11'd0} + 22'(mua);
@@ -253,6 +261,9 @@ module r3d_rast_texel #(
   end
 
 `ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!rst && en && v1 && PART != 2 && {pm1, phm1} != {{pw1[11:0], 1'b0} - 13'd1, {ph1[11:0], 1'b0} - 13'd1})
+      $fatal(1, "texel: the mirror's mask from stage 1");
   always_ff @(posedge clk)
     if (!rst && en && v1 && PART != 2 && {mirx(u1a, pw1), mirx(u1b, pw1), mirx(v1a, ph1), mirx(v1b, ph1)} !=
                             {mir(u1a, pw1), mir(u1b, pw1), mir(v1a, ph1), mir(v1b, ph1)})
@@ -329,6 +340,21 @@ module r3d_rast_texel #(
     s[3] = (d && tk[3]) ? (!tk[2] ? b[2] : !tk[1] ? b[1] : b[3]) : b[3];
     dsel = {d, s[3], s[2], s[1], s[0], tk};
   endfunction
+  // (r3d140) the same from the banks' transparencies tb, formed a stage before
+  function automatic logic [12:0] dsel2(input logic [2:0] f, input logic c, input logic [3:0] tb, input logic [7:0] bkv);
+    logic [3:0] tk;
+    logic [1:0] b [4];
+    logic [1:0] s [4];
+    logic       d;
+    for (int k = 0; k < 4; k++) b[k] = bkv[2 * k +: 2];
+    for (int k = 0; k < 4; k++) tk[k] = tb[b[k]];
+    d = SMTX && c && f != 3'd7;
+    s[0] = (d && tk[0]) ? (!tk[2] ? b[2] : !tk[1] ? b[1] : b[0]) : b[0];
+    s[1] = (d && tk[1]) ? (!tk[3] ? b[3] : !tk[0] ? b[0] : b[1]) : b[1];
+    s[2] = (d && tk[2]) ? (!tk[3] ? b[3] : !tk[0] ? b[0] : b[2]) : b[2];
+    s[3] = (d && tk[3]) ? (!tk[2] ? b[2] : !tk[1] ? b[1] : b[3]) : b[3];
+    dsel2 = {d, s[3], s[2], s[1], s[0], tk};
+  endfunction
 
   // ---- 3: the words back, by corner ---------------------------------------------------------
   logic          v3;
@@ -351,10 +377,17 @@ module r3d_rast_texel #(
   logic [19:0]   fl2r;
   logic [12:0]   ds2;
   generate if (PART == 2 && SMTX) begin : g_s2e
+    // (r3d140: each bank's transparency, the format's 8:1 of its flags, formed as the fields are registered, tb2r, and
+    // the selects from it: dsel in one stage was fmt2r -> ds3r, the filter's worst path at 140 MHz standalone, -1.34)
+    logic [3:0] tb2r;
     always_ff @(posedge clk) if (en) begin
       bk2r <= i3_bk; fu2r <= i3_fu; fv2r <= i3_fv; fmt2r <= i3_fmt; ctr2r <= i3_ctr; fl2r <= i1_f;
+      for (int k = 0; k < 4; k++) tb2r[k] <= trf(i3_fmt, i3_ctr, i1_f[5 * k +: 5]);
     end
-    always_comb ds2 = dsel(fmt2r, ctr2r, fl2r, bk2r);
+    always_comb ds2 = dsel2(fmt2r, ctr2r, tb2r, bk2r);
+`ifdef VERILATOR
+    always_ff @(posedge clk) if (!rst && en && ds2 != dsel(fmt2r, ctr2r, fl2r, bk2r)) $fatal(1, "texel: the selects from the registered transparencies");
+`endif
   end else begin : g_s2n
     always_comb begin bk2r = '0; fu2r = '0; fv2r = '0; fmt2r = '0; ctr2r = 1'b0; fl2r = '0; ds2 = '0; end
   end endgenerate
@@ -431,6 +464,29 @@ module r3d_rast_texel #(
     end
   end
 
+  // ---- 4b (r3d140): the u lerp's differences registered, so the DSP blocks' multiplicands are registers: stage 3's
+  // selects and decode with the differences behind them were the filter's worst path at 140 MHz (physical synthesis
+  // moved c4 past the subtract: fmt3r -> the subtract, 133 endpoints at -1.18 ns standalone). A stage more in the
+  // filter; its tags move with it, o_tag_e included.
+  logic          v4b;
+  logic [TW-1:0] tag4b;
+  logic signed [8:0] dt4b [4], db4b [4];
+  logic [7:0]    ct4b [4], cb4b [4];
+  logic [7:0]    fu4b, fv4b;
+  always_ff @(posedge clk) begin
+    if (rst) v4b <= 1'b0;
+    else if (en) v4b <= v4;
+    if (en) begin
+      for (int c = 0; c < 4; c++) begin
+        dt4b[c] <= $signed({1'b0, c4[1][8 * c +: 8]}) - $signed({1'b0, c4[0][8 * c +: 8]});   // b - a
+        db4b[c] <= $signed({1'b0, c4[3][8 * c +: 8]}) - $signed({1'b0, c4[2][8 * c +: 8]});   // d - c
+        ct4b[c] <= c4[0][8 * c +: 8];
+        cb4b[c] <= c4[2][8 * c +: 8];
+      end
+      fu4b <= fu4; fv4b <= fv4; tag4b <= tag4;
+    end
+  end
+
   // ---- 5: the u lerp of both rows: the products (5a), then the adds (5b) ------------------------------
   // (study R109: a stage more, so the DSP blocks' products are registered before the add; the DSP's
   // multiply and the 16-bit add were 9.2 ns at -40C. The filter's latency is one cycle longer; its tags
@@ -443,20 +499,17 @@ module r3d_rast_texel #(
   logic [7:0]    fv5a, fv5;
   always_ff @(posedge clk) begin
     if (rst) begin v5a <= 1'b0; v5 <= 1'b0; end
-    else if (en) begin v5a <= v4; v5 <= v5a; end
+    else if (en) begin v5a <= v4b; v5 <= v5a; end
     if (en) begin
       for (int c = 0; c < 4; c++) begin
-        logic signed [8:0] dt, db;     // b - a and d - c
-        dt = $signed({1'b0, c4[1][8 * c +: 8]}) - $signed({1'b0, c4[0][8 * c +: 8]});
-        db = $signed({1'b0, c4[3][8 * c +: 8]}) - $signed({1'b0, c4[2][8 * c +: 8]});
-        pt5a[c] <= dt * $signed({1'b0, fu4});
-        pb5a[c] <= db * $signed({1'b0, fu4});
-        ct5a[c] <= c4[0][8 * c +: 8];
-        cb5a[c] <= c4[2][8 * c +: 8];
+        pt5a[c] <= dt4b[c] * $signed({1'b0, fu4b});
+        pb5a[c] <= db4b[c] * $signed({1'b0, fu4b});
+        ct5a[c] <= ct4b[c];
+        cb5a[c] <= cb4b[c];
         top5[c] <= 16'({ct5a[c], 8'd0} + 16'(pt5a[c]));
         bot5[c] <= 16'({cb5a[c], 8'd0} + 16'(pb5a[c]));
       end
-      fv5a <= fv4; tag5a <= tag4;
+      fv5a <= fv4b; tag5a <= tag4b;
       fv5 <= fv5a; tag5 <= tag5a;
     end
   end

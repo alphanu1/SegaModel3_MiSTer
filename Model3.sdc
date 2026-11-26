@@ -43,14 +43,19 @@ set_false_path -to [get_registers {*sys3|rst_s[0]}]
 set m3_exe ""
 catch { set m3_exe $::quartus(nameofexecutable) }
 if {![string equal $m3_exe "quartus_map"]} {
-	foreach {m3_n m3_pfx m3_ddio m3_k} {sd1 SDRAM u_sdclk1 2 sd2 SDRAM2 u_sdclk2 3} {
+	# sys140: each SDRAM's DQ input registers are on a capture clock of their own (outclk_4 / outclk_5, m2_sdram
+	# CAPCLK), so the read is timed from the pin clock to that clock; the capture edge is the same count of edges
+	# after the launch as before (each capture clock's phase is under the pin clock's), so the multicycle stands.
+	# Without a capture clock (no outclk_4 / outclk_5) the reads are timed to clk_sys as before.
+	foreach {m3_n m3_pfx m3_ddio m3_k m3_kc} {sd1 SDRAM u_sdclk1 2 4 sd2 SDRAM2 u_sdclk2 3 5} {
 		set m3_sdr_src [get_pins -nowarn -compatibility_mode "*|pll|pll_inst|altera_pll_i|*\[${m3_k}\].*|divclk"]
 		set m3_prt [get_ports -nowarn ${m3_pfx}_CLK]
 		# no DDIO (the CPU test build, or a single build's SDRAM2): no clock on that pin
 		if {[get_collection_size $m3_prt] == 0 || [get_collection_size [get_cells -nowarn -compatibility_mode "*|${m3_ddio}|*"]] == 0} continue
 		create_generated_clock -name ${m3_n}_pin -source $m3_sdr_src $m3_prt
 		if {[info exists ::m3_sdram_io] && $::m3_sdram_io} {
-			set m3_sys [get_clocks {*|pll|pll_inst|altera_pll_i|*[1].*|divclk}]
+			set m3_sys [get_clocks -nowarn "*|pll|pll_inst|altera_pll_i|*\[${m3_kc}\].*|divclk"]
+			if {[get_collection_size $m3_sys] == 0} { set m3_sys [get_clocks {*|pll|pll_inst|altera_pll_i|*[1].*|divclk}] }
 			set m3_nr 2
 			if {[info exists ::m3_sdram_rd_edge]} { set m3_nr $::m3_sdram_rd_edge }
 			set_input_delay -clock ${m3_n}_pin -max 6.4 [get_ports ${m3_pfx}_DQ[*]]
@@ -61,5 +66,30 @@ if {![string equal $m3_exe "quartus_map"]} {
 			set_output_delay -clock ${m3_n}_pin -min -0.8 $m3_out
 			if {$m3_nr > 1} { set_multicycle_path -setup -end $m3_nr -from [get_clocks ${m3_n}_pin] -to $m3_sys }
 		}
+	}
+}
+
+# sys140: the read-capture calibration moves each capture clock (outclk_4 / outclk_5) to its window's centre, held
+# within the band m3_sdr_cal BAND_LO / BAND_HI sets: 8 PLL steps (8 x 148.8 ps = 1.19 ns) below the generated phase to
+# 14 above (2.083 ns). The capture registers' transfers into clk_sys are analysed for that whole band, as uncertainty
+# on them: a later capture clock launches later (setup, 2.083 ns), an earlier one earlier (hold, 1.190 ns). (The
+# pins-to-capture-register reads are what the calibration measures; sdram_io.tcl's figures are at the generated
+# phase.)
+foreach m3_kc {4 5} {
+	set m3_cc [get_clocks -nowarn "*|pll|pll_inst|altera_pll_i|*\[${m3_kc}\].*|divclk"]
+	set m3_cs [get_clocks -nowarn {*|pll|pll_inst|altera_pll_i|*[1].*|divclk}]
+	if {[get_collection_size $m3_cc] > 0 && [get_collection_size $m3_cs] > 0} {
+		set_clock_uncertainty -add -setup -from $m3_cc -to $m3_cs 2.083
+		set_clock_uncertainty -add -hold  -from $m3_cc -to $m3_cs 1.190
+	}
+}
+# The calibration counts 48 PLL steps to a period (148.8 ps each), which holds only with the PLL's VCO at 840 MHz:
+# the IP tool's physical parameters keep it there (rtl/pll.v). A PLL regenerated without them may run its counters at
+# 420 MHz (steps of 297.6 ps, 24 to a period: the board's 99 / 18 on t6_s1, R198); say so loudly.
+set m3_vco [get_clocks -nowarn "*|pll|pll_inst|altera_pll_i|*|vcoph\[0\]"]
+if {[get_collection_size $m3_vco] > 0} {
+	set m3_vp [get_clock_info -period $m3_vco]
+	if {abs($m3_vp - 1.190) > 0.01} {
+		post_message -type critical_warning "Model3.sdc: the PLL's VCO period is $m3_vp ns, not 1.190 (840 MHz): m3_sdr_cal's NSTEP 48 and the stepper's modulo do not match the PLL"
 	}
 }

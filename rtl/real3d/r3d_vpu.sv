@@ -81,7 +81,12 @@ module r3d_vpu
   // the same addresses, then SETUP4 and SETUP2; r3d_geo SETUP_OUT)
   parameter bit SU_ROM   = 1'b0,
   // the adders' shifts in DSP blocks (r3d_fp_add DSP_SHIFT, study R98)
-  parameter bit FP_DSP   = 1'b0
+  parameter bit FP_DSP   = 1'b0,
+  // r3d140: the adders' align shifts in DSP blocks between their registers (r3d_fp_add DSP_AL)
+  parameter bit FP_DSPAL = 1'b0,
+  // MUL_PRE (r3d140): the multipliers a stage longer (r3d_fp_mul PRE), product at +6, sum at +12, write-back chosen
+  // at +13 and written at the end of +14: the micro-code must be built with gen_ucode.py's MAC_W 14 (13 at 0)
+  parameter bit MUL_PRE  = 1'b1
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -228,10 +233,17 @@ module r3d_vpu
   } wctl_t;
   // wq[1] and wq[2] are registers (the divide issues at +2); +3 to +12 is r3d_dline, its last clock wq[12]
   // (area pass: 10 x 25 flip-flops before). The subnormal monitor's +6 tap is the bench's alone.
-  wctl_t wq [1:12];
-  r3d_dline #(.W($bits(wctl_t)), .D(10)) u_wq (.clk, .en(1'b1), .d(wq[2]), .q(wq[12]));
+  localparam int ML = MUL_PRE ? 1 : 0;
+  localparam int WB = 12 + ML;            // the write-back's stage
+  wctl_t wq [1:WB];
+  // (r3d140: the line a step shorter, wq[12] a register in ALMs beside the MAC's write flag: the block's output
+  // through the lane's write selects was a write-back path of every lane)
+  wctl_t wq11;
+  logic  mac12;
+  r3d_dline #(.W($bits(wctl_t)), .D(9 + ML)) u_wq (.clk, .en(1'b1), .d(wq[2]), .q(wq11));
+  always_ff @(posedge clk) begin wq[WB] <= wq11; mac12 <= wq11.v && !wq11.div; end
 `ifdef VERILATOR
-  always_ff @(posedge clk) for (int q = 3; q <= 6; q++) wq[q] <= wq[q-1];
+  always_ff @(posedge clk) for (int q = 3; q <= 6 + ML; q++) wq[q] <= wq[q-1];
 `endif
   always_ff @(posedge clk) begin
     wq[1].v     <= u_valid;
@@ -247,7 +259,10 @@ module r3d_vpu
     wq[2] <= wq[1];
   end
   logic mac10;
-  assign mac10 = wq[12].v && !wq[12].div;
+  assign mac10 = mac12;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && mac10 != (wq[WB].v && !wq[WB].div)) $fatal(1, "vpu: mac12");
+`endif
 
   // ---- divide / reciprocal: four lanes through one unit ---------------------
   logic [31:0] opA [4], opB [4];
@@ -313,11 +328,19 @@ module r3d_vpu
     else begin d_v = dq_v[1]; d_x = dq_x[1]; d_a = dq_a[1]; end
   end
 
-  r3d_recip i_div (.clk, .in_valid(d_v), .div(1'b1), .a(d_a), .x(d_x), .out_valid(d_ov), .result(d_out), .tiny(d_tiny));
+  // (r3d140 variant: the divide's operands registered before the unit, a clock more a divide (gen_ucode.py DIV_W 16):
+  // wq[2].div through div_go's select into the unit's unpack was wq.div -> i_div c0, -2.71 ns in the 140 MHz full fit)
+  logic        d_vr, d_gor;
+  logic [1:0]  d_lr;
+  logic [31:0] d_xr, d_ar;
+  always_ff @(posedge clk) begin
+    d_vr <= d_v && !rst; d_xr <= d_x; d_ar <= d_a; d_gor <= div_go; d_lr <= dlane;
+  end
+  r3d_recip i_div (.clk, .in_valid(d_vr), .div(1'b1), .a(d_ar), .x(d_xr), .out_valid(d_ov), .result(d_out), .tiny(d_tiny));
 
   always_ff @(posedge clk) begin
-    dv[0] <= d_v && !rst;
-    dl[0] <= div_go ? 2'd0 : dlane;
+    dv[0] <= d_vr && !rst;
+    dl[0] <= d_gor ? 2'd0 : d_lr;
     for (int q = 1; q <= 11; q++) begin dv[q] <= dv[q-1] && !rst; dl[q] <= dl[q-1]; end
   end
   // the result of the value entered at cycle n is out at n+12, beside dv[11]
@@ -372,14 +395,21 @@ module r3d_vpu
     // in merge4b_s3)
     logic [31:0] prod, c_d4;
     logic        pv, p_unf, s_unf;
-    r3d_dline #(.W(32), .D(4)) u_cd (.clk, .en(1'b1), .d(c_op), .q(c_d4));
-    r3d_fp_mul #(.SUBNORM(SUBNORM)) u_mul (
-      .clk, .rst_n(!rst), .in_valid(1'b1), .a(opA[l]), .b(b_op),
+    // (r3d140: three steps in the line and the fourth a register in ALMs: the block's output register straight into
+    // the adder's stage A was every lane's u_cd -> p_big / p_exp / p_shamt, -1.84 ns in the 140 MHz full fit)
+    logic [31:0] c_d3;
+    r3d_dline #(.W(32), .D(3 + ML)) u_cd (.clk, .en(1'b1), .d(c_op), .q(c_d3));
+    always_ff @(posedge clk) c_d4 <= c_d3;
+    // (r3d140) no reset into the FP units: in_valid is 1 and their out_valid unread, and nothing takes a result
+    // before an operation issued after the reset reaches it; the reset was an asynchronous clear of every stage
+    // register from rst_geo, the base140_s1 fit's whole recovery failure (368 endpoints, -0.767 ns, TNS -272)
+    r3d_fp_mul #(.SUBNORM(SUBNORM), .PRE(MUL_PRE)) u_mul (
+      .clk, .rst_n(1'b1), .in_valid(1'b1), .a(opA[l]), .b(b_op),
       .out_valid(pv), .result(prod), .overflow(), .underflow(p_unf), .invalid());
     logic [31:0] sum;
     logic        sv;
-    r3d_fp_add #(.SUBNORM(SUBNORM), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP), .NORM_B(1'b1), .PIPE_B2(1'b1)) u_add (
-      .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(c_d4), .sub(1'b0),
+    r3d_fp_add #(.SUBNORM(SUBNORM), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP), .NORM_B(1'b1), .PIPE_B2(1'b1), .DSP_AL(FP_DSPAL)) u_add (
+      .clk, .rst_n(1'b1), .in_valid(1'b1), .a(prod), .b(c_d4), .sub(1'b0),
       .out_valid(sv), .result(sum), .overflow(), .underflow(s_unf), .invalid());
 
     // post-op at +12: which constant replaces the sum, pz +0 or pk the clamp
@@ -397,12 +427,12 @@ module r3d_vpu
       neg    = sum[31] && !isnan && !iszero;
       pz = 1'b0; pk = 1'b0;
       if (SM_LIGHT) begin
-        if (wq[12].post == 2'd1 && neg) pz = 1'b1;
-        else if ((wq[12].post == 2'd1 || wq[12].post == 2'd2) && !sum[31] && !isnan && sum[30:0] > 31'h3f80_0000)
+        if (wq[WB].post == 2'd1 && neg) pz = 1'b1;
+        else if ((wq[WB].post == 2'd1 || wq[WB].post == 2'd2) && !sum[31] && !isnan && sum[30:0] > 31'h3f80_0000)
           pk = 1'b1;
       end else begin
-        if ((wq[12].post == 2'd1 || wq[12].post == 2'd3) && neg) pz = 1'b1;
-        else if (wq[12].post == 2'd3 && !sum[31] && !isnan && sum[30:0] > 31'h437f_0000) pk = 1'b1;
+        if ((wq[WB].post == 2'd1 || wq[WB].post == 2'd3) && neg) pz = 1'b1;
+        else if (wq[WB].post == 2'd3 && !sum[31] && !isnan && sum[30:0] > 31'h437f_0000) pk = 1'b1;
       end
     end
 
@@ -420,20 +450,20 @@ module r3d_vpu
     // both write in one cycle), chosen once for both files
     logic        mac_l;
     logic [31:0] rr;
-    assign mac_l = mac10 && wq[12].lanes[l];
+    assign mac_l = mac10 && wq[WB].lanes[l];
     assign rr = mac_l ? sum : d_res;
     always_comb begin
       we_n = 1'b0; wa_n = ext_waddr; wd_n = ext_wdata[l];
-      if (mac_l && wq[12].wrf) begin
-        we_n = 1'b1; wa_n = wq[12].dst; wd_n = rr;
+      if (mac_l && wq[WB].wrf) begin
+        we_n = 1'b1; wa_n = wq[WB].dst; wd_n = rr;
       end else if (div_wb && dcur.wrf) begin
         we_n = 1'b1; wa_n = dcur.dst; wd_n = rr;
       end else if (!running && ext_we[l]) begin
         we_n = 1'b1;
       end
       bwe_n = 1'b0; bwa_n = ext_baddr; bwd_n = ext_bdata;
-      if (mac_l && wq[12].wbc) begin
-        bwe_n = 1'b1; bwa_n = wq[12].dstb; bwd_n = rr;
+      if (mac_l && wq[WB].wbc) begin
+        bwe_n = 1'b1; bwa_n = wq[WB].dstb; bwd_n = rr;
       end else if (div_wb && dcur.wbc) begin
         bwe_n = 1'b1; bwa_n = dcur.dstb; bwd_n = rr;
       end else if (!running && ext_bwe && ext_bbank == l) begin
@@ -444,9 +474,9 @@ module r3d_vpu
     logic        wpz, wpk, spz, spk;
     always_ff @(posedge clk) begin
       we <= we_n && !rst; wa <= wa_n; wd_r <= wd_n;
-      wpz <= mac_l && wq[12].wrf && pz; wpk <= mac_l && wq[12].wrf && pk;
+      wpz <= mac_l && wq[WB].wrf && pz; wpk <= mac_l && wq[WB].wrf && pk;
       bc_we[l] <= bwe_n && !rst; bc_waddr[l] <= bwa_n; bwd_r <= bwd_n;
-      sw_we[l] <= mac10 && wq[12].wside && wq[12].lanes[l] && !rst;
+      sw_we[l] <= mac10 && wq[WB].wside && wq[WB].lanes[l] && !rst;
       swd_r <= sum; spz <= pz; spk <= pk;
     end
     // the micro-code puts post-op results only in the lane registers, and, with
@@ -457,7 +487,7 @@ module r3d_vpu
     assign sw_data[l] = SM_LIGHT ? swd_r : spz ? 32'd0 : spk ? PK : swd_r;
 `ifdef VERILATOR
     always_ff @(posedge clk)
-      if (mac10 && wq[12].lanes[l] && (pz || pk) && (wq[12].wbc || (SM_LIGHT && wq[12].wside)))
+      if (mac10 && wq[WB].lanes[l] && (pz || pk) && (wq[WB].wbc || (SM_LIGHT && wq[WB].wside)))
         $error("r3d_vpu: a post-op result into a memory without the post-op select");
 `endif
 
@@ -467,13 +497,13 @@ module r3d_vpu
     always_comb begin
       sn_ev[l] = 1'b0;
       if (wq[2].v && wq[2].lanes[l] && (issub(opA[l]) || issub(b_op))) sn_ev[l] = 1'b1;
-      if (wq[6].v && !wq[6].div && wq[6].lanes[l] && (issub(prod) || issub(c_d4) || p_unf)) sn_ev[l] = 1'b1;
-      if (mac10 && wq[12].lanes[l] && (issub(sum) || s_unf)) sn_ev[l] = 1'b1;
+      if (wq[6 + ML].v && !wq[6 + ML].div && wq[6 + ML].lanes[l] && (issub(prod) || issub(c_d4) || p_unf)) sn_ev[l] = 1'b1;
+      if (mac10 && wq[WB].lanes[l] && (issub(sum) || s_unf)) sn_ev[l] = 1'b1;
     end
 `endif
   end
   endgenerate
-  always_ff @(posedge clk) sw_addr <= wq[12].dst[6:0];
+  always_ff @(posedge clk) sw_addr <= wq[WB].dst[6:0];
 
 `ifdef VERILATOR
   // pool occupancy: instructions issued, and lane operations (issue x lanes)

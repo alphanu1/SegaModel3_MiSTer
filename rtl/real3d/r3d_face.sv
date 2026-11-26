@@ -51,7 +51,8 @@
 module r3d_face #(
   parameter bit          LOD = 1'b0,
   parameter logic [31:0] KZ2 = 32'h3f80_0000,
-  parameter bit          FP_DSP = 1'b0   // the adder's shifts in DSP blocks (study R98)
+  parameter bit          FP_DSP = 1'b0,  // the adder's shifts in DSP blocks (study R98)
+  parameter bit          FP_DSPAL = 1'b0 // r3d140: the adder's align shift in a DSP block between its registers (DSP_AL)
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -99,11 +100,24 @@ module r3d_face #(
   logic [1:0] fp /* verilator public_flat_rd */, cp /* verilator public_flat_rd */;                  // fill, next to start
   logic [1:0] tv /* verilator public_flat_rd */;                      // matrix buffer valid
 
-  assign in_ready = !full[fp];
-  always_comb for (int b = 0; b < 2; b++) begin
-    mb_busy[b] = 1'b0;
-    for (int k = 0; k < 4; k++) if (full[k] && mbs[k] == 1'(b)) mb_busy[b] = 1'b1;
+  // (r3d140: in_ready as a register from the slots and the fill pointer as they will stand: the decoder's stall and
+  // its state took it from full[fp]'s select, u_face fp -> dst.D_INV -3.14 ns in the 140 MHz full fit)
+  logic in_rdy;
+  assign in_ready = in_rdy;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && in_rdy != !full[fp]) $fatal(1, "face: in_ready registered");
+`endif
+  // (r3d140: mb_busy as a register from the slots and their buffers as they will stand, set beside in_rdy below)
+  logic [1:0] mb_q;
+  assign mb_busy = mb_q;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst) for (int b = 0; b < 2; b++) begin
+    logic m;
+    m = 1'b0;
+    for (int k = 0; k < 4; k++) if (full[k] && mbs[k] == 1'(b)) m = 1'b1;
+    if (mb_q[b] != m) $fatal(1, "face: mb_busy registered");
   end
+`endif
   // C (LOD): the register, and with CMUL its product pending / in flight
   logic [31:0] creg /* verilator public_flat_rd */;
   logic        c_pend, c_busy;
@@ -196,26 +210,43 @@ module r3d_face #(
   r3d_ram #(.W(32), .A(5), .SYNC(1'b1), .BLOCK(1'b1)) u_b (.clk, .we(b_we), .wa(b_wa), .wd(b_wd), .ra(op_ba), .rq(br_q));
 
   // ---- the multiply-add ----------------------------------------------------
-  // t: read; t+1 convert; t+2 multiplier in; t+11 sum (the adder's align
-  // stage split, as the pool's)
-  logic [31:0] ar_q, br_q;
-  logic [2:0]  ak_q;
-  logic        bc_q;
+  // t: read; t+1 the word registered; t+2 its magnitude and leading one; t+3 multiplier in; t+13 sum (the adder's
+  // align stage split, as the pool's). (r3d140: one stage more between the read and the multiplier, so the read,
+  // the negation and the leading-one search with the shift are each a stage: s -> ar_m and ar_m -> opa were the
+  // facing test's worst paths at 140 MHz, -0.57 / -0.66 ns standalone. Every step of the schedule moves a clock
+  // later together, the chain's two-clock gap included; a verdict comes a clock later.)
+  logic [31:0] ar_q, br_q, ar_q2, br_q2;
+  logic [2:0]  ak_q, ak_q2;
+  logic        bc_q, bc_q2, ar_sg;
   logic [31:0] dreg;                   // LOD: d of the polygon two back
   logic [31:0] opa, opb;
-  logic [5:1]  c0_d;
-  logic [31:0] prod, sum /* verilator public_flat_rd */, sd1, sd2;
+  logic [6:1]  c0_d;
+  logic [31:0] prod, sum /* verilator public_flat_rd */, sd1;
 `ifdef VERILATOR
-  logic [31:0] sd2_was;
+  logic [31:0] sd1_was;
 `endif
   typedef struct packed { logic v; logic [2:0] k; logic [1:0] j, slot; logic par; } wb_t;
-  wb_t         wb [1:11] /* verilator public_flat_rd */;
-  // the write-back tag at +11 (area pass): v from the chain of registers (it is reset), {k, j, slot, par} from
-  // r3d_dline, the words wb[1] held ten clocks before, as the chain gave them (wb[2 .. 11] hold only v)
-  wb_t         wb11;
-  logic [7:0]  wbf11;
-  r3d_dline #(.W(8), .D(10)) u_wbf (.clk, .en(1'b1), .d({wb[1].k, wb[1].j, wb[1].slot, wb[1].par}), .q(wbf11));
-  assign wb11 = {wb[11].v, wbf11};
+  wb_t         wb [1:13] /* verilator public_flat_rd */;
+  // the write-back tag at +13 (area pass; +11 before r3d140): v from the chain of registers (it is reset), {k, j, slot, par} from
+  // r3d_dline, the words wb[1] held eleven clocks before, as the chain gave them (wb[2 .. 12] hold only v)
+  wb_t         wb11;                   // (the write-back's tag, at +13 since r3d140; the name kept)
+  logic [7:0]  wbf11, wbf10;           // (r3d140: the tags at +13 and +12 since the adder's PIPE_B2; the names kept)
+  // (r3d140: the line ten steps and a register in ALMs after it, with the kind's decode for the holds beside it:
+  // the block's output through the decode into in_hold / t_hold was the face's path into the main machine's and
+  // the decoder's states, u_wbf -> mst.* -2.36 ns in the 130 MHz full fits)
+  // (and the line a step shorter again, its kind decoded at +11 as well: V's at +11 is the hold of the decoder's write,
+  // which the unit takes a clock on, below)
+  logic [7:0]  wbf9;
+  r3d_dline #(.W(8), .D(10)) u_wbf (.clk, .en(1'b1), .d({wb[1].k, wb[1].j, wb[1].slot, wb[1].par}), .q(wbf9));
+  logic        kv11, kv12, knq12;      // the tag at +12 is V's; at +13 V's, N's or Q's (the names kept)
+  always_ff @(posedge clk) begin
+    wbf10 <= wbf9;
+    kv11  <= wbf9[7:5] == W_V;
+    wbf11 <= wbf10;
+    kv12  <= kv11;
+    knq12 <= wbf10[7:5] == W_N || (LOD && wbf10[7:5] == W_Q);
+  end
+  assign wb11 = {wb[13].v, wbf11};
 
   // raw 24-bit integer (signed, or unsigned with !sgd) x 2^(eb - 127) to
   // FP32, exact. One converter for the position, normal and NP words. The
@@ -234,45 +265,78 @@ module r3d_face #(
     end
   endfunction
 
-  logic        ar_s;
+  // (r3d140) the converter in two halves: the magnitude and its leading one's place (t+2), then the shift and
+  // the pack (t+3). For a negative word the leading one of -a is that of ~a, or one place up when ~a is all
+  // ones below its leading one (a a negative power of two): the search runs beside the negation, not after it.
+  function automatic logic [4:0] msb24(input logic [23:0] v);
+    msb24 = 5'd0;
+    for (int i = 0; i < 24; i++) if (v[i]) msb24 = 5'(i);
+  endfunction
+  function automatic logic [31:0] itof2(input logic sg, input logic [23:0] mag, input logic [4:0] msb, input logic nz,
+                                        input logic [7:0] eb);
+    logic [23:0] m;
+    m = mag << (5'd23 - msb);
+    itof2 = nz ? {sg, eb + {3'd0, msb}, m[22:0]} : 32'd0;
+  endfunction
+  logic        ar_s, ar_nz;
   logic [23:0] ar_m;
+  logic [4:0]  ar_msb;
   always_ff @(posedge clk) begin
-    logic [7:0] eb;
-    logic       sg;
-    ar_q <= a_q; ak_q <= op_ak; bc_q <= op_bc;
-    sg = !(LOD && op_ak == A_NP) && a_q[23];
-    ar_s <= sg; ar_m <= sg ? (~a_q[23:0] + 24'd1) : a_q[23:0];
-    eb = (ak_q == A_NRM) ? 8'd105 : (LOD && ak_q == A_NP) ? (step15 ? 8'd113 : 8'd115) : step15 ? 8'd116 : 8'd120;
-    case (ak_q)
+    logic [7:0]  eb;
+    logic [23:0] x;
+    logic        mk;
+    // t+1: the word
+    // (r3d140: with the adder's PIPE_B2 a chain's V word is written in the clock the d chain reads it, V0 at round 0
+    // slot 6 of the next period: the read takes the write's word then)
+    ar_q <= (wv && a_wa == op_aa) ? sum : a_q; ak_q <= op_ak; bc_q <= op_bc;
+    ar_sg <= !(LOD && op_ak == A_NP) && a_q[23];
+    // t+2: the magnitude, its leading one, whether it is zero
+    ar_q2 <= ar_q; ak_q2 <= ak_q; bc_q2 <= bc_q; br_q2 <= br_q;
+    x = ar_sg ? ~ar_q[23:0] : ar_q[23:0];
+    mk = ar_sg && ((x | (x >> 1)) == x) && x[0];      // ~a is 2^k - 1: -a = 2^k (x = 0 is a = -1: -a = 1, k = 0)
+    ar_s <= ar_sg; ar_m <= ar_sg ? (~ar_q[23:0] + 24'd1) : ar_q[23:0];
+    ar_msb <= mk ? msb24(x) + 5'd1 : (ar_sg && x == 24'd0) ? 5'd0 : msb24(x);
+    ar_nz <= ar_q[23:0] != 24'd0;
+    // t+3: the operands
+    eb = (ak_q2 == A_NRM) ? 8'd105 : (LOD && ak_q2 == A_NP) ? (step15 ? 8'd113 : 8'd115) : step15 ? 8'd116 : 8'd120;
+    case (ak_q2)
       A_ONE: opa <= F_ONE;
-      A_RAW: opa <= ar_q;
-      A_D: opa <= LOD ? dreg : ar_q;
-      A_KZ: opa <= CMUL ? KZ2 : ar_q;
-      default: opa <= itof(ar_s, ar_m, eb);
+      A_RAW: opa <= ar_q2;
+      A_D: opa <= LOD ? dreg : ar_q2;
+      A_KZ: opa <= CMUL ? KZ2 : ar_q2;
+      default: opa <= itof2(ar_s, ar_m, ar_msb, ar_nz, eb);
     endcase
-    opb <= (LOD && bc_q) ? creg : br_q;
-    c0_d[1] <= op_c0;
-    for (int q = 2; q <= 5; q++) c0_d[q] <= c0_d[q - 1];
-    // (the adder's b operand, c0_d[5] ? -0 : sd1 a clock on, selected as it is registered: the select sat between
-    // sd2 and the adder's exponent compare, the face's worst path at 120 MHz; tclose3)
-    sd1 <= sum; sd2 <= c0_d[4] ? 32'h8000_0000 : sd1;
 `ifdef VERILATOR
-    sd2_was <= sd1;
-    if (!rst && sd2 != (c0_d[5] ? 32'h8000_0000 : sd2_was)) $fatal(1, "face: sd2");
+    if (!rst && !(ak_q2 inside {A_ONE, A_RAW, A_D, A_KZ}) && itof2(ar_s, ar_m, ar_msb, ar_nz, eb) != itof(ar_s, ar_m, eb))
+      $fatal(1, "face: the converter in two halves");
+`endif
+    opb <= (LOD && bc_q2) ? creg : br_q2;
+    c0_d[1] <= op_c0;
+    for (int q = 2; q <= 6; q++) c0_d[q] <= c0_d[q - 1];
+    // (the adder's b operand, c0_d[6] ? -0 : the sum a clock on, selected as it is registered: the select sat between
+    // the register and the adder's exponent compare, the face's worst path at 120 MHz; tclose3. r3d140: one register,
+    // the adder a stage longer, PIPE_B2: sA_small -> s1_sum, the add and its byte normalise, was the face's worst
+    // standalone path at 140 MHz, -0.97 / -1.14 ns, and -2.28 in the full fit)
+    sd1 <= c0_d[5] ? 32'h8000_0000 : sum;
+`ifdef VERILATOR
+    sd1_was <= sum;
+    if (!rst && sd1 != (c0_d[6] ? 32'h8000_0000 : sd1_was)) $fatal(1, "face: sd1");
 `endif
     wb[1] <= '{v: op_v && op_wk != W_NO, k: op_wk, j: op_wj, slot: op_wslot, par: op_wpar};
-    for (int q = 2; q <= 11; q++) wb[q].v <= wb[q - 1].v;
-    if (rst) for (int q = 1; q <= 11; q++) wb[q].v <= 1'b0;
+    for (int q = 2; q <= 13; q++) wb[q].v <= wb[q - 1].v;
+    if (rst) for (int q = 1; q <= 13; q++) wb[q].v <= 1'b0;
   end
 
+  // (r3d140) no reset into the FP units (as r3d_vpu's): in_valid is 1, out_valid unread, and a result is taken only
+  // for a polygon issued after the reset; the asynchronous clear from rst_geo failed recovery at 140 MHz
   r3d_fp_mul #(.SUBNORM(1'b0)) u_mul (
-    .clk, .rst_n(!rst), .in_valid(1'b1), .a(opa), .b(opb),
+    .clk, .rst_n(1'b1), .in_valid(1'b1), .a(opa), .b(opb),
     .out_valid(), .result(prod), .overflow(), .underflow(), .invalid());
-  r3d_fp_add #(.SUBNORM(1'b0), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP), .NORM_B(1'b1)) u_add (
-    .clk, .rst_n(!rst), .in_valid(1'b1), .a(prod), .b(sd2), .sub(1'b0),
+  r3d_fp_add #(.SUBNORM(1'b0), .PIPE_A2(1'b1), .DSP_SHIFT(FP_DSP), .NORM_B(1'b1), .PIPE_B2(1'b1), .DSP_AL(FP_DSPAL)) u_add (
+    .clk, .rst_n(1'b1), .in_valid(1'b1), .a(prod), .b(sd1), .sub(1'b0),
     .out_valid(), .result(sum), .overflow(), .underflow(), .invalid());
 
-  // ---- write-back (t+11): V into A, N and Q into B, the verdict, B, C -----
+  // ---- write-back (t+13): V into A, N and Q into B, the verdict, B, C -----
   logic wv /* verilator public_flat_rd */, wn /* verilator public_flat_rd */, wd /* verilator public_flat_rd */;
   logic wq, wbo, wc;
   assign wv = wb11.v && wb11.k == W_V;
@@ -281,12 +345,30 @@ module r3d_face #(
   assign wq = LOD && wb11.v && wb11.k == W_Q;
   assign wbo = LOD && wb11.v && wb11.k == W_B;
   assign wc = CMUL && wb11.v && wb11.k == W_C;
-  assign in_hold = wv;
-  assign t_hold  = wn || wq;
+  // (r3d140: the decoder's word is written a clock after it is offered, from registers: the decoder's state through
+  // its word's select into A's write port was the face's worst full-fit family, dst.D_CHK -> u_a -2.82 ns at 140 MHz.
+  // So the hold is the unit's own V write a clock on, wb[11] with kv11; a held word is not taken and comes again.)
+  assign in_hold = wb[12].v && kv11;
+  assign t_hold  = wb[13].v && knq12;
+  logic        in_we_r;
+  logic [4:0]  in_wa_r;
+  logic [23:0] in_d_r;
+  always_ff @(posedge clk) begin
+    in_we_r <= in_we && !in_hold && !rst;
+    in_wa_r <= {fp, in_word}; in_d_r <= in_d;
+  end
+`ifdef VERILATOR
+  logic in_hold_q;
+  always_ff @(posedge clk) begin
+    in_hold_q <= in_hold;
+    if (!rst && (in_hold_q != wv || t_hold != (wn || wq))) $fatal(1, "face: the holds registered");
+    if (!rst && in_we_r && wv) $fatal(1, "face: the decoder's word against the unit's V write");
+  end
+`endif
   always_comb begin
-    a_we = wv || in_we;
-    a_wa = wv ? {wb11.slot, 1'b0, wb11.j} : {fp, in_word};
-    a_wd = wv ? sum : {8'd0, in_d};
+    a_we = wv || in_we_r;
+    a_wa = wv ? {wb11.slot, 1'b0, wb11.j} : in_wa_r;
+    a_wd = wv ? sum : {8'd0, in_d_r};
     b_we = wn || wq || t_we;
     b_wa = wn ? {wb11.par, wb11.j, 2'd3} : wq ? {wb11.par, 2'd3, 2'd3} : {t_buf, t_row, t_col};
     b_wd = (wn || wq) ? sum : t_d;
@@ -297,7 +379,7 @@ module r3d_face #(
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      full <= '0; started <= '0; fp <= '0; cp <= '0; tv <= '0;
+      full <= '0; started <= '0; fp <= '0; cp <= '0; tv <= '0; in_rdy <= 1'b1; mb_q <= '0;
       run <= 1'b0; r <= '0; s <= '0; cur_v <= 1'b0; prev_v <= 1'b0; cur_par <= 1'b0;
       v_valid <= 1'b0; prev2_v <= 1'b0; b_valid <= 1'b0; c_pend <= 1'b0; c_busy <= 1'b0;
     end else begin
@@ -312,6 +394,20 @@ module r3d_face #(
       if (t_clr) tv[t_buf] <= 1'b0;
       if (t_set) tv[t_buf] <= 1'b1;
       if (in_commit) begin full[fp] <= 1'b1; mbs[fp] <= in_mb; fp <= fp + 2'd1; end
+      begin
+        logic [3:0] fn, mn;
+        logic [1:0] pn;
+        fn = full; pn = fp; mn = mbs;
+        if (in_commit) begin fn[fp] = 1'b1; mn[fp] = in_mb; pn = fp + 2'd1; end
+        if (wd) fn[wb11.slot] = 1'b0;
+        in_rdy <= !fn[pn];
+        for (int b = 0; b < 2; b++) begin
+          logic m;
+          m = 1'b0;
+          for (int k = 0; k < 4; k++) if (fn[k] && mn[k] == 1'(b)) m = 1'b1;
+          mb_q[b] <= m;
+        end
+      end
       if (wd) begin
         v_valid <= 1'b1;
         v_gt <= !sum[31] && !s_zero && !s_nan;
@@ -341,12 +437,12 @@ module r3d_face #(
   function automatic logic issub(input logic [31:0] x);
     issub = (x[30:23] == 8'd0) && (x[22:0] != 23'd0);
   endfunction
-  logic [11:1] mv;
+  logic [13:1] mv;
   always_ff @(posedge clk) begin
     mv[1] <= op_v;
-    for (int q = 2; q <= 11; q++) mv[q] <= mv[q - 1];
+    for (int q = 2; q <= 13; q++) mv[q] <= mv[q - 1];
     if (rst) subn_cnt <= '0;
-    else subn_cnt <= subn_cnt + 32'(mv[2] && (issub(opa) || issub(opb))) + 32'(mv[6] && issub(prod)) + 32'(mv[11] && issub(sum));
+    else subn_cnt <= subn_cnt + 32'(mv[3] && (issub(opa) || issub(opb))) + 32'(mv[7] && issub(prod)) + 32'(mv[13] && issub(sum));
   end
 `endif
 
