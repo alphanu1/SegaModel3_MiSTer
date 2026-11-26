@@ -65,7 +65,12 @@ module r3d_fp_add #(
   // PIPE_B2 (Model 3 study R148, D-50): a register between stage B's add and its byte normalise -- LATENCY one
   // more. B's add (28 bits, with the sticky borrow) and the byte shift's zero tests behind it were the adder's
   // slowest stage at 120 MHz (sA_sticky -> s1_sum). Same results.
-  parameter bit PIPE_B2 = 1'b0
+  parameter bit PIPE_B2 = 1'b0,
+  // DSP_AL (r3d140, PIPE_A2 only): the align shift as one 27 x 27 DSP multiply between the cut's registers and stage
+  // A's, nothing in between: the multiplicand is chosen before the cut (the swap of equal exponents with it, which
+  // has a shift of 0, so 2^26 passes it whole), the product's quotient bits go straight into sA_small, and the
+  // sticky is the mask's on the multiplicand. Same results; the soft barrel shifter and the swap's select go.
+  parameter bit DSP_AL = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst_n,
@@ -166,10 +171,21 @@ module r3d_fp_add #(
   logic [4:0]  p_shamt;
   logic [26:0] p_big, p_sh, p_b;
   logic [26:0] p_pow;                // DSP_SHIFT: the align multiplier, decoded before the cut
-  wire  [26:0] pow_n = 27'd1 << (5'd26 - shamt);
+  logic [26:0] p_mc;                 // DSP_AL: the multiplicand (the swap applied)
+  // (r3d140) as a decode of the exponent difference, not a subtract and a shift of a constant: bit i is set when
+  // shamt = 26 - i, and shamt is 26 when saturated (geo_t8al: u_mul result -> u_add p_pow -1.34 ns, p_shamt -0.42)
+  logic [26:0] pow_n;
+  always_comb
+    for (int i = 0; i < 27; i++) pow_n[i] = shift_saturated ? (i == 0) : (exp_diff_full[4:0] == 5'(26 - i));
+`ifdef VERILATOR
+  always_comb if (in_valid && pow_n != 27'd1 << (5'd26 - shamt)) $fatal(1, "fp_add: the align power as a decode");
+`endif
   assign small_ext     = p_sh;
   logic [53:0] al_prod;
-  generate if (DSP_SHIFT) begin : g_al_dsp
+  generate if (DSP_AL && PIPE_A2) begin : g_al_reg
+    assign al_prod = {27'd0, p_mc} * {27'd0, p_pow};     // p_pow = 2^(26 - shamt); a swap has shamt 0
+    assign small_aligned = al_prod[52:26];
+  end else if (DSP_SHIFT) begin : g_al_dsp
     assign al_prod = {27'd0, p_sh} * {27'd0, p_pow};     // p_pow = 2^(26 - shamt), shamt <= 26
     assign small_aligned = p_swap ? p_b : al_prod[52:26];
   end else begin : g_al_sh
@@ -198,8 +214,11 @@ module r3d_fp_add #(
   always_comb
     for (int i = 0; i < 27; i++) sticky_mask[i] = (5'(i) < p_shamt);
 
-  assign sticky_lost   = p_sat ? (|small_ext)
-                               : DSP_SHIFT ? (|al_prod[25:0]) : (|(small_ext & sticky_mask));
+  // (DSP_AL: on the multiplicand, which is the shifted operand unless the exponents are equal, when the shift and
+  // its mask are 0)
+  wire [26:0] st_op = (DSP_AL && PIPE_A2) ? p_mc : small_ext;
+  assign sticky_lost   = p_sat ? (|st_op)
+                               : (DSP_SHIFT && !(DSP_AL && PIPE_A2)) ? (|al_prod[25:0]) : (|(st_op & sticky_mask));
 
   logic [26:0] big_ext;
   assign big_ext = {big_sig, 3'b000};
@@ -218,6 +237,7 @@ module r3d_fp_add #(
         p_sign <= big_sign;  p_exp <= big_exp;  p_big <= big_ext;  p_eff_sub <= eff_sub;
         p_sh <= {sh_sig, 3'b000};  p_b <= {b_sig, 3'b000};  p_swap <= e_eq && sig_ge;
         p_shamt <= shamt;  p_sat <= shift_saturated;  p_pow <= pow_n;
+        p_mc <= (e_eq && sig_ge) ? {b_sig, 3'b000} : {sh_sig, 3'b000};
         p_nan <= pre_nan;  p_inf <= pre_inf;
         p_both_zero <= a_is_zero & b_is_zero;  p_zero_sign <= a_sign & b_sign;
       end
@@ -227,6 +247,7 @@ module r3d_fp_add #(
     assign p_sign = big_sign;  assign p_exp = big_exp;  assign p_big = big_ext;  assign p_eff_sub = eff_sub;
     assign p_sh = {sh_sig, 3'b000};  assign p_b = {b_sig, 3'b000};  assign p_swap = e_eq && sig_ge;
     assign p_shamt = shamt;  assign p_sat = shift_saturated;  assign p_pow = pow_n;
+    assign p_mc = (e_eq && sig_ge) ? {b_sig, 3'b000} : {sh_sig, 3'b000};
     assign p_nan = pre_nan;  assign p_inf = pre_inf;
     assign p_both_zero = a_is_zero & b_is_zero;  assign p_zero_sign = a_sign & b_sign;
   end endgenerate
@@ -457,8 +478,17 @@ module r3d_fp_add #(
   assign frac_final = frac_rnd[23] ? 23'd0 : frac_rnd[22:0];
 
   logic ovf, unf, is_zero_result;
-  assign ovf            = (exp_rnd >= 10'sd255);
-  assign unf            = (exp_rnd <= 10'sd0);
+  // (r3d140: the round's carry as an AND of the fraction and the exponent's tests for either carry on the register
+  // beside it, chosen by the carry, for SUBNORM = 0: the round's carry chain, the exponent's add and its compares were
+  // in series into the result, as in r3d_fp_mul)
+  wire rc = round_up && (&frac_pre);
+  assign ovf            = SUBNORM ? (exp_rnd >= 10'sd255) : (rc ? (sC_exp_adj >= 10'sd254) : (sC_exp_adj >= 10'sd255));
+  assign unf            = SUBNORM ? (exp_rnd <= 10'sd0) : (rc ? (sC_exp_adj <= -10'sd1) : (sC_exp_adj <= 10'sd0));
+`ifdef VERILATOR
+  always_ff @(posedge clk)
+    if (!SUBNORM && sC_valid && (rc != frac_rnd[23] || ovf != (exp_rnd >= 10'sd255) || unf != (exp_rnd <= 10'sd0)))
+      $fatal(1, "fp_add: the exponent's tests a stage early");
+`endif
   assign is_zero_result = sC_zero_result;
 
   always_ff @(posedge clk or negedge rst_n) begin

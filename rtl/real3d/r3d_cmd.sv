@@ -154,7 +154,19 @@ module r3d_cmd #(
   logic [PFW:0]   pf_n, pf_max /* verilator public_flat_rd */;
   wire         pf_pop;
   assign b_v = pf_n != '0;
-  assign {b_hi, b_a, b_d} = pf[pf_r];
+  // r3d140: the head as registers of its own ({b_hi, b_a, b_d} = pf[pf_r] whenever the FIFO holds a word, and its
+  // target's decode beside it), loaded from the entry after it on a pop or from the word going in when it is the only
+  // one; the MLAB is read at pf_r + 1 only. Its read was the head straight into r3d_mem's and r3d_texup's inputs
+  // (r3d_cmd pf -> r3d_mem's MLABs, states and DDR3 words: 249 endpoints, -2.16 ns in the 130 MHz full fits)
+  logic [PFW-1:0] pf_r1;                   // pf_r + 1
+  // (the MLAB's one read as a wire: the same read written twice in the head's load stopped Quartus 17's synthesis
+  // with an internal error, VRFX operators.cpp 2349, splitting it as a dual-read RAM)
+  wire  [59:0]    pf_q1 = pf[pf_r1];
+  logic [59:0]    pf_hw;                   // the word going in
+  logic           hd_mem, hd_tex, hd_cmd, hd_8e, hd_8c;
+  function automatic logic [4:0] hdec(input logic [7:0] hi);   // {mem, tex, cmd, 8E, 8C}
+    hdec = {hi == 8'h8C || hi == 8'h8E || hi == 8'h98, hi == 8'h90 || hi == 8'h94, hi == 8'h88, hi == 8'h8E, hi == 8'h8C};
+  endfunction
 `ifdef M3_DMAFAST_RW
   assign h_rdy = !sw_wait && (h_we ? pf_n < (PFW+1)'(PFN) : pf_n == '0);
 `else
@@ -167,12 +179,23 @@ module r3d_cmd #(
   assign h_rdy = !b_v && !sw_wait;
 `endif
 
+`ifdef M3_DMAFAST
+  wire  b_mem = hd_mem, b_tex = hd_tex, b_cmd = hd_cmd;
+  assign m_reg   = hd_8c ? 2'd0 : hd_8e ? 2'd1 : 2'd2;
+  assign m_addr  = hd_8e ? {2'd0, b_a[19:2]} : b_a[21:2];
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && b_v && ({b_hi, b_a, b_d} != pf[pf_r] || {hd_mem, hd_tex, hd_cmd, hd_8e, hd_8c} != hdec(b_hi) ||
+                                               pf_r1 != pf_r + 1'b1))
+    $fatal(1, "r3d_cmd: the FIFO's head registered");
+`endif
+`else
   wire  b_mem = (b_hi == 8'h8C) || (b_hi == 8'h8E) || (b_hi == 8'h98);
   wire  b_tex = (b_hi == 8'h90) || (b_hi == 8'h94);
   wire  b_cmd = (b_hi == 8'h88);
-  assign m_valid = b_v && b_mem;
   assign m_reg   = (b_hi == 8'h8C) ? 2'd0 : (b_hi == 8'h8E) ? 2'd1 : 2'd2;
   assign m_addr  = (b_hi == 8'h8E) ? {2'd0, b_a[19:2]} : b_a[21:2];
+`endif
+  assign m_valid = b_v && b_mem;
   assign m_data  = b_d;
   assign t_valid = b_v && b_tex;
   assign t_vrom  = (b_hi == 8'h90);
@@ -229,17 +252,24 @@ module r3d_cmd #(
 `ifdef M3_DMAFAST
   // the FIFO: a write pushed as the host's strobe is taken; the head popped as its target takes it
   wire pf_push = h_go && h_rdy && h_we;
+`ifdef M3_DMAFAST_FAULT
+  // (a planted fault: one word in 8,192 through the FIFO has its low bit flipped; the comparison must catch it)
+  assign pf_hw = {h_addr[31:24], h_addr[21:2], h_wdata ^ {31'd0, pf_w == PFW'(PFN - 1)}};
+`else
+  assign pf_hw = {h_addr[31:24], h_addr[21:2], h_wdata};
+`endif
   assign pf_pop = b_v && (b_mem ? m_ready : (b_tex || b_cmd) ? t_ready : 1'b1);
   always_ff @(posedge clk)
-    if (rst) begin pf_w <= '0; pf_r <= '0; pf_n <= '0; pf_max <= '0; end
+    if (rst) begin pf_w <= '0; pf_r <= '0; pf_r1 <= PFW'(1); pf_n <= '0; pf_max <= '0; end
     else begin
-`ifdef M3_DMAFAST_FAULT
-      // (a planted fault: one word in 8,192 through the FIFO has its low bit flipped; the comparison must catch it)
-      if (pf_push) begin pf[pf_w] <= {h_addr[31:24], h_addr[21:2], h_wdata ^ {31'd0, pf_w == PFW'(PFN - 1)}}; pf_w <= pf_w + 1'b1; end
-`else
-      if (pf_push) begin pf[pf_w] <= {h_addr[31:24], h_addr[21:2], h_wdata}; pf_w <= pf_w + 1'b1; end
-`endif
-      if (pf_pop) pf_r <= pf_r + 1'b1;
+      if (pf_push) begin pf[pf_w] <= pf_hw; pf_w <= pf_w + 1'b1; end
+      // the head: the word going in when nothing stays ahead of it, else the next entry on a pop
+      if (pf_push && pf_n == (PFW+1)'(pf_pop)) begin
+        {b_hi, b_a, b_d} <= pf_hw; {hd_mem, hd_tex, hd_cmd, hd_8e, hd_8c} <= hdec(pf_hw[59:52]);
+      end else if (pf_pop && pf_n >= (PFW+1)'(2)) begin
+        {b_hi, b_a, b_d} <= pf_q1; {hd_mem, hd_tex, hd_cmd, hd_8e, hd_8c} <= hdec(pf_q1[59:52]);
+      end
+      if (pf_pop) begin pf_r <= pf_r + 1'b1; pf_r1 <= pf_r1 + 1'b1; end
       pf_n <= pf_n + (PFW+1)'(pf_push) - (PFW+1)'(pf_pop);
       if (pf_n > pf_max) pf_max <= pf_n;
     end

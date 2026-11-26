@@ -377,6 +377,7 @@ module r3d_rast_store #(
   // count) are formed from the registered entry, not from the table's output. The next read of that
   // entry is the next record's, many cycles later; the next band's (W_BRD) is another entry.
   logic          bq_v, bq_ext, bq_cl;
+  logic          bq_last, bq_ovf;               // (r3d140) W_BQ's last-band test for W_RUN; the overflow count a cycle on
   logic [9:0]    bq_wa;
   logic [EW-1:0] bq_e;
 `ifdef VERILATOR
@@ -414,11 +415,11 @@ module r3d_rast_store #(
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      ws <= W_IDLE; end_pend <= 1'b0; wq_req <= 1'b0; t_we <= 1'b0; bq_v <= 1'b0;
+      ws <= W_IDLE; end_pend <= 1'b0; wq_req <= 1'b0; t_we <= 1'b0; bq_v <= 1'b0; bq_ovf <= 1'b0;
       bst[0] <= B_FREE; bst[1] <= B_FREE; wbk <= 1'b0;
       n_rec <= '0; n_pair <= '0; n_run <= '0; n_drop <= '0; ovf <= '0; n_ovff <= '0;
     end else begin
-      t_we <= 1'b0; bq_v <= 1'b0;
+      t_we <= 1'b0; bq_v <= 1'b0; bq_ovf <= 1'b0;
       if (b_end) end_pend <= 1'b1;
       case (ws)
         W_IDLE: if (b_begin && bst[wbk] == B_FREE) begin
@@ -454,18 +455,23 @@ module r3d_rast_store #(
           end
         end
         W_ADDR: begin
+          // (r3d140: the record's write words, its start and its band range load on every W_ADDR clock, the fit
+          // and the bank test in wq_req's and the state's enables only: wfit_q -> wq_addr was -0.61 ns at 140 MHz.
+          // A dropped record goes back to W_REC, where none of them is read; W_BQ and its entry a cycle on read wa,
+          // bc and bhi only after a record that went, and the next W_ADDR comes a record's words later.)
+          wa <= wa_q;
+          bc <= blo_q; bhi <= bhi_q;
+          wq_we <= 1'b1; wq_be <= 8'hff;
+          wq_addr <= 25'(rec_a(wb, wl, wa_q));
+          wq_blen <= 8'(wnb);
+          wbt <= '0;
           if (nob_q) begin n_drop <= n_drop + 16'd1; ws <= W_REC; end
           else if (!wfit_q) begin
             n_drop <= n_drop + 16'd1; ovf[1] <= 1'b1; ws <= W_REC;
             if (ovf == 3'd0 && n_ovff != 16'hffff) n_ovff <= n_ovff + 16'd1;   // the frame's first overflow
           end
           else begin
-            wa <= wa_q;
-            bc <= blo_q; bhi <= bhi_q;
-            wq_req <= 1'b1; wq_we <= 1'b1; wq_be <= 8'hff;
-            wq_addr <= 25'(rec_a(wb, wl, wa_q));
-            wq_blen <= 8'(wnb);
-            wbt <= '0;
+            wq_req <= 1'b1;
             ws <= W_WR;
             n_rec <= n_rec + 16'd1;
           end
@@ -482,11 +488,11 @@ module r3d_rast_store #(
           close = q_ov && !q_ext;
           keep  = !(close && q_full);
           ne = t_q;
-          if (!keep) begin
-            ovf[2] <= 1'b1;
-            if (ovf == 3'd0 && n_ovff != 16'hffff) n_ovff <= n_ovff + 16'd1;
-          end
+          // (r3d140: the frame's first overflow counted a cycle on, from a register: the table's word through the
+          // run tests was in front of n_ovff's 16 enables, RAM -> n_ovff -1.01 ns at 140 MHz)
+          if (!keep) ovf[2] <= 1'b1;
           else n_pair <= n_pair + 18'd1;
+          bq_ovf <= !keep && ovf == 3'd0 && n_ovff != 16'hffff;
           bq_v <= keep; bq_wa <= tidx(wb, wbin); bq_e <= t_q; bq_ext <= q_ext; bq_cl <= close;
 `ifdef VERILATOR
           if (keep) begin
@@ -502,21 +508,26 @@ module r3d_rast_store #(
           wq_we <= 1'b1; wq_be <= q_nr[0] ? 8'hf0 : 8'h0f;
           wq_addr <= 25'(run_a(wb, wbin, q_nr[BB:1]));
           wq_blen <= 8'd1;
+          // (r3d140: the next band steps here whether or not the old run is written, bq_last keeping the test for
+          // W_RUN: the run's write words are loaded above and W_RUN reads bc only through that test, so the table's
+          // word through the close test no longer reaches bc's enables, RAM -> bc -1.28 ns at 140 MHz)
+          bq_last <= bc == bhi;
+          if (bc != bhi) bc <= bc + 6'd1;
           if (close && keep) begin
             // the old open run to the bin's run list, entry q_nr
             wq_req <= 1'b1;
             n_run <= n_run + 16'd1;
             ws <= W_RUN;
           end else if (bc == bhi) ws <= W_REC;
-          else begin bc <= bc + 6'd1; ws <= W_BRD; end
+          else ws <= W_BRD;
         end
         W_RUN: if (w_ack) begin
           wq_req <= 1'b0;
-          if (bc == bhi) ws <= W_REC;
-          else begin bc <= bc + 6'd1; ws <= W_BRD; end
+          ws <= bq_last ? W_REC : W_BRD;
         end
         default: ws <= W_IDLE;
       endcase
+      if (bq_ovf) n_ovff <= n_ovff + 16'd1;
       // W_BQ's entry, written a cycle on
       if (bq_v) begin
         t_we <= 1'b1; t_wa <= bq_wa;
@@ -631,6 +642,19 @@ module r3d_rast_store #(
           ps <= P_RE;
         end
         P_RE: begin
+          // the chunk's request words load on every P_RE clock (r3d140): the port reads them only with pq_req,
+          // which only the chunk's branch sets, and P_RQ loads its own before its request. The item tests (pr
+          // against the bin's count, the chunk compare) were in front of their 33 enables (pr -> pq_addr, the
+          // store's worst family at 140 MHz)
+          logic [NRB-1:0] cs;
+          logic [7:0]     bl;
+          cs = pal ? {pr[NRB-1:5], 5'd0} : pr;
+          if (pal) bl = 8'(pr[4:1]) + 8'd1;
+          else if ({pr[NRB-1:5], 5'd31} < pnm1) bl = 8'd16 - 8'(pr[4:1]);
+          else bl = 8'(pnm1h - pr[NRB-1:1]);
+          pq_addr <= 25'(run_a(pb, pbin, cs[BB:1]));
+          pq_blen <= bl;
+          rr_wa <= cs[4:1];
           // the item in hand: the open run, or DDR3 run pr (its chunk loaded first)
           if (pn == '0) begin
             if (!pal && e_ov(ea)) begin pal <= 1'b1; ecur <= ea; ps <= P_BIN; end
@@ -642,12 +666,6 @@ module r3d_rast_store #(
             // (the beats from registers, side by side, study R109: nr - 1, the compare, the select, the
             // subtract and the add were in series; backward the chunk's beats are pr[4:1] + 1, forward
             // 16 - pr[4:1] to the chunk's end or (nr - 1) / 2 + 1 - pr / 2 to the last run)
-            logic [NRB-1:0] cs;
-            logic [7:0]     bl;
-            cs = pal ? {pr[NRB-1:5], 5'd0} : pr;
-            if (pal) bl = 8'(pr[4:1]) + 8'd1;
-            else if ({pr[NRB-1:5], 5'd31} < pnm1) bl = 8'd16 - 8'(pr[4:1]);
-            else bl = 8'(pnm1h - pr[NRB-1:1]);
 `ifdef VERILATOR
             begin
               logic [NRB-1:0] ce;
@@ -656,9 +674,6 @@ module r3d_rast_store #(
             end
 `endif
             pq_req <= 1'b1;
-            pq_addr <= 25'(run_a(pb, pbin, cs[BB:1]));
-            pq_blen <= bl;
-            rr_wa <= cs[4:1];
             ck_c <= pr >> 5;
             ps <= P_CKW;
           end
@@ -668,11 +683,11 @@ module r3d_rast_store #(
           if (p_ack) begin pq_req <= 1'b0; ck_v <= 1'b1; ps <= P_RE; end
         end
         P_CK: begin rst_b <= rr_q[7 +: RB]; rnb <= rr_q[6:0]; ps <= P_RQ; end
-        P_RQ: if (f_free > (FB+1)'(rnb) && !mk_we) begin
-          pq_req <= 1'b1;
+        P_RQ: begin
+          // (r3d140: the record's words load on every P_RQ clock, the FIFO's room test in pq_req's enable only)
           pq_addr <= 25'(rec_a(pb, {pp, pal}, rst_b));
           pq_blen <= 8'(rnb);
-          ps <= P_RW;
+          if (f_free > (FB+1)'(rnb) && !mk_we) begin pq_req <= 1'b1; ps <= P_RW; end
         end
         P_RW: if (p_ack) begin
           pq_req <= 1'b0;
@@ -721,6 +736,11 @@ module r3d_rast_store #(
   (* ramstyle = "logic" *) logic [33:0] oq [4];   // registers: an MLAB's read here was the worst path
   logic [1:0]    oq_wp, oq_rp;
   logic [2:0]    oq_n;
+  // r3d140: the head as a register of its own (oq_hr = oq[oq_rp] whenever the FIFO holds a word), loaded from the
+  // entry after it on a pop or from the word going in when it is the only one: the read pointer's select was in
+  // front of the intake's first stage (oq_rp -> u_in f_raw, -1.01 ns at 140 MHz)
+  logic [33:0]   oq_hr;
+  logic [1:0]    oq_rp1;                            // = oq_rp + 1
   wire  [32:0]   y_w = y_par ? y_o : y_e;
   wire           emit = y_v && (y_op == O_HEAD ? !y_w[32] : (y_op != O_S1));
   wire           o_pop = o_valid && o_ready;
@@ -771,7 +791,7 @@ module r3d_rast_store #(
   always_ff @(posedge clk) begin
     if (rst) begin
       gs <= G_HEAD; g_hw <= '0; y_v <= 1'b0; new_pend <= 1'b0; mk_seen <= 1'b0; mk_end <= 1'b0;
-      oq_wp <= '0; oq_rp <= '0; oq_n <= '0; o_band <= '0;
+      oq_wp <= '0; oq_rp <= '0; oq_rp1 <= 2'd1; oq_n <= '0; o_band <= '0;
     end else begin
       y_v <= g_iss; y_op <= g_iop; y_par <= g_ra[0]; y_last <= g_ilast;
       y_newm <= (g_iop == O_HEAD) && new_pend;
@@ -799,8 +819,13 @@ module r3d_rast_store #(
         endcase
         oq[oq_wp] <= {y_newm, y_last, d};
         oq_wp <= oq_wp + 2'd1;
+        // the head: the word going in when nothing stays ahead of it
+        if (oq_n == 3'(o_pop)) oq_hr <= {y_newm, y_last, d};
       end
-      if (o_pop) oq_rp <= oq_rp + 2'd1;
+      if (o_pop) begin
+        oq_rp <= oq_rp + 2'd1; oq_rp1 <= oq_rp1 + 2'd1;
+        if (oq_n >= 3'd2) oq_hr <= oq[oq_rp1];
+      end
       oq_n <= oq_n + 3'(emit) - 3'(o_pop);
       case (gs)
         G_HEAD: if (g_iss) gs <= G_S1;
@@ -829,7 +854,10 @@ module r3d_rast_store #(
       endcase
     end
   end
-  wire [33:0] oq_h = oq[oq_rp];
+  wire [33:0] oq_h = oq_hr;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && oq_n != '0 && (oq_hr != oq[oq_rp] || oq_rp1 != oq_rp + 2'd1)) $fatal(1, "store: the output head registered");
+`endif
   assign o_valid = oq_n != '0;
   assign o_data  = oq_h[31:0];
   assign o_last  = oq_h[32];

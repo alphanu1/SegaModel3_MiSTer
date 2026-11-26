@@ -284,8 +284,17 @@ module r3d_texup #(
                              tx_x[1:0] == 2'd2 ? {2'd0, tex_be, 4'd0} : {tex_be, 6'd0});
 
   // the write data: the owner's (its state holds still until the write is done)
-  assign d_din = (own == 2'd0) ? {a_d, a_d} : bacc;
-  assign d_be  = (own == 2'd0) ? (wp[0] ? 8'hF0 : 8'h0F) : bbe;
+  // (r3d140: as registers, loaded with the request: a_d and wp hold until an append's ack, bacc and bbe until a
+  // texel beat's; the select by own went straight into the DDR3 port's write data, a_v -> DDRAM_DIN -2.21 ns in
+  // the 130 MHz full fits)
+  logic [63:0] d_din_r;
+  logic [7:0]  d_be_r;
+  assign d_din = d_din_r;
+  assign d_be  = d_be_r;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && d_busy && d_we && {d_din_r, d_be_r} != ((own == 2'd0) ? {a_d, a_d, (wp[0] ? 8'hF0 : 8'h0F)} : {bacc, bbe}))
+    $fatal(1, "texup: the write words registered");
+`endif
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -382,9 +391,11 @@ module r3d_texup #(
         if (a_v) begin
           own <= 2'd0; d_busy <= 1'b1; d_req <= 1'b1; d_we <= 1'b1; d_blen <= 8'd1;
           d_addr <= DDR_STG + 25'(wp[RW-1:1]);
+          d_din_r <= {a_d, a_d}; d_be_r <= wp[0] ? 8'hF0 : 8'h0F;
         end else if (wr_v) begin
           own <= 2'd2; d_busy <= 1'b1; d_req <= 1'b1; d_we <= 1'b1; d_blen <= 8'd1;
           d_addr <= DDR_TEX + {5'd0, tx_y[10:2], tx_x[10:2], tx_y[1:0]};
+          d_din_r <= bacc; d_be_r <= bbe;
         end else if (busy && !f_on && f_room && us != U_IDLE) begin
           own <= 2'd1; d_busy <= 1'b1; d_req <= 1'b1; d_we <= 1'b0; d_blen <= 8'(1 << FB);
           d_addr <= DDR_STG + 25'(fbp[RW-2:0]);

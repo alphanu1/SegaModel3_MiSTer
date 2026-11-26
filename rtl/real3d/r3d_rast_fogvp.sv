@@ -54,6 +54,9 @@ module r3d_rast_fogvp (
   logic        kzero;
   logic [15:0] acc;
   logic [23:0] fc;
+  logic        k_up;                  // (r3d140) the round-up bit, K rounded down, q + 1: cnt 24 to 25
+  logic [31:0] k_0;
+  logic [24:0] k_s1;
 
   assign i_ready = !busy;
 
@@ -70,11 +73,27 @@ module r3d_rast_fogvp (
   wire signed [31:0] sfull = (32'(st16) <<< 14) + (32'(st16) <<< 6) + 32'sd2048;
   wire signed [31:0] s12 = sfull >>> 12;
   wire signed [13:0] sclp = (s12 < -32'sd4096) ? -14'sd4096 : (s12 > 32'sd1024) ? 14'sd1024 : 14'(s12);
+  // (r3d140) the clamped start term as a register, every clock: n25 loads only with the record's word 4, while the
+  // unit is not busy, and o_s takes it at cnt 25, many clocks on (n25 -> the add and the clamps -> o_s was -0.65 /
+  // -1.10 ns standalone at 140 MHz)
+  logic signed [13:0] sclp_q;
+  always_ff @(posedge clk) sclp_q <= sclp;
 
   // the multiplier's operand: channel cnt[4:3] of the colour, bit cnt[2:0] of the ambient
+  // (r3d140: the step's operand registered a step ahead, mt_q, from cnt + 1 (cnt counts every busy cycle) and from 0
+  // as the record starts: cnt's selects and the shift were in front of the add into acc and af, u_fv cnt -> af
+  // -2.58 ns in the 140 MHz full fit)
   wire [7:0]  amb = n25[23:16];
-  wire [7:0]  ch  = (cnt[4:3] == 2'd0) ? col[23:16] : (cnt[4:3] == 2'd1) ? col[15:8] : col[7:0];
-  wire [15:0] acc_n = acc + (amb[cnt[2:0]] ? (16'(ch) << cnt[2:0]) : 16'd0);
+  function automatic logic [15:0] mterm(input logic [4:0] c, input logic [23:0] cl, input logic [7:0] am);
+    logic [7:0] h;
+    h = (c[4:3] == 2'd0) ? cl[23:16] : (c[4:3] == 2'd1) ? cl[15:8] : cl[7:0];
+    mterm = am[c[2:0]] ? (16'(h) << c[2:0]) : 16'd0;
+  endfunction
+  logic [15:0] mt_q;
+  wire [15:0] acc_n = acc + mt_q;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && busy && cnt < 5'd24 && mt_q != mterm(cnt, col, amb)) $fatal(1, "fogvp: the step's operand a step ahead");
+`endif
   // a channel's product is rounded the cycle after its last step (the round's add after the
   // step's was a -40C path); the last channel's goes straight to o_fc
   logic [15:0] af;
@@ -121,6 +140,7 @@ module r3d_rast_fogvp (
             if (mlt[23] != (ma < {1'b1, z[22:0]})) $fatal(1, "fogvp: the record's compare as a borrow");
 `endif
             q <= '0; cnt <= '0; acc <= '0;
+            mt_q <= mterm(5'd0, (k == 3'd2) ? i_data[23:0] : col, (k == 3'd4) ? i_data[23:16] : n25[23:16]);
             busy <= 1'b1;
           end
         end
@@ -143,25 +163,31 @@ module r3d_rast_fogvp (
           end
         end
         cnt <= cnt + 5'd1;
+        mt_q <= mterm(cnt + 5'd1, col, amb);
         if (cnt == 5'd24) begin
           // q holds 24 bits; this cycle's bit is the last (the guard). K is formed for both
           // roundings side by side and chosen by the round-up bit last (study R109): the guard's
           // compare, the increment and the exponent's range test were in series into o_k.
-          logic        g, st, up;
-          logic [24:0] sg1;
-          logic signed [9:0] ee1;
-          logic [31:0] k0, k1;
+          // (r3d140: over two cycles, the round-down K, the round-up bit and the incremented significand
+          // registered here and the round-up K formed from them in the next: q -> o_k was -0.95 ns at 140 MHz)
+          logic        g, st;
           g  = rge;
           st = g ? (r != {1'b0, mb}) : (r != 25'd0);
-          up = g && (st || q[0]);
-          k0 = (kzero || e >= 10'sd255 || e <= 10'sd0) ? 32'd0 : {1'b0, e[7:0], q[22:0]};
-          sg1 = {1'b0, q[23:0]} + 25'd1;
+          k_up <= g && (st || q[0]);
+          k_0  <= (kzero || e >= 10'sd255 || e <= 10'sd0) ? 32'd0 : {1'b0, e[7:0], q[22:0]};
+          k_s1 <= {1'b0, q[23:0]} + 25'd1;
+        end
+        if (cnt == 5'd25) begin
+          logic [24:0] sg1;
+          logic signed [9:0] ee1;
+          logic [31:0] k1;
+          sg1 = k_s1;
           ee1 = e;
           if (sg1[24]) begin sg1 = {2'b01, 23'd0}; ee1 = e + 10'sd1; end
           k1 = (kzero || ee1 >= 10'sd255 || ee1 <= 10'sd0) ? 32'd0 : {1'b0, ee1[7:0], sg1[22:0]};
-          o_k <= up ? k1 : k0;
-          o_s <= sclp;
-          o_fc <= {fc[23:8], pr[15:8]};       // the last channel, rounded this cycle
+          o_k <= k_up ? k1 : k_0;
+          o_s <= sclp_q;
+          o_fc <= fc;                         // the last channel was rounded into fc at cnt 24
           o_valid <= 1'b1;
           busy <= 1'b0;
         end
@@ -170,6 +196,7 @@ module r3d_rast_fogvp (
   end
 
 `ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && busy && cnt == 5'd25 && sclp_q != sclp) $fatal(1, "fogvp: the start term registered");
   always_ff @(posedge clk) if (!rst && ((k3 != (k == 3'd3)) || (k5 != (k == 3'd5)) || (rge != (r >= {1'b0, mb}))))
     $fatal(1, "fogvp: k3 / k5 / the borrow");
 `endif

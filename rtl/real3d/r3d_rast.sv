@@ -66,6 +66,9 @@ module r3d_rast #(
   parameter logic [24:0] RUNO = 25'(1 << (LB + 4)),   // store: the run lists, words from store_base
   parameter int BB  = 12,           // store: log2 beats a bin's run list (study R136: 12)
   parameter bit FOV = 1'b1,         // study R131: a pair enters the front while the one before it walks
+  // EPB (r3d140): the edge walker's product bits a cycle (r3d_rast_edge PB): 2 three adders of their own, 1 the walk's
+  // adders (study R131: -389 ALUTs / -123 ALM at about 0.8% of the replay; left off under D-48, priced under D-81)
+  parameter int EPB = 2,
   parameter bit TSPLIT = 1'b1,      // study R131: ring A carries the texel's stage-2 banks and fractions
   parameter bit L8K = 1'b1,         // study R134: an L8 texel of 0xFF has alpha 0 (Supermodel); 0: MAME's decode
   // study R135: Supermodel's texture decode (format 2, contour on formats 1-4), contour's dilation and test,
@@ -315,7 +318,8 @@ module r3d_rast #(
   // ===========================================================================
   // front, a triangle at a time; the triangle tables
   // ===========================================================================
-  logic        f_tready, f_busy, f_svalid, f_sready;
+  logic        f_tready, f_svalid, f_sready;
+  logic        f_busy /* verilator public_flat_rd */;   // (tc130: the bench prints it; with busy_now registered Verilator inlined it)
   logic [8:0]  f_sy, f_sx0, f_sx1;
   logic [7:0]  tag_n, cur_tag, f_stag, f_stag_n;
   logic [1:0]  cur_zk;
@@ -329,7 +333,7 @@ module r3d_rast #(
   assign t_go = t_full && f_tready && ((FOV && !t_gen) || (!f_busy && !f_svalid));
 
   // the triangle's words are in tv beats before the record ends and hold until t_go (PRE_DIV, study R109)
-  r3d_rast_front #(.PRE_DIV(1'b1), .TGW(8)) u_front (
+  r3d_rast_front #(.PRE_DIV(1'b1), .TGW(8), .PB(EPB)) u_front (
     .clk, .rst,
     .t_valid(t_go), .t_ready(f_tready),
     .t_x1(tv[0]), .t_y1(tv[1]), .t_x2(tv[2]), .t_y2(tv[3]), .t_x3(tv[4]), .t_y3(tv[5]),
@@ -499,7 +503,14 @@ module r3d_rast #(
   // R87's two were moved). The skid takes the pair whenever it is empty; it is
   // full when the Z band refused the pair offered.
   localparam int SKW = 1 + 9 + 9 + 2 + 24 + 24 + 42 + 42 + 2 + 8;
-  wire         pair_v = za_pvalid && (tq_n != 4'd0);
+  // (r3d140: tq_n != 0 as a register from tq_n's next value, as tq_full: the count's test was in front of the Z
+  // walk's p_ready and through it every enable of the walk, tq_n -> u_za w_l0 / w_l1 / q_v0 ..., ~350 endpoints at
+  // -1.2 to -2.3 ns in the 140 MHz full fit)
+  logic        tq_nz;
+  wire         pair_v = za_pvalid && tq_nz;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && tq_nz != (tq_n != 4'd0)) $fatal(1, "rast: tq_nz is not tq_n != 0");
+`endif
   logic        sk_v;
   logic [SKW-1:0] sk_d;
   wire         pair_take = pair_v && !sk_v;
@@ -522,13 +533,13 @@ module r3d_rast #(
   end
   always_ff @(posedge clk) begin
     if (rst) begin
-      tq_wp <= '0; tq_rp <= '0; tq_n <= '0; tq_full <= 1'b0; gen_carry <= 1'b0; zfirst <= 1'b1;
+      tq_wp <= '0; tq_rp <= '0; tq_n <= '0; tq_nz <= 1'b0; tq_full <= 1'b0; gen_carry <= 1'b0; zfirst <= 1'b1;
     end else begin
       if (t_go && t_gen) gen_carry <= 1'b1;
       if (s_take) begin tq[tq_wp] <= {gen_carry, cur_zk, cur_tag}; tq_wp <= tq_wp + 3'd1; gen_carry <= 1'b0; end
       if (pair_take && za_plast) tq_rp <= tq_rp + 3'd1;
       if (pair_take) zfirst <= za_plast;
-      tq_n <= tq_n_n;
+      tq_n <= tq_n_n; tq_nz <= tq_n_n != 4'd0;
       tq_full <= tq_n_n >= 4'd7;
     end
   end
@@ -545,12 +556,17 @@ module r3d_rast #(
   logic signed [41:0] zr_p0, zr_p1;
   logic [7:0]  zr_tag;
   logic        cv_valid, cv_zw;            // contour verdicts, from the colour stage
-  r3d_rast_zband #(.OOW(1'b1), .TRANS(0), .PW(42), .TW(8)) u_zband (
+  // (Z8: the pair's two sources beside the select, for the Z band's scoreboard test)
+  logic [8:0] sk_y, sk_x;
+  logic [1:0] sk_on;
+  always_comb {sk_y, sk_x, sk_on} = sk_d[SKW-2 -: 20];
+  r3d_rast_zband #(.OOW(1'b1), .TRANS(0), .PW(42), .TW(8), .SBY(1'b1)) u_zband (
     .clk, .rst,
     .s_valid(zb_v), .s_ready(zs_ready), .s_new(zb_new),
     .s_y(zb_y), .s_x(zb_x), .s_on(zb_on), .s_z0(zb_z0), .s_z1(zb_z1),
     .s_p0(zb_v0), .s_p1(zb_v1), .s_zk(zb_zk), .s_tag(zb_tag),
     .s_stip(1'b0), .s_trans(5'd0), .s_pinv(1'b0),
+    .s_sk(sk_v), .s_y_k(sk_y), .s_x_k(sk_x), .s_on_k(sk_on), .s_y_w(za_py), .s_x_w(za_px), .s_on_w(za_pon),
     .o_valid(zr_valid), .o_ready(zr_ready), .o_y(zr_y), .o_x(zr_x), .o_on(zr_on),
     .o_p0(zr_p0), .o_p1(zr_p1), .o_tag(zr_tag), .o_ctr(zr_ctr),
     .c_valid(cv_valid), .c_zw(cv_zw));
@@ -603,11 +619,26 @@ module r3d_rast #(
       p_y <= h_y; p_x <= h_x + {8'd0, h_l}; p_o2 <= h_l ? h_p1 : h_p0; p_tag <= h_tag; p_ctr <= h_ctr;
     end
   end
-  wire [110:0] t1_s = t1_q[T1W-1 -: 111], t1_u = t1_q[T1W-112 -: 111], t1_v = t1_q[T1W-223 -: 111];
-  wire [8:0]   t1_eo = t1_q[LW+9 -: 9];
-  wire         t1_tex = t1_q[LW];
-  wire [16:0]  t1_lk  = MIP ? t1_q[16:0] : 17'd0;
-  wire [3:0]   t1_lvm = MIP ? t1_q[20:17] : 4'd0;
+  // Q (r3d140): the pixel and table 1's words a stage more before the interpolants, the words in the tables' output
+  // registers: the tables' read straight into the interpolants' DSP blocks (RAM -> hiu / hiv, -0.89 ns at 140 MHz
+  // standalone; the interpolants -2.14 ns in the 130 MHz full fits) has the stage's whole clock for its route
+  logic        q_v, q_ctr;
+  logic [8:0]  q_y, q_x;
+  logic signed [41:0] q_o2;
+  logic [7:0]  q_tag;
+  logic [T1W-1:0] t1_q2;
+  always_ff @(posedge clk) begin
+    if (rst) q_v <= 1'b0;
+    else if (en_f) begin
+      q_v <= p_v; q_y <= p_y; q_x <= p_x; q_o2 <= p_o2; q_tag <= p_tag; q_ctr <= p_ctr;
+    end
+    if (en_f) t1_q2 <= t1_q;
+  end
+  wire [110:0] t1_s = t1_q2[T1W-1 -: 111], t1_u = t1_q2[T1W-112 -: 111], t1_v = t1_q2[T1W-223 -: 111];
+  wire [8:0]   t1_eo = t1_q2[LW+9 -: 9];
+  wire         t1_tex = t1_q2[LW];
+  wire [16:0]  t1_lk  = MIP ? t1_q2[16:0] : 17'd0;
+  wire [3:0]   t1_lvm = MIP ? t1_q2[20:17] : 4'd0;
   function automatic logic signed [39:0] sx31(input logic [30:0] d);
     sx31 = {{9{d[30]}}, d};
   endfunction
@@ -622,8 +653,8 @@ module r3d_rast #(
   logic [3:0]  n_lv;
   r3d_rast_interp #(.TW(9), .MIP(MIP)) u_interp (
     .clk, .rst,
-    .i_valid(p_v && en_f), .i_ready(), .i_tag({p_ctr, p_tag}), .i_x(p_x), .i_y(p_y),
-    .i_o2(p_o2), .i_eo(t1_eo), .i_tex(t1_tex),
+    .i_valid(q_v && en_f), .i_ready(), .i_tag({q_ctr, q_tag}), .i_x(q_x), .i_y(q_y),
+    .i_o2(q_o2), .i_eo(t1_eo), .i_tex(t1_tex),
     .i_sc(t1_s[110:71]), .i_sdx(sx31(t1_s[70:40])), .i_sdy(sx31(t1_s[39:9])), .i_se(t1_s[8:0]),
     .i_uc(t1_u[110:71]), .i_udx(sx31(t1_u[70:40])), .i_udy(sx31(t1_u[39:9])), .i_ue(t1_u[8:0]),
     .i_vc(t1_v[110:71]), .i_vdx(sx31(t1_v[70:40])), .i_vdy(sx31(t1_v[39:9])), .i_ve(t1_v[8:0]),
@@ -661,6 +692,11 @@ module r3d_rast #(
   localparam logic [T1W-1:0] T1_UV = {{111{1'b0}}, {222{1'b1}}, {(T1W - 333){1'b0}}};   // slots 1 and 2 (u, v)
   wire [T1W-1:0] t1_cm = t1_q[LW] ? '1 : ~T1_UV;
   always_ff @(posedge clk) if (!rst && ((p_v && (t1_chk & t1_cm) != (t1_q & t1_cm)) || (r_v && t2_chk != t2_q))) $fatal(1, "rast: table read on en_f");
+  // (r3d140) and the Q stage's copy against the same read a stage on
+  logic [T1W-1:0] t1_chk2;
+  always_ff @(posedge clk) if (en_f) t1_chk2 <= t1_chk;
+  wire [T1W-1:0] t1_cm2 = t1_q2[LW] ? '1 : ~T1_UV;
+  always_ff @(posedge clk) if (!rst && q_v && (t1_chk2 & t1_cm2) != (t1_q2 & t1_cm2)) $fatal(1, "rast: table 1 in the Q stage");
   // R179: tab1 above is the old table (written whole at t_go), so t1_chk also checks table 1 by field
   // against it at every pixel; table Z by field against the old one at every span the Z walk takes
   always_ff @(posedge clk) if (!rst && s_take && tz_q != tzo_q) $fatal(1, "rast: table Z by field against the old table");
@@ -920,6 +956,7 @@ module r3d_rast #(
   logic [6:0]  cb_n;
   logic [31:0] cb_texel;
   logic [23:0] cb_col;
+  logic [47:0] cb_mod;
   // (SMTX: the texel's RGB is inverted here, with the entry's inversion bit read from ring B as it goes into
   // rq_b, and the colour unit is given am[3] = 0: the bit ran from ring B's output through the inversion into
   // the colour unit's 8 x 8 products and on into b1, the design's worst Real3D path at 120 MHz; tclose3)
@@ -927,6 +964,10 @@ module r3d_rast #(
     if (rst) cb_v <= 1'b0; else cb_v <= tb_valid;
     cb_n <= tb_n; cb_texel <= {tb_texel[31:24], tb_texel[23:0] ^ {24{SMTX && rq_bm[3]}}};
     cb_col <= rq_bm[64:41];
+    // (r3d140: the colour's modulation products formed here, a stage before its stage 1: the 8 x 8 products and the
+    // base's select were in one stage there, cb_texel -> u_col b1 -1.13 ns standalone and -2.57 in the 140 MHz full fit)
+    for (int c = 0; c < 3; c++)
+      cb_mod[16 * c +: 16] <= {8'd0, tb_texel[8 * c +: 8] ^ {8{SMTX && rq_bm[3]}}} * {8'd0, rq_bm[41 + 8 * c +: 8]};
   end
 `ifdef VERILATOR
   logic [RBW-1:0] rq_bc;
@@ -939,11 +980,11 @@ module r3d_rast #(
   logic [6:0]  co_n;
   logic [7:0]  co_fb;
   logic [23:0] co_rgb;
-  r3d_rast_colour #(.TW(7), .SMTX(SMTX)) u_col (
+  r3d_rast_colour #(.TW(7), .SMTX(SMTX), .MODIN(1'b1)) u_col (
     .clk, .rst, .en(1'b1),
     .i_valid(cb_v), .i_tag(cb_n), .i_kind(rq_b[RBW-1 -: 3]), .i_texel(cb_texel),
     .i_color(cb_col), .i_trans(rq_b[70:65]), .i_shade(rq_b[40:9]),
-    .i_fogint(rq_b[8:4]), .i_am({1'b0, rq_b[2:0]}), .i_fc(rq_d1[23:0]), .i_fs({{4{rq_d1[37]}}, rq_d1[37:24]}), .i_fp(rq_d2),
+    .i_fogint(rq_b[8:4]), .i_am({1'b0, rq_b[2:0]}), .i_mod(cb_mod), .i_fc(rq_d1[23:0]), .i_fs({{4{rq_d1[37]}}, rq_d1[37:24]}), .i_fp(rq_d2),
     .o_valid(co_v), .o_tag(co_n), .o_ok(co_ok), .o_zw(co_zw), .o_fbv(co_fbv), .o_fb(co_fb), .o_rgb(co_rgb));
 
   // ring C a cycle on: the pixel's place; the contour verdict
@@ -1024,19 +1065,35 @@ module r3d_rast #(
   always_ff @(posedge clk) begin
     if (rst) begin ip_n <= '0; tc_n <= '0; end
     else begin
-      ip_n <= ip_n + 6'(p_v && en_f) - 6'(n_valid && en_f);
+      ip_n <= ip_n + 6'(q_v && en_f) - 6'(n_valid && en_f);
       tc_n <= tc_n + 8'(f2_v && tc_iready) - 8'(tc_pop);
     end
   end
   wire busy_now = (ip_n != '0) || (tc_n != '0) || r_valid || g_valid || t_full || f_busy || f_svalid || za_pvalid ||
-                  (tq_n != 4'd0) || sk_v || !zs_ready || zo_valid || h_v || p_v || r_v || f1_v || f2_v ||
+                  (tq_n != 4'd0) || sk_v || !zs_ready || zo_valid || h_v || p_v || q_v || r_v || f1_v || f2_v ||
                   n_valid || !tc_iready || tc_ovalid || (bk_n != '0) || b_in_v || tb_valid || cb_v || co_v || cc_v;
+  // (tc130's change, R194 #7, taken here: busy_now registered (bz_q) and quiet counting from it, so quiet is the old
+  // count a cycle late; idle (old: quiet >= 15, fifteen free cycles ending last cycle) is then quiet >= 14 with last
+  // cycle free (!bz_q), the same cycle as before. busy_now ORs some 25 flags from all over the rasteriser, and with
+  // the reset in its tree it was rst_rast -> quiet -2.58 ns and b_in_v -> quiet -1.19 at 140 MHz. bz_q starts at 1
+  // out of reset (the old count was held at 0 through it). The old count is the check below.)
+  logic bz_q;
   always_ff @(posedge clk) begin
+    bz_q <= rst || busy_now;
     if (rst) quiet <= 4'd0;
-    else if (busy_now) quiet <= 4'd0;
+    else if (bz_q) quiet <= 4'd0;
     else if (quiet != 4'd15) quiet <= quiet + 4'd1;
   end
-  wire idle = (quiet >= 4'd15);
+  wire idle = (quiet >= 4'd14) && !bz_q;
+`ifdef VERILATOR
+  logic [3:0] quiet_o;                     // the old count
+  always_ff @(posedge clk) begin
+    if (rst) quiet_o <= 4'd0;
+    else if (busy_now) quiet_o <= 4'd0;
+    else if (quiet_o != 4'd15) quiet_o <= quiet_o + 4'd1;
+    if (!rst && idle != (quiet_o >= 4'd15)) $fatal(1, "r3d_rast: idle from the registered busy against the old count");
+  end
+`endif
   // for the bench's stall counts (no logic: nothing reads them)
   wire dbg_cache /* verilator public_flat_rd */ = f2_v && !tc_iready;                 // the cache refuses a pixel
   wire dbg_back  /* verilator public_flat_rd */ = tc_ovalid && !tc_oready;            // the band FIFO is full

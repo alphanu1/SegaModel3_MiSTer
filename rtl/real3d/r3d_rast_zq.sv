@@ -50,7 +50,11 @@ module r3d_rast_zq #(
   logic         byp;             // the head is bd: it was pushed last clock, into a queue left empty
   logic [W-1:0] bd, q;
 
-  assign i_ready = n != (A+1)'(D);
+  // (r3d140: i_ready as a register from n's next value: the count's compare was the z band's output ready, through
+  // its advance into the band's RAM enables and its stage registers, u_zq n -> u_zband RAM / sb_q -1.05 ns at 140 MHz
+  // standalone)
+  logic         i_rdy;
+  assign i_ready = i_rdy;
 
   wire          push = i_valid && i_ready;
   wire          pop  = o_v && o_ready;
@@ -76,13 +80,14 @@ module r3d_rast_zq #(
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      o_v <= 1'b0; byp <= 1'b0; wp <= '0; rp <= '0; n <= '0;
+      o_v <= 1'b0; byp <= 1'b0; wp <= '0; rp <= '0; n <= '0; i_rdy <= 1'b1;
     end else begin
       o_v <= push || !none;
       byp <= push && none;                        // (the read this clock is of the word being written)
       if (push) wp <= wp + 1'b1;
       if (pop)  rp <= rp + 1'b1;
       n <= n + (A+1)'(push) - (A+1)'(pop);
+      i_rdy <= n + (A+1)'(push) - (A+1)'(pop) != (A+1)'(D);
     end
   end
   // the word itself holds no reset
@@ -90,6 +95,6 @@ module r3d_rast_zq #(
 
 `ifdef VERILATOR
   always_ff @(posedge clk)
-    if (!rst && (o_v != (n != '0) || wp != rp + A'(n))) $fatal(1, "r3d_rast_zq: the count");
+    if (!rst && (o_v != (n != '0) || wp != rp + A'(n) || i_rdy != (n != (A+1)'(D)))) $fatal(1, "r3d_rast_zq: the count");
 `endif
 endmodule
