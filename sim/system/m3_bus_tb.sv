@@ -121,7 +121,7 @@ module m3_bus_tb
   logic [1:0][63:0] pd;
   assign p_ack = pk[0]; assign p_lo = pl[0]; assign p_dout = pd[0];
   m2_sdram #(.COL_BITS(10), .NP(2), .T_REFI(770), .ACK_HOLD(1), .DUAL(1'b1), .MASK_ON_A(1'b1), .INIT_NOP(200), .WB(2'b01), .L16({1'b0, L16}), .BXOR(BXOR), .PAIR({1'b0, PAIR}), .FDSP(FDSP), .HITRD(HITRD), .SHD(BR ? 2'b11 : 2'b00)) u_sdram (
-    .clk, .rst_n, .ready, .rd_lat_sel(3'd2),
+    .clk, .clk_cap(clk), .rst_n, .ready, .rd_lat_sel(3'd2),
     .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm(), .sd_dq_o, .sd_dq_oe(), .sd_dq_i,
     .wr_req(1'b0), .wr_addr('0), .wr_din('0), .wr_be('0), .wr_ack(),
     .p_req({1'b0, p_req}), .p_we({1'b0, p_we}), .p_addr({26'd0, p_addr}), .p_din({16'd0, p_din}), .p_be({2'b00, p_be}),

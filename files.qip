@@ -90,6 +90,9 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/m3_dsp_ring.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/m3_scsp_dsp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/sound/m3_sndbridge.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m3_ddr3p.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m3_avl_reg.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m3_sdr_opipe.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/mem/m3_sdr_cal.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/m2_fb_read.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/video/m3_compose.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/viewer/m3v_sdr_rd.sv

@@ -238,7 +238,7 @@ int main(int argc, char **argv) {
       t->DDRAM_DOUT_READY = 1; t->DDRAM_DOUT = dd.at(b.addr); b.addr++; dd.rd_beats++;
       if (--b.n == 0) dd.rq.pop_front();
     }
-    t->clk = 0; t->eval();
+    t->clk = 0; t->clk_cap1 = 0; t->clk_cap2 = 0; t->cap1_settled = 1; t->cap2_settled = 1; t->eval();   // (sys140: the DQ capture clocks with clk; the phase stepper always there)
     sd.cmd(cyc, t->sd_cke, t->sd_cs_n, t->sd_ras_n, t->sd_cas_n, t->sd_we_n, t->sd_ba, t->sd_a, t->sd_dq_o);
     if (!sd2_nomod) sd2.cmd(cyc, 1, t->sd2_cs_n, t->sd2_ras_n, t->sd2_cas_n, t->sd2_we_n, t->sd2_ba, t->sd2_a, t->sd2_dq_o);
     if (!t->DDRAM_BUSY && t->mem_rst_n) {
@@ -254,7 +254,7 @@ int main(int argc, char **argv) {
         dd.rq.push_back({a, t->DDRAM_ADDR, t->DDRAM_BURSTCNT ? uint32_t(t->DDRAM_BURSTCNT) : 256u});
       }
     }
-    t->clk = 1; t->eval();
+    t->clk = 1; t->clk_cap1 = 1; t->clk_cap2 = 1; t->eval();
     cyc++;
     if (p2.f) p2.tick(t->rootp, cyc, t->rt_valid_o, t->rt_pc_o, t->frame);
     if (lwc.on) {

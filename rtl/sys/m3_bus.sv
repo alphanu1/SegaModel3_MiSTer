@@ -132,6 +132,10 @@ module m3_bus
   parameter bit          C106_M10K  = 1'b0,
   parameter bit          EXT_SEC    = 1'b0,
   parameter bit          OWIRE      = 1'b0,
+  // sys140: OWIRE_SC 0 gives the 53C810's register and configuration ports (sc_*, cf_*) the registered copies
+  // again (the old form, loaded with each request), whatever OWIRE: at 140 MHz the bus's cmd / addr into the
+  // SCRIPTS core's registers were 310 failing endpoints (-2.5 ns); about 40 registers
+  parameter bit          OWIRE_SC   = OWIRE,
   parameter bit          WD_DEC     = 1'b0,
   // W2 (D-66, D-68): work RAM is on the second SDRAM (m3_sdr2). Its transactions, either master's, go out on the
   // same s_* port with s_w2 set, at the same SDRAM byte address (SDR_RAM + the low 23 bits), and the caller routes
@@ -509,18 +513,18 @@ module m3_bus
   logic [3:0]  sc_be_q, sec_be_q, cf_be_q;
   logic [31:0] sc_wdata_q, sec_wdata_q, cf_wdata_q, tg_reg_wdata_q;
   logic [15:0] tg_pal_wdata_q;
-  assign sc_we        = OWIRE ? cur_w      : sc_we_q;
-  assign sc_addr      = OWIRE ? addr[6:2]  : sc_addr_q;
-  assign sc_be        = OWIRE ? be         : sc_be_q;
-  assign sc_wdata     = OWIRE ? wd         : sc_wdata_q;
+  assign sc_we        = OWIRE_SC ? cur_w      : sc_we_q;
+  assign sc_addr      = OWIRE_SC ? addr[6:2]  : sc_addr_q;
+  assign sc_be        = OWIRE_SC ? be         : sc_be_q;
+  assign sc_wdata     = OWIRE_SC ? wd         : sc_wdata_q;
   assign sec_we       = OWIRE ? cur_w      : sec_we_q;
   assign sec_addr     = OWIRE ? addr[17:2] : sec_addr_q;
   assign sec_be       = OWIRE ? be         : sec_be_q;
   assign sec_wdata    = OWIRE ? wd         : sec_wdata_q;
-  assign cf_we        = OWIRE ? cur_w      : cf_we_q;
-  assign cf_idx       = OWIRE ? pci_reg    : cf_idx_q;
-  assign cf_be        = OWIRE ? {be[0], be[1], be[2], be[3]} : cf_be_q;
-  assign cf_wdata     = OWIRE ? bswap(wd)  : cf_wdata_q;
+  assign cf_we        = OWIRE_SC ? cur_w      : cf_we_q;
+  assign cf_idx       = OWIRE_SC ? pci_reg    : cf_idx_q;
+  assign cf_be        = OWIRE_SC ? {be[0], be[1], be[2], be[3]} : cf_be_q;
+  assign cf_wdata     = OWIRE_SC ? bswap(wd)  : cf_wdata_q;
   assign tg_reg_wdata = OWIRE ? wd_le      : tg_reg_wdata_q;
   assign tg_pal_wdata = OWIRE ? {wd[23:16], wd[31:24]} : tg_pal_wdata_q;
 

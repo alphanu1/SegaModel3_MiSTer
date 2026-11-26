@@ -56,6 +56,13 @@ module m3_sdr2
   parameter int          T_REFI   = 924,
   parameter int          T_RC     = 8,
   parameter int          T_RAS    = 6,
+  parameter int          T_RCD    = 2,                // sys140: tRCD and tRP (15 ns) in clocks, m3_system's from its clock
+  parameter int          T_RP     = 2,
+  parameter bit          CAPCLK   = 1'b0,             // sys140: m2_sdram's CAPCLK / CAPPIPE (dq_r on clk_cap, one more register)
+  parameter bit          CAPPIPE  = 1'b0,
+  parameter bit          OPIPE    = 1'b0,             // sys140: a register stage on the pins (m3_sdr_opipe; m2_sdram XLAT 1)
+  parameter int          CAPX     = 0,                // sys140: m2_sdram's CAPX (more capture registers)
+  parameter bit          CAL      = 1'b0,             // sys140: the read-capture calibration (m3_sdr_cal) after the probe
   parameter logic [26:0] PROBE_SA = 27'h640_0000,     // the probe's four words: the work RAM's base (SDR_RAM)
   parameter bit          L16      = 1'b1,
   parameter bit          LW1      = 1'b1,
@@ -70,12 +77,20 @@ module m3_sdr2
   parameter int          INFO_BIT = 28                // the OSD message's period: 2^(INFO_BIT+1) clocks (4.1 s at 130 MHz)
 ) (
   input  logic          clk,
+  input  logic          clk_cap,       // sys140: the DQ capture clock (CAPCLK)
   input  logic          mem_rst_n,     // the memory's reset (PLL lock)
   input  logic          ra_clr,        // m3_sdr_port's (the game's reset)
   input  logic          en,            // SDRAM2_EN (static)
   output logic          ok,            // the probe passed: the game may run
   output logic          missing,       // the probe failed (sticky)
   output logic          info_req,      // hps_io info_req: the OSD's message while missing
+  // sys140: the calibration (CAL): the capture clock's offset to the stepper and its state, the OSD's choice, results
+  input  logic [4:0]    cal_osd,
+  output logic [5:0]    cal_off,
+  input  logic          cal_settled,
+  output logic [6:0]    cal_width,
+  output logic [5:0]    cal_last,
+  output logic [5:0]    cal_flags,
 
   // the bus's work-RAM transactions (m3_bus s_*, s_w2)
   input  logic          s_req,
@@ -105,6 +120,30 @@ module m3_sdr2
   logic        en_s1, en_s2;
   always_ff @(posedge clk) begin en_s1 <= en; en_s2 <= en_s1; end
 
+  // ---- sys140: the calibration (CAL). It starts once the probe is over with the module there (SDRAM2_EN), owns
+  // the port's s_* until it is done (the bus is held off: ok is still low, so the game is in reset), and then `ok`
+  // says the calibration found a passing window (the probe's own reads were at the generated phase, which may be
+  // outside it). Without CAL: done from reset, ok the probe's, as before
+  logic        k_req, k_done, k_go;
+  logic [1:0]  k_cmd;
+  logic [AW:0] k_sa;
+  logic [3:0]  k_be, k_wbe;
+  logic [31:0] k_wdata;
+  m3_sdr_cal #(.AW(AW), .EN(CAL), .BASE(PROBE_SA ^ 27'h010_0000), .TWO_CHIPS(1'b0)) u_cal (   // (1 MiB past the probe's words)
+    .clk, .rst(!mem_rst_n), .start(k_go), .done(k_done),
+    .s_req(k_req), .s_cmd(k_cmd), .s_sa(k_sa), .s_be(k_be), .s_wdata(k_wdata), .s_wbe(k_wbe),
+    .s_ack, .s_wnext, .s_rvalid, .s_rdata,
+    .osd(cal_osd), .off(cal_off), .settled(cal_settled), .c_width(cal_width), .c_centre(),
+    .c_last(cal_last), .c_off(), .c_flags(cal_flags), .pass_map());
+  wire         q_cal = CAL && !k_done;
+  wire         q_req = q_cal ? k_req : s_req;
+  wire  [1:0]  q_cmd = q_cal ? k_cmd : s_cmd;
+  wire  [AW:0] q_sa  = q_cal ? k_sa : s_sa;
+  wire         q_swap = !q_cal && s_swap, q_zero = !q_cal && s_zero;
+  wire  [3:0]  q_be  = q_cal ? k_be : s_be;
+  wire  [31:0] q_wdata = q_cal ? k_wdata : s_wdata;
+  wire  [3:0]  q_wbe = q_cal ? k_wbe : s_wbe;
+
   // ---- the bus's port
   logic        sp_req, sp_we, sp_long, sp_lo, sp_ack;
   logic [AW:1] sp_addr;
@@ -116,9 +155,11 @@ module m3_sdr2
   logic [1:0]  wb_be;
   m3_sdr_port #(.AW(AW), .L16(L16), .LW1(LW1), .PAIR(PAIR), .RA(1'b0), .PW(PW), .FWD(FWD), .FREQ(FREQ), .PW_DLY(PW_DLY)) u_port (
     .clk, .rst(!mem_rst_n), .ra_clr,
-    .s_req, .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_wbe, .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle(),
+    .s_req(q_req), .s_cmd(q_cmd), .s_sa(q_sa), .s_swap(q_swap), .s_zero(q_zero), .s_be(q_be), .s_wdata(q_wdata), .s_wbe(q_wbe),
+    .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle(),
     .p_req(sp_req), .p_we(sp_we), .p_addr(sp_addr), .p_din(sp_din), .p_be(sp_be), .p_long(sp_long),
     .p_dout(sp_dout), .p_lo(sp_lo), .p_ack(sp_ack), .wb_col, .wb_din, .wb_be);
+
 
   // ---- the start-up probe
   typedef enum logic [1:0] { PR_IDLE, PR_W, PR_R, PR_DONE } pr_t;
@@ -162,10 +203,13 @@ module m3_sdr2
       end
       default: begin
         pr_act <= 1'b0;
-        ok <= pr_pass; missing <= !pr_pass;
+        if (!CAL) begin ok <= pr_pass; missing <= !pr_pass; end
+        else if (!en_s2) begin ok <= 1'b0; missing <= 1'b1; end                // no module: no calibration
+        else if (k_done) begin ok <= !cal_flags[0]; missing <= cal_flags[0]; end  // no passing window: missing
       end
     endcase
   end
+  assign k_go = (pr_s == PR_DONE) && !pr_act && en_s2;
   logic [INFO_BIT:0] inf_cnt;
   always_ff @(posedge clk) begin
     if (!missing) begin inf_cnt <= '0; info_req <= 1'b0; end
@@ -193,14 +237,27 @@ module m3_sdr2
   localparam bit W2_C1 = (PROBE_SA >= 27'h400_0000) && ({1'b0, PROBE_SA} + 28'h80_0000 <= 28'h800_0000);
   logic [1:0] sd_dqm_unused;
   logic       sd_cke_unused;
-  m2_sdram #(.COL_BITS(10), .NP(NP), .T_REFI(T_REFI), .T_RC(T_RC), .T_RAS(T_RAS), .ACK_HOLD(1),
+  // sys140: the controller's pin outputs, straight to the pins or through m3_sdr_opipe (OPIPE)
+  logic        q_cs_n, q_ras_n, q_cas_n, q_we_n, q_dq_oe;
+  logic [1:0]  q_ba;
+  logic [12:0] q_a;
+  logic [15:0] q_dq_o;
+  generate if (OPIPE) begin : g_op
+    m3_sdr_opipe u_op (.clk, .i_cke(1'b1), .i_cs_n(q_cs_n), .i_ras_n(q_ras_n), .i_cas_n(q_cas_n), .i_we_n(q_we_n),
+      .i_ba(q_ba), .i_a(q_a), .i_dqm(2'b00), .i_dq_o(q_dq_o), .i_dq_oe(q_dq_oe),
+      .sd_cke(), .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm(), .sd_dq_o, .sd_dq_oe);
+  end else begin : g_nop
+    assign {sd_cs_n, sd_ras_n, sd_cas_n, sd_we_n, sd_ba, sd_a, sd_dq_o, sd_dq_oe} =
+           {q_cs_n, q_ras_n, q_cas_n, q_we_n, q_ba, q_a, q_dq_o, q_dq_oe};
+  end endgenerate
+  m2_sdram #(.COL_BITS(10), .NP(NP), .T_REFI(T_REFI), .T_RC(T_RC), .T_RAS(T_RAS), .T_RCD(T_RCD), .T_RP(T_RP), .CAPCLK(CAPCLK), .CAPPIPE(CAPPIPE), .XLAT(OPIPE ? 1 : 0), .CAPX(CAPX), .ACK_HOLD(1),
              .INIT_NOP(CLK_MHZ * 110), .DUAL(1'b1), .MASK_ON_A(1'b1),
              .PRI(P0), .PRI_TOP(P0), .BXOR(BXOR),
              .WB(P0), .L16(L16 ? P0 : NP'(0)), .PAIR(PAIR ? P0 : NP'(0)), .FDSP(FDSP), .HITRD(HITRD),
              .SHD(P0), .DCHIP1(W2_C1)) u_sdram (
-    .clk, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
-    .sd_cke(sd_cke_unused), .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm(sd_dqm_unused),
-    .sd_dq_o, .sd_dq_oe, .sd_dq_i,
+    .clk, .clk_cap, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
+    .sd_cke(sd_cke_unused), .sd_cs_n(q_cs_n), .sd_ras_n(q_ras_n), .sd_cas_n(q_cas_n), .sd_we_n(q_we_n), .sd_ba(q_ba),
+    .sd_a(q_a), .sd_dqm(sd_dqm_unused), .sd_dq_o(q_dq_o), .sd_dq_oe(q_dq_oe), .sd_dq_i,
     .wr_req(pr_wreq), .wr_addr({PA[AW:3], pr_i}), .wr_din(pr_d), .wr_be(2'b11), .wr_ack,
     .p_req(c_req), .p_we(c_we), .p_addr(c_addr), .p_din(c_din), .p_be(c_be), .p_dout(c_dout), .p_ack(c_ack),
     .p_long(c_long), .p_lo(c_lo), .wb_col, .wb_din, .wb_be,

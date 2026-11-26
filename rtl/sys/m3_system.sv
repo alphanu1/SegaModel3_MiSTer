@@ -200,9 +200,29 @@ module m3_system
   //   SDRAM (m3_sdr2, its own m2_sdram on the sd2_* pins, the CPU's port at priority), at the same byte address; the
   //   game is held in reset until its start-up probe passes. 0: work RAM on the first SDRAM, the sd2_* outputs
   //   idle (Model3.sv does not use them), as before
-  parameter bit          W2          = 1'b0
+  parameter bit          W2          = 1'b0,
+  // ---- sys140 (D-81): the SDRAMs' read capture and the DDR3 port at 140 MHz
+  //   SDR_CAPCLK   each controller's DQ input register on its own clock (clk_cap1 / clk_cap2: clk's rate at a phase
+  //                of its own, the read eye set apart from the pin clock that times commands and writes; m2_sdram CAPCLK)
+  //   SDR_CAPPIPE  one more register after it (m2_sdram CAPPIPE): the word reaches the capture logic a clock later
+  //   DDR_OREG     one register stage on the DDR3 port's command side (m3_avl_reg), a clock on each command
+  parameter bit          SDR_CAPCLK  = 1'b0,
+  parameter bit          SDR_CAPPIPE = 1'b0,
+  parameter bit          DDR_OREG    = 1'b0,
+  //   SDR_OPIPE    one register stage between each controller and its pins (m3_sdr_opipe), its reads a clock deeper
+  parameter bit          SDR_OPIPE   = 1'b0,
+  //   SDR_TRCD     tRCD / tRP in clocks; 0: from CLK_HZ (15 ns, at least 2)
+  parameter int          SDR_TRCD    = 0,
+  //   SDR2_CAPX    more capture registers on the second SDRAM (m2_sdram CAPX), a read clock each
+  parameter int          SDR2_CAPX   = 0,
+  //   SDR_CAL      the read-capture calibration of each SDRAM at power-up (m3_sdr_cal): the capture clocks stepped
+  //                through their period, the phase set to the widest passing window's centre; the loader (and so
+  //                the HPS's downloads) waits for the first SDRAM's, the game for the second's (m3_sdr2's ok)
+  parameter bit          SDR_CAL     = 1'b0
 ) (
   input  logic        clk,
+  input  logic        clk_cap1,      // sys140: the first SDRAM's DQ capture clock (SDR_CAPCLK)
+  input  logic        clk_cap2,      // the second's
   input  logic        mem_rst_n,
   input  logic        reset,         // RESET | OSD reset | buttons
 
@@ -276,6 +296,15 @@ module m3_system
   output logic        led,
   output logic        uart_tx,
   input  logic        tb_fast,       // bench only (0 on the board): the timebase at the clock rate
+  // sys140: the capture clocks' offsets (0-47 PLL steps from the generated phase) to Model3.sv's stepper and its
+  // state per counter, the OSD's choice per SDRAM (0 Auto, 1-7 manual), and the FPS box showing the calibration
+  output logic [5:0]  cap1_off,
+  output logic [5:0]  cap2_off,
+  input  logic        cap1_settled,
+  input  logic        cap2_settled,
+  input  logic [4:0]  cap1_osd,
+  input  logic [4:0]  cap2_osd,
+  input  logic        cal_show,
 
   // bench
   output logic        rom_loaded,
@@ -311,6 +340,9 @@ module m3_system
   // stay at m2_sdram's 2 clocks to 133 MHz.
   localparam int T_RC_N     = (CLK_MHZ * 60 + 999) / 1000;
   localparam int T_RAS_N    = (CLK_MHZ * 42 + 999) / 1000;
+  // sys140: tRCD and tRP (15 ns) in whole clocks, 2 to 133 MHz as before, 3 at 140 (2 clocks would be 14.3 ns)
+  localparam int T_RCD_A    = (CLK_MHZ * 15 + 999) / 1000 > 2 ? (CLK_MHZ * 15 + 999) / 1000 : 2;
+  localparam int T_RCD_C    = (SDR_TRCD != 0) ? SDR_TRCD : T_RCD_A;
   localparam int T_RC_C     = (T_RC_N  > 7) ? T_RC_N  : 7;
   localparam int T_RAS_C    = (T_RAS_N > 5) ? T_RAS_N : 5;
   localparam logic [26:0] SDR_CROM = 27'h000_0000, SDR_FIXED = 27'h600_0000, SDR_BACKUP = 27'h620_0000,
@@ -332,14 +364,17 @@ module m3_system
   (* preserve *) logic rst_cpu = 1'b1;
   // and one for the sound link (SND_DSP), which spans its own corner of the device
   (* preserve *) logic rst_snd = 1'b1;
+  // sys140: and one for m3_xmem (rst_s[2] into its queue's entries' enables: 301 endpoints, -2.75 ns at 140 MHz)
+  (* preserve *) logic rst_xm = 1'b1;
   always_ff @(posedge clk) begin
     rst_geo  <= rst_s[1];
     rst_rast <= rst_s[1];
     rst_cpu  <= rst_s[1];
     rst_snd  <= rst_s[1];
+    rst_xm   <= rst_s[1];
   end
 `ifdef VERILATOR
-  always_ff @(posedge clk) if ({rst_geo, rst_rast, rst_cpu, rst_snd} != {4{rst}}) $fatal(1, "m3_system: the reset copies");
+  always_ff @(posedge clk) if ({rst_geo, rst_rast, rst_cpu, rst_snd, rst_xm} != {5{rst}}) $fatal(1, "m3_system: the reset copies");
 `endif
   logic por_n;                       // power-on: the EEPROM and the I/O latches
   always_ff @(posedge clk) por_n <= mem_rst_n;
@@ -372,7 +407,21 @@ module m3_system
   assign wb_din = (wb_grant == 3'd4) ? r3_wbd : sp_wbd;
   assign wb_be  = (wb_grant == 3'd4) ? r3_wbb : sp_wbb;
 `endif
-  m2_sdram #(.COL_BITS(COL_BITS), .NP(NSP), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL),
+  // sys140: the first controller's pin outputs, straight to the pins or through m3_sdr_opipe (SDR_OPIPE)
+  logic        q_cke, q_cs_n, q_ras_n, q_cas_n, q_we_n, q_dq_oe;
+  logic [1:0]  q_ba, q_dqm;
+  logic [12:0] q_a;
+  logic [15:0] q_dq_o;
+  generate if (SDR_OPIPE) begin : g_sdop
+    m3_sdr_opipe u_op1 (.clk, .i_cke(q_cke), .i_cs_n(q_cs_n), .i_ras_n(q_ras_n), .i_cas_n(q_cas_n), .i_we_n(q_we_n),
+      .i_ba(q_ba), .i_a(q_a), .i_dqm(q_dqm), .i_dq_o(q_dq_o), .i_dq_oe(q_dq_oe),
+      .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm, .sd_dq_o, .sd_dq_oe);
+  end else begin : g_sdnop
+    assign {sd_cke, sd_cs_n, sd_ras_n, sd_cas_n, sd_we_n, sd_ba, sd_a, sd_dqm, sd_dq_o, sd_dq_oe} =
+           {q_cke, q_cs_n, q_ras_n, q_cas_n, q_we_n, q_ba, q_a, q_dqm, q_dq_o, q_dq_oe};
+  end endgenerate
+  m2_sdram #(.COL_BITS(COL_BITS), .NP(NSP), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .T_RCD(T_RCD_C), .T_RP(T_RCD_C),
+             .CAPCLK(SDR_CAPCLK), .CAPPIPE(SDR_CAPPIPE), .XLAT(SDR_OPIPE ? 1 : 0), .ACK_HOLD(1), .DUAL(DUAL), .MASK_ON_A(DUAL),
              .PRI(SDR_PRI), .PRI_CAP(SDR_PRI_CAP), .AGE(SDR_AGE), .AGE_T(SDR_AGE_T), .BXOR(SDR_BXOR),
              .L16({{(NSP-1){1'b0}}, SDR_L16}), .PAIR({{(NSP-1){1'b0}}, SDR_PAIR}),
 `ifdef M3_R3B
@@ -382,8 +431,9 @@ module m3_system
              .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD),
              .SHD(SDR_SHD ? NSP'(6'b101111) : NSP'(0))) u_sdram (   // port 0 (the bus) writes in bursts (R101)
 `endif
-    .clk, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
-    .sd_cke, .sd_cs_n, .sd_ras_n, .sd_cas_n, .sd_we_n, .sd_ba, .sd_a, .sd_dqm, .sd_dq_o, .sd_dq_oe, .sd_dq_i,
+    .clk, .clk_cap(clk_cap1), .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
+    .sd_cke(q_cke), .sd_cs_n(q_cs_n), .sd_ras_n(q_ras_n), .sd_cas_n(q_cas_n), .sd_we_n(q_we_n), .sd_ba(q_ba), .sd_a(q_a),
+    .sd_dqm(q_dqm), .sd_dq_o(q_dq_o), .sd_dq_oe(q_dq_oe), .sd_dq_i,
     .wr_req(ld_req), .wr_addr(ld_addr), .wr_din(ld_din), .wr_be(ld_be), .wr_ack(ld_ack),
     .p_req, .p_we, .p_addr, .p_din, .p_be, .p_dout, .p_ack, .p_long, .p_lo, .wb_col, .wb_din, .wb_be,
 `ifdef M3_R3B
@@ -391,6 +441,7 @@ module m3_system
 `endif
     .dbg_req(), .dbg_grant());
 
+  logic        k_done, sdr1_usable;    // sys140: the first SDRAM's calibration over; up and calibrated
   logic [26:0] ld_bytes;
   logic        ld_ovf;
   // R100: the extra memory's writes, the 93C46's load, the game configuration
@@ -406,7 +457,7 @@ module m3_system
   logic [7:0]  cfg_prof /* verilator public_flat_rd */, cfg_pflg;   // the input profile and its flags
   m3_loader #(.AW(AW), .BACKUP(SDR_BACKUP), .FIX8(SDR_FIX8), .OWIRE(BR_LD),
               .VROM_X((VROM_LOC != 0) && (VROM_LOC == XMEM)), .VROM_AT(27'h400_0000)) u_ld (   // R100: VROM placement
-    .clk, .rst(!mem_rst_n), .mem_ready, .x_ok(ddr_ok),
+    .clk, .rst(!mem_rst_n), .mem_ready(sdr1_usable), .x_ok(ddr_ok),
     .ioctl_download, .ioctl_index, .ioctl_wr, .ioctl_addr, .ioctl_dout, .ioctl_wait,
     .sdr_wr_req(ld_req), .sdr_wr_addr(ld_addr), .sdr_wr_din(ld_din), .sdr_wr_be(ld_be), .sdr_wr_ack(ld_ack),
     .x_req(lx_req), .x_addr(lx_addr), .x_din(lx_din), .x_ack(lx_ack),
@@ -638,7 +689,7 @@ module m3_system
   logic       tg_nw;                      // a write into the name table (the bus's tr_nw; R103, R179)
   m3_bus #(.AW(AW), .SDR_CROM(SDR_CROM), .SDR_FIXED(SDR_FIXED), .SDR_BACKUP(SDR_BACKUP), .SDR_RAM(SDR_RAM),
            .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P), .TGT(TG_TIMING), .TG_MHZ(CLK_MHZ),
-           .C106_M10K(BR_C106), .OWIRE(BR_BUS), .WD_DEC(BR_BUS), .W2(W2)
+           .C106_M10K(BR_C106), .OWIRE(BR_BUS), .OWIRE_SC(1'b0), .WD_DEC(BR_BUS), .W2(W2)
 `ifdef M3_STEP2_BUS
            , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ), .EXT_SEC(BR_SEC)
 `endif
@@ -664,9 +715,31 @@ module m3_system
     .snd_we, .snd_data, .snd_byte,
     .tr_v, .tr_master, .tr_we, .tr_addr, .tr_be, .tr_data, .tr_nw(tg_nw));
 
+  // sys140: the first SDRAM's read-capture calibration (SDR_CAL), on the bus's port while the loader waits (the game
+  // is in reset until the downloads are in, so the bus asks nothing of it)
+  logic        k_req;
+  logic [1:0]  k_cmd;
+  logic [AW:0] k_sa;
+  logic [3:0]  k_be, k_wbe;
+  logic [31:0] k_wdata;
+  logic [6:0]  cal1_width, cal2_width;
+  logic [5:0]  cal1_last, cal2_last;
+  logic [5:0]  cal1_flags, cal2_flags;
+  m3_sdr_cal #(.AW(AW), .EN(SDR_CAL), .BASE(27'h000_0000), .TWO_CHIPS(DUAL)) u_cal1 (
+    .clk, .rst(!mem_rst_n), .start(mem_ready), .done(k_done),
+    .s_req(k_req), .s_cmd(k_cmd), .s_sa(k_sa), .s_be(k_be), .s_wdata(k_wdata), .s_wbe(k_wbe),
+    .s_ack(sp_ack), .s_wnext(sp_wnext), .s_rvalid(sp_rvalid), .s_rdata(sp_rdata),
+    .osd(cap1_osd), .off(cap1_off), .settled(cap1_settled), .c_width(cal1_width), .c_centre(),
+    .c_last(cal1_last), .c_off(), .c_flags(cal1_flags), .pass_map());
+  // the SDRAM may take traffic: up (m2_sdram ready) and calibrated (one meaning: usable; mem_ready stays the
+  // controller's own)
+  assign       sdr1_usable = mem_ready && k_done;
+  wire         k_cal = SDR_CAL && !k_done;
   m3_sdr_port #(.AW(AW), .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .RA(SDR_RA), .RA_TOP(SDR_VRAM), .RA_CONF(SDR_RA_CONF), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ), .PW_DLY(SDR_PW_DLY)) u_sport (
     .clk, .rst(!mem_rst_n), .ra_clr(rst),
-    .s_req(s_req && !s_x && !s_w2), .s_cmd, .s_sa, .s_swap, .s_zero, .s_be, .s_wdata, .s_wbe, .s_ack(sp_ack), .s_wnext(sp_wnext), .s_rvalid(sp_rvalid),
+    .s_req(k_cal ? k_req : (s_req && !s_x && !s_w2)), .s_cmd(k_cal ? k_cmd : s_cmd), .s_sa(k_cal ? k_sa : s_sa),
+    .s_swap(!k_cal && s_swap), .s_zero(!k_cal && s_zero), .s_be(k_cal ? k_be : s_be), .s_wdata(k_cal ? k_wdata : s_wdata),
+    .s_wbe(k_cal ? k_wbe : s_wbe), .s_ack(sp_ack), .s_wnext(sp_wnext), .s_rvalid(sp_rvalid),
     .s_rdata(sp_rdata), .s_idle,
     .p_req(p_req[0]), .p_we(p_we[0]), .p_addr(p_addr[0]), .p_din(p_din[0]), .p_be(p_be[0]), .p_long(p_long[0]),
 `ifdef M3_R3B
@@ -685,10 +758,13 @@ module m3_system
   // D-66 / D-68: the second SDRAM, the CPU's work RAM (W2)
   generate if (W2) begin : g_w2
     logic sd2_ok_q;
-    m3_sdr2 #(.AW(AW), .CLK_MHZ(CLK_MHZ), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .PROBE_SA(SDR_RAM),
+    m3_sdr2 #(.AW(AW), .CLK_MHZ(CLK_MHZ), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .T_RCD(T_RCD_C), .T_RP(T_RCD_C),
+              .CAPCLK(SDR_CAPCLK), .CAPPIPE(SDR_CAPPIPE), .OPIPE(SDR_OPIPE), .CAPX(SDR2_CAPX), .CAL(SDR_CAL), .PROBE_SA(SDR_RAM),
               .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ),
               .PW_DLY(SDR_PW_DLY), .BXOR(SDR_BXOR), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdr2 (
-      .clk, .mem_rst_n, .ra_clr(rst), .en(sd2_en), .ok(sd2_ok_q), .missing(sd2_missing), .info_req(sd2_info_req),
+      .clk, .clk_cap(clk_cap2), .mem_rst_n, .ra_clr(rst), .en(sd2_en), .ok(sd2_ok_q), .missing(sd2_missing), .info_req(sd2_info_req),
+      .cal_osd(cap2_osd), .cal_off(cap2_off), .cal_settled(cap2_settled), .cal_width(cal2_width), .cal_last(cal2_last),
+      .cal_flags(cal2_flags),
       // (area130 A) the bus sends only work RAM here (m3_bus: s_w2 is its decode's first case): word form,
       // never a zero read, at SDR_RAM + the low 23 bits, so bits AW:24 are SDR_RAM's; tied as constants
       .s_req(s_req && s_w2), .s_cmd, .s_sa({SDR_RAM[AW:24], s_sa[23:0]}), .s_swap(1'b0), .s_zero(1'b0), .s_be, .s_wdata, .s_wbe,
@@ -703,6 +779,7 @@ module m3_system
 `endif
   end else begin : g_now2
     assign sd2_ok = 1'b1; assign sd2_missing = 1'b0; assign sd2_info_req = 1'b0;
+    assign cap2_off = 6'd0; assign cal2_width = '0; assign cal2_last = '0; assign cal2_flags = '0;
     assign w2_ack = 1'b0; assign w2_wnext = 1'b0; assign w2_rvalid = 1'b0; assign w2_rdata = '0;
     // the pins as d130 held them: deselected (NOP), DQ not driven
     assign {sd2_cs_n, sd2_ras_n, sd2_cas_n, sd2_we_n} = 4'b1111;
@@ -802,17 +879,34 @@ module m3_system
     wire _unused_vol = &{1'b0, snd_vol};
   end endgenerate
 
+  // sys140: the gate as a register of its own here (ddr_ok comes from Model3.sv's top: ddr_ok -> m3_ddr3p's take was
+  // -2.8 ns at 140 MHz); it rises once, 100 ms after Main's release, a clock later than before
+  (* preserve *) logic ddr_go = 1'b0;
+  always_ff @(posedge clk) ddr_go <= ddr_ok;
+  logic        dq_rd, dq_we, dq_busy;
+  logic [28:0] dq_addr;
+  logic [7:0]  dq_n, dq_be;
+  logic [63:0] dq_din;
   m3_ddr3p #(.PIPE(1'b1), .NP(2), .MAXQ(DDR_MAXQ)) u_ddr3 (   // R101: reads in flight capped (the probe: 16 or more raise latency)
     .clk, .rst_n(mem_rst_n), .base(DDR_BASE),
-    .req(dm_req && ddr_ok), .we(dm_we), .addr(dm_addr), .blen(dm_blen), .din(dm_din), .be(dm_be),
+    .req(dm_req && ddr_go), .we(dm_we), .addr(dm_addr), .blen(dm_blen), .din(dm_din), .be(dm_be),
     .wnext(), .wacc(dm_wacc), .rvalid(dm_rvalid), .ack(dm_ack),
-    .p_req({xp_req && ddr_ok, tx_req && ddr_ok}), .p_addr({xp_addr, tx_addr}), .p_blen({xp_blen, 8'd4}),
+    .p_req({xp_req && ddr_go, tx_req && ddr_go}), .p_addr({xp_addr, tx_addr}), .p_blen({xp_blen, 8'd4}),
     .p_we(2'b00), .p_din('0), .p_ack({xp_ack, tx_ack}), .p_rvalid({xp_rvalid, tx_rvalid}), .p_wacc(),
     .dout(dm_dout),
-    .DDRAM_CLK, .DDRAM_BUSY, .DDRAM_BURSTCNT, .DDRAM_ADDR, .DDRAM_DIN, .DDRAM_BE,
-    .DDRAM_WE, .DDRAM_RD, .DDRAM_DOUT, .DDRAM_DOUT_READY,
+    .DDRAM_CLK, .DDRAM_BUSY(dq_busy), .DDRAM_BURSTCNT(dq_n), .DDRAM_ADDR(dq_addr), .DDRAM_DIN(dq_din), .DDRAM_BE(dq_be),
+    .DDRAM_WE(dq_we), .DDRAM_RD(dq_rd), .DDRAM_DOUT, .DDRAM_DOUT_READY,
     .dbg_lat_v(), .dbg_lat(), .dbg_lat_src(), .dbg_lat_max(), .dbg_acc(), .dbg_acc_max(),
     .dbg_take(), .dbg_take_src(), .dbg_done(), .dbg_done_src(), .dbg_idle(), .dbg_st(), .dbg_rdy(), .dbg_rq());
+  generate if (DDR_OREG) begin : g_doreg
+    m3_avl_reg u_dreg (
+      .clk, .rst_n(mem_rst_n), .u_rd(dq_rd), .u_we(dq_we), .u_addr(dq_addr), .u_burstcnt(dq_n), .u_din(dq_din),
+      .u_be(dq_be), .u_busy(dq_busy),
+      .DDRAM_RD, .DDRAM_WE, .DDRAM_ADDR, .DDRAM_BURSTCNT, .DDRAM_DIN, .DDRAM_BE, .DDRAM_BUSY);
+  end else begin : g_nodoreg
+    assign {DDRAM_RD, DDRAM_WE, DDRAM_ADDR, DDRAM_BURSTCNT, DDRAM_DIN, DDRAM_BE} = {dq_rd, dq_we, dq_addr, dq_n, dq_din, dq_be};
+    assign dq_busy = DDRAM_BUSY;
+  end endgenerate
 
   // ---- command, status, the frame sequence
   logic        m3_valid, m3_ready, m3_can_swap, m3_rbusy;
@@ -951,7 +1045,7 @@ module m3_system
   generate if (XMEM == 1) begin : g_xmem
     logic [23:0] xb_addr;
     m3_xmem #(.AW(AW), .SDR_VROM(SDR_VROM), .XLIN(VROM_LIN)) u_xmem (
-      .clk, .rst, .vrom64,
+      .clk, .rst(rst_xm), .vrom64,
       .g_req(vr_req && vrom_x), .g_addr(vr_addr), .g_len(vr_len), .g_ack(xg_ack), .g_rvalid(xg_rv), .g_rdata(xg_rd),
       .t_req(tu_sreq && vrom_x), .t_addr(tu_saddr), .t_ack(xt_ack), .t_dout(xt_dout),
       .b_req(xp_req), .b_addr(xb_addr), .b_blen(xp_blen), .b_ack(xp_ack), .b_rvalid(xp_rvalid), .b_dout(dm_dout));
@@ -1327,16 +1421,27 @@ module m3_system
     assign ov_box = 1'b0; assign ov_ink = 1'b0; assign ov_idx = '0; assign ov_v = '0;
   end endgenerate
 
+  // sys140: a calibration's result code for the FPS box (below), from m3_sdr_cal's flags
+  function automatic logic [2:0] ccode(input logic [5:0] f);    // {verify, out, clamped, all, narrow, none}
+    ccode = f[5] ? 3'd6 : f[0] ? 3'd4 : f[2] ? 3'd5 : f[4] ? 3'd2 : f[3] ? 3'd1 : f[1] ? 3'd3 : 3'd0;
+  endfunction
   // the frame counter: Real3D frames begun a second, n_draw's low bit toggling once a frame
   logic fps_box, fps_ink;
   generate if (FPS) begin : g_fps
     logic nd0_q;
     always_ff @(posedge clk) nd0_q <= n_draw[0];
-    m3_fps #(.CLK_HZ(CLK_HZ), .EXT_SEC(BR_SEC)) u_fps (.clk, .rst, .sec_tick, .en(fps_en), .avg(fps_avg), .draw(n_draw[0] ^ nd0_q), .x(x_d), .y(y_d),
+    // (sys140) with cal_show the box shows the calibration instead, a value a second after a blank second, for the
+    // first SDRAM and then the second: the offset applied (given to the stepper, Auto's or the OSD's: 0-47 PLL
+    // steps of 148.8 ps from the generated phase, 1488 / 1190 ps; 40-47 are -8 .. -1), the result's code (0 centred,
+    // 1 clamped to the band's end, 2 out of the band: offset 0, 3 narrow, 4 no window, 5 every step passed, 6 the
+    // verify pass failed: offset 0), the passing window's width (steps) and its last step (0-47, as the offset)
+    m3_fps #(.CLK_HZ(CLK_HZ), .EXT_SEC(BR_SEC)) u_fps (.clk, .rst, .sec_tick, .en(fps_en || cal_show), .avg(fps_avg), .draw(n_draw[0] ^ nd0_q), .x(x_d), .y(y_d),
+                                     .cal_show, .cal_v({{1'b0, cal2_last}, cal2_width, {4'd0, ccode(cal2_flags)}, {1'b0, cap2_off},
+                                                        {1'b0, cal1_last}, cal1_width, {4'd0, ccode(cal1_flags)}, {1'b0, cap1_off}}),
                                      .box(fps_box), .ink(fps_ink));
   end else begin : g_nofps
     assign fps_box = 1'b0; assign fps_ink = 1'b0;
-    wire _unused_avg = &{1'b0, fps_avg};
+    wire _unused_avg = &{1'b0, fps_avg, cal_show};
   end endgenerate
 
   always_ff @(posedge clk) if (ce_pix) begin

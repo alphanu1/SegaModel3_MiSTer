@@ -370,3 +370,16 @@ set_global_assignment -name VERILOG_MACRO "M3_R3B=1"
 # phase): Quartus would otherwise merge outclk_3 into outclk_2, and Model3.sdc's sd2_pin and the second SDRAM's I/O
 # constraints would then match nothing (c135y_s1, 2026-11-20). As sys/pll_hdmi does for its PLL.
 set_instance_assignment -name UNFORCE_MERGE_PLL_OUTPUT_COUNTER ON -to "*pll_0002*|altera_pll:altera_pll_i*|*"
+
+# sys140: the DQ capture clocks (outclk_4 / outclk_5) on global clocks, so the DQ pins' input registers (in banks 3A,
+# 3B, 4A, 5A, 5B and 8A) can all be in their I/O cells: on a regional clock (t1_s1, outclk_4 on CLKCTRL_R76) the
+# first SDRAM's went into the core at X46 Y35
+# (with the dynamic-phase ports the PLL is built as altera_cyclonev_pll and its outputs are divclk[n]: t2_s1's
+# outclk_wire[4] assignment matched nothing, and outclk_4 went on CLKCTRL_R33 again)
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|pll:pll|pll_0002:pll_inst|altera_pll:altera_pll_i|altera_cyclonev_pll:cyclonev_pll|divclk[4]"
+set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|pll:pll|pll_0002:pll_inst|altera_pll:altera_pll_i|altera_cyclonev_pll:cyclonev_pll|divclk[5]"
+# sys140: the tile generator's line start into its palette, its line buffers and its fetch (t1_s1: 185 + 27 endpoints,
+# -2.0 / -2.1 ns, the one register's route)
+set_instance_assignment -name MAX_FANOUT 16 -to "emu:emu|m3_system:sys3|tg_go"
+# sys140: m3_xmem's own reset copy, duplicated
+set_instance_assignment -name MAX_FANOUT 64 -to "emu:emu|m3_system:sys3|rst_xm"
