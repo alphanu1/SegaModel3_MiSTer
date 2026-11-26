@@ -155,6 +155,8 @@ package ppc_pkg;
     // stfs (a second EX cycle), and the fast port's route kind (frsqrte; a
     // single op the single unit runs when its operands allow)
     logic       ffma, fdiv, fmsc, fmw, ffsx, ff2c, frq, frs;
+    // frsp, fctiw, fctiwz (cpu140 kit 1a): the conversion port's kind (ppc_core CVL)
+    logic       frc;
     // fetch-side, set by the core (ppc_pdw leaves them 0), for the BTB's keys
     // (D-30): the word's slot in its two-word request, whether the request
     // before it was two words, and whether its request was sequential
@@ -176,6 +178,6 @@ package ppc_pkg;
     // fields for the GPR file's read addresses (ppc_fetchq r_rf)
     logic [2:0] sh;          // rA, rB, rS is a TGPR shadow: MSR[TGPR] and the field < 4
   } pd_t;
-  localparam int PDW = 76;                             // (alu_op_t is 6 bits)
+  localparam int PDW = 77;                             // (alu_op_t is 6 bits)
 
 endpackage

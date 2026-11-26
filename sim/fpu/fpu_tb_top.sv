@@ -27,6 +27,8 @@ module fpu_tb_top
   /* verilator lint_off UNUSEDPARAM */
   parameter bit SQ1 = 1'b1, SQ2 = 1'b1, SQ3 = 1'b1, SQ4 = 1'b1, SQ5 = 1'b1,
   parameter bit EF = 1'b0,              // the single unit's early forward (ppc_fpu_fast rule 6)
+  parameter int CV = 0,
+  parameter int DS = 0,                 // cpu140 / dfront: the double unit's ops DS or more cycles apart (rule 8); FAST = 0 with DS = 3: the iterative front
   /* verilator lint_on UNUSEDPARAM */
   parameter bit P1A = 1'b1, P2 = 1'b1, P3 = 1'b1, P4A = 1'b1, P5A = 1'b1, P5 = 1'b1, P6A = 1'b1, P6 = 1'b1, P7 = 1'b1
 ) (
@@ -46,6 +48,9 @@ module fpu_tb_top
   input  logic [63:0] f_aq, f_bq, f_cq, f_ax, f_bx, f_cx,
   output logic        f_fast_ok,
   output logic        f_route,
+  input  logic        f_cvt,
+  output logic        f_cvt_ok,
+  output logic        f_dbl_ok,
 
   // iterative unit
   input  logic        d_start,
@@ -101,19 +106,21 @@ module fpu_tb_top
 
   generate if (FAST) begin : g_fast
     ppc_fpu_fast #(.TAGW(8), .P1A(P1A), .P2(P2), .P3(P3), .P4A(P4A), .P5A(P5A), .P5(P5), .P6A(P6A), .P6(P6), .P7(P7),
-                   .SQ1(SQ1), .SQ2(SQ2), .SQ3(SQ3), .SQ4(SQ4), .SQ5(SQ5), .EF(EF)) u_fpu (
+                   .SQ1(SQ1), .SQ2(SQ2), .SQ3(SQ3), .SQ4(SQ4), .SQ5(SQ5), .EF(EF), .CV(CV), .DS(DS)) u_fpu (
       .clk (clk), .rst (rst),
       .f_valid (f_valid), .f_op (fma_op_t'(f_op)), .f_single (f_single), .f_fast (f_fast), .f_ctl (f_ctl),
       .f_a (f_a), .f_b (f_b), .f_c (f_c), .f_ad (f_a), .f_bd (f_b), .f_cd (f_c), .f_tag (f_tag),
       .f_sel (f_sel), .f_aq (f_aq), .f_bq (f_bq), .f_cq (f_cq), .f_ax (f_ax), .f_bx (f_bx), .f_cx (f_cx),
-      .f_fast_ok (f_fast_ok),
+      .f_fast_ok (f_fast_ok), .f_cvt (f_cvt), .f_cvt_ok (f_cvt_ok), .f_dbl_ok (f_dbl_ok),
       .d_start (d_start), .d_op (div_op_t'(d_op)), .d_single (d_single), .d_ctl (d_ctl),
       .d_a (d_a), .d_b (d_b), .d_tag (d_tag), .d_busy (d_busy), .d_inj_req (d_inj_req),
       .out_valid (o_valid), .out_tag (o_tag), .out_div (o_div), .out_res (o_res), .out_flags (of)
     );
   end else begin : g_unified
     assign f_fast_ok = 1'b0;
-    ppc_fpu #(.TAGW(8), .P1A(P1A), .P2(P2), .P3(P3), .P4A(P4A), .P5A(P5A), .P5(P5), .P6A(P6A), .P6(P6), .P7(P7)) u_fpu (
+    assign f_cvt_ok = 1'b0;
+    assign f_dbl_ok = 1'b1;
+    ppc_fpu #(.TAGW(8), .P1A(P1A), .P2(P2), .P3(P3), .P4A(P4A), .P5A(P5A), .P5(P5), .P6A(P6A), .P6(P6), .P7(P7), .IT(DS == 3)) u_fpu (
       .clk (clk), .rst (rst),
       .f_valid (f_valid), .f_op (fma_op_t'(f_op)), .f_single (f_single), .f_ctl (f_ctl),
       .f_a (f_a), .f_b (f_b), .f_c (f_c), .f_tag (f_tag),

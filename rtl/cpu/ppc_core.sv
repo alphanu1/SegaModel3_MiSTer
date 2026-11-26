@@ -191,7 +191,16 @@ module ppc_core
   parameter bit DRP = 1'b1,
   // FAST = 0: no single unit (ppc_fpu_fast SF = 0); every multiply-add op goes to the double unit, frsqrte
   // still to its estimate pipe. Same results, single ops at the double unit's latency (study R129)
-  parameter bit FAST = 1'b1
+  parameter bit FAST = 1'b1,
+  // CVL (cpu140 kit 1a): frsp, fctiw and fctiwz on the FPU's conversion port (ppc_fpu_fast CV, ppc_fpu_cvt), CVL cycles
+  // issue to result where the double unit takes FL; issued under rule 7 (fcbl_q, as the fast port's ffbl_q). frsp
+  // stays on the double unit while FPSCR[UE] = 1, decided in ID (and while an FPSCR instruction is in EX, whose
+  // write as it leaves would be after ID's look). 0: every conversion on the double unit, as before
+  parameter int CVL = 4,
+  // DS (cpu140, dfront): the double unit's issue spacing (ppc_fpu_fast rule 8): a double-unit op in EX waits DS - 1
+  // cycles behind another (fp_wait, dbk_q). 2: the unit's S4a / S4b share one adder pair; 3: its iterative front
+  // (ppc_fpu_fma IT); 0: an op every cycle
+  parameter int DS = 3
 )(
   input  logic        clk,
   input  logic        rst,
@@ -1733,6 +1742,19 @@ module ppc_core
   wire        x_ex  = (!id_xz && ex_w && (id_xs ? qe_e[2] : qe_e[0])) ||
                       (id_xfea && ex_valid && ex_fd0) || (id_xuea && ex_valid);
   wire        y_ex  = id_yreg && ex_w && qe_e[1];
+`ifdef VERILATOR
+  // cpu140 (the xra triage): a step 1 that takes its x from EX's sum (an FP double's second word, id_xfea; an update
+  // load's rA, id_xuea) must leave ID in the cycle its own step 0 is in EX, unless a replay resumed it at step 1
+  // (x = 0, y = fea4_q): x_ex has no other source for it
+  logic inv_rs1;
+  always_ff @(posedge clk)
+    if (rst) inv_rs1 <= 1'b0;
+    else if (redirect) inv_rs1 <= m_kp && m.rp && !sl_flt && m.step == 5'd1;
+    else if (id_adv) inv_rs1 <= 1'b0;
+  always_ff @(posedge clk)
+    if (!rst && id_adv && !inv_rs1 && ((id_xfea && !(ex_valid && ex_fd0)) || (id_xuea && !(ex_valid && ex_u.pc == id_u.pc))))
+      $fatal(1, "cpu140 invariant: step 1 of %08X leaves ID without its step 0 in EX", id_u.pc);
+`endif
   wire        a_ex  = ex_w && qe_e[0];
   wire        s_ex  = ex_w && qe_e[3];
   // (MEM is always empty when a resumed step 1 is in ID: no id_xfea here)
@@ -3169,6 +3191,8 @@ module ppc_core
   wire         sv_b   = f_hit_id[1] ? sv_fw : f_byp_id[1] ? sv_by : f_bye_id[1] ? sv_be : !rf_nb;
   wire         sv_c   = f_hit_id[2] ? sv_fw : f_byp_id[2] ? sv_by : f_bye_id[2] ? sv_be : !rf_nc;
   wire         id_frt = q_pd.frq || (FAST && q_pd.frs && sv_a && (!q_pd.fub || sv_b) && (!q_pd.fuc || sv_c));
+  // CVL: the conversion port's route (frsp is q_hi[2] = 0: xo 12; fctiw 14, fctiwz 15)
+  wire         id_cvr = (CVL != 0) && q_pd.frc && !(!q_hi[2] && (fpscr_q[5] || (ex_valid && ex_fsx)));
   // One register per operand for every FP unit and the store data. Separate
   // copies per unit (the FPU's standalone fits pointed at the operand
   // fanout) measured worse in the core on all three seeds and cost 357
@@ -3179,6 +3203,8 @@ module ppc_core
   logic [63:0] fa_q, fb_q, fc_q;
   (* preserve *) logic ex_ffast;
   (* preserve *) logic ex_ffw;                         // = ex_ffast, for fp_wait alone (fanout)
+  logic        ex_fcvt;                                // CVL: EX's op goes to the conversion port
+  (* preserve *) logic ex_fcw;                         // = ex_fcvt, for fp_wait alone
   // FP operand bypass: ex_fbl[p] in a consumer's first EX cycle, when operand p is the FPU result written
   // in this cycle (fo_res). The fast port, the divider's copy and the small unit read fa_x / fb_x / fc_x:
   // fo_res in that cycle, and, while the uop is then held in EX, a copy taken in it (fx_*, ex_fbh). The
@@ -3218,7 +3244,7 @@ module ppc_core
       ex_fbed <= 1'b0;
     end else begin
       ex_fbl  <= f_byp_id;
-      ex_fbd  <= f_byp_id != 3'b000 && q_pd.ffma && !id_frt;
+      ex_fbd  <= f_byp_id != 3'b000 && q_pd.ffma && !id_frt && !id_cvr;   // (the conversion port reads fb_x)
       ex_fbe  <= f_bye_id;
       ex_fbed <= f_bye_id != 3'b000 && !id_frt;
     end
@@ -3249,6 +3275,8 @@ module ppc_core
       ex_fbu <= f_byp_id != 3'b000 || f_bye_id != 3'b000;
       ex_ffast <= id_frt;
       ex_ffw   <= id_frt;
+      ex_fcvt  <= id_cvr;
+      ex_fcw   <= id_cvr;
     end
 
   // ------------------------------------------------------------- the units
@@ -3272,12 +3300,14 @@ module ppc_core
     dq_frd <= ex_frd;
   end
   logic f_fast_ok;                                     // the unit's own issue check (simulation only)
+  logic f_cvt_ok;                                      // ... and the conversion port's (CVL)
   ppc_fpu_fast #(.TAGW (5), .P1A (P1A), .P2 (P2), .P3 (P3), .P4A (P4A), .P5A (P5A), .P5 (P5), .P6A (P6A), .P6 (P6), .P7 (P7),
-                 .SQ1 (SQ1), .SQ2 (SQ2), .SQ3 (SQ3), .SQ4 (SQ4), .SQ5 (SQ5), .EF (FEF && FBYP && SQ5 && FAST), .SF (FAST)) u_fpu (
+                 .SQ1 (SQ1), .SQ2 (SQ2), .SQ3 (SQ3), .SQ4 (SQ4), .SQ5 (SQ5), .EF (FEF && FBYP && SQ5 && FAST), .SF (FAST), .CV (CVL), .DS (DS)) u_fpu (
     .clk (clk), .rst (rst),
     .f_valid (ex_fma && fp_go), .f_op (fma_op_t'(ex_u.fop)), .f_single (ex_u.fsgl), .f_fast (ex_ffast),
     .f_ctl (fpscr_q[7:0]), .f_a (fa_x), .f_b (fb_x), .f_c (fc_x), .f_ad (fa_q), .f_bd (fb_q), .f_cd (fc_q), .f_tag (ex_frd),
     .f_sel (ex_fs), .f_aq (fa_q), .f_bq (fb_q), .f_cq (fc_q), .f_ax (fx_a), .f_bx (fx_b), .f_cx (fx_c), .f_fast_ok (f_fast_ok),
+    .f_cvt (ex_fcvt), .f_cvt_ok (f_cvt_ok), .f_dbl_ok (),
     .d_start (d_go), .d_op (div_op_t'(dq_op)), .d_single (dq_sgl), .d_ctl (fpscr_q[7:0]),
     .d_a (dq_a), .d_b (dq_b), .d_tag (dq_frd), .d_busy (d_busy), .d_inj_req (d_inj_req),
     .out_valid (fo_valid), .out_tag (fo_tag), .out_div (), .out_res (fo_res), .out_flags (fo_flags)
@@ -3329,8 +3359,10 @@ module ppc_core
   // FDL = 7); with fewer stages WB writers also wait while it hands over
   assign         wb_blk   = (FDL < 4) && (d_inj_req || inj_q);
   wire           f_iss    = ex_fma && fp_go;             // an op leaves for the multiply-add port
-  assign fr_at_n = (fr_at >> 1) | ({FL{f_iss && !ex_ffast}} & (FL'(1) << (FL - 1))) |
+  localparam int CVQ = (CVL != 0) ? CVL : LS;          // (a legal shift where CVL = 0)
+  assign fr_at_n = (fr_at >> 1) | ({FL{f_iss && !ex_ffast && !ex_fcvt}} & (FL'(1) << (FL - 1))) |
                    ({FL{f_iss && ex_ffast}} & (FL'(1) << (LS - 1))) |
+                   ({FL{f_iss && ex_fcvt}} & (FL'(1) << (CVQ - 1))) |
                    ({FL{inj_fall}} & (FL'(1) << (FDL - 2)));
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -3346,6 +3378,7 @@ module ppc_core
     for (int k = 0; k < FL - 1; k++) fr_ix[k] <= fr_ix[k + 1];
     fr_ix[FL - 1] <= ex_frd;
     if (f_iss && ex_ffast) fr_ix[LS - 1] <= ex_frd;
+    if (f_iss && ex_fcvt)  fr_ix[CVQ - 1] <= ex_frd;
     if (inj_fall) fr_ix[FDL - 2] <= div_frd;
     if (d_go) div_frd <= dq_frd;
     // the result surely a single value (FP operand bypass, sv_by): a single-precision op's, frsp's, and
@@ -3355,11 +3388,13 @@ module ppc_core
     // PEM 3.3.6.2; the FPSCR changes only with the FPU empty)
     fr_sv[FL - 1] <= sv_ok && (ex_u.fsgl || ex_u.fop == 4'(FMA_RSP) || (ex_u.fop == 4'(FMA_RSQRTE) && ex_svb));
     if (f_iss && ex_ffast) fr_sv[LS - 1] <= sv_ok && (ex_u.fsgl || (ex_u.fop == 4'(FMA_RSQRTE) && ex_svb));
+    if (f_iss && ex_fcvt)  fr_sv[CVQ - 1] <= sv_ok && ex_u.fop == 4'(FMA_RSP);
     if (inj_fall) fr_sv[FDL - 2] <= sv_ok && div_sgl;
     // FEF: the write is a single-unit op's (not frsqrte's) issued with OE = UE = 0
     for (int k = 0; k < FL - 1; k++) fr_sf[k] <= fr_sf[k + 1];
     fr_sf[FL - 1] <= 1'b0;
     if (f_iss && ex_ffast) fr_sf[LS - 1] <= sv_ok && ex_u.fop != 4'(FMA_RSQRTE);
+    if (f_iss && ex_fcvt)  fr_sf[CVQ - 1] <= 1'b0;           // (no early forward from the conversion port)
     if (inj_fall) fr_sf[FDL - 2] <= 1'b0;
     if (d_go) div_sgl <= dq_sgl;
   end
@@ -3383,15 +3418,24 @@ module ppc_core
   // rarer instructions' waits as capture bits (ex_fsw, ex_fsx, ex_f2c).
   // ffbl_q: an FPU result is due LS or more cycles ahead, so a fast op waits
   logic fblk_q, fpre_q, ffbl_q;
+  logic fcbl_q;                                        // CVL: a result is due CVL or more cycles ahead (rule 7)
+  logic dbk_q;                                         // DS: a double-unit op may not leave EX this cycle (rule 8)
+  logic dbk1_q;                                        // DS: one left EX last cycle
   always_ff @(posedge clk) begin
     if (rst) begin
       fblk_q <= 1'b0;
       fpre_q <= 1'b0;
       ffbl_q <= 1'b0;
+      fcbl_q <= 1'b0;
+      dbk_q  <= 1'b0;
+      dbk1_q <= 1'b0;
     end else begin
+      dbk1_q <= DS >= 2 && f_iss && !ex_ffast && !ex_fcvt;
+      dbk_q  <= (DS >= 2 && f_iss && !ex_ffast && !ex_fcvt) || (DS >= 3 && dbk1_q);
       fblk_q <= (ex_div && fp_go) || d_go || (div_out && !inj_fall);
       fpre_q <= (fr_at_n & FPRE) != '0;
       ffbl_q <= (fr_at_n >> LS) != '0;
+      fcbl_q <= (fr_at_n >> CVQ) != '0;
     end
   end
   // All of it but the fast op's term is registered as fwq, formed for both
@@ -3406,8 +3450,9 @@ module ppc_core
   wire  fw_bk  = d_go || (div_out && !inj_fall);       // fblk_q next cycle, no divide leaving EX
   wire  fw_ba  = (ex_div && fw_go) || fw_bk;           // ... a divide in EX leaving
   wire  [FL-1:0] fw_rk = (fr_at >> 1) | ({FL{inj_fall}} & (FL'(1) << (FDL - 2)));   // fr_at next, EX held
-  wire  [FL-1:0] fw_ra = fw_rk | ({FL{ex_fma && fw_go && !ex_ffast}} & (FL'(1) << (FL - 1))) |
-                                 ({FL{ex_fma && fw_go &&  ex_ffast}} & (FL'(1) << (LS - 1)));
+  wire  [FL-1:0] fw_ra = fw_rk | ({FL{ex_fma && fw_go && !ex_ffast && !ex_fcvt}} & (FL'(1) << (FL - 1))) |
+                                 ({FL{ex_fma && fw_go &&  ex_ffast}} & (FL'(1) << (LS - 1))) |
+                                 ({FL{ex_fma && fw_go &&  ex_fcvt}} & (FL'(1) << (CVQ - 1)));
   wire  fw_idl = (fr_at >> 1) == '0 && !div_out && !d_go &&
                  !(ex_valid && (ex_fma || ex_div || (ex_fcmp && fs_idle)) && !mfp_hold);   // fs_idle next
   wire  fwk_h   = (ex_fma && fw_bk) || (ex_div && (fw_bk || (fw_rk & FPRE) != '0)) || (ex_fsw && !fw_idl) ||
@@ -3418,7 +3463,8 @@ module ppc_core
                  (q_pd.fmw && fw_ra[2]);
   always_ff @(posedge clk) fwq <= ex_hold ? fwk_h : fw_n;
   always_comb
-    fp_wait = ex_valid && (fwq || (ex_ffw && ffbl_q) || (ex_mw && wb_blk) || ex_fbd || ex_fbed);
+    fp_wait = ex_valid && (fwq || (ex_ffw && ffbl_q) || (ex_fcw && fcbl_q) || (ex_mw && wb_blk) || ex_fbd || ex_fbed ||
+                           (ex_fma && !ex_ffw && !ex_fcw && dbk_q));
 `ifdef VERILATOR
   always_ff @(posedge clk)
     if (!rst && ex_valid && fwq != ((ex_fma && fblk_q) || (ex_div && (fblk_q || fpre_q)) || (ex_fsw && !fs_idle) ||
@@ -3525,6 +3571,8 @@ module ppc_core
       if (fblk_q != (div_out || d_go))   $fatal(1, "fblk_q");
       if (fpre_q != ((fr_at & FPRE) != '0)) $fatal(1, "fpre_q");
       if (ffbl_q != ((fr_at >> LS) != '0)) $fatal(1, "ffbl_q");
+      if (fcbl_q != ((fr_at >> CVQ) != '0)) $fatal(1, "fcbl_q");
+      if (ex_fcw != ex_fcvt || (ex_fcvt && (!ex_fma || ex_ffast))) $fatal(1, "ex_fcw / ex_fcvt");
       if (ex_ffw != ex_ffast || (ex_ffast && !ex_fma)) $fatal(1, "ex_ffw");
       // (with a bypassed operand the route is from its predicted single-value bit: fast only where
       // the values allow it, and not always where they do)
@@ -3548,6 +3596,10 @@ module ppc_core
         $fatal(1, "fast route kind of %08X off the multiply-add port", q_hi);
       if (wb_live_q != (wb_isld && !wb_got)) $fatal(1, "wb_live_q");
       if (f_iss && ex_ffast && !f_fast_ok) $fatal(1, "fast op issued against the unit's own check");
+      if (f_iss && ex_fcvt && !f_cvt_ok) $fatal(1, "conversion issued against the unit's own check");
+      if (id_valid && !q_pd.ifault && q_pd.frc != (id_u.funit == 2'd1 && (id_u.fop == 4'(FMA_RSP) || id_u.fop == 4'(FMA_CTIW) ||
+                                                                       id_u.fop == 4'(FMA_CTIWZ))))
+        $fatal(1, "conversion kind of %08X against the decoder", q_hi);
       if (f_iss && ex_fbe == 3'b000 && (ex_fbu ? (ex_ffast && !rt_ref(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x))
                                      : ex_ffast != rt_ref(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x)))
         $fatal(1, "fast route %0d is not for EX's operands", ex_ffast);
