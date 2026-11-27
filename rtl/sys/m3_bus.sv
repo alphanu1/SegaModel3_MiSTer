@@ -148,7 +148,32 @@ module m3_bus
   // board they are PCI-to-PCI, behind none of the MPC105's posted writes). They are counted in n_* as every
   // host-port write is (the counters read h_go), but they are not in the bench trace (tr_*): no bus
   // transaction carries them. 0: d_take is 0
-  parameter bit          DDIR       = 1'b0
+  parameter bit          DDIR       = 1'b0,
+  // sys-timing (cycle-exact, 0: as before):
+  //   QIN  the decode's outside inputs from registers here: the bank register's map (crom_slot, crom_zero, crom_x: the
+  //        loader's 16 bank entries through a 16:1 select, cfg_bank -> s_x -3.49 ns at 140 MHz) and the 53C810's window
+  //        (sc_win_en, sc_win_base: bar1 -> the decode -> the state, -3.31 ns). Each is read in B_DEC or later, two
+  //        clocks or more after it can change: the bank register is written in B_INTW and the window in B_CFG, and
+  //        B_IDLE lies between either and the next B_DEC; the loader's and step2's changes are under reset
+  //   TGH  the target class in the states after B_DEC from a register (tgh_q: the decode of everything but address
+  //        bits 4:3, loaded every clock, with the two PCI configuration ranges' low bits applied after it): the
+  //        address above bit 4, the command and the window do not move between B_DEC and the transaction's end, so
+  //        the register is the decode there (addr -> the decode -> m_wnext / the state, -3.21 ns)
+  //   SCWP the 53C810's window compare (24 bits, in front of every class and of tg_hold) made for each master's
+  //        address every clock into a register (scw_p); a transaction's first B_DEC clock reads its master's (loaded
+  //        at the grant's edge from the address addr was loaded from, and from the window QIN's registers show in
+  //        that clock), later clocks the copy kept for the transaction (scw_tq)
+  parameter bit          QIN        = 1'b0,
+  parameter bit          TGH        = 1'b0,
+  parameter bit          SCWP       = 1'b0,
+  //   DLD  B_DEC loads the SDRAM port's fields (s_cmd, s_sa, s_swap, s_zero, s_be, s_x, s_w2, s_wdata, s_wbe) in
+  //        every one of its clocks, not only when the class is the SDRAM's; only s_req (and its copies) and the
+  //        state wait for the class. As FAST's idle load (R112): nothing reads the fields while s_req is low. And
+  //        the SDRAM address comes from a select on the address's top byte alone (dsa_f: FF the CROM forms, F1 the
+  //        tile RAM's, Fx the backup RAM's, else work RAM's), which is the decode's address whenever the class is
+  //        the SDRAM's (checked in the bench) and is not read otherwise. The class decode was the enable of 70 of
+  //        these registers and in front of s_sa's 27 (addr -> the window compare -> the class -> s_sa, 7 levels)
+  parameter bit          DLD        = 1'b0
 ) (
   input  logic          clk,
   input  logic          rst,
@@ -194,6 +219,11 @@ module m3_bus
   output logic              s_zero,
   output logic              s_x,            // STEP2: a banked CROM read of a bank in the extra memory (R170)
   output logic              s_w2,           // W2: a work-RAM transaction, for the second SDRAM
+  // sys-timing: the request by destination, each a register set and cleared with s_req: s_rq1 = s_req && !s_x && !s_w2
+  // (the first SDRAM's port), s_rq2 = s_req && s_w2 (the second's), s_rqx = s_req && s_x (m3_xcrom); m3_system
+  // formed them after the registers, in front of each port's and controller's request chain (s_x -> the first
+  // SDRAM's states, -0.95 ns with the CPU's own paths out of the fitter's way)
+  output logic              s_rq1, s_rq2, s_rqx,
   output logic [3:0]        s_be,
   output logic [31:0]       s_wdata,
   output logic [3:0]        s_wbe,          // with s_wdata: a line write's beat lanes (m_wbe)
@@ -289,7 +319,11 @@ module m3_bus
   input  logic              d_v,
   input  logic [31:0]       d_addr,
   input  logic [31:0]       d_wdata,
-  output logic              d_take
+  output logic              d_take,
+  // sys-timing: h_addr[31:24]'s decode for r3d_cmd's FIFO head, {mem, tex, cmd, 8E, 8C}, formed for each of the
+  // strobe's three sources beside the address select (the select then the compares were two more levels on DDIR's
+  // path: the 53C810's state -> dh_v -> d_go -> h_addr -> the compares -> hd_8c, -1.51 ns)
+  output logic [4:0]        h_dec
 );
 
   function automatic logic [31:0] bswap(input logic [31:0] v);
@@ -318,7 +352,8 @@ module m3_bus
     X_NONE, X_SDR, X_ROM_W, X_R3DH, X_R3D, X_SCSI, X_IO, X_MIDI, X_SYS, X_RTC,
     X_PCIA, X_PCID, X_PAL, X_TGREG, X_MPC, X_SEC
   } tgt_t;
-  tgt_t        tgt;
+  tgt_t        tgt, tgt_h;          // tgt_h: the class with address bits 4:3 taken as 11 (the PCI ranges' low bits)
+  logic        pcl;                 // tgt_h is one of the two PCI configuration ranges, which need bits 4:3 = 11
   logic [AW:0] dsa;
   logic        dswap, dzero, dx;
 
@@ -329,17 +364,36 @@ module m3_bus
   wire  [7:0]  a_hi = addr[31:24];
   wire         io_win = (a_hi[7:4] == 4'hF) && !a_hi[0];       // F0, F2 ... FE (MPC105's F8FFF0xx decoded first)
   wire s2 = STEP2 && step2;
+  // QIN: the outside inputs, registered
+  logic [5:0]  cm_q;                // {crom_x, crom_zero, crom_slot}
+  logic        scw_en_q;
+  logic [31:8] scw_base_q;
+  always_ff @(posedge clk) begin cm_q <= {crom_x, crom_zero, crom_slot}; scw_en_q <= sc_win_en; scw_base_q <= sc_win_base; end
+  wire  [3:0]  d_slot = QIN ? cm_q[3:0] : crom_slot;
+  wire         d_zero = QIN ? cm_q[4]   : crom_zero;
+  wire         d_x    = QIN ? cm_q[5]   : crom_x;
+  wire         d_scwe = QIN ? scw_en_q  : sc_win_en;
+  wire  [31:8] d_scwb = QIN ? scw_base_q : sc_win_base;
+  // SCWP: the window compare
+  logic [1:0]  scw_p;
+  logic        scw_tq, first;
+  wire         scw_c = d_scwe && addr[31:8] == d_scwb;
+  wire         scw_t = SCWP ? (first ? scw_p[who] : scw_tq) : scw_c;
+  always_ff @(posedge clk) begin
+    for (int m = 0; m < 2; m++) scw_p[m] <= sc_win_en && (m_addr[m][31:8] == sc_win_base);
+    scw_tq <= scw_t;
+  end
   always_comb begin
-    tgt = X_NONE; dsa = '0; dswap = 1'b0; dzero = 1'b0; dx = 1'b0;
+    tgt_h = X_NONE; pcl = 1'b0; dsa = '0; dswap = 1'b0; dzero = 1'b0; dx = 1'b0;
     if (addr[31:23] == 9'd0) begin
-      tgt = X_SDR; dsa = SDR_RAM + {4'd0, addr[22:0]};
+      tgt_h = X_SDR; dsa = SDR_RAM + {4'd0, addr[22:0]};
     end else if (a_hi == 8'hFF) begin
-      tgt = cmd[0] ? X_ROM_W : X_SDR;
+      tgt_h = cmd[0] ? X_ROM_W : X_SDR;
       if (!addr[23]) begin
         if (STEP2) begin
-          dsa = SDR_CROM + {crom_slot, addr[22:0]};
-          dzero = crom_zero;
-          dx = crom_x && !crom_zero;
+          dsa = SDR_CROM + {d_slot, addr[22:0]};
+          dzero = d_zero;
+          dx = d_x && !d_zero;
         end else begin
           dsa = SDR_CROM + {bank_n[2:0], addr[22:0]};
           dzero = ({1'b0, bank_n} >= CROM_BANKS);
@@ -347,30 +401,61 @@ module m3_bus
       end else if (STEP2 && fixed8) dsa = SDR_FIX8 + {4'd0, addr[22:0]};            // a Step 2 set's 8 MiB
       else if (addr[22:21] != 2'b11) dsa = SDR_CROM + {3'd0, addr[22:0]};       // CROM0's first 6 MiB
       else dsa = SDR_FIXED + {6'd0, addr[20:0]};
-    end else if (addr[31:6] == 26'h210_0000) tgt = X_R3DH;                           // 84000000-3F
+    end else if (addr[31:6] == 26'h210_0000) tgt_h = X_R3DH;                           // 84000000-3F
     else if (a_hi == 8'h88 || a_hi == 8'h8C || a_hi == 8'h8E || a_hi == 8'h90 || a_hi == 8'h94 ||
-             a_hi == 8'h98) tgt = X_R3DH;
-    else if (a_hi == 8'h9C) tgt = X_R3D;
-    else if (sc_win_en && addr[31:8] == sc_win_base) tgt = X_SCSI;
+             a_hi == 8'h98) tgt_h = X_R3DH;
+    else if (a_hi == 8'h9C) tgt_h = X_R3D;
+    else if (scw_t) tgt_h = X_SCSI;
     else if (a_hi == 8'hF1) begin
-      if (addr[23:20] == 4'h0) begin tgt = X_SDR; dsa = SDR_VRAM + {7'd0, addr[19:0]}; dswap = 1'b1; end
-      else if (addr[23:17] == 7'b0001000) tgt = X_PAL;                              // F1100000-F111FFFF
-      else if (addr[23:8] == 16'h1800) tgt = X_TGREG;                               // F1180000-FF
-    end else if (a_hi == 8'hF8 && addr[23:8] == 16'hFFF0) tgt = X_MPC;
+      if (addr[23:20] == 4'h0) begin tgt_h = X_SDR; dsa = SDR_VRAM + {7'd0, addr[19:0]}; dswap = 1'b1; end
+      else if (addr[23:17] == 7'b0001000) tgt_h = X_PAL;                              // F1100000-F111FFFF
+      else if (addr[23:8] == 16'h1800) tgt_h = X_TGREG;                               // F1180000-FF
+    end else if (a_hi == 8'hF8 && addr[23:8] == 16'hFFF0) tgt_h = X_MPC;
     else if (io_win) begin
-      if (addr[23:6] == 18'h0_1000) tgt = X_IO;                                     // xx040000-3F
-      else if (addr[23:16] == 8'h08) tgt = X_MIDI;
+      if (addr[23:6] == 18'h0_1000) tgt_h = X_IO;                                     // xx040000-3F
+      else if (addr[23:16] == 8'h08) tgt_h = X_MIDI;
       else if (addr[23:17] == 7'b0000110) begin                                     // xx0C0000-xx0DFFFF
-        tgt = X_SDR; dsa = SDR_BACKUP + {10'd0, addr[16:0]};
-      end else if (addr[23:6] == 18'h0_4000) tgt = X_SYS;                           // xx100000-3F
-      else if (addr[23:6] == 18'h0_5000) tgt = X_RTC;                               // xx140000-3F
-      else if (a_hi == 8'hF0 && addr[23:3] == 21'h10_019F) tgt = X_PCIA;            // F0800CF8-CFF
-      else if (a_hi == 8'hF0 && addr[23:3] == 21'h18_019F) tgt = X_PCID;            // F0C00CF8-CFF
-      else if (s2 && addr[23:18] == 6'b0001_10) tgt = X_SEC;                         // xx180000-xx1BFFFF
-      else if (s2 && a_hi == 8'hFE && addr[23:21] == 3'b110) tgt = X_PCIA;           // FEC00000-FEDFFFFF
-      else if (s2 && a_hi == 8'hFE && addr[23:20] == 4'hE) tgt = X_PCID;             // FEE00000-FEEFFFFF
+        tgt_h = X_SDR; dsa = SDR_BACKUP + {10'd0, addr[16:0]};
+      end else if (addr[23:6] == 18'h0_4000) tgt_h = X_SYS;                           // xx100000-3F
+      else if (addr[23:6] == 18'h0_5000) tgt_h = X_RTC;                               // xx140000-3F
+      else if (a_hi == 8'hF0 && addr[23:5] == 19'h4_0067) begin tgt_h = X_PCIA; pcl = 1'b1; end            // F0800CF8-CFF
+      else if (a_hi == 8'hF0 && addr[23:5] == 19'h6_0067) begin tgt_h = X_PCID; pcl = 1'b1; end            // F0C00CF8-CFF
+      else if (s2 && addr[23:18] == 6'b0001_10) tgt_h = X_SEC;                         // xx180000-xx1BFFFF
+      else if (s2 && a_hi == 8'hFE && addr[23:21] == 3'b110) tgt_h = X_PCIA;           // FEC00000-FEDFFFFF
+      else if (s2 && a_hi == 8'hFE && addr[23:20] == 4'hE) tgt_h = X_PCID;             // FEE00000-FEEFFFFF
     end
   end
+  // (the two PCI ranges' low bits: F0800CF8-CFF and F0C00CF8-CFF; with the upper bits of either and other low bits
+  // no later case of the decode matches, so the class is X_NONE)
+  assign tgt = (pcl && addr[4:3] != 2'b11) ? X_NONE : tgt_h;
+  // DLD: the SDRAM address and its swap flag by the top byte alone (dzero and dx are the decode's: they are set in
+  // its FF case only, whatever came before)
+  logic [AW:0] dsa_f;
+  wire         dswap_f = (a_hi == 8'hF1);
+  always_comb begin
+    if (a_hi == 8'hFF) begin
+      if (!addr[23]) dsa_f = STEP2 ? SDR_CROM + {d_slot, addr[22:0]} : SDR_CROM + {bank_n[2:0], addr[22:0]};
+      else if (STEP2 && fixed8) dsa_f = SDR_FIX8 + {4'd0, addr[22:0]};
+      else if (addr[22:21] != 2'b11) dsa_f = SDR_CROM + {3'd0, addr[22:0]};
+      else dsa_f = SDR_FIXED + {6'd0, addr[20:0]};
+    end else if (a_hi == 8'hF1) dsa_f = SDR_VRAM + {7'd0, addr[19:0]};
+    else if (a_hi[7:4] == 4'hF) dsa_f = SDR_BACKUP + {10'd0, addr[16:0]};
+    else dsa_f = SDR_RAM + {4'd0, addr[22:0]};
+  end
+  wire [AW:0]  dsa_u   = DLD ? dsa_f : dsa;
+  wire         dswap_u = DLD ? dswap_f : dswap;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && bs == B_DEC && tgt == X_SDR && {dsa_f, dswap_f} != {dsa, dswap})
+    $fatal(1, "m3_bus: DLD's SDRAM address");
+`endif
+  // TGH: the class for the states after B_DEC
+  tgt_t        tgh_q;
+  logic        pcl_q;
+  always_ff @(posedge clk) begin tgh_q <= tgt_h; pcl_q <= pcl; end
+  tgt_t        tgt_r, tgt_b;
+  assign tgt_r = (pcl_q && addr[4:3] != 2'b11) ? X_NONE : tgh_q;
+  assign tgt_b = TGH ? tgt_r : tgt;
+
 
   // ===========================================================================
   // registers
@@ -469,7 +554,7 @@ module m3_bus
   // target decode -> pci_addr's enable -0.70 ns)
   tgt_t        tgt_q;
   wire  [31:0] cq_q;
-  always_ff @(posedge clk) tgt_q <= tgt;
+  always_ff @(posedge clk) tgt_q <= (TGH && bs != B_DEC) ? tgt_r : tgt;
   assign cq_q = C106_M10K ? c106m_q : cq_r;
   logic [31:0] cq_r;
   always_ff @(posedge clk) cq_r <= cq;
@@ -770,7 +855,7 @@ module m3_bus
   // (the tile and palette ranges straight from addr, the decode's priority being only the SCSI window's before
   // them: the decode chain ran through tg_inslot into tg_free and the bus state, the bus's worst paths at 120 MHz;
   // tclose3)
-  wire         tg_f1    = (a_hi == 8'hF1) && !(sc_win_en && addr[31:8] == sc_win_base);
+  wire         tg_f1    = (a_hi == 8'hF1) && !scw_t;
   // (ln < 384 from the caller's register ln_vis, kept with ln: the compare after ln's long route into tg_inslot
   // and tg_free was the bus's worst path at 120 MHz in tz3_b4_s3; tclose3. Asserted.)
   wire         tg_fetch = ln_start ? ln_vis : (tg_act && !tg_pn[5]);   // the line starts in this clock
@@ -814,13 +899,15 @@ module m3_bus
   // ---- the state machine ----
   always_ff @(posedge clk) begin
     m_ack <= '0; m_wnext <= '0; m_rvalid <= '0; r3_push <= 1'b0;
-    s_req <= s_req && !s_ack;
+    first <= !rst && (bs == B_IDLE) && (rq != 2'b00);        // SCWP: the clock after a grant
+    s_req <= s_req && !s_ack; s_rq1 <= s_rq1 && !s_ack; s_rq2 <= s_rq2 && !s_ack; s_rqx <= s_rqx && !s_ack;
     sc_req <= sc_req && !sc_ack;
     sec_req <= sec_req && !sec_ack;
     cf_req <= cf_req && !cf_ack;
     do_w <= 1'b0; do_r <= 1'b0;
     tr_v <= 1'b0; tr_nw <= 1'b0;
     if (rst) begin
+      s_rq1 <= 1'b0; s_rq2 <= 1'b0; s_rqx <= 1'b0;
       bs <= B_IDLE; last <= 1'b1; s_req <= 1'b0; sc_req <= 1'b0; cf_req <= 1'b0; r_pend <= 1'b0; sec_req <= 1'b0;
       s_x <= 1'b0; s_w2 <= 1'b0;
     end else begin
@@ -847,7 +934,7 @@ module m3_bus
           // SDR_RAM plus the low 23 bits, word form, never zero), so it goes to the port now. Reads only:
           // s_wdata keeps following the master this clock for LW1 (above), and B_SDR takes it on
           if (FAST && !g && m_addr[0][31:23] == 9'd0 && !m_cmd[0][0]) begin
-            s_req <= 1'b1;
+            s_req <= 1'b1; s_rq1 <= !W2; s_rq2 <= W2; s_rqx <= 1'b0;       // (s_x 0, s_w2 W2: the idle load above)
             bs <= B_SDR;
           end
           end
@@ -855,13 +942,21 @@ module m3_bus
 
         B_DEC: begin
           if (WD_DEC) wd <= m_wdata[who];   // the owner's word, held until its m_ack
+          if (DLD) begin
+            s_cmd <= cmd; s_sa <= dsa_u; s_swap <= dswap_u; s_zero <= dzero; s_be <= be; s_x <= STEP2 && dx;
+            s_w2 <= W2 && (addr[31:23] == 9'd0);
+            s_wdata <= WD_DEC ? m_wdata[who] : wd; s_wbe <= m_wbe[who];
+          end
           if (tg_hold || c_swp) begin
             // TGT: the tile generator is busy, fetching, or has accesses still to land; C106_M10K: the reset values
             // are still being written (the 64 clocks from a reset's start; the sweep's register alone, not the target
             // decode, so the hold adds no level to B_DEC's choice: br2_s3 had the decode in it, addr -0.66 ns)
           end else if (tgt == X_SDR) begin
-            s_req <= 1'b1; s_cmd <= cmd; s_sa <= dsa; s_swap <= dswap; s_zero <= dzero; s_be <= be; s_x <= STEP2 && dx;
+            s_req <= 1'b1; s_cmd <= cmd; s_sa <= dsa_u; s_swap <= dswap_u; s_zero <= dzero; s_be <= be; s_x <= STEP2 && dx;
             s_w2 <= W2 && (addr[31:23] == 9'd0);     // work RAM (the decode's first case)
+            s_rq1 <= !(STEP2 && dx) && !(W2 && (addr[31:23] == 9'd0));
+            s_rq2 <= W2 && (addr[31:23] == 9'd0);
+            s_rqx <= STEP2 && dx;
             s_wdata <= WD_DEC ? m_wdata[who] : wd; s_wbe <= m_wbe[who];
             bs <= B_SDR;
           end else if (R3P && !(tgt == X_R3DH && cur_w) && (!r3_empty || r3_push)) begin
@@ -907,7 +1002,7 @@ module m3_bus
 
         // internal targets: one beat, or eight for a line
         B_BEAT: begin
-          if (R3P && tgt == X_R3DH && cur_w) begin
+          if (R3P && tgt_b == X_R3DH && cur_w) begin
             // R3P: the beat into the buffer (a line write's beat taken from the master as below), then on;
             // r3_push is registered, so the buffer has its word an edge later: B_R3P waits that edge out
             if (!r3_full && !(r3_push && 3'(r3_wp[2:0] + 3'd1) == r3_rp[2:0])) begin
@@ -919,9 +1014,9 @@ module m3_bus
               tr_data <= (cmd == MC_LINE_WR) ? m_wdata[who] : wd;
               bs <= B_R3P;
             end
-          end else if (R3P && (tgt == X_R3DH || (tgt == X_R3D && cur_w)) && (!r3_empty || r3_push)) begin
+          end else if (R3P && (tgt_b == X_R3DH || (tgt_b == X_R3D && cur_w)) && (!r3_empty || r3_push)) begin
             // R3P: a read of the host port, or a 9C write, after every posted write
-          end else if (tgt == X_R3DH) begin
+          end else if (tgt_b == X_R3DH) begin
             // the Real3D: a line write's beat is taken first, then each word goes
             if (cur_w && cmd == MC_LINE_WR) begin m_wnext[who] <= 1'b1; wd <= m_wdata[who]; be <= 4'hF; end
             bs <= B_R3D;
@@ -932,7 +1027,7 @@ module m3_bus
               wd <= m_wdata[who]; be <= 4'hF;
               bs <= B_INTW;
             end else begin
-              if (tgt == X_SYS && addr[5:2] == 4'h3 && jt_busy) ;   // the JTAG chain is still applying the last edge
+              if (tgt_b == X_SYS && addr[5:2] == 4'h3 && jt_busy) ;   // the JTAG chain is still applying the last edge
               else begin do_w <= 1'b1; bs <= B_INTW; end
             end
           end else begin
@@ -1045,8 +1140,22 @@ module m3_bus
   assign h_addr  = r3_go ? {r3_head[59:52], 2'b00, r3_head[51:32], 2'b00} :
                    d_go  ? {d_addr[31:24], 2'b00, d_addr[21:2], 2'b00} : addr;
   assign h_wdata = r3_go ? bswap(r3_head[31:0]) : d_go ? bswap(d_wdata) : wd_le;
+  function automatic logic [4:0] hdec(input logic [7:0] hi);   // r3d_cmd's: {mem, tex, cmd, 8E, 8C}
+    hdec = {hi == 8'h8C || hi == 8'h8E || hi == 8'h98, hi == 8'h90 || hi == 8'h94, hi == 8'h88, hi == 8'h8E, hi == 8'h8C};
+  endfunction
+  assign h_dec   = r3_go ? hdec(r3_head[59:52]) : d_go ? hdec(d_addr[31:24]) : hdec(addr[31:24]);
 
 `ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && {s_rq1, s_rq2, s_rqx} != {s_req && !s_x && !s_w2, s_req && s_w2, s_req && s_x})
+    $fatal(1, "m3_bus: the request registers by destination");
+  // QIN / TGH: the registered inputs and the registered class against the wires wherever one is used
+  always_ff @(posedge clk) if (!rst) begin
+    if (bs == B_DEC && ({cm_q, scw_en_q, scw_base_q} != {crom_x, crom_zero, crom_slot, sc_win_en, sc_win_base}))
+      $fatal(1, "m3_bus: QIN's registers in B_DEC");
+    if (bs == B_DEC && scw_t != scw_c) $fatal(1, "m3_bus: SCWP's window compare in B_DEC");
+    if ((bs == B_BEAT || do_w || do_r) && (tgt_r != tgt || {scw_en_q, scw_base_q} != {sc_win_en, sc_win_base}))
+      $fatal(1, "m3_bus: TGH's class after B_DEC");
+  end
   // tr_nw against m3_system's old form, from the trace's we and address (R179)
   always_ff @(posedge clk)
     if (!rst && tr_nw != (tr_v && tr_we && tr_addr[31:15] == {12'hF10, 5'h1F})) $fatal(1, "m3_bus: tr_nw against the trace's name-table write");

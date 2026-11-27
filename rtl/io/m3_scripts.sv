@@ -96,7 +96,8 @@ module m3_scripts
   parameter bit RD_ALL = 1'b0,   // TEMP, DBC/DCMD, DSPS readable
   parameter bit R3DMA  = 1'b0,   // the Step 2.x Real3D DMA front end (step2)
   parameter bit LDV    = 1'b0,   // the bridges pass: DSPS and TEMP load one shared value (m3_scripts_core)
-  parameter bit DIR    = 1'b0    // D-85: a Step 2 move into the host port writes it from the FIFO (dh_*), not the bus
+  parameter bit DIR    = 1'b0,   // D-85: a Step 2 move into the host port writes it from the FIFO (dh_*), not the bus
+  parameter bit FLG    = 1'b0    // sys-timing: the move's count compares from flag registers (m3_scripts_core)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -143,7 +144,7 @@ module m3_scripts
 
   generate
   if (ENABLE) begin : g_on
-    m3_scripts_core #(.LINE(LINE), .INT_OP(INT_OP), .RD_ALL(RD_ALL), .R3DMA(R3DMA), .LDV(LDV), .DIR(DIR)) u_core (
+    m3_scripts_core #(.LINE(LINE), .INT_OP(INT_OP), .RD_ALL(RD_ALL), .R3DMA(R3DMA), .LDV(LDV), .DIR(DIR), .FLG(FLG)) u_core (
       .clk, .rst, .step2,
       .c_req, .c_we, .c_idx, .c_be, .c_wdata, .c_ack, .c_rdata, .win_en, .win_base,
       .s_req, .s_we, .s_addr, .s_be, .s_wdata, .s_ack, .s_rdata,
@@ -183,7 +184,13 @@ module m3_scripts_core
   parameter bit RD_ALL = 1'b0,
   parameter bit R3DMA  = 1'b0,
   parameter bit LDV    = 1'b0,   // the bridges pass: DSPS and TEMP load one shared value (lv, below)
-  parameter bit DIR    = 1'b0    // D-85: Step 2 moves into the host port leave on dh_* (see the header)
+  parameter bit DIR    = 1'b0,   // D-85: Step 2 moves into the host port leave on dh_* (see the header)
+  // sys-timing: FLG 1 keeps "eight words or more left" and "any word left" for the read count and "eight or more"
+  // for the write count in flag registers, set from each new count as it is loaded, so the move's choice of its next
+  // transaction starts at three flip-flops, not at two 19- and 22-bit zero compares (rd_left -> do_lrd / do_srd ->
+  // the port's address select: 34 endpoints, -2.92 ns at 140 MHz, 8 levels). The same values at every clock
+  // (checked in the bench); 0: the compares
+  parameter bit FLG    = 1'b0
 )(
   input  logic        clk,
   input  logic        rst,
@@ -287,11 +294,19 @@ module m3_scripts_core
   assign dh_data = m_wdata;
 
   // what the move asks for next (decided with the port idle)
-  wire wr_line_ok = LINE && temp[4:2] == 3'd0 && dbc[23:5] != 19'd0;
+  logic rl_ge8, rl_nz, db_ge8;          // FLG: rd_left[21:3] != 0, rd_left != 0, dbc[23:5] != 0
+  wire  f_rl8 = FLG ? rl_ge8 : rd_left[21:3] != 19'd0;
+  wire  f_rlz = FLG ? rl_nz  : rd_left != 22'd0;
+  wire  f_db8 = FLG ? db_ge8 : dbc[23:5] != 19'd0;
+  // a count of words less one (modulo 2^22, as the subtraction): eight or more left, i.e. the count now is not 1-8
+  function automatic logic ge9(input logic [21:0] w);
+    ge9 = !((w[21:3] == 19'd0 && w[2:0] != 3'd0) || (w[21:3] == 19'd1 && w[2:0] == 3'd0));
+  endfunction
+  wire wr_line_ok = LINE && temp[4:2] == 3'd0 && f_db8;
   wire do_lwr = wr_line_ok && cnt >= 5'd8;
   wire do_swr = !wr_line_ok && cnt != 5'd0;
-  wire do_lrd = LINE && dsps[4:2] == 3'd0 && rd_left[21:3] != 19'd0 && cnt <= 5'd8;
-  wire do_srd = !do_lrd && rd_left != 22'd0 && cnt != 5'd16;
+  wire do_lrd = LINE && dsps[4:2] == 3'd0 && f_rl8 && cnt <= 5'd8;
+  wire do_srd = !do_lrd && f_rlz && cnt != 5'd16;
   // With the port idle, the words still to write are those still to read plus the FIFO's, so
   // while any remain one of the four above can go: a move with nothing to issue is done.
 
@@ -367,7 +382,7 @@ module m3_scripts_core
       case (s_addr)
         5'h00: if (!busy) dsps <= lv;
         5'h01: if (!busy) temp <= lv;
-        5'h02: if (!busy) dbc <= {d_v[21:0], 2'b00};
+        5'h02: if (!busy) begin dbc <= {d_v[21:0], 2'b00}; db_ge8 <= d_v[21:3] != 19'd0; end
         5'h03: begin
           if (s_be[2] && s_wdata[16]) d2_irq <= 1'b0;                  // byte D: acknowledge
           if (s_be[1]) d2_cfg <= s_wdata[15:8];                         // byte E
@@ -444,7 +459,7 @@ module m3_scripts_core
         end
         if (p_last) begin
           case (est)
-            E_F0: begin {dcmd, dbc} <= bswap(m_rdata); est <= E_F1; end
+            E_F0: begin {dcmd, dbc} <= bswap(m_rdata); db_ge8 <= {m_rdata[15:8], m_rdata[23:16], m_rdata[31:29]} != 19'd0; est <= E_F1; end
             E_F1: begin
               dsps <= LDV ? lv : bswap(m_rdata);
               if (is_mmov) est <= E_F2;
@@ -456,7 +471,7 @@ module m3_scripts_core
         end
       end
       E_CHK: begin
-        rd_left <= dbc[23:2];
+        rd_left <= dbc[23:2]; rl_ge8 <= dbc[23:5] != 19'd0; rl_nz <= dbc[23:2] != 22'd0;
         mv_dir <= DIR && s2 && t_hp;
         if (s2) est <= (dbc[23:2] == 22'd0) ? E_END : E_MOVE;
         else if (mov_bad) est <= E_IDLE;
@@ -470,6 +485,8 @@ module m3_scripts_core
             m_req <= 1'b1; m_cmd <= do_lrd ? MC_LINE_RD : MC_RD; m_addr <= {dsps[31:2], 2'b00}; m_be <= 4'hF;
             p_out <= 1'b1; p_kind <= K_RD; p_line <= do_lrd;
             rd_left <= rd_left - (do_lrd ? 22'd8 : 22'd1);
+            rl_ge8  <= do_lrd ? rd_left[21:3] != 19'd1 : ge9(rd_left);
+            rl_nz   <= do_lrd ? (rd_left[21:3] != 19'd1 || rd_left[2:0] != 3'd0) : rd_left != 22'd1;
           end else if (rd_left == 22'd0 && cnt == 5'd0) begin
             est <= E_END;
           end
@@ -477,16 +494,20 @@ module m3_scripts_core
         if (dh_pop) begin
           temp[31:2] <= temp[31:2] + 30'd1;
           dbc[23:2]  <= dbc[23:2] - 22'd1;
+          db_ge8     <= ge9(dbc[23:2]);
         end
       end else if (!p_out && !p_done) begin
         if (do_lwr || do_swr) begin
           m_req <= 1'b1; m_cmd <= do_lwr ? MC_LINE_WR : MC_WR; m_addr <= {temp[31:2], 2'b00}; m_be <= 4'hF;
           p_out <= 1'b1; p_kind <= K_WR; p_line <= do_lwr;
           dbc[23:2] <= dbc[23:2] - (do_lwr ? 22'd8 : 22'd1);
+          db_ge8    <= do_lwr ? dbc[23:5] != 19'd1 : ge9(dbc[23:2]);
         end else if (do_lrd || do_srd) begin
           m_req <= 1'b1; m_cmd <= do_lrd ? MC_LINE_RD : MC_RD; m_addr <= {dsps[31:2], 2'b00}; m_be <= 4'hF;
           p_out <= 1'b1; p_kind <= K_RD; p_line <= do_lrd;
           rd_left <= rd_left - (do_lrd ? 22'd8 : 22'd1);
+          rl_ge8  <= do_lrd ? rd_left[21:3] != 19'd1 : ge9(rd_left);
+          rl_nz   <= do_lrd ? (rd_left[21:3] != 19'd1 || rd_left[2:0] != 3'd0) : rd_left != 22'd1;
         end else begin
           est <= E_END;
         end
@@ -513,6 +534,7 @@ module m3_scripts_core
       dmode <= 8'd0; dien <= 8'd0; dcntl <= 8'd0;
       st_ssi <= 1'b0; st_sir <= 1'b0; st_iid <= 1'b0;
       halted <= 1'b0; irq_l <= 1'b0;
+      db_ge8 <= 1'b0;
     end
 
     if (rst) begin
@@ -521,6 +543,7 @@ module m3_scripts_core
       p_out <= 1'b0; p_acked <= 1'b0; p_beats <= 3'd0; p_kind <= K_FETCH; p_line <= 1'b0; mv_dir <= 1'b0;
       wp <= 4'd0; rp <= 4'd0; cnt <= 5'd0;
       dsp <= 30'd0; dsps <= 32'd0; temp <= 32'd0; dbc <= 24'd0; dcmd <= 8'd0; rd_left <= 22'd0;
+      rl_ge8 <= 1'b0; rl_nz <= 1'b0; db_ge8 <= 1'b0;
       dmode <= 8'd0; dien <= 8'd0; dcntl <= 8'd0;
       st_ssi <= 1'b0; st_sir <= 1'b0; st_iid <= 1'b0;
       is_srst <= 1'b0; is_sigp <= 1'b0; is_sem <= 1'b0;
@@ -529,6 +552,16 @@ module m3_scripts_core
       d2_cfg <= 8'd0; d2_irq <= 1'b0; d2_data <= 32'd0; d2_reg <= 4'd0;
     end
   end
+
+`ifdef VERILATOR
+  logic flg_ok;                          // (the flags are defined from the first reset)
+  initial flg_ok = 1'b0;
+  always_ff @(posedge clk) begin
+    if (rst) flg_ok <= 1'b1;
+    if (flg_ok && !rst && {rl_ge8, rl_nz, db_ge8} != {rd_left[21:3] != 19'd0, rd_left != 22'd0, dbc[23:5] != 19'd0})
+      $fatal(1, "m3_scripts: the count flags");
+  end
+`endif
 
   // ------------------------------------------------------------------ read data
   always_ff @(posedge clk) begin

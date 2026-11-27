@@ -22,6 +22,12 @@ into `main` with all1 and calib-shared without their entries, each with its boar
 | TLB misses made cheaper (D-88) | not started | after the CPU rebuild's current steps |
 | M3_R3EMPTY, M3_R3PF | in `main`, switched off | need area |
 
+Branch `sys-timing` (R210): the system side's timing at 140 MHz, all cycle-exact behind m3_system parameters, with
+377 register sites in the qsf. Both SDRAM capture clocks close on every fit (+0.26 to +0.56 ns; main -0.8 to -1.4),
+hold positive at every corner on its three final fits, the clk_hps / clk_sys crossings registered. System-side setup
+is not closed: it needs room from the CPU and Real3D work (R210's experiment fit). HDMI still fails on 6 of 10 fits.
+Board: st11_s2 (f4052cd0) good in VF3, Scud Race, Sega Rally 2, Daytona 2.
+
 Open from the board: Sega Rally 2's slowdowns going through water, Real3D or CPU, to be measured on replay frames
 captured there.
 

@@ -219,6 +219,31 @@ module m3_system
   //                through their period, the phase set to the widest passing window's centre; the loader (and so
   //                the HPS's downloads) waits for the first SDRAM's, the game for the second's (m3_sdr2's ok)
   parameter bit          SDR_CAL     = 1'b0,
+  // sys-timing (D-81, D-87; every one cycle-exact, 0 the form before):
+  //   KCAL_REG     the calibration engine's port select from the first SDRAM's done register (below, k_cal)
+  //   BUS_QIN      m3_bus QIN: the bank map and the 53C810's window taken from registers inside the bus
+  //   BUS_TGH      m3_bus TGH: the target class from a register in every state after B_DEC
+  parameter bit          KCAL_REG    = 1'b1,
+  parameter bit          BUS_QIN     = 1'b1,
+  parameter bit          BUS_TGH     = 1'b1,
+  //   SC_FLG       m3_scripts FLG: the move's count compares from flag registers
+  parameter bit          SC_FLG      = 1'b1,
+  //   DDR_RLF      m3_ddr3p RLF: the head read's last beat from a flag register
+  parameter bit          DDR_RLF     = 1'b1,
+  //   BUS_RQD      the SDRAM ports' and m3_xcrom's requests from m3_bus's registers by destination (s_rq1/2/x)
+  //   R3_HDP       r3d_cmd HDP: the host port's head decode from m3_bus's h_dec
+  parameter bit          BUS_RQD     = 1'b1,
+  //   BUS_SCWP     m3_bus SCWP: the 53C810's window compare a clock ahead, per master
+  parameter bit          BUS_SCWP    = 1'b1,
+  //   BUS_DLD      m3_bus DLD: B_DEC loads the SDRAM fields in every clock; the address by the top byte alone
+  parameter bit          BUS_DLD     = 1'b1,
+  //   TG_QDC       m3_tilegen_fetch QDC: the chunk queue's free entry written ahead of the pattern compare
+  parameter bit          TG_QDC      = 1'b1,
+  //   TG_CHF       m3_tilegen_fetch CHF: the chunk's two stencil bits from flag registers
+  parameter bit          TG_CHF      = 1'b1,
+  //   DDR_SKF      m3_avl_reg SKF: the skid slot's fields loaded whenever it is empty
+  parameter bit          DDR_SKF     = 1'b1,
+  parameter bit          R3_HDP      = 1'b1,
   // ---- D-85: changes taken from the contributor's fork, each off until board-tested
   //   DMA_DIR      (macro M3_DMADIR) a Step 2 move into the Real3D's host port writes r3d_cmd straight from
   //                m3_scripts' FIFO (m3_scripts DIR, m3_bus DDIR), not as line writes over the bus
@@ -382,15 +407,21 @@ module m3_system
   (* preserve *) logic rst_snd = 1'b1;
   // sys140: and one for m3_xmem (rst_s[2] into its queue's entries' enables: 301 endpoints, -2.75 ns at 140 MHz)
   (* preserve *) logic rst_xm = 1'b1;
+  // sys-timing: and one each for the tile generator, the Real3D's command / memory / texture blocks and the DDR3
+  // readers (rst_s[2] into them at 140 MHz: 268 endpoints, one or two levels, 6-7 ns of route across 35-58 LABs)
+  (* preserve *) logic rst_tg = 1'b1, rst_r3 = 1'b1, rst_dd = 1'b1;
   always_ff @(posedge clk) begin
     rst_geo  <= rst_s[1];
     rst_rast <= rst_s[1];
     rst_cpu  <= rst_s[1];
     rst_snd  <= rst_s[1];
     rst_xm   <= rst_s[1];
+    rst_tg   <= rst_s[1];
+    rst_r3   <= rst_s[1];
+    rst_dd   <= rst_s[1];
   end
 `ifdef VERILATOR
-  always_ff @(posedge clk) if ({rst_geo, rst_rast, rst_cpu, rst_snd, rst_xm} != {5{rst}}) $fatal(1, "m3_system: the reset copies");
+  always_ff @(posedge clk) if ({rst_geo, rst_rast, rst_cpu, rst_snd, rst_xm, rst_tg, rst_r3, rst_dd} != {8{rst}}) $fatal(1, "m3_system: the reset copies");
 `endif
   logic por_n;                       // power-on: the EEPROM and the I/O latches
   always_ff @(posedge clk) por_n <= mem_rst_n;
@@ -617,7 +648,7 @@ module m3_system
   logic [31:0] dh_addr /* verilator public_flat_rd */;
   logic [31:0] dh_data /* verilator public_flat_rd */;
 
-  m3_scripts #(.R3DMA(STEP2), .LDV(BR_BUS), .DIR(DMA_DIR)) u_scsi (
+  m3_scripts #(.R3DMA(STEP2), .LDV(BR_BUS), .DIR(DMA_DIR), .FLG(SC_FLG)) u_scsi (
     .clk, .rst, .step2,     // R100: Step 2.x, the Real3D DMA device on this move engine
     .c_req(cf_req), .c_we(cf_we), .c_idx(cf_idx), .c_be(cf_be), .c_wdata(cf_wdata), .c_ack(cf_ack), .c_rdata(cf_rdata),
     .win_en(sc_win_en), .win_base(sc_win_base),
@@ -630,6 +661,8 @@ module m3_system
   // the bus and its devices
   // ===========================================================================
   logic        s_req, s_swap, s_zero, s_ack, s_wnext, s_rvalid;
+  logic        s_rq1, s_rq2, s_rqx;
+  logic [4:0]  h_dec;
   logic        s_x, sp_ack, sp_rvalid, xc_ack, xc_rvalid;     // R170: a read of a bank in the extra memory, to m3_xcrom
   logic [31:0] sp_rdata, xc_rdata;
   logic        s_w2, sp_wnext, w2_ack, w2_wnext, w2_rvalid;   // W2: a work-RAM transaction, to the second SDRAM (m3_sdr2)
@@ -711,7 +744,7 @@ module m3_system
   logic       tg_nw;                      // a write into the name table (the bus's tr_nw; R103, R179)
   m3_bus #(.AW(AW), .SDR_CROM(SDR_CROM), .SDR_FIXED(SDR_FIXED), .SDR_BACKUP(SDR_BACKUP), .SDR_RAM(SDR_RAM),
            .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P), .TGT(TG_TIMING), .TG_MHZ(CLK_MHZ),
-           .C106_M10K(BR_C106), .OWIRE(BR_BUS), .OWIRE_SC(1'b0), .WD_DEC(BR_BUS), .W2(W2), .DDIR(DMA_DIR)
+           .C106_M10K(BR_C106), .OWIRE(BR_BUS), .OWIRE_SC(1'b0), .WD_DEC(BR_BUS), .W2(W2), .DDIR(DMA_DIR), .QIN(BUS_QIN), .TGH(BUS_TGH), .SCWP(BUS_SCWP), .DLD(BUS_DLD)
 `ifdef M3_STEP2_BUS
            , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ), .EXT_SEC(BR_SEC)
 `endif
@@ -736,7 +769,7 @@ module m3_system
     .jt_wr, .jt_wdata, .jt_busy, .jt_tdo, .jt_cfg_we, .jt_cfg0, .jt_cfg1, .jt_cfg2,
     .snd_we, .snd_data, .snd_byte,
     .tr_v, .tr_master, .tr_we, .tr_addr, .tr_be, .tr_data, .tr_nw(tg_nw),
-    .d_v(dh_v), .d_addr(dh_addr), .d_wdata(dh_data), .d_take(dh_take));
+    .d_v(dh_v), .d_addr(dh_addr), .d_wdata(dh_data), .d_take(dh_take), .s_rq1, .s_rq2, .s_rqx, .h_dec);
 
   // sys140: the first SDRAM's read-capture calibration (SDR_CAL), on the bus's port while the loader waits (the game
   // is in reset until the downloads are in, so the bus asks nothing of it). area-sys: with W2 one engine calibrates
@@ -779,7 +812,11 @@ module m3_system
   assign       sdr1_usable = mem_ready && k_done;
   // area-sys: while the engine owns the ports (k_busy: until the last SDRAM, the first, is done, so k_cal is k_busy)
   // its transaction goes to both SDRAMs' ports through one select here, each port its own request
-  wire         k_cal = SDR_CAL && k_busy;
+  // sys-timing: the select from the first SDRAM's done register alone. k_busy is !k_done at every clock out of the
+  // memory reset (asserted below: the first SDRAM's run is the last), but as m3_sdr_cal forms it it came through the
+  // second SDRAM's start-up state and skip (pr_s.PR_DONE -> busy -> this select -> both ports' and both controllers'
+  // states: 290 failing endpoints at 140 MHz, to -2.1 ns). In the memory reset both forms are 1. KCAL_REG 0: k_busy
+  wire         k_cal = SDR_CAL && (KCAL_REG ? !k_dn[0] : k_busy);
   wire  [1:0]  b_cmd   = k_cal ? k_cmd : s_cmd;
   wire  [AW:0] b_sa    = k_cal ? k_sa : s_sa;
   wire         b_swap  = !k_cal && s_swap, b_zero = !k_cal && s_zero;
@@ -799,7 +836,7 @@ module m3_system
 `endif
   m3_sdr_port #(.AW(AW), .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .RA(SDR_RA), .RA_TOP(SDR_VRAM), .RA_CONF(SDR_RA_CONF), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ), .PW_DLY(SDR_PW_DLY)) u_sport (
     .clk, .rst(!mem_rst_n), .ra_clr(rst),
-    .s_req(k_cal ? k_req[0] : (s_req && !s_x && !s_w2)), .s_cmd(b_cmd), .s_sa({b_sa[AW:23], b_x22a, b_sa[21:0]}),
+    .s_req(k_cal ? k_req[0] : (BUS_RQD ? s_rq1 : (s_req && !s_x && !s_w2))), .s_cmd(b_cmd), .s_sa({b_sa[AW:23], b_x22a, b_sa[21:0]}),
     .s_swap(b_swap), .s_zero(b_zero), .s_be(b_be), .s_wdata(b_wdata),
     .s_wbe(b_wbe), .s_ack(sp_ack), .s_wnext(sp_wnext), .s_rvalid(sp_rvalid),
     .s_rdata(sp_rdata), .s_idle(sp_idle),
@@ -832,7 +869,7 @@ module m3_system
       .x_go(w2_go), .x_skip(k_skip2), .x_done(k_dn[NCAL-1]), .x_none(k_flags[NCAL-1][0]), .s_idle(w2_idle),
       // (area130 A) the bus sends only work RAM here (m3_bus: s_w2 is its decode's first case): word form,
       // never a zero read, at SDR_RAM + the low 23 bits, so bits AW:24 are SDR_RAM's; tied as constants
-      .s_req(k_cal ? k_req[NCAL-1] : (s_req && s_w2)), .s_cmd(b_cmd), .s_sa({SDR_RAM[AW:24], b_sa[23], b_x22b, b_sa[21:0]}), .s_swap(1'b0),
+      .s_req(k_cal ? k_req[NCAL-1] : (BUS_RQD ? s_rq2 : (s_req && s_w2))), .s_cmd(b_cmd), .s_sa({SDR_RAM[AW:24], b_sa[23], b_x22b, b_sa[21:0]}), .s_swap(1'b0),
       .s_zero(1'b0), .s_be(b_be), .s_wdata(b_wdata), .s_wbe(b_wbe),
       .s_ack(w2_ack), .s_wnext(w2_wnext), .s_rvalid(w2_rvalid), .s_rdata(w2_rdata),
       .rd_lat_sel(sd2_rd_lat_sel), .sd_cs_n(sd2_cs_n), .sd_ras_n(sd2_ras_n), .sd_cas_n(sd2_cas_n), .sd_we_n(sd2_we_n),
@@ -956,7 +993,7 @@ module m3_system
   logic [28:0] dq_addr;
   logic [7:0]  dq_n, dq_be;
   logic [63:0] dq_din;
-  m3_ddr3p #(.PIPE(1'b1), .NP(2), .MAXQ(DDR_MAXQ)) u_ddr3 (   // R101: reads in flight capped (the probe: 16 or more raise latency)
+  m3_ddr3p #(.PIPE(1'b1), .NP(2), .MAXQ(DDR_MAXQ), .RLF(DDR_RLF)) u_ddr3 (   // R101: reads in flight capped (the probe: 16 or more raise latency)
     .clk, .rst_n(mem_rst_n), .base(DDR_BASE),
     .req(dm_req && ddr_go), .we(dm_we), .addr(dm_addr), .blen(dm_blen), .din(dm_din), .be(dm_be),
     .wnext(), .wacc(dm_wacc), .rvalid(dm_rvalid), .ack(dm_ack),
@@ -968,7 +1005,7 @@ module m3_system
     .dbg_lat_v(), .dbg_lat(), .dbg_lat_src(), .dbg_lat_max(), .dbg_acc(), .dbg_acc_max(),
     .dbg_take(), .dbg_take_src(), .dbg_done(), .dbg_done_src(), .dbg_idle(), .dbg_st(), .dbg_rdy(), .dbg_rq());
   generate if (DDR_OREG) begin : g_doreg
-    m3_avl_reg u_dreg (
+    m3_avl_reg #(.SKF(DDR_SKF)) u_dreg (
       .clk, .rst_n(mem_rst_n), .u_rd(dq_rd), .u_we(dq_we), .u_addr(dq_addr), .u_burstcnt(dq_n), .u_din(dq_din),
       .u_be(dq_be), .u_busy(dq_busy),
       .DDRAM_RD, .DDRAM_WE, .DDRAM_ADDR, .DDRAM_BURSTCNT, .DDRAM_DIN, .DDRAM_BE, .DDRAM_BUSY);
@@ -989,8 +1026,8 @@ module m3_system
   logic        f_end /* verilator public_flat_rd */, r_done /* verilator public_flat_rd */;
   logic [1:0]  f_buf /* verilator public_flat_rd */, show_buf;
   logic [15:0] n_draw, n_drop, n_runs, n_copy, n_tex_up, n_tex_skip;
-  r3d_cmd u_r3cmd (
-    .clk, .rst, .h_go, .h_rdy, .h_we, .h_addr, .h_wdata, .h_rv, .h_rdata,
+  r3d_cmd #(.HDP(R3_HDP)) u_r3cmd (
+    .clk, .rst(rst_r3), .h_go, .h_rdy, .h_we, .h_addr, .h_dec, .h_wdata, .h_rv, .h_rdata,
     .tg_reg_we, .tg_reg_addr, .tg_reg_wdata, .ln_start, .ln, .mw_we, .mw_dev, .mw_val,
     .m_valid(m3_valid), .m_ready(m3_ready), .m_reg(m3_reg), .m_addr(m3_addr), .m_data(m3_data),
     .m_swap(m3_swap), .m_can_swap(m3_can_swap), .m_rbusy(m3_rbusy),
@@ -1005,7 +1042,7 @@ module m3_system
 
   // ---- culling and polygon RAM windows
   r3d_mem #(.AW(AW), .SDR_8C(SDR_8C), .SDR_8E0(SDR_8E0), .SDR_8E1(SDR_8E1), .DDR_P0(D_POLY0), .DDR_P1(D_POLY1)) u_r3mem (
-    .clk, .rst, .w_valid(m3_valid), .w_ready(m3_ready), .w_reg(m3_reg), .w_addr(m3_addr), .w_data(m3_data),
+    .clk, .rst(rst_r3), .w_valid(m3_valid), .w_ready(m3_ready), .w_reg(m3_reg), .w_addr(m3_addr), .w_data(m3_data),
     .swap(m3_swap), .r_busy(m3_rbusy), .bank(m3_bank), .can_swap(m3_can_swap),
     .s_req(p_req[4]), .s_we(p_we[4]), .s_addr(p_addr[4]), .s_din(p_din[4]), .s_be(p_be[4]), .s_ack(p_ack[4]), .s_dout(p_dout[4]),
     .d_req(d_req[4]), .d_we(d_we[4]), .d_addr(d_addr[4]), .d_blen(d_blen[4]), .d_din(d_din[4]), .d_be(d_be[4]),
@@ -1043,7 +1080,7 @@ module m3_system
               , .STEP2_PORT(STEP2)
 `endif
               ) u_r3tex (
-    .clk, .rst,
+    .clk, .rst(rst_r3),
 `ifdef M3_STEP2_TEX
     .port3w(step15),
 `else
@@ -1087,7 +1124,7 @@ module m3_system
     else cb_zero = 1'b1;
   end
   m3v_sdr_rd #(.AW(AW)) u_crd (
-    .clk, .rst,
+    .clk, .rst(rst_dd),
     .g_req(cr_req), .g_addr(cr_addr), .g_len(cr_len), .g_ack(cr_ack), .g_rvalid(cr_rv), .g_rdata(cr_rd),
     .blk_addr(cb_addr), .blk_sdr(cb_sdr), .blk_zero(cb_zero),
     .p_req(p_req[2]), .p_addr(p_addr[2]), .p_lo(p_lo[2]), .p_ack(p_ack[2]), .p_dout(p_dout[2]), .n_req());
@@ -1102,7 +1139,7 @@ module m3_system
     assign p_req[3] = 1'b0; assign p_addr[3] = '0;
   end else begin : g_vrd
     r3d_vrom_rd #(.AW(AW), .SDR_VROM(SDR_VROM)) u_vrd (
-      .clk, .rst,
+      .clk, .rst(rst_dd),
       .g_req(vr_req && !vrom_x), .g_addr(vr_addr), .g_len(vr_len), .g_ack(vs_ack), .g_rvalid(vs_rv), .g_rdata(vs_rd),
       .p_req(p_req[3]), .p_addr(p_addr[3]), .p_ack(p_ack[3]), .p_dout(p_dout[3]), .n_req());
   end endgenerate
@@ -1133,7 +1170,7 @@ module m3_system
     logic [7:0]  xc_blen;
     m3_xcrom #(.BASE(D_XCROM)) u_xcrom (
       .clk, .rst,
-      .s_req(s_req && s_x), .s_cmd, .s_sa(s_sa[23:2]), .s_ack(xc_ack), .s_rvalid(xc_rvalid), .s_rdata(xc_rdata),
+      .s_req(BUS_RQD ? s_rqx : (s_req && s_x)), .s_cmd, .s_sa(s_sa[23:2]), .s_ack(xc_ack), .s_rvalid(xc_rvalid), .s_rdata(xc_rdata),
       .m_req(xc_req), .m_addr(xc_addr), .m_blen(xc_blen), .m_rvalid(d_rvalid[6]), .m_ack(d_ack[6]), .m_dout(dm_dout));
     assign d_req[6] = lx_req || xc_req; assign d_we[6] = !xc_req; assign d_addr[6] = xc_req ? xc_addr : lx_da;
     assign d_blen[6] = xc_req ? xc_blen : 8'd1; assign d_din[6] = {4{lx_din}}; assign d_be[6] = 8'b11 << {lx_addr[2:1], 1'b0};
@@ -1149,7 +1186,7 @@ module m3_system
     assign xc_ack = 1'b0; assign xc_rvalid = 1'b0; assign xc_rdata = '0;   // (no extra memory: no bank can be there)
   end endgenerate
   m3v_ddr_rd u_prd (
-    .clk, .rst, .base(m3_bank ? D_POLY1 : D_POLY0),
+    .clk, .rst(rst_dd), .base(m3_bank ? D_POLY1 : D_POLY0),
     .g_req(pr_req), .g_addr(pr_addr), .g_len(pr_len), .g_ack(pr_ack), .g_rvalid(pr_rv), .g_rdata(pr_rd),
     .m_req(d_req[3]), .m_addr(d_addr[3]), .m_blen(d_blen[3]), .m_rvalid(d_rvalid[3]), .m_ack(d_ack[3]), .m_dout(dm_dout),
     .n_req());
@@ -1218,8 +1255,8 @@ module m3_system
 
   logic       t_long, tg_ninv;            // R103: the name row buffer's eight-word reads and its emptying
   logic [5:0] tg_ncnt;
-  m3_tilegen #(.AW(AW), .VBASE(AW'(SDR_VRAM >> 1))) u_tg (
-    .clk, .rst_n(!rst), .ready(tg_ready),
+  m3_tilegen #(.AW(AW), .VBASE(AW'(SDR_VRAM >> 1)), .QDC(TG_QDC), .CHF(TG_CHF)) u_tg (
+    .clk, .rst_n(!rst_tg), .ready(tg_ready),
     .reg_we(tg_reg_we), .reg_addr(tg_reg_addr), .reg_wdata(tg_reg_wdata),
     .pal_we(tg_pal_we), .pal_addr(tg_pal_addr), .pal_wdata(tg_pal_wdata),
     .swap(tg_swap), .go(tg_go), .go_y(tg_go_y), .busy(tg_busy), .overrun(tg_ovr),

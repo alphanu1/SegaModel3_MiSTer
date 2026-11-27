@@ -52,7 +52,12 @@ module m3_ddr3p #(
   parameter int NP   = 1,          // pipelined read ports
   parameter int QB   = 5,          // log2 reads tracked in flight
   parameter bit RQREG = 1'b0,      // the read queue in registers, not an MLAB
-  parameter int MAXQ = 1 << QB     // reads queued or in flight at most (1 .. 2^QB)
+  parameter int MAXQ = 1 << QB,    // reads queued or in flight at most (1 .. 2^QB)
+  // sys-timing: RLF 1 keeps "the next beat is the head read's last" (rbeat + 1 == the head's count) in a flag
+  // register, set from the head and the beat count as each is loaded, so a beat's r_last is one gate after
+  // DDRAM_DOUT_READY, not an 8-bit add and compare before the queue's read address (rbeat -> r_last -> the queue's
+  // read -> rh: -2.73 ns at 140 MHz). The same value at every clock (checked in the bench); 0: the add and compare
+  parameter bit RLF  = 1'b0
 ) (
   input  logic        clk,
   input  logic        rst_n,
@@ -161,7 +166,8 @@ module m3_ddr3p #(
   wire  [SB-1:0] rh_s = rh[SB+24-1 -: SB];
   wire  [7:0]    rh_n = rh[23:16];
   wire  [15:0]   rh_t = rh[15:0];
-  wire           r_last = DDRAM_DOUT_READY && (rbeat + 8'd1 == rh_n);
+  logic          rl_q;             // RLF: rbeat + 1 == rh_n
+  wire           r_last = DDRAM_DOUT_READY && (RLF ? rl_q : (rbeat + 8'd1 == rh_n));
   // RQREG: the two candidates (the head staying, or the next one) come from
   // registers only, and the port's late signals (the beat's valid, BUSY
   // through rd_take) only pick between them at the end. Reading the queue at
@@ -170,6 +176,8 @@ module m3_ddr3p #(
   wire  [QB:0]   rp_next = rq_rp + (QB+1)'(r_last);
   wire  [QB:0]   rp_1 = rq_rp + (QB+1)'(1);
   wire  [SB+8+16-1:0] rq_new = {c_s[0], c_n[0], c_t};
+  wire  [SB+8+16-1:0] rh_d, rh_rd; // the head for the next clock; the queue's read before the forward
+  wire           rh_fw;            // the entry going in is that head
   generate if (RQREG) begin : g_rqr
     (* ramstyle = "logic" *) logic [SB+8+16-1:0] rq [Q];
     wire fw0 = rq_wp[QB-1:0] == rq_rp[QB-1:0];
@@ -177,14 +185,36 @@ module m3_ddr3p #(
     wire [SB+8+16-1:0] rq0 = rq[rq_rp[QB-1:0]];
     wire [SB+8+16-1:0] rq1 = rq[rp_1[QB-1:0]];
     always_ff @(posedge clk) if (rd_take) rq[rq_wp[QB-1:0]] <= rq_new;
-    always_ff @(posedge clk)
-      rh <= r_last ? ((rd_take && fw1) ? rq_new : rq1) : ((rd_take && fw0) ? rq_new : rq0);
+    assign rh_d = r_last ? ((rd_take && fw1) ? rq_new : rq1) : ((rd_take && fw0) ? rq_new : rq0);
+    assign rh_fw = rd_take && (r_last ? fw1 : fw0);
+    assign rh_rd = r_last ? rq1 : rq0;
   end else begin : g_rqm
     (* ramstyle = "MLAB, no_rw_check" *) logic [SB+8+16-1:0] rq [Q];
     always_ff @(posedge clk) if (rd_take) rq[rq_wp[QB-1:0]] <= rq_new;
-    always_ff @(posedge clk)
-      rh <= (rd_take && rq_wp[QB-1:0] == rp_next[QB-1:0]) ? rq_new : rq[rp_next[QB-1:0]];
+    assign rh_rd = rq[rp_next[QB-1:0]];
+    assign rh_fw = rd_take && rq_wp[QB-1:0] == rp_next[QB-1:0];
+    assign rh_d = rh_fw ? rq_new : rh_rd;
   end endgenerate
+  always_ff @(posedge clk) rh <= rh_d;
+  // RLF: the flag for the next clock, from the head and the beat count that clock will have: the count is 0 after a
+  // last beat (and in reset), one more after any other beat, else as it is
+  // (the three compares made for the entry going in and for the entry read, then picked as the head is: with one
+  // compare after the head's select the flag was the port's worst path, c_wr -> rd_take -> the forward -> rh_d ->
+  // the compare, 7 levels, in the first full fit)
+  wire  [7:0]    rb1 = rbeat + 8'd1, rb2 = rbeat + 8'd2;
+  wire  [2:0]    e_nw = {c_n[0] == 8'd1, c_n[0] == rb2, c_n[0] == rb1};
+  wire  [2:0]    e_rd = {rh_rd[23:16] == 8'd1, rh_rd[23:16] == rb2, rh_rd[23:16] == rb1};
+  wire  [2:0]    e_hd = rh_fw ? e_nw : e_rd;
+  always_ff @(posedge clk)
+    rl_q <= !rst_n ? e_hd[2] : DDRAM_DOUT_READY ? (r_last ? e_hd[2] : e_hd[1]) : e_hd[0];
+`ifdef VERILATOR
+  logic rl_ok;
+  initial rl_ok = 1'b0;
+  always_ff @(posedge clk) begin
+    rl_ok <= 1'b1;
+    if (RLF && rl_ok && rl_q != (rbeat + 8'd1 == rh_n)) $fatal(1, "m3_ddr3p: the last-beat flag");
+  end
+`endif
   assign dbg_rq = {rh_s, rh_n, rbeat, 6'(rq_wp), 6'(rq_rp)};
   assign dbg_take = rd_take;
   assign dbg_take_src = c_s[0];

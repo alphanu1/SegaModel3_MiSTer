@@ -21181,3 +21181,223 @@ stages it pays for.
 
 *Left:* where Sega Rally 2's water slowdowns come from (the Real3D's translucent polygons or the CPU), on replay
 frames captured there; the table's two failing flip-flop paths go with the rebuilt front end.
+
+**R210 — The system side at 140 MHz in the full chip (D-81, D-87): what fails there is mostly the fitter not
+working on it while the CPU is at -4 ns. With the CPU's and the Real3D's own paths taken out of the fitter's way (an
+experiment fit, not a build) the system clock's worst falls from -4.03 to -1.5 ns and its failing endpoints from
+18,979 to about 450. The SDRAM capture clocks, which failed on every 140 MHz fit (-0.8 to -1.4 ns), close on every
+fit since (+0.26 to +0.51 ns over twelve fits) with their second registers pinned part-way to the pins. The clk_hps / clk_sys
+crossings that failed hold on some seeds (the OSD's options, the analog inputs, the calibration's targets) go
+through falling-edge registers with sites, the inputs with no added latency: hold is positive at every corner in
+the three final fits. Thirteen cycle-exact changes shorten the bus, the 53C810, the DDR3 port, the tile fetch and
+the host port (alone at 140 MHz: the 53C810 +0.94 -> +1.76 ns, the tile generator from 223 failing endpoints to
+15), each proven identical on the benches. The full chip does not show those: at 4,191 of 4,191 LABs one fit differs
+from the next by more than they give, and the system side stays 1.1-1.5 ns from closing even in the experiment.
+It does not close at 140 MHz in this chip until the chip has room, and HDMI still fails on six seeds of ten. Desk
+and bench only: nothing on the board, nothing committed.**
+
+Work in `sm3-builds/sys-timing/` (`base`: main afb2e8f by `git archive`; `tree`: the patch; `var/tree_r6`: m3_system's RTL
+as benched, `var/tree_r11`: the patch as fitted last; `NOTES.md` every step, wrong turns included;
+`sys-timing-afb2e8f.patch`, which `patch -p1` takes on afb2e8f). Rests on D-48, D-50, D-57, D-58, D-81, D-83, D-86,
+D-87; R187, R194, R197, R198, R203, R206, R209; my Model 2B core's R1043 for the placement method. The CPU, the
+geometry, the rasteriser, r3d_texup and r3d_mem are being reworked elsewhere and are not touched; sys/ stays stock
+but for the audio-filter patch.
+
+*What I believed:*
+- The system side's 3,779 failing endpoints in dirn140_s3 (worst -3.49 ns) were a list of paths too long for
+  7.14 ns, to be shortened block by block.
+- A fix proven in a block fitted alone with about a nanosecond of margin would show in the full chip.
+- The capture clocks' -0.95 ns was something the run-time calibration would take care of.
+
+*What I know now:*
+
+**1. The census.** dirn140_s2 / s3 were fitted without their database, so I refitted main at seed 3 keeping it
+(`base_s3`: the same RBF bit for bit) and read every failing endpoint's worst path: logic levels, cell delay, route.
+Of the 3,779 endpoints with a system-side end, 398 are structural (six levels or more, or 3.4 ns or more of cell
+delay) and 3,381 are placement: three to five LUTs with 2 ns of cell delay and 6-7 ns of route, often between
+registers 3-10 LABs apart; 995 start at the top level's reset and step registers and end in the CPU or the Real3D
+on one-level paths with 6.5-8 ns of route. pr_s.PR_DONE, the second SDRAM's start-up state, was the launch register
+of 290 endpoints in both SDRAM ports and controllers (through m3_sdr_cal's busy into the select of every port field).
+
+| block | endpoints | worst ns | structural | placement |
+|---|---|---|---|---|
+| m3_bus | 365 | -3.49 | 56 | 309 |
+| m3_tilegen | 360 | -2.60 | 26 | 334 |
+| top-level resets / steps into the CPU, geometry, rasteriser, r3d_texup, r3d_mem | 918 | -3.31 | 3 | 915 |
+| m3_scripts | 250 | -2.92 | 81 | 169 |
+| m3_sndbridge | 205 | -2.08 | 26 | 179 |
+| m3_avl_reg | 175 | -2.23 | 2 | 173 |
+| r3d_cmd (and into r3d_mem) | 332 | -3.03 | 11 | 321 |
+| m3_sdr2 / m2_sdram / m3_sdr_port | 287 | -2.10 | 34 | 253 |
+| m3_loader | 161 | -2.70 | 0 | 161 |
+| m3_ddr3p / m3_ddr_arb | 167 | -2.79 | 90 | 77 |
+| m3_xmem / m3_xcrom | 168 | -2.35 | 2 | 166 |
+| m3_io, m3_inputs, m3_compose, m3_sec, m3_jtag, m3_sdr_cal, readers, FPS, f2sdram terminator | 391 | -2.59 | 67 | 324 |
+
+**2. Two measurements that separate "too long" from "not worked on".**
+- *Each block alone at 140 MHz*, with the parameters the full chip gives it, register to register (`tools/sa.sh`; slow
+  100 / slow -40 C): the tile generator **-0.93 / -1.00** (223 endpoints failing) and m3_jtag -0.11 fail; the
+  calibration +0.17, the sound link +0.17 / -0.19, the bus +0.49, the security board +0.61, the DDR3 port +0.73 / +0.52
+  and the 53C810 +0.94 pass with less than a block needs to carry into the full chip; the loader, r3d_cmd, m3_xmem,
+  both SDRAM controllers, m3_io, m3_inputs, m3_xcrom, m3_compose and the DDR3 arbiter have +1.4 to +2.7.
+- *The full chip with the CPU's and the Real3D's own paths given two clocks* (`tools/relax.sdc`; an experiment, its
+  bitstream deleted, the fit script keeps none): the system clock **-1.509 / -1.453 ns, 448 endpoints** (base_s3:
+  -4.027 / -3.885, 18,979), 446 of them with a system-side end; HDMI +0.205 / -0.019 with nothing changed in it; hold
+  positive. So about 3,300 of the 3,779 are the fitter and the router spending nothing on paths at -2.5 while
+  others are at -4, and the system side's own distance from closing in this chip is 0.5-1.5 ns on about 450
+  endpoints, with the route share still 60-70%: the chip is full.
+
+**3. The capture clocks are static paths the calibration cannot move, and they close by placement.** Each failure
+was one hop: the DQ pin's I/O-cell register (dq_c) to the next register on the same capture clock (dq_r; on the
+second SDRAM dq_x[1]), 4.9-5.7 ns of route over 60-70 LABs, the fitter keeping dq_r beside the capture logic because
+its next hop into clk_sys has only 3.57 ns (the capture phase and the calibration band's 2.083 ns come off the
+period). The phase moves launch and capture of the first hop together. The first SDRAM's 16 DQ pins are spread from
+X8 to X82 along the bottom edge with three on the top edge, so the far bit changes with the seed (bits 11 and 8 in
+base_s3, bit 4 in a later fit after I had pinned only three). **All 16 dq_r and the second SDRAM's 16 dq_x[1] have
+sites in the qsf**, each dq_r at a LAB about 45% of the way from its pin to the die's centre; each bit's capture
+registers follow it. Capture 1 / 2 at slow 100 C: -0.952 / -0.059 (base_s3), -1.377 / -0.094 (the experiment on
+main); with the sites, over twelve fits, +0.37 to +0.51 / +0.26 to +0.40.
+
+**4. The clk_hps / clk_sys crossings.** hps_io runs on clk_hps (70 MHz, R198) and 4,723 paths go from it straight
+into clk_sys; each has its hold check at the common edge of two global clocks, and the fitter leaves one failing on
+some seeds: status[9] -> m3_fps's avg_q (-0.26 in a fit of mine, R198's single build, R206's c5_s1), the paddle ->
+m3_system's pad0_q (-0.41 in dirn140_s2 and in two of my fits, -0.12 to -0.42), and the other direction too
+(m3_sdr_cal's offset -> the phase stepper, -0.04 to -0.09). A hop on clk_sys's falling edge has no hold check at its
+launch edge; across the two clocks it has half a clk_sys period less the two globals' skew, about 2.2 ns, which
+the fitter does not give a path it does not think critical (a free falling-edge register failed setup by 0.3-0.5
+ns in three fits), so each such hop's two registers have sites side by side in the qsf:
+- the 29 OSD option bits m3_system takes and the stepper's two settled flags: clk_hps falling (opt_a), clk_sys
+  falling (opt_n), clk_sys rising (opt_p, beside), then a free register (opt_q) a whole clock on. The options land
+  about three clocks later; nothing times them;
+- the calibration's two targets: a clk_sys register (pst_p), clk_sys falling (pst_n), clk_hps rising (pst_h). The
+  calibration waits 16 clocks after a change before it reads settled; the round trip is about 9;
+- **the 72 analog input bits** (three sticks, two triggers, the paddle): one clk_sys falling-edge register (ain_n)
+  between hps_io's output register and m3_system's first register, which takes the value at the same clk_sys edge
+  as before, so **no latency is added**; the three registers of each bit have sites side by side (72 of the sites
+  are on hps_io's registers: a site, not an edit of sys/).
+Left direct: the buttons (joystick_0 / 1, through m3_inputs' logic before their first register; hold +0.11 at least
+in every fit), the download port's registers and the video's transfer (vq -> vh, +0.04 at least). Model3.sdc also
+gives the fitter, and only the fitter, 0.1 ns more hold uncertainty on clk_sys and to and from clk_hps.
+
+**5. The changes in the blocks** (m3_system parameters, 1 by default; 0 is main's form). Every one is cycle-exact;
+three are not bit-exact inside, where a register that nothing reads at that moment holds another value (marked).
+
+| switch | where | what | why |
+|---|---|---|---|
+| KCAL_REG | m3_system | the calibration engine's port select from the first SDRAM's done register (it is !busy at every clock, as the bench already asserted) | PR_DONE -> busy -> the select: 290 endpoints |
+| BUS_QIN | m3_bus | the bank map and the 53C810's window from registers in the bus (each read two clocks or more after it can change) | cfg_bank -> s_x -3.49; bar1 -> the decode -3.31 |
+| BUS_TGH | m3_bus | the class after B_DEC from a register (the decode without address bits 4:3, the two PCI ranges' low bits applied after) | addr -> the decode -> m_wnext / the state -3.21 |
+| BUS_SCWP | m3_bus | the window's 24-bit compare made per master a clock ahead, read once at the transaction's first B_DEC clock and kept | the compare stood in front of every class and of tg_hold |
+| BUS_RQD | m3_bus | the SDRAM request as three registers by destination (first SDRAM, second, m3_xcrom) | s_x / s_w2 in front of each port's request chain |
+| BUS_DLD | m3_bus | B_DEC loads the port's fields in every clock (as FAST's idle load, R112); the SDRAM address from the top byte alone (*not bit-exact inside*: the fields differ while s_req is low) | the class decode was the enable of 70 registers and in front of s_sa |
+| R3_HDP | r3d_cmd, m3_bus | the host port's head decode formed in the bus beside the address select | the 53C810's state -> d_go -> h_addr -> the compares -> hd_8c -1.51 (experiment) |
+| SC_FLG | m3_scripts | "eight words or more left", "any left" for the read count and "eight or more" for the write count as flag registers | rd_left -> do_lrd / do_srd -> the port's address select, 8 levels, -2.92 |
+| DDR_RLF | m3_ddr3p | the head read's last beat as a flag register, its compares made for the entry going in and the entry read, picked by the head's own forward | rbeat -> r_last -> the queue's read, -2.73 |
+| DDR_SKF | m3_avl_reg | the skid slot's fields follow the upstream fields whenever it is empty (*not bit-exact inside*) | DDRAM_BUSY -> 109 enables 25 LABs from the HPS's f2sdram block |
+| TG_QDC | m3_tilegen_fetch | the chunk queue's free entry written whenever a push may happen; only its valid bit waits for the pattern compare (*not bit-exact inside*) | 188 endpoints failing in the block alone |
+| TG_CHF | m3_tilegen_fetch | the chunk's two stencil bits, the stale carry, the span crossing and x > xhi from flags loaded with x | pmask / x -> stale -> srcx -> p_addr, 8 levels |
+| (none) | m3_system, qsf | reset copies for the tile generator, the Real3D's command side and the DDR3 readers; MAX_FANOUT on rst_cpu | rst_s[2]'s one-level paths, 35-58 LABs |
+
+Alone at 140 MHz with the switches on (one seed each; tenths are noise): the 53C810 +0.94 -> **+1.76**; the bus
++0.49 -> +0.62 (below +1.0: 74 -> 54); the DDR3 port +0.73 / +0.52 -> +0.94 / +0.67 (23 -> 3); r3d_cmd +2.25 -> +2.35;
+the tile generator -0.93 with 223 failing -> **-0.20 to -0.53 with 15 failing** (254 below +1.0 -> 44-69). What still
+fails in the tile generator alone is x -> the chunk rule -> srcx -> the name row's valid bit -> p_addr.
+
+**6. Proof.**
+- quartus_map --analyze_file (Quartus 17.0, the dual build's macros and M3_RELEASE) of every changed file: 0 errors,
+  0 warnings. (It refused `wire tgt_t tgt_r = ...;`, which Verilator takes: "identifier already declared".)
+- Every new register has a bench assertion against the wire it replaces, live in every run below; none fired.
+- **The system bench** (m3_system with the board's options, dual, 140 MHz), VF3 from reset, 60 frames, 179,868,650
+  clocks: rounds 1 to 5 of the tree against main: **the bus trace identical (27,155,688 bytes, 1,131,427 records),
+  the --prof2 and VROM profiles identical, run.log identical but for wall-clock figures**. Daytona 2 from reset, 40
+  frames (131,193,450 clocks; only 86 bus records that early: a thin check of the Step 2 map): identical for rounds
+  1, 4 and 5. m3_system's RTL as fitted (round 6: round 5 with DDR_RLF's compares rearranged): VF3 and Daytona 2
+  identical again. Model3.sv's crossing registers are outside this bench: they rest on the fits' timing and on the
+  settled round trip's arithmetic.
+- The 53C810 bench (test_scripts' six runs: five captures, 500-2,000 synthetic programs each, quick and hostile
+  memories), main against SC_FLG, as the Makefile builds the block and with R3DMA and DIR as the board does: 6 of 6
+  PASS each, the outputs identical.
+- The tile generator bench (test_tilegen: SM and MAME configurations, mutated, slow memory, real time), main
+  against each step of TG_QDC / TG_CHF: 4 of 4 PASS each, the logs identical line for line (line clocks, request
+  census, 0 overruns).
+- The DDR3 port bench (R198's wrapper and sweep): switches off 240 runs / 0 failed; DDR_RLF and DDR_SKF on 240 / 0,
+  and 240 / 0 with the register form of the queue.
+- Not rerun: the phase stepper's bench (its inputs now arrive through the crossing registers: desk only) and the
+  calibration's sweeps (m3_sdr_cal is unchanged).
+
+**7. The full chip** (Quartus 17.0, release, dual, 140 MHz; ns; setup slow 100 / slow -40 C; hold the least over
+every clock at slow 100 / slow -40 / fast 100 / fast -40; system endpoints with either end in a system block):
+
+| fit | system setup | hold | capture 1 / 2 (s100) | HDMI | ALM / LABs / M10K / DSP | system endpoints |
+|---|---|---|---|---|---|---|
+| dirn140_s2 (main) | -4.209 / -4.367 | -0.406 / -0.306 / -0.202 / -0.211 | -1.347 / | -0.369 / -0.256 | 41,274 / 4,188 / 537 / 87 | 4,056 |
+| dirn140_s3 (main) | -4.027 / -3.885 | +0.255 / +0.139 / +0.121 / +0.066 | -0.952 / -0.059 | -0.603 / -0.391 | 41,361 / 4,191 / 537 / 87 | 3,779 |
+| st11_s1 (the patch) | -5.142 / -4.519 | +0.244 / +0.123 / +0.095 / +0.078 | +0.476 / +0.286 | -0.676 / -0.493 | 41,301 / 4,191 / 537 / 87 | 3,629 |
+| st11_s2 (the patch) | -4.405 / -4.268 | +0.175 / +0.141 / +0.105 / +0.084 | +0.470 / +0.312 | -0.549 / -0.344 | 41,326 / 4,191 / 537 / 87 | 2,979 |
+| xbase_s3 (experiment, main) | -1.509 / -1.453 | +0.200 / +0.054 / +0.068 / +0.014 | -1.377 / -0.094 | +0.205 / -0.019 | 41,316 / 4,190 / 537 / 87 | 446 |
+| xst11_s3 (experiment, the patch) | -1.092 / -1.499 | +0.150 / +0.068 / +0.104 / +0.071 | +0.451 / +0.337 | -0.312 / -0.158 | 41,228 / 4,190 / 537 / 87 | 446 |
+
+- The system clock's worst is the CPU's in every true fit; the system side's count moves inside the spread
+  between two seeds of main. Under the experiment the patch is 446 -> 446 endpoints and -1.51 / -1.45 -> -1.09 /
+  -1.50: the bus 108 -> 24, the tile generator 56 -> 23, the 53C810 34 -> 15, the sound link 26 -> 3, m3_avl_reg 41
+  -> 14, and m3_jtag 0 -> 50, m3_xmem 1 -> 43, r3d_cmd 48 -> 70, m3_ddr3p 33 -> 49 in that placement. Four experiment
+  fits of the same system RTL gave 488, 419, 644 and 446 endpoints and -1.44 to -1.05 / -1.97 to -1.35 ns.
+  **Nothing here is measurable against the fit-to-fit spread at 4,191 of 4,191 LABs.**
+- **Hold is positive at every corner in the three final fits**, and no crossing register fails setup in them.
+  Earlier fits of the patch failed hold on the paths now changed (the paddle, the calibration's targets), and two
+  by 0.005-0.054 ns inside the rasteriser (bq_wp -> its MLAB, rq_b -> r3d_rast_colour's s1: not these files).
+- st11_s1's fast 100 C setup failure (-1.143 ns, one endpoint) is inside the geometry (r3d_vpu's bwd_r -> its
+  M10K's write data), not in these files.
+- **HDMI is not closed.** Over the ten true fits of the patch it closes at both slow corners in four (+0.11 to +0.23)
+  and fails in six (to -0.68). I pinned the scaler's, the HDMI OSD's and the shadow mask's 59 M10K and DSP blocks at
+  the sites of a fit where it closed (my Model 2B's method, its R1043): -0.20 / -0.05 and -0.67 / -0.43 in two fits
+  of three with them, so they are not in the patch. In the experiment fits without anchors it sits at +0.21 to
+  -0.31: the same thing as the system side, the fitter's effort while the CPU is at -4.
+- Area: the patch is about +310 registers (the crossings' 232: options 124, analog inputs 72, targets 36) and no
+  M10K or DSP; the chip total moves by the fitter's own noise (41,301 and 41,326 ALM against 41,274 and 41,361).
+
+**8. What it takes to close the system side, and what each costs** (not done):
+- *Room.* With the CPU's and the Real3D's paths relaxed the system side is at -1.5 ns with 60-70% route. Blocks
+  that have +1.4 ns or more alone fail in the chip by placement only; they close when the chip has free LABs and the
+  fitter's effort is not spent at -4. This is the CPU's and the Real3D's rework (D-81) and the area passes (D-87),
+  not more system RTL.
+- *The DDR3 intake* (a client's request -> m3_ddr_arb's select -> m3_ddr3p's take -> the command queue: six to
+  eight levels across three modules, -0.7 to -1.4 in the experiment): a register stage at the arbiter's output.
+  One clock on every DDR3 command, where DDR_OREG already added one against a latency of 13 or more; about 110
+  registers. It needs pricing on the Real3D's frame time (D-87).
+- *The bus's B_DEC*: with the window compare ahead and the fields loaded early, what is left is addr -> the class
+  -> the state and the request (about 20 endpoints at -0.9 in the experiment). The whole class a clock ahead per
+  master, as BUS_SCWP does for the window: about 80-100 ALM, no cycle.
+- *The tile fetch's chunk rule*: the row buffer's valid bit and tag compare as flags loaded with x and my (no
+  cycle), or S_CHUNK in two clocks (one clock a chunk; the slowest line in the bench is 3,150 clocks, a line about
+  5,700 at 140 MHz: to be measured in the real-time run before it is taken).
+- *r3d_cmd's head* (r3d_mem's m_ready -> pf_pop -> the head's 60 registers): m_ready is combinational in r3d_mem,
+  which is not mine to change now; a registered ready there, or the QDC form here (the head loaded ahead, a valid
+  bit waiting).
+- *The calibration's compare* (start-up only, but it must close): s_wdata already registers the pattern every
+  clock; with the beat index stepped a clock early in the read beats the compare is s_rdata against s_wdata with no
+  adder and no new register. It needs the calibration's sweeps and planted faults, which I did not run.
+- *m3_jtag* (the device RAM's M10K read -> the shift -> its write data, no register between; -0.11 alone): a register
+  on the read costs a clock an edge of the chain, behind jt_busy.
+- *The steering scale* (jl0_q -> steer_rq, 8 levels with two adders, -0.6 to -1.5 in the experiment): m3_inputs /
+  m3_cab_inputs are about to change for the gear lever; left for that work, with the adders' operands registered a
+  clock earlier where the axis already waits.
+- *The security board's size compare, the sound link's c_end compare, the FPS box's position adders*: flags loaded
+  with their counters, as SC_FLG; a few endpoints each.
+- *The buttons', the download port's and the video's crossings*: the same hold exposure as the options and the
+  analog inputs had (positive in every fit so far). The buttons go through m3_inputs' logic before their first
+  register, so the zero-latency form needs that register moved to the front of the logic; the video's transfer
+  the other way needs its own look (R198's stretched enable).
+
+*Wrong turns* (NOTES.md has each): standalone fits with the clock as a virtual pin (hold -1 to -4 ns: thrown away)
+and then with port delays against a clock without its insertion delay; the tree's standalone fits run with the
+new switches off; DDR_RLF's flag as first written was the DDR3 port's worst path in the full chip (7 levels);
+the options' first crossing (one falling-edge register) failed setup in three fits (2.3 ns of data against 2.2);
+a site in row 37, which is not a LAB row at those columns, stopped three fits at their start; only three of the
+sixteen capture registers pinned at first; the options' last register pinned at the die's centre, far from what
+reads it; the HDMI anchors; the inputs' crossing left direct until it failed hold in two fits.
+
+*Board (2026-11-27):* st11_s2 (RBF f4052cd0, main 812a6b4 + this patch, dual, 140 MHz, seed 2). Calibration on
+Auto: SDRAM1 6 1 37 21, SDRAM2 12 1 23 19. VF3, Scud Race and Sega Rally 2 good. Daytona 2 felt to slow down less
+than on dirn140_s3, only at one corner and in multi-car collisions; the patch changes no cycle, so that is placement or
+the run, not a measured gain.
