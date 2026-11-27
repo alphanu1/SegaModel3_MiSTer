@@ -44,7 +44,8 @@ module ppc_fpu
   parameter bit P5     = 1'b1,
   parameter bit P6A    = 1'b1,
   parameter bit P6     = 1'b1,
-  parameter bit P7     = 1'b1
+  parameter bit P7     = 1'b1,
+  parameter bit IT     = 1'b0       // dfront: the double unit's iterative front (f_* ops three or more cycles apart)
 ) (
   input  logic            clk,
   input  logic            rst,
@@ -98,7 +99,7 @@ module ppc_fpu
 
   assign d_inj_req = inj_valid;
 
-  ppc_fpu_fma #(.TAGW(TAGW), .P1A(P1A), .P2(P2), .P3(P3), .P4A(P4A), .P5A(P5A), .P5(P5), .P6A(P6A), .P6(P6), .P7(P7)) u_fma (
+  ppc_fpu_fma #(.TAGW(TAGW), .P1A(P1A), .P2(P2), .P3(P3), .P4A(P4A), .P5A(P5A), .P5(P5), .P6A(P6A), .P6(P6), .P7(P7), .IT(IT)) u_fma (
     .clk (clk), .rst (rst),
     .in_valid (f_valid), .in_op (f_op), .in_single (f_single), .in_ctl (f_ctl),
     .in_a (f_a), .in_b (f_b), .in_c (f_c), .in_tag (f_tag),

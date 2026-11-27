@@ -138,7 +138,26 @@ module r3d_geo
   // goes to the emitter (and its staging half back to the staging machine) at the clock a single kernel's would;
   // the second group's operations fill the cycles left, and its addresses carry bit 6, which selects the other
   // half. 0: one group a kernel, as before.
-  parameter bit SU_PAIR    = 1'b1
+  parameter bit SU_PAIR    = 1'b1,
+  // EMPTY_DROP (D-85, macro M3_R3EMPTY): with SETUP_OUT, a triangle that covers no pixel is dropped after its
+  // staging words, as a non-finite one is, before the set-up kernel. The rasteriser draws rows round(y_min) ..
+  // round(y_max) - 1 within 0 .. 383 and, in a row, columns round(x_left) .. round(x_right) - 1 within 0 .. 495,
+  // each edge's x at a row centre lying between the triangle's least and greatest vertex x (the 16.16 vertex,
+  // to nearest with ties away, then poly.h's round, half down: rtl_tri::setup and span, r3d_rast_edge). So a
+  // triangle with round(y_min) >= round(y_max) or round(x_min) >= round(x_max), each clamped to the screen, draws
+  // nothing. Distant models send many of these (Sega Rally 2's snow stage: over half of 20,000 triangles a
+  // frame). 0: they are set up and sent, as before.
+`ifdef M3_R3EMPTY
+  parameter bit EMPTY_DROP = 1'b1,
+`else
+  parameter bit EMPTY_DROP = 1'b0,
+`endif
+  // WALK_PF (D-85, macro M3_R3PF): the walker reads ahead (r3d_walker PF). 0: one request at a time, as before.
+`ifdef M3_R3PF
+  parameter bit WALK_PF    = 1'b1
+`else
+  parameter bit WALK_PF    = 1'b0
+`endif
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -190,7 +209,7 @@ module r3d_geo
   logic        cu_v, cu_out;
   logic        cu_vd;             // (r3d140) the verdict a clock on
   logic [3:0]  cu_c;
-  r3d_walker #(.CULL(CULL), .CTAB(SM_CTAB), .VP_M10K(VP_M10K)) u_walker (
+  r3d_walker #(.CULL(CULL), .CTAB(SM_CTAB), .VP_M10K(VP_M10K), .PF(WALK_PF)) u_walker (
     .clk, .rst, .start(w_start), .step15, .busy(w_busy), .overflow(w_overflow),
     .mem_req(w_req), .mem_addr(w_addr), .mem_len(w_len), .mem_ack(w_ack),
     .mem_rvalid(w_rvalid), .mem_rdata(cull_rdata),
@@ -1183,6 +1202,7 @@ module r3d_geo
   logic [1:0]  s_v;                      // sorted vertex
   logic [2:0]  s_j;                      // x, y, 1/w, (u/w, v/w,) shade
   logic        s_dv, s_dchk, s_nonfin;   // a gathered word arriving (read last cycle)
+  logic        em_drop;                  // EMPTY_DROP: the triangle being staged covers no pixel
   logic [4:0]  s_dk;
   logic [1:0]  s_dql;                    // the lane of the word read last cycle
   logic [1:0]  sl;                       // triangles in the group being gathered
@@ -2238,7 +2258,7 @@ module r3d_geo
           end
           // the last word written: queue the triangle (or drop it), close a full group
           S_TE: if (!s_dv) begin
-            if (!s_nonfin) begin
+            if (!s_nonfin && !em_drop) begin
               tq_we <= 1'b1; tq_wd <= {s_tex, SM_CULL && s_cf, s_inv, s_poly};
               if (sl == 2'd3) begin
                 stg_busy[sg] <= 1'b1; g_n[sg] <= 3'd4; g_tex[sg] <= s_gtex || s_tex;
@@ -2320,6 +2340,52 @@ module r3d_geo
     end
   end
 
+
+  // EMPTY_DROP: the triangle's pixel rows and columns from its staging words (the parameter's comment). The words
+  // taken are k 0-2 (the three x) and k 3 and 5 (the sorted y: the least and the greatest). Stage 1 takes the
+  // word, stage 2 forms its 16.16 value (to nearest, ties away; 0 for a negative word, 1024.0 for 1024 and
+  // above), stage 3 its pixel (poly.h's round: up only above one half), clamped to the screen, into the least
+  // and greatest. k 5 is through stage 3 long before the triangle's last word (k 11, or 17 textured), when S_TE
+  // reads em_drop.
+  generate if (SETUP_OUT && EMPTY_DROP) begin : g_empty
+    logic        em_v, em_v2;
+    logic [4:0]  em_k, em_k2;
+    logic [31:0] em_f;
+    logic [25:0] em_y16;
+    logic [10:0] em_rmin, em_rmax, em_cmin, em_cmax;
+    assign em_drop = em_rmin >= em_rmax || em_cmin >= em_cmax;
+    always_ff @(posedge clk) begin
+      logic [7:0]  e;
+      logic [23:0] m;
+      logic [10:0] px, lim;
+      // stage 1
+      em_v <= s_dv && (s_dk <= 5'd5) && (s_dk != 5'd4);
+      em_k <= s_dk; em_f <= po_d;
+      // stage 2: the value is m 2^(e - 150); times 2^16, m 2^(e - 134), with e - 134 in -24 .. 2 here (below
+      // 2^-17, under half of 2^-16: 0)
+      e = em_f[30:23]; m = {1'b1, em_f[22:0]};
+      if (em_f[31] || e <= 8'd109) em_y16 <= '0;
+      else if (e >= 8'd137) em_y16 <= 26'h3FF_FFFF;
+      else if (e >= 8'd134) em_y16 <= 26'(m) << (e - 8'd134);
+      else em_y16 <= (26'(m) >> (8'd134 - e)) + 26'(m[5'(8'd133 - e)]);
+      em_v2 <= em_v; em_k2 <= em_k;
+      // stage 3
+      px = 11'(em_y16[25:16]) + 11'(em_y16[15:0] > 16'h8000);
+      lim = (em_k2 >= 5'd3) ? 11'd384 : 11'd496;
+      if (px > lim) px = lim;
+      if (em_v2) begin
+        case (em_k2)
+          5'd0: begin em_cmin <= px; em_cmax <= px; end
+          5'd1, 5'd2: begin if (px < em_cmin) em_cmin <= px; if (px > em_cmax) em_cmax <= px; end
+          5'd3: em_rmin <= px;
+          default: em_rmax <= px;
+        endcase
+      end
+      if (rst) begin em_v <= 1'b0; em_v2 <= 1'b0; end
+    end
+  end else begin : g_noempty
+    assign em_drop = 1'b0;
+  end endgenerate
 
   // cb_cl's next value: the polygon machine's moves into and out of P_CL0, P_X1 / P_X2 and P_Q0 / P_Q1
   always_ff @(posedge clk) begin

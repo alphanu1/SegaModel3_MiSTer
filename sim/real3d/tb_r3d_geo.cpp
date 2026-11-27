@@ -123,6 +123,8 @@ int main(int argc, char **argv) {
   bool setup_cr = false, cull = false, frustum_sm = false, face_keep = false, lod = false, setup_out = false;
   uint32_t step = 0x10;
   std::string rows = "sm";
+  bool empty_drop = false;   // --empty: the RTL built with EMPTY_DROP = 1 (a triangle covering no pixel not sent)
+  uint64_t su_empty = 0, su_empty_rows = 0, su_empty_px = 0, su_empty_tri_px = 0;
   unsigned hostile = 0, h_maxrd = 0;
   std::vector<uint8_t> replay;
   bool replaying = false;
@@ -143,6 +145,7 @@ int main(int argc, char **argv) {
     else if (a == "--step") step = uint32_t(std::strtoul(nx().c_str(), nullptr, 16));
     else if (a == "--face-keep") face_keep = true;
     else if (a == "--lod") lod = true;
+    else if (a == "--empty") empty_drop = true;
     else if (a == "--setup-out") {
 #ifdef GEO_SETUP_OUT
       setup_out = true;
@@ -273,18 +276,47 @@ int main(int argc, char **argv) {
         bool nf = false;
         for (int v = 0; v < 3; v++) for (int k = 0; k < 3; k++) if (((e.w[size_t(4 + 6 * v + k)] >> 23) & 0xff) == 0xff) nf = true;
         if (nf) { su_nonfin++; continue; }
-        e.w[2] = e.w[1] ? ra++ : ro++;
         rtri t{};
         for (int v = 0; v < 3; v++) {
           uint32_t const *q = &e.w[size_t(4 + 6 * v)];
           // the model's w: rtl_tri::setup forms 1/w as 1.0f / w
           t.x[v] = bf(q[0]); t.y[v] = bf(q[1]); t.w[v] = bf(e.w[size_t(37 + v)]);
-          { float const iw = 1.0f / t.w[v]; uint32_t u; std::memcpy(&u, &iw, 4); if (u != q[2]) su_nonfin_w++; }
           t.p0[v] = bf(q[3]); t.p1[v] = bf(q[4]); t.p2[v] = bf(q[5]);
         }
         t.param = e.w[29]; t.alpha = e.w[1];
         rtl_tri r;
         bool const rows = r.setup(t, kind_of(t), o);
+        if (empty_drop) {
+          // r3d_geo EMPTY_DROP: rows round(y) and columns round(x) of the 16.16 vertex (rtl_tri::setup's
+          // to_fix, then poly.h's round), clamped to the screen; none between the least and the greatest
+          auto pix = [](uint32_t u, int lim) {
+            float f; std::memcpy(&f, &u, 4);
+            // r3d_rast_rtl.cpp's to_fix at 16 bits: f 2^16 rounded to nearest, ties away (non-negative here)
+            int64_t const v = (u >> 31) ? 0 : std::min<int64_t>(std::llround(std::ldexp(double(f), 16)), 0x3ffffff);
+            int64_t p = (v >> 16) + ((v & 0xffff) > 0x8000 ? 1 : 0);
+            return int(std::min<int64_t>(p, lim));
+          };
+          int rmin = 1 << 20, rmax = -1, cmin = 1 << 20, cmax = -1;
+          for (int v = 0; v < 3; v++) {
+            int const c = pix(e.w[size_t(4 + 6 * v)], SCR_W), rr = pix(e.w[size_t(5 + 6 * v)], SCR_H);
+            cmin = std::min(cmin, c); cmax = std::max(cmax, c); rmin = std::min(rmin, rr); rmax = std::max(rmax, rr);
+          }
+          if (rmin >= rmax || cmin >= cmax) {
+            // dropped: the rasteriser's model (bit for bit the RTL's edge walker) must draw no pixel from it
+            su_empty++;
+            if (!rows) su_empty_rows++;
+            else {
+              uint64_t n = 0;
+              for (int32_t y = r.y0; y < r.y1; y++) { int32_t x0, x1; if (r.span(y, x0, x1)) n += uint64_t(x1 - x0); }
+              su_empty_px += n; if (n) su_empty_tri_px++;
+            }
+            continue;
+          }
+        }
+        e.w[2] = e.w[1] ? ra++ : ro++;
+        for (int v = 0; v < 3; v++) {
+          float const iw = 1.0f / t.w[v]; uint32_t u; std::memcpy(&u, &iw, 4); if (u != e.w[size_t(4 + 6 * v + 2)]) su_nonfin_w++;
+        }
         if (!rows) su_rows0++;
         std::vector<uint32_t> w;
         auto fb = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
@@ -640,10 +672,15 @@ int main(int argc, char **argv) {
               files.size(), frames_ok, tris_total, count_bad, lat_lo, lat_hi, stall);
   for (auto const &kv : fbad) std::printf("  field %-12s %" PRIu64 " mismatches\n", kv.first.c_str(), kv.second);
   if (port_open) std::printf("  %" PRIu64 " frames ended with a port still open\n", port_open);
-  if (setup_out)
+  if (setup_out) {
     std::printf("set-up records (model): %" PRIu64 " triangles, %" PRIu64 " textured, %" PRIu64 " flat; %" PRIu64 " left out (x, y or 1/w not finite), "
                 "%" PRIu64 " vertices whose 1/w word is not 1.0f / w, %" PRIu64 " with no row on screen (sent)\n",
                 su_tris, su_tex, su_flat, su_nonfin, su_nonfin_w, su_rows0);
+    if (empty_drop)
+      std::printf("  --empty: %" PRIu64 " triangles covering no pixel not sent (EMPTY_DROP): %" PRIu64 " with no row on screen, "
+                  "%" PRIu64 " pixels the model's rasteriser draws from the rest (%" PRIu64 " triangles)\n",
+                  su_empty, su_empty_rows, su_empty_px, su_empty_tri_px);
+  }
   std::printf("cycles per frame p50 %.0f p99 %.0f max %.0f (p99 = %.1f%% of a 50 MHz frame, %.1f%% at 100 MHz)\n",
               pct(cycles, .5), pct(cycles, .99), pct(cycles, 1), 100.0 * pct(cycles, .99) / 869265, 100.0 * pct(cycles, .99) / 1738530);
   std::printf("subnormal or flushed values at an FP unit input or output: %" PRIu64 " (in %" PRIu64 " frames); at the facing test's units %" PRIu64 "%s\n",

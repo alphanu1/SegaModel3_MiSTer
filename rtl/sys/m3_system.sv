@@ -218,7 +218,23 @@ module m3_system
   //   SDR_CAL      the read-capture calibration of each SDRAM at power-up (m3_sdr_cal): the capture clocks stepped
   //                through their period, the phase set to the widest passing window's centre; the loader (and so
   //                the HPS's downloads) waits for the first SDRAM's, the game for the second's (m3_sdr2's ok)
-  parameter bit          SDR_CAL     = 1'b0
+  parameter bit          SDR_CAL     = 1'b0,
+  // ---- D-85: changes taken from the contributor's fork, each off until board-tested
+  //   DMA_DIR      (macro M3_DMADIR) a Step 2 move into the Real3D's host port writes r3d_cmd straight from
+  //                m3_scripts' FIFO (m3_scripts DIR, m3_bus DDIR), not as line writes over the bus
+  //   SND_WD       the sound bridge's watchdog, 2^SND_WD samples (m3_sndbridge WD_BITS): 12 is 93 ms; 13 (macro
+  //                M3_SND_WD13) is 186 ms, which a stalled server rides out up to 186 ms while every real server
+  //                restart (220 ms or more, R166) still lands in a new epoch
+`ifdef M3_DMADIR
+  parameter bit          DMA_DIR     = 1'b1,
+`else
+  parameter bit          DMA_DIR     = 1'b0,
+`endif
+`ifdef M3_SND_WD13
+  parameter int          SND_WD      = 13
+`else
+  parameter int          SND_WD      = 12
+`endif
 ) (
   input  logic        clk,
   input  logic        clk_cap1,      // sys140: the first SDRAM's DQ capture clock (SDR_CAPCLK)
@@ -594,15 +610,21 @@ module m3_system
   logic [31:0] sc_wdata, sc_rdata, cf_wdata, cf_rdata;
   logic [31:8] sc_win_base;
   logic [5:0]  cf_idx;
+  // DMA_DIR: a move's word for the host port, and the bus taking it (public for the system bench's trace: no bus
+  // transaction carries these words, so tr_* does not)
+  logic        dh_v;
+  logic        dh_take /* verilator public_flat_rd */;
+  logic [31:0] dh_addr /* verilator public_flat_rd */;
+  logic [31:0] dh_data /* verilator public_flat_rd */;
 
-  m3_scripts #(.R3DMA(STEP2), .LDV(BR_BUS)) u_scsi (
+  m3_scripts #(.R3DMA(STEP2), .LDV(BR_BUS), .DIR(DMA_DIR)) u_scsi (
     .clk, .rst, .step2,     // R100: Step 2.x, the Real3D DMA device on this move engine
     .c_req(cf_req), .c_we(cf_we), .c_idx(cf_idx), .c_be(cf_be), .c_wdata(cf_wdata), .c_ack(cf_ack), .c_rdata(cf_rdata),
     .win_en(sc_win_en), .win_base(sc_win_base),
     .s_req(sc_req), .s_we(sc_we), .s_addr(sc_addr), .s_be(sc_be), .s_wdata(sc_wdata), .s_ack(sc_ack), .s_rdata(sc_rdata),
     .m_req(m_req[1]), .m_cmd(m_cmd[1]), .m_addr(m_addr[1]), .m_be(m_be[1]), .m_wdata(m_wdata[1]),
     .m_ack(m_ack[1]), .m_wnext(m_wnext[1]), .m_rvalid(m_rvalid[1]), .m_rdata,
-    .irq(scsi_irq), .busy(scsi_busy));
+    .irq(scsi_irq), .busy(scsi_busy), .dh_v, .dh_addr, .dh_data, .dh_take);
 
   // ===========================================================================
   // the bus and its devices
@@ -689,7 +711,7 @@ module m3_system
   logic       tg_nw;                      // a write into the name table (the bus's tr_nw; R103, R179)
   m3_bus #(.AW(AW), .SDR_CROM(SDR_CROM), .SDR_FIXED(SDR_FIXED), .SDR_BACKUP(SDR_BACKUP), .SDR_RAM(SDR_RAM),
            .SDR_VRAM(SDR_VRAM), .CROM_BANKS(CROM_BANKS), .MIDI_GAP(MIDI_GAP_C), .FAST(BUS_FAST), .R3P(BUS_R3P), .TGT(TG_TIMING), .TG_MHZ(CLK_MHZ),
-           .C106_M10K(BR_C106), .OWIRE(BR_BUS), .OWIRE_SC(1'b0), .WD_DEC(BR_BUS), .W2(W2)
+           .C106_M10K(BR_C106), .OWIRE(BR_BUS), .OWIRE_SC(1'b0), .WD_DEC(BR_BUS), .W2(W2), .DDIR(DMA_DIR)
 `ifdef M3_STEP2_BUS
            , .STEP2(STEP2), .SDR_FIX8(SDR_FIX8), .RTC_HZ(CLK_HZ), .EXT_SEC(BR_SEC)
 `endif
@@ -713,7 +735,8 @@ module m3_system
     .r3d_cfg0, .r3d_cfg1, .r3d_cfg2,
     .jt_wr, .jt_wdata, .jt_busy, .jt_tdo, .jt_cfg_we, .jt_cfg0, .jt_cfg1, .jt_cfg2,
     .snd_we, .snd_data, .snd_byte,
-    .tr_v, .tr_master, .tr_we, .tr_addr, .tr_be, .tr_data, .tr_nw(tg_nw));
+    .tr_v, .tr_master, .tr_we, .tr_addr, .tr_be, .tr_data, .tr_nw(tg_nw),
+    .d_v(dh_v), .d_addr(dh_addr), .d_wdata(dh_data), .d_take(dh_take));
 
   // sys140: the first SDRAM's read-capture calibration (SDR_CAL), on the bus's port while the loader waits (the game
   // is in reset until the downloads are in, so the bus asks nothing of it)
@@ -867,7 +890,7 @@ module m3_system
   logic       snd_we, snd_data;
   logic [7:0] snd_byte;
   generate if (SND_DSP) begin : g_snd
-    m3_sndbridge #(.CLK_HZ(CLK_HZ), .D(256), .BLOCK(25'h1E4_0000)) u_snd (
+    m3_sndbridge #(.CLK_HZ(CLK_HZ), .D(256), .BLOCK(25'h1E4_0000), .WD_BITS(SND_WD)) u_snd (
       .clk, .rst(rst_snd), .midi_we(snd_we), .midi_data(snd_data), .midi_byte(snd_byte), .vol(snd_vol),
       .d_req(d_req[7]), .d_we(d_we[7]), .d_addr(d_addr[7]), .d_blen(d_blen[7]), .d_din(d_din[7]), .d_be(d_be[7]),
       .d_wacc(d_wacc[7]), .d_rvalid(d_rvalid[7]), .d_ack(d_ack[7]), .d_dout(dm_dout),

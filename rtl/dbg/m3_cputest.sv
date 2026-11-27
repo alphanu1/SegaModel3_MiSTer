@@ -93,13 +93,17 @@ module m3_cputest
     .clk (clk), .rst (cpu_rst), .pvr_alt (1'b0),
     .i_req (i_req), .i_addr (i_addr), .i_wimg (), .i_seq (), .i_valid (i_valid), .i_data (i_data),
     .i_way (2'd0), .i_arr (1'b0), .i_pa (20'd0), .i_pv (), .i_pidx (), .i_pway (), .i_ppa (), .i_pre (), .ev_btb (),
-    .i_two (1'b0), .i_w2 (), .i_data2 (32'd0),
+    .i_two (1'b0), .i_w2 (), .i_data2 (32'd0), .i_eix (),
     .d_req (d_req), .d_we (d_we), .d_addr (d_addr), .d_be (d_be), .d_wdata (d_wdata),
     .d_wimg (), .d_op (), .d_rdy (1'b1), .d_idle (1'b1), .d_valid (d_valid), .d_rdata (d_rdata),
+    // no D-cache here, so no early load word: d_eok stays low and a load's consumer waits for WB, as an open
+    // input did; RPX is 0, so its outputs stay low
+    .d_eword (32'd0), .d_eok (1'b0), .d_ew4 ('0), .d_epw (2'd0),
+    .d_xlp (), .d_xgo (), .d_xcan (), .d_xpa (), .d_xwimg (),
     .d_resv (), .d_cond (), .res_kill (1'b0),
     .hid_ice (), .hid_dce (), .hid_ilock (), .hid_dlock (), .hid_icfi (), .hid_dcfi (), .hid_noopti (),
     .icbi_req (icbi_req), .icbi_set (), .icbi_ack (icbi_req),
-    .tb_tick (tb_tick), .ext_int (1'b0), .ev (ev), .ev_mmu (),
+    .tb_tick (tb_tick), .ext_int (1'b0), .dec_wr (), .dec_val (), .ev (ev), .ev_mmu (), .ev_xrf (),
     .rt_valid (rt_valid), .rt_last (rt_last), .rt_pc (rt_pc), .rt_insn (rt_insn),
     .rt_gpr_we (rt_gpr_we), .rt_gpr (rt_gpr), .rt_gpr_sh (), .rt_irq (), .rt_gpr_val (rt_gpr_val),
     .rt_cr (), .rt_xer (), .rt_lr (), .rt_ctr (), .rt_msr (), .rt_srr0 (), .rt_srr1 (),
@@ -178,13 +182,14 @@ module m3_cputest
     .m_req (m_req), .m_cmd (m_cmd), .m_addr (m_addr), .m_be (m_be), .m_wdata (m_wdata), .m_wbe (m_wbe),
     .m_ack (m_ack), .m_wnext (m_wnext), .m_rvalid (m_rvalid), .m_rdata (m_rdata),
     .sn_req (1'b0), .sn_addr (27'd0), .sn_inv (1'b0), .sn_ack (),   // no DMA here
-    .tb_tick (tb_tick), .ext_int (1'b0), .ev (ev), .ev_mmu (), .ev_btb (),
+    .tb_tick (tb_tick), .ext_int (1'b0), .dec_wr (), .dec_val (), .ev (ev), .ev_mmu (), .ev_btb (),
     .rt_valid (rt_valid), .rt_last (rt_last), .rt_pc (rt_pc), .rt_insn (rt_insn),
     .rt_gpr_we (rt_gpr_we), .rt_gpr (rt_gpr), .rt_gpr_sh (), .rt_irq (), .rt_gpr_val (rt_gpr_val),
     .rt_cr (), .rt_xer (), .rt_lr (), .rt_ctr (), .rt_msr (), .rt_srr0 (), .rt_srr1 (),
     .rt_fpscr (), .rt_fpq (), .rt_fw_en (), .rt_fw_idx (), .rt_fw_val (), .rt_dly (),
     .t_dreq (), .t_dwe (), .t_daddr (), .t_dwimg (), .t_dop (), .t_dvalid (), .t_drdata (),
-    .t_dbe (), .t_dwdata (), .t_drsv (), .t_dcnd ()
+    .t_dbe (), .t_dwdata (), .t_drsv (), .t_dcnd (),
+    .t_dxlp (), .t_dxgo (), .t_dxcan (), .t_dxpa (), .t_dxwimg ()
   );
 
   localparam logic [1:0] C_IDLE = 2'd0, C_ACK = 2'd1, C_RD = 2'd2, C_WB = 2'd3;

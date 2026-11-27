@@ -251,7 +251,7 @@ struct DivStat { long n = 0, mn = 1 << 30, mx = 0, sum = 0; } dstat[4];  // fdiv
 struct Twin { int n = 0; bool wr[2]; uint64_t res[2]; uint32_t fs[2]; };
 std::map<int, Twin> twins;
 int next_pair = 0;
-long n_fast = 0, n_twin = 0, n_route_bad = 0, n_stall = 0, n_rsq = 0;
+long n_fast = 0, n_twin = 0, n_route_bad = 0, n_stall = 0, n_rsq = 0, n_cvt = 0;
 long last_fseq = -1, fseq = 0;
 double rsq_worst = 0;
 // a fast op's twin waiting for the double unit
@@ -429,7 +429,7 @@ void run_pipeline(long n_rand, int issue_pct, int div_pct) {
     bool req = top->d_inj_req;
     top->f_valid = 0;
 #ifdef FPU_FAST
-    top->f_fast = 0;
+    top->f_fast = 0; top->f_cvt = 0;
     if (!have_next) {
       if (!dup_q.empty() && (P(50) || !more_fma())) { next = dup_q.front(); dup_q.pop_front(); have_next = true; }
       else if (more_fma()) {
@@ -453,16 +453,30 @@ void run_pipeline(long n_rand, int issue_pct, int div_pct) {
         report(route ? "route (RTL fast)" : "route (RTL double)", in, exec(in), false, 0, 0);
       }
       bool fast = route && !next.dup;
-      if (fast && !top->f_fast_ok) {
+#ifdef FPU_CVT
+      // cpu140 kit 1a: frsp / fctiw / fctiwz on the conversion port (rule 7), frsp only with UE = 0 (ppc_core's
+      // route); each also goes to the double unit as a twin, compared as the fast port's are
+      bool cvt = !next.dup && (in.op == FCTIW || in.op == FCTIWZ || (in.op == FRSP && !(in.fpscr & UE)));
+#else
+      bool cvt = false;
+#endif
+#ifdef FPU_DS
+      bool dbl_wait = !fast && !cvt && !top->f_dbl_ok;   // rule 8: the double unit's ops two cycles apart
+#else
+      bool dbl_wait = false;
+#endif
+      if ((fast && !top->f_fast_ok) || (cvt && !top->f_cvt_ok) || dbl_wait) {
         n_stall++;                                  // wait for the port
       } else {
         int tag = ftag++ & 127;
         top->f_valid = 1;
         top->f_fast = fast;
+        top->f_cvt = cvt;
         top->f_tag = tag;
         Pend pd{in, exec(in), cycle};
-        pd.fast = fast; pd.seq = fseq++; pd.pair = next.pair;
-        if (fast && in.op != FRSQRTE) {
+        pd.fast = fast || cvt; pd.seq = fseq++; pd.pair = next.pair;
+        if (cvt) n_cvt++;
+        if ((fast && in.op != FRSQRTE) || cvt) {
           pd.pair = next_pair++;
           dup_q.push_back(Item{in, pd.pair, true});
         }
@@ -473,7 +487,14 @@ void run_pipeline(long n_rand, int issue_pct, int div_pct) {
       }
     }
 #else
-    if (more_fma() && !(req && !prev_req) && P(issue_pct)) {
+#ifdef FPU_DS3
+    // dfront: FAST = 0 with the iterative front (IT): an op three or more cycles after the one before it
+    static uint64_t last_f = 0;
+    bool gap_ok = cycle >= last_f + 3;
+#else
+    bool gap_ok = true;
+#endif
+    if (more_fma() && gap_ok && !(req && !prev_req) && P(issue_pct)) {
       In in;
       if (dir) { in = dir_fma.front(); dir_fma.pop_front(); }
       else in = gen_pipe_op(false);
@@ -485,6 +506,9 @@ void run_pipeline(long n_rand, int issue_pct, int div_pct) {
       top->f_a = in.a; top->f_b = in.b; top->f_c = in.c; top->f_tag = tag;
       pend[tag] = Pend{in, exec(in), cycle};
       issued++;
+#ifdef FPU_DS3
+      last_f = cycle;
+#endif
     }
 #endif
     prev_req = req;
@@ -525,7 +549,7 @@ void run_ef(long n, int ls, int issue_pct) {
   int ftag = 0;
   ef_mode = true;
   while (issued < n || !pend.empty()) {
-    top->f_valid = 0; top->f_fast = 0; top->d_start = 0; top->f_sel = 0;
+    top->f_valid = 0; top->f_fast = 0; top->f_cvt = 0; top->d_start = 0; top->f_sel = 0;
     if (issued < n && P(issue_pct)) {
       In in = gen_ef_op();
       uint64_t *opv[3] = {&in.a, &in.b, &in.c};
@@ -795,7 +819,7 @@ int main(int argc, char **argv) {
     pend[203] = Pend{in, exec(in), cycle};
     uint64_t t0 = cycle;
     tick();
-    top->f_valid = 0; top->f_fast = 0;
+    top->f_valid = 0; top->f_fast = 0; top->f_cvt = 0;
     while (!top->o_valid) tick();
     int ls = int(cycle - t0);
     check_out();
@@ -818,6 +842,7 @@ int main(int argc, char **argv) {
 #ifdef FPU_FAST
   printf("iterative unit, normal operands, idle pipe: fdiv %ld, fdivs %ld, fres %ld cycles\n",
          measure(FDIV, false), measure(FDIV, true), measure(FRES, true));
+  printf("conversion port: %ld conversions (each with its double-unit twin)\n", n_cvt);
   printf("fast port: %ld fast ops, %ld twins compared, %ld route mismatches, %ld issue waits;\n"
          "  frsqrte estimates checked %ld, worst relative error %.4g (2^%.2f)\n",
          n_fast, n_twin, n_route_bad, n_stall, n_rsq, rsq_worst, rsq_worst > 0 ? std::log2(rsq_worst) : 0.0);
@@ -828,7 +853,7 @@ int main(int argc, char **argv) {
     pend[202] = Pend{in, exec(in), cycle};
     uint64_t t0 = cycle;
     tick();
-    top->f_valid = 0; top->f_fast = 0;
+    top->f_valid = 0; top->f_fast = 0; top->f_cvt = 0;
     while (!top->o_valid) tick();
     printf("fast port latency: %llu cycles\n", (unsigned long long)(cycle - t0));
     check_out();

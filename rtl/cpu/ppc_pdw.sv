@@ -315,6 +315,7 @@ module ppc_pdw
                    !mark;
     pd.frq     = pa_op && pa_d && pa5 == 5'd26 && !mark;
     pd.frs     = pa_op && !pa_d && pa_fs && !mark;
+    pd.frc     = pa_op && pa_d && (pd_x == 10'd12 || pd_x == 10'd14 || pd_x == 10'd15) && !mark;
   end
 `ifdef VERILATOR
   // the predecode's raw-word compares against the decoder's op, every cycle

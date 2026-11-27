@@ -56,6 +56,14 @@
 //   Daytona 2 waits for the interrupt between moves and polls busy before each
 //   command (sim/system/notes.md, Daytona 2).
 //
+// DIR (D-85, M3_DMADIR): a Step 2 move whose destination is the Real3D's host port (88, 8C, 8E, 90, 94 or
+// 98; 9C, the configuration, is not one) does not write over the bus. The port only reads, and the FIFO's head
+// goes out on dh_* to m3_bus, which hands it to r3d_cmd in a clock when no other host-port strobe is going. On
+// the board the Real3D DMA is a PCI master writing a PCI target and never holds the 603e's bus (R112, R114), so
+// the CPU no longer waits behind the move's writes and the next line is read while the last one drains. TEMP
+// and DBC step a word at each word taken; the move ends (busy falls, the interrupt) once its last word is
+// taken, as it ended with its last line write posted in m3_bus's R3P buffer. 0: every move writes over the bus.
+//
 // One datapath (study 8.4): the move's source and destination pointers are DSPS
 // and TEMP (the manual's holding registers) and the write count is DBC. Each pointer
 // has its own incrementer: one adder shared through the port's address measured 16
@@ -87,7 +95,8 @@ module m3_scripts
   parameter bit INT_OP = 1'b1,   // decode INT (not run by the captured games)
   parameter bit RD_ALL = 1'b0,   // TEMP, DBC/DCMD, DSPS readable
   parameter bit R3DMA  = 1'b0,   // the Step 2.x Real3D DMA front end (step2)
-  parameter bit LDV    = 1'b0    // the bridges pass: DSPS and TEMP load one shared value (m3_scripts_core)
+  parameter bit LDV    = 1'b0,   // the bridges pass: DSPS and TEMP load one shared value (m3_scripts_core)
+  parameter bit DIR    = 1'b0    // D-85: a Step 2 move into the host port writes it from the FIFO (dh_*), not the bus
 )(
   input  logic        clk,
   input  logic        rst,
@@ -122,17 +131,24 @@ module m3_scripts
   input  logic [31:0] m_rdata,
 
   output logic        irq,
-  output logic        busy
+  output logic        busy,
+
+  // DIR: the move's next word for the host port while dh_v (its address and the word as m_wdata would carry it);
+  // dh_take in the clock m3_bus gives it to r3d_cmd
+  output logic        dh_v,
+  output logic [31:0] dh_addr,
+  output logic [31:0] dh_data,
+  input  logic        dh_take
 );
 
   generate
   if (ENABLE) begin : g_on
-    m3_scripts_core #(.LINE(LINE), .INT_OP(INT_OP), .RD_ALL(RD_ALL), .R3DMA(R3DMA), .LDV(LDV)) u_core (
+    m3_scripts_core #(.LINE(LINE), .INT_OP(INT_OP), .RD_ALL(RD_ALL), .R3DMA(R3DMA), .LDV(LDV), .DIR(DIR)) u_core (
       .clk, .rst, .step2,
       .c_req, .c_we, .c_idx, .c_be, .c_wdata, .c_ack, .c_rdata, .win_en, .win_base,
       .s_req, .s_we, .s_addr, .s_be, .s_wdata, .s_ack, .s_rdata,
       .m_req, .m_cmd, .m_addr, .m_be, .m_wdata, .m_ack, .m_wnext, .m_rvalid, .m_rdata,
-      .irq, .busy);
+      .irq, .busy, .dh_v, .dh_addr, .dh_data, .dh_take);
   end else begin : g_off
     // No device: configuration reads all ones (no device at this slot), the
     // window acknowledges with 0 so a stray access cannot hang the CPU.
@@ -151,6 +167,9 @@ module m3_scripts
     assign m_wdata  = 32'd0;
     assign irq      = 1'b0;
     assign busy     = 1'b0;
+    assign dh_v     = 1'b0;
+    assign dh_addr  = 32'd0;
+    assign dh_data  = 32'd0;
   end
   endgenerate
 
@@ -163,7 +182,8 @@ module m3_scripts_core
   parameter bit INT_OP = 1'b1,
   parameter bit RD_ALL = 1'b0,
   parameter bit R3DMA  = 1'b0,
-  parameter bit LDV    = 1'b0    // the bridges pass: DSPS and TEMP load one shared value (lv, below)
+  parameter bit LDV    = 1'b0,   // the bridges pass: DSPS and TEMP load one shared value (lv, below)
+  parameter bit DIR    = 1'b0    // D-85: Step 2 moves into the host port leave on dh_* (see the header)
 )(
   input  logic        clk,
   input  logic        rst,
@@ -194,7 +214,11 @@ module m3_scripts_core
   input  logic        m_rvalid,
   input  logic [31:0] m_rdata,
   output logic        irq,
-  output logic        busy
+  output logic        busy,
+  output logic        dh_v,
+  output logic [31:0] dh_addr,
+  output logic [31:0] dh_data,
+  input  logic        dh_take
 );
 
   function automatic logic [31:0] bswap(input logic [31:0] x);
@@ -247,11 +271,20 @@ module m3_scripts_core
 
   wire [29:0] step = p_line ? 30'd8 : 30'd1;               // words a transaction moves
 
+  // DIR: this move's words go to the host port (decided at E_CHK from TEMP's top byte, the bus's X_R3DH writes)
+  logic mv_dir;
+  wire  t_hp = temp[31:24] == 8'h88 || temp[31:24] == 8'h8C || temp[31:24] == 8'h8E ||
+               temp[31:24] == 8'h90 || temp[31:24] == 8'h94 || temp[31:24] == 8'h98;
+  wire  dh_pop = dh_v && dh_take;
+
   assign f_push = p_beat && p_kind == K_RD;
-  assign f_pop  = (p_beat && p_kind == K_WR) || p_wack;
+  assign f_pop  = (p_beat && p_kind == K_WR) || p_wack || dh_pop;
 
   always_ff @(posedge clk) if (f_push) fifo[wp] <= m_rdata;
   assign m_wdata = (s2 && d2_cfg[7]) ? bswap(fifo_q) : fifo_q;
+  assign dh_v    = DIR && mv_dir && est == E_MOVE && cnt != 5'd0;
+  assign dh_addr = {temp[31:2], 2'b00};
+  assign dh_data = m_wdata;
 
   // what the move asks for next (decided with the port idle)
   wire wr_line_ok = LINE && temp[4:2] == 3'd0 && dbc[23:5] != 19'd0;
@@ -424,11 +457,28 @@ module m3_scripts_core
       end
       E_CHK: begin
         rd_left <= dbc[23:2];
+        mv_dir <= DIR && s2 && t_hp;
         if (s2) est <= (dbc[23:2] == 22'd0) ? E_END : E_MOVE;
         else if (mov_bad) est <= E_IDLE;
         else est <= E_MOVE;
       end
-      E_MOVE: if (!p_out && !p_done) begin
+      E_MOVE: if (DIR && mv_dir) begin
+        // DIR: the port only reads; the FIFO's head leaves on dh_* as m3_bus takes it, and the move is done
+        // when nothing is left to read and the FIFO is empty
+        if (!p_out && !p_done) begin
+          if (do_lrd || do_srd) begin
+            m_req <= 1'b1; m_cmd <= do_lrd ? MC_LINE_RD : MC_RD; m_addr <= {dsps[31:2], 2'b00}; m_be <= 4'hF;
+            p_out <= 1'b1; p_kind <= K_RD; p_line <= do_lrd;
+            rd_left <= rd_left - (do_lrd ? 22'd8 : 22'd1);
+          end else if (rd_left == 22'd0 && cnt == 5'd0) begin
+            est <= E_END;
+          end
+        end
+        if (dh_pop) begin
+          temp[31:2] <= temp[31:2] + 30'd1;
+          dbc[23:2]  <= dbc[23:2] - 22'd1;
+        end
+      end else if (!p_out && !p_done) begin
         if (do_lwr || do_swr) begin
           m_req <= 1'b1; m_cmd <= do_lwr ? MC_LINE_WR : MC_WR; m_addr <= {temp[31:2], 2'b00}; m_be <= 4'hF;
           p_out <= 1'b1; p_kind <= K_WR; p_line <= do_lwr;
@@ -468,7 +518,7 @@ module m3_scripts_core
     if (rst) begin
       est <= E_IDLE;
       m_req <= 1'b0; m_cmd <= MC_RD; m_addr <= 32'd0; m_be <= 4'h0;
-      p_out <= 1'b0; p_acked <= 1'b0; p_beats <= 3'd0; p_kind <= K_FETCH; p_line <= 1'b0;
+      p_out <= 1'b0; p_acked <= 1'b0; p_beats <= 3'd0; p_kind <= K_FETCH; p_line <= 1'b0; mv_dir <= 1'b0;
       wp <= 4'd0; rp <= 4'd0; cnt <= 5'd0;
       dsp <= 30'd0; dsps <= 32'd0; temp <= 32'd0; dbc <= 24'd0; dcmd <= 8'd0; rd_left <= 22'd0;
       dmode <= 8'd0; dien <= 8'd0; dcntl <= 8'd0;

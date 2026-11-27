@@ -818,6 +818,16 @@ int main(int argc, char **argv) {
       }
       nrec++;
     }
+    // DMA_DIR (D-85): a Step 2 move's word into the host port goes from m3_scripts to r3d_cmd in no bus transaction,
+    // so tr_* does not carry it: it is recorded here as the bus recorded a line write's beat into the host port
+    // (master 1, a write, four bytes, the word as m3_scripts gives it). Never with DMA_DIR = 0.
+    if (t->rootp->m3_system__DOT__dh_take) {
+      if (trf) {
+        Rec r{t->frame, last_pc, uint32_t(t->rootp->m3_system__DOT__dh_addr), 1, 4, 1, 0, uint64_t(t->rootp->m3_system__DOT__dh_data)};
+        std::fwrite(&r, sizeof r, 1, trf);
+      }
+      nrec++;
+    }
     // stage B: a draw's memories and its layer (--r3d)
     if (!r3d_dir.empty()) {
       auto *rp = t->rootp;

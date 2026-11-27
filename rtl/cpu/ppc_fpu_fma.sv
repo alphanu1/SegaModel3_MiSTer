@@ -73,6 +73,14 @@
 //   S7  round: the increment, fctiw candidates                       -> R7 (P7)
 //   S8  exponent, overflow, defaults, NaN / inf / zero, fctiw, flags  -> R8
 //
+// IT = 1 (dfront, study R200): the front (S1a ... S4b) built for one op every three cycles at the same latency, the
+// back end (R4 on) and the divider's injection unchanged. The multiplicands are normalised in S1a, so the products
+// run a cycle earlier (c1); the addend is never normalised by a shifter of its own: one funnel places it into the
+// window 55 bits a cycle (c2 ... c4), its alignment shift and normalise count folded into one place per chunk, V[0]
+// its sticky; T1 and T2 run on one pair of 55-bit adders, a chunk a cycle with the carries registered (c3 ... c5).
+// R4 receives the same bits as from the pipelined front (IT = 0), which stays for every other spacing and for
+// moving the stage boundaries.
+//
 // Against my Model 1 / Model 2 FP units (rtl/tgp/fp_add.sv, fp_mul.sv, IEEE
 // single, a separate adder and multiplier, 4 stages each): the same split of
 // the work into align / add / normalise / round, and two of their timing
@@ -101,7 +109,13 @@ module ppc_fpu_fma
   parameter bit P5  = 1'b1,
   parameter bit P6A = 1'b1,
   parameter bit P6  = 1'b1,
-  parameter bit P7  = 1'b1
+  parameter bit P7  = 1'b1,
+  // SH4 (cpu140): S4a and S4b take turns on one pair of adders (T1, T2: the low halves for the op in S4a, the high
+  // halves for the op in S4b). Needs P4A and every op at least two cycles after the one before it (ppc_core DBK)
+  parameter bit SH4 = 1'b0,
+  // IT (dfront): the iterative front -- every op at least three cycles after the one before it (ppc_fpu_fast
+  // rule 8 with DS = 3), the latency kept; one pair of 55-bit adders, one funnel for the addend (see g_it)
+  parameter bit IT  = 1'b0
 ) (
   input  logic            clk,
   input  logic            rst,
@@ -316,8 +330,7 @@ module ppc_fpu_fma
     cls_t        k;
   } r1a_t;
 
-  r1a_t s1a_d, r1a_q;
-  logic r1a_v;
+  r1a_t s1a_d;
   always_comb begin
     s1a_d.a = {~a_e0, a_f};
     s1a_d.b = {~b_e0, b_f};
@@ -327,7 +340,80 @@ module ppc_fpu_fma
     s1a_d.k = k1;
   end
 
-  generate if (P1A) begin : g_r1a
+  // IT: the multiplicands normalised in c0, so the products run in c1; a NaN operand's fraction by the NaN
+  // priority (frA, frB, frC) in frB's place; fctiw's alignment shift clamped as S1b's sh_cv
+  wire [52:0] a_n0  = {~a_e0, a_f} << {cna, 4'b0000};
+  wire [52:0] c_n0  = {~c_e0, c_f} << {cnc, 4'b0000};
+  wire        pa_n0 = has_a & a_nan, pb_n0 = has_b & b_nan, pc_n0 = has_c & c_nan;
+  wire [51:0] nanf0 = pa_n0 ? a_f : pb_n0 ? b_f : pc_n0 ? c_f : 52'd0;
+  wire [7:0]  shcv0 = (sh_cvt > exp_t'(255)) ? 8'd255 : sh_cvt[7:0];
+  // frB, or (not fctiw) a NaN operand's fraction quieted in its place: the special result's fraction
+  // (bits 50:0 are frA's, frC's or frB's: one select per bit from two decisions; frB's NaN is frB's own fraction)
+  wire        b0_sa = ~cvt & pa_n0, b0_sc = ~cvt & ~pa_n0 & ~pb_n0 & pc_n0, b0_nan = ~cvt & (pa_n0 | pb_n0 | pc_n0);
+  wire [52:0] b0_n0 = {~b0_nan & ~b_e0, b0_nan | (b0_sa ? a_f[51] : b0_sc ? c_f[51] : b_f[51]),
+                       b0_sa ? a_f[50:0] : b0_sc ? c_f[50:0] : b_f[50:0]};
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (IT && !rst && in_valid && b0_n0 != ((~cvt & (pa_n0 | pb_n0 | pc_n0)) ? {1'b0, nanf0 | (52'd1 << 51)} : {~b_e0, b_f}))
+    $fatal(1, "ppc_fpu_fma: b0 by bit");
+`endif
+
+  typedef struct packed {
+    logic [52:0] b;                 // frB, or the NaN operand's fraction quieted
+    logic [1:0]  na, nc;
+    logic [5:0]  nb;
+    exp_t        esum, ep00, ebm;  // ebm: frB's exponent - 160
+    logic [7:0]  shcv;
+    cls_t        k;
+  } r1i_t;
+
+  // IT: an addend place clamped to 0 ... 108
+  function automatic logic [6:0] uclamp(input exp_t x);
+    uclamp = (x < 0) ? 7'd0 : (x > exp_t'(108)) ? 7'd108 : x[6:0];
+  endfunction
+  typedef struct packed {
+    logic [53:0]  ll, x;
+    logic [51:0]  hh;
+    logic [177:0] alc;
+    logic         cst;
+    logic [3:0]   shf;
+    logic         pon;
+    exp_t         e0;
+    logic         sp, sb, effsub;
+    side_t        sd;
+  } r2_t;
+
+  typedef struct packed {
+    logic [105:0] p;
+    logic [161:0] al;
+    exp_t         e0;
+    logic         sp, sb, effsub;
+    side_t        sd;
+  } r3_t;
+
+  typedef struct packed {
+    logic [81:0] t1, t2;
+    logic        c1, c2;
+    logic [80:0] p_hi, a_hi;         // bits 162:82 of pw, alw
+    logic [7:0]  sden;
+    logic        cap;
+    exp_t        e0;
+    logic        sp, sb, effsub;
+    side_t       sd;
+  } r4a_t;
+
+  // what the front hands R4 (beside the divider's injection)
+  logic         f4_v, v_pre4b;
+  logic [161:0] f4_s;
+  logic         f4_sign, f4_effsub, f4_cap;
+  exp_t         f4_e0;
+  logic [7:0]   f4_sden;
+  side_t        f4_sd;
+
+  generate if (!IT) begin : g_pf
+  // ============================================================ the pipelined front (S1a ... S4b)
+  r1a_t r1a_q;
+  logic r1a_v;
+  if (P1A) begin : g_r1a
     always_ff @(posedge clk) begin
       if (rst) r1a_v <= 1'b0;
       else     r1a_v <= in_valid;
@@ -336,7 +422,7 @@ module ppc_fpu_fma
   end else begin : g_c1a
     assign r1a_v = in_valid;
     assign r1a_q = s1a_d;
-  end endgenerate
+  end
 
   // ================================================================= S1b
   cls_t kq;
@@ -523,17 +609,6 @@ module ppc_fpu_fma
     for (int i = 0; i < 53; i++) c_lost[i] = (9'(i) + 9'd125 < {1'b0, r1_shc[3], 4'b0000});
   wire cst2 = |(r1_b & c_lost);
 
-  typedef struct packed {
-    logic [53:0]  ll, x;
-    logic [51:0]  hh;
-    logic [177:0] alc;
-    logic         cst;
-    logic [3:0]   shf;
-    logic         pon;
-    exp_t         e0;
-    logic         sp, sb, effsub;
-    side_t        sd;
-  } r2_t;
 
   r2_t  s2_d, r2_q;
   logic r2_v;
@@ -543,7 +618,7 @@ module ppc_fpu_fma
     s2_d.e0 = r1_e0;  s2_d.sp = r1_sp;  s2_d.sb = r1_sb;  s2_d.effsub = r1_effsub;  s2_d.sd = r1_sd;
   end
 
-  generate if (P2) begin : g_r2
+  if (P2) begin : g_r2
     always_ff @(posedge clk) begin
       if (rst) r2_v <= 1'b0;
       else     r2_v <= r1_v;
@@ -552,7 +627,7 @@ module ppc_fpu_fma
   end else begin : g_c2
     assign r2_v = r1_v;
     assign r2_q = s2_d;
-  end endgenerate
+  end
 
   // ================================================================== S3
   wire [105:0] prod = r2_q.pon ? ({r2_q.hh, r2_q.ll} + {25'd0, r2_q.x, 27'd0}) : 106'd0;
@@ -567,13 +642,6 @@ module ppc_fpu_fma
   wire ast3 = r2_q.cst | (|r2_q.alc[16:0]) | (|(r2_q.alc[32:17] & f_lost));
   wire [161:0] al3 = {alf[177:17], ast3};
 
-  typedef struct packed {
-    logic [105:0] p;
-    logic [161:0] al;
-    exp_t         e0;
-    logic         sp, sb, effsub;
-    side_t        sd;
-  } r3_t;
 
   r3_t  s3_d, r3_q;
   logic r3_v;
@@ -582,7 +650,7 @@ module ppc_fpu_fma
     s3_d.e0 = r2_q.e0;  s3_d.sp = r2_q.sp;  s3_d.sb = r2_q.sb;  s3_d.effsub = r2_q.effsub;  s3_d.sd = r2_q.sd;
   end
 
-  generate if (P3) begin : g_r3
+  if (P3) begin : g_r3
     always_ff @(posedge clk) begin
       if (rst) r3_v <= 1'b0;
       else     r3_v <= r2_v;
@@ -591,7 +659,7 @@ module ppc_fpu_fma
   end else begin : g_c3
     assign r3_v = r2_v;
     assign r3_q = s3_d;
-  end endgenerate
+  end
 
   // ================================================================= S4a
   // T1 = P + addend or P - addend; T2 = addend - P (used when T1 < 0); 163
@@ -601,8 +669,9 @@ module ppc_fpu_fma
   wire         sub4 = r3_q.effsub;
   wire [162:0] alx  = sub4 ? ~alw : alw;
 
-  wire [82:0]  t1_lo = {1'b0, pw[81:0]} + {1'b0, alx[81:0]} + {82'd0, sub4};
-  wire [82:0]  t2_lo = {1'b0, alw[81:0]} + {1'b0, ~pw[81:0]} + 83'd1;
+  // (SH4: from the shared pair below, in the cycles no op is in S4b)
+  wire [82:0]  t1_lo, t2_lo;
+  wire [82:0]  sh_t1, sh_t2;                            // SH4: the shared pair's outputs
 
   // The denormal cap (doubles, UE=0): V[161] may weigh no less than 2^-1022.
   // E0 is raised to -1182 if it is lower; s_den = E0 + 1182 is how far the
@@ -614,16 +683,6 @@ module ppc_fpu_fma
   assign e0c4a  = (cap4a && r3_q.e0 < exp_t'(-1182)) ? exp_t'(-1182) : r3_q.e0;
   assign sden4a = e0c4a + exp_t'(1182);
 
-  typedef struct packed {
-    logic [81:0] t1, t2;
-    logic        c1, c2;
-    logic [80:0] p_hi, a_hi;         // bits 162:82 of pw, alw
-    logic [7:0]  sden;
-    logic        cap;
-    exp_t        e0;
-    logic        sp, sb, effsub;
-    side_t       sd;
-  } r4a_t;
 
   r4a_t s4a_d, r4a_q;
   logic r4a_v;
@@ -636,7 +695,7 @@ module ppc_fpu_fma
     s4a_d.e0 = e0c4a;  s4a_d.sp = r3_q.sp;  s4a_d.sb = r3_q.sb;  s4a_d.effsub = sub4;  s4a_d.sd = r3_q.sd;
   end
 
-  generate if (P4A) begin : g_r4a
+  if (P4A) begin : g_r4a
     always_ff @(posedge clk) begin
       if (rst) r4a_v <= 1'b0;
       else     r4a_v <= r3_v;
@@ -645,13 +704,293 @@ module ppc_fpu_fma
   end else begin : g_c4a
     assign r4a_v = r3_v;
     assign r4a_q = s4a_d;
-  end endgenerate
+  end
 
   // ================================================================= S4b
   wire [80:0] x_hi  = r4a_q.effsub ? ~r4a_q.a_hi : r4a_q.a_hi;
-  wire [80:0] t1_hi = r4a_q.p_hi + x_hi + {80'd0, r4a_q.c1};
-  wire [80:0] t2_hi = r4a_q.a_hi + ~r4a_q.p_hi + {80'd0, r4a_q.c2};
+  wire [80:0] t1_hi, t2_hi;
+  if (SH4) begin : g_sh4
+    // one pair of 83-bit adders: the op in S4b's high halves when there is one (r4a_v), else S4a's low halves; the
+    // two are never in those stages together (ops two or more cycles apart)
+    wire        hi = r4a_v;
+    wire [82:0] a1 = hi ? {2'b00, r4a_q.p_hi} : {1'b0, pw[81:0]};
+    wire [82:0] b1 = hi ? {2'b00, x_hi}       : {1'b0, alx[81:0]};
+    wire [82:0] a2 = hi ? {2'b00, r4a_q.a_hi} : {1'b0, alw[81:0]};
+    wire [82:0] b2 = hi ? {2'b00, ~r4a_q.p_hi} : {1'b0, ~pw[81:0]};
+    assign sh_t1 = a1 + b1 + {82'd0, hi ? r4a_q.c1 : sub4};
+    assign sh_t2 = a2 + b2 + {82'd0, hi ? r4a_q.c2 : 1'b1};
+    assign t1_lo = sh_t1;  assign t2_lo = sh_t2;
+    assign t1_hi = sh_t1[80:0];  assign t2_hi = sh_t2[80:0];
+    // synthesis translate_off
+    always_ff @(posedge clk) if (!rst && r4a_v && r3_v) $fatal(1, "ppc_fpu_fma SH4: ops in S4a and S4b together");
+    initial if (!P4A) $error("ppc_fpu_fma: SH4 needs P4A");
+    // synthesis translate_on
+  end else begin : g_sep4
+    assign t1_lo = {1'b0, pw[81:0]} + {1'b0, alx[81:0]} + {82'd0, sub4};
+    assign t2_lo = {1'b0, alw[81:0]} + {1'b0, ~pw[81:0]} + 83'd1;
+    assign t1_hi = r4a_q.p_hi + x_hi + {80'd0, r4a_q.c1};
+    assign t2_hi = r4a_q.a_hi + ~r4a_q.p_hi + {80'd0, r4a_q.c2};
+    assign sh_t1 = '0;  assign sh_t2 = '0;
+  end
   wire        neg4  = r4a_q.effsub & t1_hi[80];
+  assign f4_v      = r4a_v;
+  assign v_pre4b   = P4A ? r3_v : P3 ? r2_v : P2 ? r1_v : r1a_v;
+  assign f4_s      = neg4 ? {t2_hi[79:0], r4a_q.t2} : {t1_hi[79:0], r4a_q.t1};
+  assign f4_sign   = neg4 ? r4a_q.sb : r4a_q.sp;
+  assign f4_effsub = r4a_q.effsub;
+  assign f4_e0     = r4a_q.e0;
+  assign f4_sden   = r4a_q.sden;
+  assign f4_cap    = r4a_q.cap;
+  assign f4_sd     = r4a_q.sd;
+  end else begin : g_it
+    // ============================================================ the iterative front (IT)
+    // One op every three cycles or more (ppc_fpu_fast rule 8 with DS = 3), R4 still six cycles after issue. Cycle c0
+    // is S1a above plus the multiplicands normalised (so the products run in c1, a cycle earlier than the pipelined
+    // front's) and a NaN operand's fraction put in frB's place; R1a then holds the op for c1 ... c3 (the next op
+    // reaches c0 no earlier than c3), so the special operands, E0 and the addend's places are formed from it in each
+    // of those cycles by the same logic. c2 and c3: the product's sum, its low 54 bits then its high 52, on one adder;
+    // c2 ... c4: the funnel places the addend into the window 55 bits a cycle; c3 ... c5: T1 / T2 on one pair of
+    // 55-bit adders, a chunk a cycle, low first, the carries registered; c5 the sign and the select into R4. Each
+    // register a later cycle reads holds its op until the next op overwrites it, three or more cycles on.
+    //
+    // The addend is placed without being normalised first: frB's bit i goes to V[109 + i - d], d = sh - nb, sh the
+    // pipelined front's alignment shift and nb its normalise count, so one funnel does both shifts. Chunk j
+    // (V[55j + 54 : 55j]) bit k is frB[k + d - 109 + 55j]; u_j = clamp(d - 54 + 55j, 0, 108) selects it from
+    // {55 zeros, frB, 55 zeros}, and V[0] is the sticky: every bit i with i + 55 <= u_0. The window is bit for bit the
+    // pipelined front's (the bench's miter compares R4 with k1t's unit every cycle, DF_MITER).
+
+    // ---------------------------------------------------------------- R1a: c0 -> c1 ... c3 (loaded at the end of c0)
+    r1i_t        q1;
+    logic        v1, v2, v3, v4, v5;                   // an op in c1 ... c5
+    logic [26:0] q1_alo, q1_clo;                       // the DSPs' operand registers (nothing else reads them)
+    logic [25:0] q1_ahi, q1_chi;
+    always_ff @(posedge clk) begin
+      if (rst) begin v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0; v4 <= 1'b0; v5 <= 1'b0; end
+      else     begin v1 <= in_valid; v2 <= v1; v3 <= v2; v4 <= v3; v5 <= v4; end
+      // held in c1 and c2, loaded in every other cycle: an op's c0 never falls in another's c1 or c2, and the enable
+      // is two registers, not the core's late in_valid (core.wb_got -> q1_alo -2.27 ns at 140 standalone with it)
+      if (!v1 && !v2) begin
+        q1.b    <= b0_n0;
+        q1.na   <= na;  q1.nc <= nc;  q1.nb <= nb;
+        q1.esum <= esum;  q1.ep00 <= ep00;  q1.ebm <= eb0 - exp_t'(160);  q1.shcv <= shcv0;
+        q1.k    <= k1;
+        q1_alo  <= a_n0[26:0];  q1_ahi <= a_n0[52:27];
+        q1_clo  <= c_n0[26:0];  q1_chi <= c_n0[52:27];
+      end
+    end
+
+    // ---------------------------------------------------------------- c1 ... c3: from R1a
+    cls_t kq;
+    assign kq = q1.k;
+    // special operands, as the pipelined front's S1b [PEM 3.3.1.7, D-4]
+    wire pa_nan  = kq.has_a & kq.a_nan;
+    wire pb_nan  = kq.has_b & kq.b_nan;
+    wire pc_nan  = kq.has_c & kq.c_nan;
+    wire nan_any = pa_nan | pb_nan | pc_nan;
+    wire vxsnan  = (kq.has_a & kq.a_snan) | (kq.has_b & kq.b_snan) | (kq.has_c & kq.c_snan);
+    wire sp_  = kq.a_s ^ kq.c_s;
+    wire sbe  = kq.b_s ^ kq.subb;
+    wire imz  = kq.has_a & kq.has_c & ~kq.a_nan & ~kq.c_nan & ((kq.a_inf & kq.c_zero) | (kq.a_zero & kq.c_inf));
+    wire pinf = kq.has_a & (kq.a_inf | kq.c_inf) & ~kq.a_nan & ~(kq.has_c & kq.c_nan) & ~imz;
+    wire isi  = kq.has_b & pinf & kq.b_inf & (sp_ != sbe);
+    wire binf = kq.has_b & kq.b_inf;
+    wire cvt_nan = kq.cvt & kq.b_nan;
+    wire cvt_spc = kq.cvt & (kq.b_nan | kq.b_inf);
+    wire cvt_big = kq.cvt & ~kq.b_e1 & (q1.ebm > exp_t'(-108));    // E(frB) > 52
+    wire special = ~kq.cvt & (nan_any | imz | isi | pinf | binf);
+    logic sp_sign;
+    always_comb begin
+      if (pa_nan)          sp_sign = kq.a_s;
+      else if (pb_nan)     sp_sign = kq.b_s;
+      else if (pc_nan)     sp_sign = kq.c_s;
+      else if (imz | isi)  sp_sign = 1'b0;
+      else if (pinf)       sp_sign = sp_;
+      else                 sp_sign = sbe;
+    end
+    wire prod_on   = kq.has_a & ~special;
+    wire prod_live = prod_on & ~kq.a_zero & ~kq.c_zero;
+    wire add_on    = special | (kq.has_b & ~kq.b_zero);
+    wire r_sp      = special ? sp_sign : (kq.has_a ? sp_ : sbe);
+    wire r_sb      = special ? sp_sign : (kq.has_b ? sbe : sp_);
+    wire effsub    = ~special & (r_sp ^ r_sb);
+
+    side_t s1_sd;
+    always_comb begin
+      s1_sd          = '0;
+      s1_sd.tag      = kq.tag;
+      s1_sd.single   = kq.single_e;
+      s1_sd.negr     = kq.negr;
+      s1_sd.cvt      = kq.cvt;
+      s1_sd.cvt_spc  = cvt_spc;
+      s1_sd.cvt_nan  = cvt_nan;
+      s1_sd.cvt_big  = cvt_big;
+      s1_sd.special  = special;
+      s1_sd.sp_isnan = nan_any | imz | isi;
+      s1_sd.rmode    = kq.cvtz ? 2'b01 : kq.ctl[1:0];
+      s1_sd.ve       = kq.ctl[7];
+      s1_sd.oe       = kq.ctl[6];
+      s1_sd.ue       = kq.ctl[5];
+      s1_sd.ze       = kq.ctl[4];
+      s1_sd.ni       = kq.ctl[2];
+      s1_sd.xx_en    = 1'b1;
+      s1_sd.invalid  = vxsnan | imz | isi | cvt_spc;
+      s1_sd.exc.vxsnan = vxsnan;
+      s1_sd.exc.vximz  = imz;
+      s1_sd.exc.vxisi  = isi;
+      s1_sd.exc.vxcvi  = cvt_spc;
+    end
+
+    exp_t ep0, ebn160, sh_raw;
+    wire [7:0] sac = {1'b0, {1'b0, q1.na} + {1'b0, q1.nc}, 4'b0000};
+    wire [7:0] sbb = {2'b00, q1.nb};
+    assign ep0    = q1.ep00 - exp_t'({6'd0, sac});
+    assign ebn160 = q1.ebm - exp_t'({6'd0, sbb});      // the pipelined front's ebn - 160
+    assign sh_raw = q1.esum + exp_t'({6'd0, sbb}) - exp_t'({6'd0, sac});
+
+    exp_t e0;
+    always_comb begin
+      if (kq.cvt)                       e0 = exp_t'(-108);
+      else if (special || !prod_live)   e0 = ebn160;
+      else if (!add_on || sh_raw < 0)   e0 = add_on ? ebn160 : ep0;
+      else                              e0 = ep0;
+    end
+
+    // The addend's place for the chunk the funnel takes next cycle, u_j = clamp(d + cj): j = 0 in c1, 1 in c2, 2 in
+    // c3 (cj = -54, 1, 56). d for the cases of the pipelined front's sh, each case's place formed and chosen last:
+    // the product anchors E0 (d = esum - sac, sh_raw >= 0; beyond 255 every bit is sticky either way), the addend at
+    // the window's top (d = -nb; a special's fraction d = 0), fctiw (d = sh_cv).
+    // d = da + db: da = sh_cv, 0, 0 or esum; db = 0, 0, -nb or -sac; one ternary add with cj, one clamp
+    wire  pl_ns = kq.has_a & ~kq.a_zero & ~kq.c_zero;
+    wire  top   = ~pl_ns | (sh_raw < 0);
+    exp_t cj, da, db, xu;
+    assign cj = v1 ? exp_t'(-54) : v2 ? exp_t'(1) : exp_t'(56);
+    assign da = kq.cvt ? exp_t'({6'd0, q1.shcv}) : (special || top) ? exp_t'(0) : q1.esum;
+    assign db = (kq.cvt || special) ? exp_t'(0) : top ? (exp_t'(0) - exp_t'({8'd0, q1.nb})) : (exp_t'(0) - exp_t'({6'd0, sac}));
+    assign xu = da + db + cj;
+    wire [6:0] u = uclamp(xu);
+
+    // the addend unplaced: frB, a NaN operand's fraction quieted (c0 put it in frB's place), the default QNaN, or zero
+    // (as special ? (nan_any ? q1.b : {0, sp_isnan, 0}) : (add_on ? q1.b : 0): one enable for all bits but 51)
+    wire        en_b  = special ? nan_any : add_on;
+    wire        b51   = special ? (nan_any ? q1.b[51] : s1_sd.sp_isnan) : (add_on & q1.b[51]);
+    wire [52:0] b_use = {q1.b[52] & en_b, b51, q1.b[50:0] & {51{en_b}}};
+
+    // ---------------------------------------------------------------- R1: c1 -> c2 ... c4
+    logic [52:0] r1_b;
+    exp_t        r1_e0;
+    logic        r1_cap;
+    always_ff @(posedge clk)
+      if (v1) begin
+        r1_b   <= b_use;
+        r1_e0  <= e0;
+        r1_cap <= ~kq.single_e & ~kq.ctl[5] & ~special & ~kq.cvt;
+      end
+    // the products: four 27x27 on DSPs (lh + hl in the chain-out adder), their outputs registered (R1a holds the
+    // operands, so the products stand in c2 and c3)
+    logic [53:0] p2_ll, p2_x;
+    logic [51:0] p2_hh;
+    always_ff @(posedge clk) begin
+      p2_ll <= q1_alo * q1_clo;
+      p2_hh <= q1_ahi * q1_chi;
+      p2_x  <= q1_alo * q1_chi + q1_ahi * q1_clo;
+    end
+    // the funnel's place: u_0 in c2, u_1 in c3, u_2 in c4
+    logic [6:0] uq;
+    always_ff @(posedge clk) uq <= u;
+
+    // ---------------------------------------------------------------- c2, c3: P = {hh, ll} + x << 27 in two chunks
+    // c2: P[53:0] = {ll[53:27] + x[26:0], ll[26:0]}; c3: P[105:54] = hh + x[53:27] + the carry. Zero without a product.
+    wire [51:0] pa_a = v2 ? {25'd0, p2_ll[53:27]} : p2_hh;
+    wire [26:0] pa_b = v2 ? p2_x[26:0] : p2_x[53:27];
+    logic       pcq;
+    wire [52:0] psum = {1'b0, pa_a} + {26'd0, pa_b} + {52'd0, ~v2 & pcq};
+    logic [53:0] pq;                                   // P[53:0] in c3, P[105:54] in c4
+    logic        subq;
+    always_ff @(posedge clk) begin
+      pcq <= psum[27];
+      if (v2) pq <= prod_on ? {psum[26:0], p2_ll[26:0]} : 54'd0;
+      if (v3) pq <= prod_on ? {2'b00, psum[51:0]} : 54'd0;
+      if (v2) subq <= effsub;                         // c3 ... c5
+    end
+
+    // ---------------------------------------------------------------- c2 ... c4: the funnel
+    // In four levels (64, 16s, 4s, 1s), each level's shifted-out bits ORed as it goes: with the bit that lands at
+    // the bottom, V[0]'s sticky (every bit shifted to or below it; used in c2 only)
+    wire [162:0] fw  = {55'd0, r1_b, 55'd0};
+    wire [162:0] fl1 = fw >> {uq[6], 6'd0};
+    wire         sl1 = uq[6] & (|fw[63:0]);
+    wire [162:0] fl2 = fl1 >> {uq[5:4], 4'd0};
+    wire         sl2 = sl1 | ((uq[5:4] != 2'd0) & (|fl1[15:0])) | (uq[5] & (|fl1[31:16])) | ((uq[5:4] == 2'd3) & (|fl1[47:32]));
+    wire [162:0] fl3 = fl2 >> {uq[3:2], 2'd0};
+    wire         sl3 = sl2 | ((uq[3:2] != 2'd0) & (|fl2[3:0])) | (uq[3] & (|fl2[7:4])) | ((uq[3:2] == 2'd3) & (|fl2[11:8]));
+    wire [162:0] fsh = fl3 >> uq[1:0];
+    wire         sl4 = sl3 | ((uq[1:0] != 2'd0) & fl3[0]) | (uq[1] & fl3[1]) | ((uq[1:0] == 2'd3) & fl3[2]);
+`ifdef DF_PLANT
+    wire st0 = (sl4 | fsh[0]) ^ (uq == 7'd70);        // a planted fault (bench only): the miter must fire
+`else
+    wire st0 = sl4 | fsh[0];
+`endif
+`ifdef VERILATOR
+    // against the plain forms: one shift, and a compare per frB bit for the sticky
+    logic [52:0] th;
+    always_comb for (int i = 0; i < 53; i++) th[i] = ({1'b0, uq} >= 8'(i) + 8'd55);
+    always_ff @(posedge clk)
+      if (!rst && (fsh != (fw >> uq) || (v2 && (sl4 | fsh[0]) != (|(r1_b & th)))))
+        $fatal(1, "ppc_fpu_fma IT: the funnel's levels");
+`endif
+    logic [54:0] ach;                                  // the chunk the adders take next cycle
+    always_ff @(posedge clk) ach <= {fsh[54:1], v2 ? st0 : fsh[0]};
+
+    // ---------------------------------------------------------------- c3 ... c5: T1 = P +- addend, T2 = addend - P
+    // P sits at V[106:1]: chunk 0 takes P[53:0], chunk 1 P[105:54], chunk 2 nothing
+    wire [54:0] pin = v3 ? {pq[53:0], 1'b0} : v4 ? {3'b000, pq[51:0]} : 55'd0;
+    logic       c1q, c2q;
+    wire [55:0] t1s = {1'b0, pin} + {1'b0, ach ^ {55{subq}}} + {55'd0, v3 ? subq : c1q};
+    wire [55:0] t2s = {1'b0, ach} + {1'b0, ~pin} + {55'd0, v3 | c2q};
+    logic [54:0] t1a, t1b, t2a, t2b;
+    always_ff @(posedge clk) begin
+      c1q <= t1s[55];
+      c2q <= t2s[55];
+      if (v3) begin t1a <= t1s[54:0]; t2a <= t2s[54:0]; end
+      if (v4) begin t1b <= t1s[54:0]; t2b <= t2s[54:0]; end
+    end
+
+    // what R4 takes besides the sum, at the end of c3 (R1a and R1 still hold the op); the denormal cap as the
+    // pipelined front's S4a forms it
+    // (k = E0 + 1182: E0 < -1182 is k < 0, and then s_den = 0)
+    exp_t k_i, e0c_i, sden_i;
+    assign k_i    = r1_e0 + exp_t'(1182);
+    assign e0c_i  = (r1_cap && k_i < 0) ? exp_t'(-1182) : r1_e0;
+    assign sden_i = (k_i < 0) ? exp_t'(0) : k_i;
+    logic        s5_sp, s5_sb, s5_cap;
+    exp_t        s5_e0;
+    logic [7:0]  s5_sden;
+    side_t       s5_sd;
+    always_ff @(posedge clk)
+      if (v3) begin
+        s5_sp <= r_sp;  s5_sb <= r_sb;  s5_cap <= r1_cap;  s5_e0 <= e0c_i;  s5_sd <= s1_sd;
+        s5_sden <= (!r1_cap || sden_i > exp_t'(161)) ? 8'd255 : sden_i[7:0];
+      end
+
+    // c5: chunk 2's sum gives T1's sign (V[162])
+    wire neg4 = subq & t1s[52];
+    assign f4_v      = v5;
+    assign v_pre4b   = v4;
+    assign f4_s      = neg4 ? {t2s[51:0], t2b, t2a} : {t1s[51:0], t1b, t1a};
+    assign f4_sign   = neg4 ? s5_sb : s5_sp;
+    assign f4_effsub = subq;
+    assign f4_e0     = s5_e0;
+    assign f4_sden   = s5_sden;
+    assign f4_cap    = s5_cap;
+    assign f4_sd     = s5_sd;
+
+    // synthesis translate_off
+    always_ff @(posedge clk)
+      if (!rst && in_valid && (v1 || v2)) $fatal(1, "ppc_fpu_fma IT: ops less than three cycles apart");
+    initial if (!(P1A && P2 && P3 && P4A)) $error("ppc_fpu_fma: IT needs P1A = P2 = P3 = P4A = 1");
+    initial if (SH4) $error("ppc_fpu_fma: IT and SH4 are exclusive");
+    // synthesis translate_on
+  end endgenerate
 
   // the injected quotient: q[55] at V[56], so E0 = e - 55; a special puts its
   // fraction where the addend's would be, unshifted
@@ -682,18 +1021,17 @@ module ppc_fpu_fma
   // cycle ahead, from the valid that will be in S4b then, so the select of
   // the 162-bit mux is a register of its own (the divider's state bit drove it
   // directly and the stage missed by 0.5 ns).
-  wire v_pre4b = P4A ? r3_v : P3 ? r2_v : P2 ? r1_v : r1a_v;
   (* preserve *) logic take_q [4];
   always_ff @(posedge clk)
     for (int k = 0; k < 4; k++) take_q[k] <= ~rst & inj_next & ~v_pre4b;
   assign inj_ready = take_q[0];
   wire   take_inj  = take_q[0];
 
-  wire [161:0] s4 = take_q[1] ? inj_s : neg4 ? {t2_hi[79:0], r4a_q.t2} : {t1_hi[79:0], r4a_q.t1};
+  wire [161:0] s4 = take_q[1] ? inj_s : f4_s;
   side_t sd4;
-  assign sd4 = take_q[2] ? inj_sd : r4a_q.sd;
+  assign sd4 = take_q[2] ? inj_sd : f4_sd;
   exp_t e04;
-  assign e04 = take_inj ? exp_t'(inj_e0c) : r4a_q.e0;
+  assign e04 = take_inj ? exp_t'(inj_e0c) : f4_e0;
 
   // The normalise shift is min(lz, s_den) under the denormal cap, 0 when
   // forced (special, fctiw). Rather than a compare and a mux after the count,
@@ -701,8 +1039,8 @@ module ppc_fpu_fma
   // count of S | stopper is the shift; the stopper is decoded here, beside
   // the adder. Whether the cap bites -- the result is tiny, lz > s_den -- is
   // S's own bit at the stopper: 0 there and a count of s_den (tested in S6).
-  wire [7:0] sden4 = take_q[3] ? inj_sden : r4a_q.sden;
-  wire       cap4  = take_q[3] ? inj_cap  : r4a_q.cap;
+  wire [7:0] sden4 = take_q[3] ? inj_sden : f4_sden;
+  wire       cap4  = take_q[3] ? inj_cap  : f4_cap;
   wire       force4 = sd4.special | sd4.cvt;
   logic [161:0] stop4;
   always_comb
@@ -725,14 +1063,14 @@ module ppc_fpu_fma
   logic r4_v;
   always_ff @(posedge clk) begin
     if (rst) r4_v <= 1'b0;
-    else     r4_v <= r4a_v | take_inj;
+    else     r4_v <= f4_v | take_inj;
     r4.s      <= s4;
     r4.e0     <= e04;
     r4.sden   <= sden4;
     r4.cap    <= cap4;
     r4.stop   <= stop4;
-    r4.sign   <= take_inj ? inj_sign : (neg4 ? r4a_q.sb : r4a_q.sp);
-    r4.effsub <= take_inj ? 1'b0 : r4a_q.effsub;
+    r4.sign   <= take_inj ? inj_sign : f4_sign;
+    r4.effsub <= take_inj ? 1'b0 : f4_effsub;
     r4.sd     <= sd4;
   end
 
@@ -1240,6 +1578,48 @@ module ppc_fpu_fma
     out_res   <= x_valid ? x_res : res8f;
     out_flags <= x_valid ? x_flags : flags8;
   end
+
+`ifdef DF_MITER
+  // (dfront, benches only) the miter: k1t's unit (sim/fpu/ppc_fpu_fma_ref.sv, the pipelined front with SH4) beside
+  // this one on the same inputs; R4, the hand-over and every result must agree in every cycle
+  generate if (IT) begin : g_miter
+    logic            m_ready, m_ov, m_od;
+    logic [TAGW-1:0] m_ot;
+    logic [63:0]     m_or;
+    fpu_flags_t      m_of;
+    ppc_fpu_fma_ref #(.TAGW(TAGW), .SH4(1'b1)) u_ref (
+      .clk (clk), .rst (rst),
+      .in_valid (in_valid), .in_op (in_op), .in_single (in_single), .in_ctl (in_ctl),
+      .in_a (in_a), .in_b (in_b), .in_c (in_c), .in_tag (in_tag),
+      .inj_valid (inj_valid), .inj_next (inj_next), .inj_ready (m_ready), .inj_special (inj_special),
+      .inj_payload (inj_payload), .inj_sign (inj_sign), .inj_q (inj_q), .inj_sticky (inj_sticky),
+      .inj_e (inj_e), .inj_e0c (inj_e0c), .inj_sden (inj_sden), .inj_cap (inj_cap), .inj_single (inj_single),
+      .inj_ctl (inj_ctl), .inj_xx_en (inj_xx_en), .inj_exc (inj_exc), .inj_invalid (inj_invalid), .inj_zdiv (inj_zdiv),
+      .inj_tag (inj_tag),
+      .x_valid (x_valid), .x_tag (x_tag), .x_res (x_res), .x_flags (x_flags),
+      .out_valid (m_ov), .out_tag (m_ot), .out_div (m_od), .out_res (m_or), .out_flags (m_of)
+    );
+    longint n_r4;
+    always_ff @(posedge clk)
+      if (rst) n_r4 <= 0;
+      else begin
+        if (m_ready != inj_ready) $fatal(1, "dfront miter: hand-over %0d against %0d", inj_ready, m_ready);
+        if (u_ref.r4_v != r4_v) $fatal(1, "dfront miter: R4 valid %0d against %0d", r4_v, u_ref.r4_v);
+        if (r4_v) begin
+          n_r4 <= n_r4 + 1;
+          if (u_ref.r4.s != r4.s) $fatal(1, "dfront miter: R4 s %041X against %041X", r4.s, u_ref.r4.s);
+          if (u_ref.r4.stop != r4.stop || u_ref.r4.e0 != r4.e0 || u_ref.r4.sden != r4.sden || u_ref.r4.cap != r4.cap ||
+              u_ref.r4.sign != r4.sign || u_ref.r4.effsub != r4.effsub || u_ref.r4.sd != r4.sd)
+            $fatal(1, "dfront miter: R4 fields: e0 %0d / %0d sden %0d / %0d cap %0d / %0d sign %0d / %0d effsub %0d / %0d sd %0h / %0h",
+                   r4.e0, u_ref.r4.e0, r4.sden, u_ref.r4.sden, r4.cap, u_ref.r4.cap, r4.sign, u_ref.r4.sign,
+                   r4.effsub, u_ref.r4.effsub, r4.sd, u_ref.r4.sd);
+        end
+        if (m_ov != out_valid || (out_valid && (m_ot != out_tag || m_od != out_div || m_or != out_res || m_of != out_flags)))
+          $fatal(1, "dfront miter: result %0d %016X against %0d %016X", out_valid, out_res, m_ov, m_or);
+      end
+    final $display("dfront miter: %0d R4 entries compared", n_r4);
+  end endgenerate
+`endif
 
   // a bench catches a schedule that lets two results meet here
   // synthesis translate_off
