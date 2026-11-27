@@ -1,5 +1,26 @@
 # Handoff
 
+## Update (2026-11-27): where everything is
+
+`main` takes branch `all1` (one board test, all1_s2, RBF c26b7cad, dual, 140 MHz): the CPU kit (conversions on their
+own port, the double unit's iterative front, the FP load word forwarded, fcmpu released early, bypassed doubles: about
+-3.1% / -4.7% of the race / start-line frame on the replay bench), the SDRAM calibration with hostile traffic, four
+sweeps and a 12-step early margin, and the contributor's changes behind switches (M3_DMADIR and M3_SND_WD13 on;
+M3_R3EMPTY, M3_R3PF, M3_R3LATE off). Board: VF3 solid 60; Daytona 2's course-guide attract right and 70-80% of track 1
+at 60; Sega Rally 2 no start-line slowdown, one slowdown about halfway; Scud Race mostly 60, the bridge start line 30.
+Calibration on Auto: SDRAM1 +6 (width 36), SDRAM2 +12 (width 22). Setup -4.25 / -4.11 ns: not a release (D-87).
+
+| Work | Where | State |
+|---|---|---|
+| Everything above | `main` | board-tested |
+| Area pass: CPU / Real3D / system side (D-87) | sm3-builds/area-cpu, area-r3d, area-sys | in progress |
+| 8-stage single FPU, no early forward (R202 draft) | sm3-builds/sfpu, patch against c5d4783 | bench-proven; +3.75% / +3.44% cycles, needs rebasing |
+| M3_R3EMPTY, M3_R3PF | in `main`, switched off | need area |
+| FP store slot (kit item 1e), load-use 3 | not built | |
+
+Rule: board-proven work goes to `main` on its own branch with a `--no-ff` merge; anything waiting for the board sits on
+a pushed branch off `main`; nothing that has passed stays only in sm3-builds.
+
 ## Update (2026-11-26): where everything is
 
 `main` now carries the 140 MHz work that has run on my board: the system side with automatic SDRAM read calibration
