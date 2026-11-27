@@ -24,7 +24,13 @@
 // Cost: each command reaches the block one clock later (a read's first beat one clock later); the read data
 // (DOUT, DOUT_READY) does not pass through here.
 
-module m3_avl_reg (
+module m3_avl_reg #(
+  // sys-timing: SKF 1 lets the skid slot's fields follow the upstream fields whenever the slot is empty, so they
+  // are loaded at the edge the slot fills without their enable waiting for DDRAM_BUSY (the HPS's f2sdram output ->
+  // o_fr -> 109 enables 25 LABs away: 92 failing endpoints in dirn140_s3, 41 with the CPU's paths out of the
+  // fitter's way). An empty slot's fields are read by nothing. 0: loaded only at that edge
+  parameter bit SKF = 1'b0
+) (
   input  logic        clk,
   input  logic        rst_n,
   // m3_ddr3p's side
@@ -65,7 +71,7 @@ module m3_avl_reg (
   // the fields without a reset (RD / WE qualify them)
   always_ff @(posedge clk) begin
     if (o_fr) o_d <= s_v ? s_d : u_d;
-    if (!o_fr && u_go) s_d <= u_d;
+    if (SKF ? !s_v : (!o_fr && u_go)) s_d <= u_d;
   end
   assign {DDRAM_RD, DDRAM_WE} = o_c;
   assign {DDRAM_ADDR, DDRAM_BURSTCNT, DDRAM_DIN, DDRAM_BE} = o_d;

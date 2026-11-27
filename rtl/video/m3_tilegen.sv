@@ -44,7 +44,9 @@ module m3_tilegen #(
   parameter bit EXPAND_SM   = 1'b1,   // 5 to 8 bits as x * 255 / 31 (SM) / (x << 3) | (x >> 2) (MAME)
   parameter bit OFFSET      = 1'b1,   // the pair colour offsets F1180040 / F1180044 (SM; MAME has none)
   parameter int AW          = 25,
-  parameter logic [AW:1] VBASE = '0
+  parameter logic [AW:1] VBASE = '0,
+  parameter bit QDC         = 1'b0,   // sys-timing: m3_tilegen_fetch QDC
+  parameter bit CHF         = 1'b0    // sys-timing: m3_tilegen_fetch CHF
 ) (
   input  logic          clk,
   input  logic          rst_n,
@@ -117,7 +119,7 @@ module m3_tilegen #(
 
   m3_tilegen_fetch #(
     .MASK_SCREEN(MASK_SCREEN), .SCROLL_SM(SCROLL_SM), .RS_SWAP(RS_SWAP), .STALE(STALE),
-    .CODE_WRAP(CODE_WRAP), .AW(AW), .VBASE(VBASE)
+    .CODE_WRAP(CODE_WRAP), .AW(AW), .VBASE(VBASE), .QDC(QDC), .CHF(CHF)
   ) u_fetch (
     .clk, .rst_n, .go(go && ready), .y(go_y), .busy(f_busy), .overrun,
     .pri, .lreg,

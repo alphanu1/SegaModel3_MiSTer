@@ -93,3 +93,16 @@ if {[get_collection_size $m3_vco] > 0} {
 		post_message -type critical_warning "Model3.sdc: the PLL's VCO period is $m3_vp ns, not 1.190 (840 MHz): m3_sdr_cal's NSTEP 48 and the stepper's modulo do not match the PLL"
 	}
 }
+
+# sys-timing: while the fitter runs only, 0.1 ns more hold uncertainty on the system clock and between it and clk_hps
+# (tighter for the fitter, not for the sign-off): the fitter left same-clock hold paths at -0.005 to -0.054 ns at one
+# corner in two fits of three (the rasteriser's queues), having padded them to within a few picoseconds of zero.
+if {[string equal $m3_exe "quartus_fit"]} {
+	set m3_hs [get_clocks -nowarn {*|pll|pll_inst|altera_pll_i|*[1].*|divclk}]
+	set m3_hh [get_clocks -nowarn {*|pll|pll_inst|altera_pll_i|*[6].*|divclk}]
+	if {[get_collection_size $m3_hs] > 0} { set_clock_uncertainty -add -hold -from $m3_hs -to $m3_hs 0.100 }
+	if {[get_collection_size $m3_hs] > 0 && [get_collection_size $m3_hh] > 0} {
+		set_clock_uncertainty -add -hold -from $m3_hs -to $m3_hh 0.100
+		set_clock_uncertainty -add -hold -from $m3_hh -to $m3_hs 0.100
+	}
+}

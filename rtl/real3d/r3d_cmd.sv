@@ -64,7 +64,10 @@
 `timescale 1ns/1ps
 
 module r3d_cmd #(
-  parameter bit TOT = 1'b0
+  parameter bit TOT = 1'b0,
+  // sys-timing: HDP 1 takes the decode of a word going in as the FIFO's head from h_dec (m3_bus forms it beside the
+  // address select), not from h_addr[31:24] after the select. The same five bits (checked in the bench); 0: as before
+  parameter bit HDP = 1'b0
 ) (
   input  logic          clk,
   input  logic          rst,
@@ -74,6 +77,7 @@ module r3d_cmd #(
   output logic          h_rdy,
   input  logic          h_we,
   input  logic [31:0]   h_addr,
+  input  logic [4:0]    h_dec,          // HDP: hdec(h_addr[31:24])
   input  logic [31:0]   h_wdata,
   output logic          h_rv,
   output logic [31:0]   h_rdata,
@@ -193,6 +197,7 @@ module r3d_cmd #(
   assign m_reg   = hd_8c ? 2'd0 : hd_8e ? 2'd1 : 2'd2;
   assign m_addr  = hd_8e ? {2'd0, b_a[19:2]} : b_a[21:2];
 `ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && HDP && h_go && h_dec != hdec(h_addr[31:24])) $fatal(1, "r3d_cmd: h_dec");
   always_ff @(posedge clk) if (!rst && b_v && ({b_hi, b_a, b_d} != pf[pf_r] || {hd_mem, hd_tex, hd_cmd, hd_8e, hd_8c} != hdec(b_hi) ||
                                                pf_r1 != pf_r + 1'b1))
     $fatal(1, "r3d_cmd: the FIFO's head registered");
@@ -280,7 +285,7 @@ module r3d_cmd #(
       if (pf_push) begin pf[pf_w] <= pf_hw; pf_w <= pf_w + 1'b1; end
       // the head: the word going in when nothing stays ahead of it, else the next entry on a pop
       if (pf_push && pf_n == (PFW+1)'(pf_pop)) begin
-        {b_hi, b_a, b_d} <= pf_hw; {hd_mem, hd_tex, hd_cmd, hd_8e, hd_8c} <= hdec(pf_hw[59:52]);
+        {b_hi, b_a, b_d} <= pf_hw; {hd_mem, hd_tex, hd_cmd, hd_8e, hd_8c} <= HDP ? h_dec : hdec(pf_hw[59:52]);
       end else if (pf_pop && pf_n >= (PFW+1)'(2)) begin
         {b_hi, b_a, b_d} <= pf_q1; {hd_mem, hd_tex, hd_cmd, hd_8e, hd_8c} <= hdec(pf_q1[59:52]);
       end

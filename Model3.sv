@@ -299,19 +299,30 @@ endfunction
 function automatic logic [5:0] ps_inc(input logic [5:0] o, input logic up);
 	ps_inc = up ? ((o == 6'd47) ? 6'd0 : o + 6'd1) : ((o == 6'd0) ? 6'd47 : o - 6'd1);
 endfunction
+// sys-timing: m3_system's targets cross from clk_sys to clk_hps through clk_sys's falling edge (pst_n), then a
+// clk_hps register (pst_h): the direct transfer (m3_sdr_cal's off -> ps_set / ps_off) had its hold check at the common
+// edge of the two globals and failed it by 0.04-0.09 ns in two fits of three. The calibration waits 16 clocks after
+// a change before it looks at settled (m3_sdr_cal); the round trip with these stages is about 9.
+// (pst_p first, a clk_sys register a whole clock from m3_sdr_cal's, beside pst_n: the targets' own registers sit
+// with the calibration, and their half-period hop to a pinned pst_n missed by 0.06 ns in one fit)
+(* preserve *) reg [11:0] pst_p, pst_n, pst_h;
+always @(posedge clk_sys) pst_p <= {ps_t2, ps_t1};
+always @(negedge clk_sys) pst_n <= pst_p;
+always @(posedge clk_hps) pst_h <= pst_n;
+wire [5:0] ps_h1 = pst_h[5:0], ps_h2 = pst_h[11:6];
 always @(posedge clk_hps) begin
 	ps_lk <= {ps_lk[1:0], pll_locked};
 	ps_en <= 1'b0;
-	ps_set1 <= (ps_st == 2'd0) && (ps_off1 == ps_t1);
-	ps_set2 <= (ps_st == 2'd0) && (ps_off2 == ps_t2);
+	ps_set1 <= (ps_st == 2'd0) && (ps_off1 == ps_h1);
+	ps_set2 <= (ps_st == 2'd0) && (ps_off2 == ps_h2);
 	if (!ps_lk[2]) begin ps_st <= 2'd0; ps_off1 <= 6'd0; ps_off2 <= 6'd0; ps_set1 <= 1'b0; ps_set2 <= 1'b0; end
 	else case (ps_st)
-		2'd0: if (ps_off1 != ps_t1) begin
-				ps_cnt <= 5'd4; ps_up <= ps_upw(ps_t1, ps_off1); ps_en <= 1'b1; ps_st <= 2'd1;
-				ps_off1 <= ps_inc(ps_off1, ps_upw(ps_t1, ps_off1)); ps_set1 <= 1'b0;
-			end else if (ps_off2 != ps_t2) begin
-				ps_cnt <= 5'd5; ps_up <= ps_upw(ps_t2, ps_off2); ps_en <= 1'b1; ps_st <= 2'd1;
-				ps_off2 <= ps_inc(ps_off2, ps_upw(ps_t2, ps_off2)); ps_set2 <= 1'b0;
+		2'd0: if (ps_off1 != ps_h1) begin
+				ps_cnt <= 5'd4; ps_up <= ps_upw(ps_h1, ps_off1); ps_en <= 1'b1; ps_st <= 2'd1;
+				ps_off1 <= ps_inc(ps_off1, ps_upw(ps_h1, ps_off1)); ps_set1 <= 1'b0;
+			end else if (ps_off2 != ps_h2) begin
+				ps_cnt <= 5'd5; ps_up <= ps_upw(ps_h2, ps_off2); ps_en <= 1'b1; ps_st <= 2'd1;
+				ps_off2 <= ps_inc(ps_off2, ps_upw(ps_h2, ps_off2)); ps_set2 <= 1'b0;
 			end
 		2'd1: begin ps_en <= 1'b1; ps_st <= 2'd2; ps_to <= 6'd0; end   // phase_en two scanclk cycles
 		2'd2: begin ps_to <= ps_to + 6'd1; if (!ps_done || &ps_to) ps_st <= 2'd3; end   // the step under way
@@ -382,9 +393,39 @@ localparam bit INP_LEAN = 1'b0;
 `endif
 
 // the OSD's order to m2_sdram's rd_lat_sel (index n = CL + n): CL+2 (2, the default entry), CL+1 (1), CL+3 (3)
-wire [2:0] sdr_cap1 = (status[74:73] == 2'd1) ? 3'd1 : (status[74:73] == 2'd2) ? 3'd3 : 3'd2;
+// sys-timing: the OSD's options for m3_system (and the phase stepper's two settled flags) cross from clk_hps to
+// clk_sys through four registers. status is hps_io's (clk_hps, 70 MHz, its edges on clk_sys's); a direct transfer
+// into clk_sys has its hold check at the same edge across two global clocks, which the fitter left failing on some
+// seeds (status[9] -> m3_fps's avg_q: -0.25 ns in all1_s1, -0.50 in area-sys's c5_s1, -0.41 in dirn140_s2, R198's
+// single build). Here: opt_a on clk_hps's falling edge (half a clk_hps period from status, one clock), opt_n on
+// clk_sys's falling edge (half a clk_sys period after opt_a's edge: the one hop across the two clocks, 3.57 ns less
+// their skew, so the two are placed side by side in the qsf), opt_p and opt_q on clk_sys's rising edge. No hop has
+// a hold check at its launch edge. The options land about three clk_sys clocks later; nothing times them.
+// {ps_set2, ps_set1, 93:89, 88:84, 83, 76:73, 71:70, 54, 51:50, 30:28, 9:4}
+localparam bit M3_OPTQ = 1'b1;
+wire [30:0] opt_h = {ps_set2, ps_set1, status[93:89], status[88:84], status[83], status[76:73], status[71:70], status[54],
+                     status[51:50], status[30:28], status[9:4]};
+(* preserve *) reg [30:0] opt_a, opt_n, opt_p, opt_q;
+always @(negedge clk_hps) opt_a <= opt_h;
+always @(negedge clk_sys) opt_n <= opt_a;
+always @(posedge clk_sys) opt_p <= opt_n;      // (half a clk_sys period from opt_n: beside it in the qsf)
+always @(posedge clk_sys) opt_q <= opt_p;      // (free to sit by what reads the options, a whole clock from opt_p)
+wire [30:0] opt = M3_OPTQ ? opt_q : opt_h;
+// sys-timing: the analog axes (sticks, triggers, paddle: 72 bits) go from hps_io's registers (clk_hps) to
+// m3_system's first registers (jl0_q ... pad0_q, clk_sys) with no logic between, and that direct transfer failed
+// hold in three fits of seven (paddle_0 -> pad0_q, -0.12 to -0.42 ns; dirn140_s2's -0.41 is the same path). A
+// register on clk_sys's falling edge between the two takes the hold check off the common edge and adds no latency:
+// m3_system's register takes the value at the same clk_sys edge as before. Both hops are half a clk_sys period (the
+// first across the two globals, about 2.2 ns), so hps_io's registers, these and m3_system's have sites side by side
+// in the qsf. The buttons (joystick_0 / 1) go through m3_inputs' logic first and are left direct.
+localparam bit M3_AINQ = 1'b1;
+wire [71:0] ain_h = {joy_l0, joy_l1, joy_r0, joy_lt0, joy_rt0, paddle0};
+(* preserve *) reg [71:0] ain_n;
+always @(negedge clk_sys) ain_n <= ain_h;
+wire [71:0] ain = M3_AINQ ? ain_n : ain_h;
+wire [2:0] sdr_cap1 = (opt[15:14] == 2'd1) ? 3'd1 : (opt[15:14] == 2'd2) ? 3'd3 : 3'd2;
 `ifdef M3_CPU_SDR2
-wire [2:0] sdr_cap2 = (status[76:75] == 2'd1) ? 3'd1 : (status[76:75] == 2'd2) ? 3'd3 : 3'd2;
+wire [2:0] sdr_cap2 = (opt[17:16] == 2'd1) ? 3'd1 : (opt[17:16] == 2'd2) ? 3'd3 : 3'd2;
 `else
 wire [2:0] sdr_cap2 = 3'd2;
 `endif
@@ -408,20 +449,20 @@ m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN
 	.DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE), .DDRAM_RD(DDRAM_RD),
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY),
 	.ce_pix(ce_pix), .v_hs(v_hs), .v_vs(v_vs), .v_hblank(v_hb), .v_vblank(v_vb),
-	.v_r(v_r), .v_g(v_g), .v_b(v_b), .overlay_en(~status[4]), .fps_en(status[5]), .fps_avg(status[9:8]),
-	.joystick_0(joystick_0[15:0]), .joystick_1(joystick_1[15:0]), .joy_l0(joy_l0), .joy_l1(joy_l1), .joy_r0(joy_r0),
-	.joy_lt0(joy_lt0), .joy_rt0(joy_rt0), .paddle0(paddle0),
-	.st_pedswap(status[28]), .st_ssens(status[30:29]), .st_ssm(status[51:50]), .st_rsteer(status[54]),
-	.st_wheel(status[71:70]), .inp_drive(inp_drive),
-	.audio_l(snd_l), .audio_r(snd_r), .snd_vol(status[7:6]),
+	.v_r(v_r), .v_g(v_g), .v_b(v_b), .overlay_en(~opt[0]), .fps_en(opt[1]), .fps_avg(opt[5:4]),
+	.joystick_0(joystick_0[15:0]), .joystick_1(joystick_1[15:0]), .joy_l0(ain[71:56]), .joy_l1(ain[55:40]), .joy_r0(ain[39:24]),
+	.joy_lt0(ain[23:16]), .joy_rt0(ain[15:8]), .paddle0(ain[7:0]),
+	.st_pedswap(opt[6]), .st_ssens(opt[8:7]), .st_ssm(opt[10:9]), .st_rsteer(opt[11]),
+	.st_wheel(opt[13:12]), .inp_drive(inp_drive),
+	.audio_l(snd_l), .audio_r(snd_r), .snd_vol(opt[3:2]),
 	.led(run_led), .uart_tx(UART_TXD), .tb_fast(1'b0),
-	.cap1_off(ps_t1), .cap2_off(ps_t2), .cap1_settled(ps_set1), .cap2_settled(ps_set2), .cap1_osd(status[88:84]),
+	.cap1_off(ps_t1), .cap2_off(ps_t2), .cap1_settled(opt[29]), .cap2_settled(opt[30]), .cap1_osd(opt[23:19]),
 `ifdef M3_CPU_SDR2
-	.cap2_osd(status[93:89]),
+	.cap2_osd(opt[28:24]),
 `else
 	.cap2_osd(5'd0),
 `endif
-	.cal_show(status[83]),
+	.cal_show(opt[18]),
 	.rom_loaded(), .frame(), .tr_v(), .tr_master(), .tr_we(), .tr_addr(), .tr_be(), .tr_data(),
 	.ev_v(), .ev_kind(), .ev_data(),
 	.rt_valid_o(), .rt_pc_o(), .rt_insn_o(), .rt_gpr_we_o(), .rt_gpr_o(), .rt_gpr_sh_o(), .rt_gpr_val_o()

@@ -52,7 +52,21 @@ module m3_tilegen_fetch #(
   parameter bit STALE       = 1'b1,  // SM: a tile pair straddling a stencil change reuses the pair 16 px left
   parameter bit CODE_WRAP   = 1'b0,  // MAME: codes past the pattern area wrap (% 31744 / % 15872)
   parameter int AW          = 25,
-  parameter logic [AW:1] VBASE = '0
+  parameter logic [AW:1] VBASE = '0,
+  // sys-timing: QDC 1 writes the queue's free entry whenever a push may happen (S_PATA with room, whether the
+  // pattern held is the chunk's or not; the other two places as before); only the entry's valid bit waits for the
+  // pattern compare. An entry that is not valid is read by nothing (the emitter takes the head only with q_valid),
+  // and a real push writes the same entry again before it sets the bit. The compare (the name row's M10K -> the
+  // code -> the 17-bit pattern tag) was the enable of both entries' 94 registers: 188 endpoints failing in the
+  // block fitted alone at 140 MHz (-0.70 ns). 0: the entry written only with the push
+  parameter bit QDC         = 1'b0,
+  // sys-timing: CHF 1 keeps the chunk's two stencil bits (this 32-pixel span's and the next one's, screen space) in
+  // flag registers, loaded with x: at set-up from the mask word going into pmask, and at each chunk from each other
+  // (a chunk never passes a span boundary, so the new x is in this span or at the start of the next: the next one's
+  // bit moves up and the one after it is read from pmask). S_CHUNK's chain then starts at two flip-flops, not at x
+  // through two 16:1 selects (pmask / x -> stale -> srcx -> the name row's valid bit -> p_addr, 8 levels, -0.93 ns
+  // in the block fitted alone at 140 MHz). The same bits in every S_CHUNK clock (checked in the bench); 0: the selects
+  parameter bit CHF         = 1'b0
 ) (
   input  logic              clk,
   input  logic              rst_n,
@@ -210,16 +224,23 @@ module m3_tilegen_fetch #(
   wire [5:0] n_span  = 6'd32 - {1'b0, x[4:0]};
   wire [9:0] n_end   = xhi - x + 10'd1;
   logic [3:0] n_ch;
+  logic       ch_sp;                 // the chunk ends at the span's end (x + n_ch is the next span's first pixel)
+  logic       ch_end;                // the chunk ends the drawn range (x + n_ch is xhi + 1)
+  logic       xg_q;                  // CHF: x > xhi, loaded with x
+  wire        x_gt = CHF ? xg_q : (x > xhi);
   always_comb begin
     n_ch = n_tile;
+    ch_sp = {2'b00, n_tile} >= n_span;
     if ({2'b00, n_ch} > n_span) n_ch = n_span[3:0];
-    if ({6'd0, n_ch} > n_end)   n_ch = n_end[3:0];
+    ch_end = {6'd0, n_ch} >= n_end;
+    if ({6'd0, n_ch} > n_end) begin n_ch = n_end[3:0]; ch_sp = 1'b0; end
   end
   wire [3:0] xs      = ~x[8:5];                  // 15 - span: the screen-space stencil bit
+  logic      ms_q, mn_q;                         // CHF: pmask[xs], pmask[xs - 1]
 `ifdef TG_FAULT_STENCIL
   wire       m_scr   = pmask[x[8:5]];            // fault: spans counted from the wrong end
 `else
-  wire       m_scr   = pmask[xs];
+  wire       m_scr   = CHF ? ms_q : pmask[xs];
 `endif
 `ifdef TG_FAULT_STENCIL
   wire       m_map   = pmask[~mapx[8:5]];
@@ -231,12 +252,28 @@ module m3_tilegen_fetch #(
 `else
   wire       ch_en   = (MASK_SCREEN ? m_scr : m_map) ^ odd;
 `endif
-  wire       m_next  = pmask[xs - 4'd1];         // the span after this one (only read when x[8:5] != 15)
+  wire       m_next  = CHF ? mn_q : pmask[xs - 4'd1];   // the span after this one (only read when x[8:5] != 15)
+  // CHF: the flags' loads. Set-up: the mask word pmask takes, at su_xlo's span. A chunk: x + n_ch leaves the span
+  // (bit 5 flips: a chunk is 8 pixels at most) or stays
+  wire [15:0] pmask_n = ll[1] ? mask32[15:0] : mask32[31:16];
+  wire [3:0]  xs_su   = ~su_xlo[8:5];
+  wire [9:0]  x_ch    = x + {6'd0, n_ch};
+  wire        x_cross = ch_sp;       // (x_ch[5] != x[5], without the add: checked below)
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (rst_n && CHF && st == S_CHUNK && !(x > xhi) && (x_cross != (x_ch[5] != x[5]) || s_sum5 != s_sum[5]))
+    $fatal(1, "m3_tilegen_fetch: the span crossing or the stale carry");
+  always_ff @(posedge clk) if (rst_n && CHF && st == S_CHUNK && xg_q != (x > xhi)) $fatal(1, "m3_tilegen_fetch: x past the range");
+  always_ff @(posedge clk) if (rst_n && CHF && st == S_CHUNK && {ms_q, mn_q} != {pmask[xs], pmask[xs - 4'd1]})
+    $fatal(1, "m3_tilegen_fetch: the stencil flags");
+`endif
   wire [5:0] s_sum   = {1'b0, x[4:0]} + {2'b00, off[3:0]};
 `ifdef TG_FAULT_STALE
   wire       stale   = 1'b0;
 `else
-  wire       stale   = STALE && (x[8:5] != 4'd15) && (m_scr != m_next) && (off[3:0] != 4'd0) && s_sum[5];
+  // CHF: s_sum's carry from the map x register: the carry into bit 4 of x + off is mapx[4] ^ x[4] ^ off[4], and
+  // s_sum[5] is x[4] and that carry (mapx_q is x + off in every S_CHUNK clock, asserted above)
+  wire       s_sum5  = CHF ? (x[4] && (mapx_q[4] == off[4])) : s_sum[5];
+  wire       stale   = STALE && (x[8:5] != 4'd15) && (m_scr != m_next) && (off[3:0] != 4'd0) && s_sum5;
 `endif
   wire [8:0] srcx    = stale ? (mapx - 9'd16) : mapx;
 
@@ -271,7 +308,7 @@ module m3_tilegen_fetch #(
   // Queue a chunk: the pattern burst (4-bit: the one row it needs, in the low half) and the name word's
   // palette bits. Three places push: S_PATA on a pattern already held, S_PREQ in the acknowledge cycle,
   // S_PUSH when the queue was full.
-  logic          pu_en;
+  logic          pu_en, pu_wr;      // pu_wr (QDC): the free entry is written (a push, or S_PATA with room)
   logic [63:0]   pu_d;
   logic          pu_r0;
   logic [15:0]   pu_t;
@@ -282,11 +319,11 @@ module m3_tilegen_fetch #(
 `endif
   wire           p_hit  = pval && (ptag == pa_n);
   always_comb begin
-    pu_en = 1'b0; pu_d = pbuf; pu_r0 = prow0; pu_t = tw;
+    pu_en = 1'b0; pu_d = pbuf; pu_r0 = prow0; pu_t = tw; pu_wr = 1'b0;
     case (st)
-      S_PATA: begin pu_en = p_hit && !q_full; pu_r0 = row[0]; pu_t = t_sel; end
-      S_PREQ: begin pu_en = p_take && !q_full; pu_d = p_dout; end
-      S_PUSH: pu_en = !q_full;
+      S_PATA: begin pu_en = p_hit && !q_full; pu_r0 = row[0]; pu_t = t_sel; pu_wr = !q_full; end
+      S_PREQ: begin pu_en = p_take && !q_full; pu_d = p_dout; pu_wr = pu_en; end
+      S_PUSH: begin pu_en = !q_full; pu_wr = pu_en; end
       default: ;
     endcase
   end
@@ -328,8 +365,12 @@ module m3_tilegen_fetch #(
         qh     <= ~qh;
       end
       if (pu_en && !restart) begin
-        if (!qv[qh]) begin qe[qh] <= pu_e; qv[qh] <= 1'b1; end
-        else begin qe[~qh] <= pu_e; qv[~qh] <= 1'b1; end
+        if (!qv[qh]) begin if (!QDC) qe[qh] <= pu_e; qv[qh] <= 1'b1; end
+        else begin if (!QDC) qe[~qh] <= pu_e; qv[~qh] <= 1'b1; end
+      end
+      if (QDC && pu_wr && !restart) begin
+        if (!qv[qh]) qe[qh] <= pu_e;
+        else qe[~qh] <= pu_e;
       end
 
       if (restart) begin
@@ -386,6 +427,9 @@ module m3_tilegen_fetch #(
             mapx_q <= su_xlo[8:0] + off_n;
             my    <= ly + rreg[24:16];
             pmask <= ll[1] ? mask32[15:0] : mask32[31:16];
+            ms_q  <= pmask_n[xs_su];
+            xg_q  <= su_xlo > su_xhi;
+            mn_q  <= pmask_n[xs_su - 4'd1];
             odd   <= ll[0];
             is4   <= pri[4 + ll];
 `ifdef TG_FAULT_PRIO
@@ -404,7 +448,7 @@ module m3_tilegen_fetch #(
           // in the next; a fetched pattern goes into the queue in its acknowledge cycle. So a tile costs
           // three clocks plus the memory's latency, and a tile already held costs two.
           S_CHUNK: begin
-            if (x > xhi) begin
+            if (x_gt) begin
               if (slot == 3'd7) st <= S_DRAIN;
               else begin slot <= slot + 3'd1; st <= S_SLOT; end
             end else begin
@@ -412,6 +456,8 @@ module m3_tilegen_fetch #(
               cn   <= n_ch;
               csrc <= srcx;
               x    <= x + {6'd0, n_ch};
+              if (x_cross) begin ms_q <= mn_q; mn_q <= pmask[xs - 4'd2]; end
+              xg_q <= ch_end;        // (the range's end limits the chunk, so x + n_ch is at most xhi + 1)
               mapx_q <= mapx_q + {5'd0, n_ch};
               if (ch_en) begin
                 // the row buffer is read at {ll, srcx[8:5]} this clock (nra), so a held name is in nbuf in S_PATA
