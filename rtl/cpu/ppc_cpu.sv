@@ -43,6 +43,11 @@ module ppc_cpu
   parameter logic [31:0] PVR2     = PVR,              // read while pvr_alt is high (ppc_core)
   parameter bit          BTB      = 1'b1,             // the core's BTB and the I-cache's pre-read port (D-30)
   parameter bit          FETCH2   = 1'b0,             // two-word fetch (D-30; off by default, D-36)
+`ifdef M3_DIRN
+  parameter int          DIRN     = `M3_DIRN,         // the direction table's counters (ppc_core DIRN)
+`else
+  parameter int          DIRN     = 0,
+`endif
   parameter bit          LA       = 1'b1,             // the 603e's CR look-ahead (D-30)
   parameter bit          SNOOP    = 1'b1,             // the data cache's snoop port (D-41)
   parameter bit          LU2      = 1'b1,             // load-use 2: the D-cache's early word into the core (ppc_core LU2)
@@ -159,7 +164,7 @@ module ppc_cpu
   logic [19:0] d_xpa;
   logic [3:0]  d_xwimg;
 
-  ppc_core #(.RPE (RPE), .RPX (RPX), .F1S (F1S), .F1C (F1C), .RESET_PC (RESET_PC), .PVR (PVR), .PVR2 (PVR2), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA), .LU2 (LU2), .FAST (FAST), .EWL (EWL)) u_core (
+  ppc_core #(.DIRN (DIRN), .RPE (RPE), .RPX (RPX), .F1S (F1S), .F1C (F1C), .RESET_PC (RESET_PC), .PVR (PVR), .PVR2 (PVR2), .BTB (BTB), .FETCH2 (FETCH2), .LA (LA), .LU2 (LU2), .FAST (FAST), .EWL (EWL)) u_core (
     .clk (clk), .rst (rst), .pvr_alt (pvr_alt),
     .i_req (i_req), .i_addr (i_addr), .i_wimg (i_wimg), .i_seq (i_seq), .i_valid (i_valid), .i_data (i_data),
     .i_way (i_way), .i_arr (i_arr), .i_pa (i_pa), .i_pv (i_pv), .i_pidx (i_pidx), .i_pway (i_pway), .i_ppa (i_ppa),

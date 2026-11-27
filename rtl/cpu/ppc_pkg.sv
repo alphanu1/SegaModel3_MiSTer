@@ -166,6 +166,8 @@ package ppc_pkg;
     // (a bclr / bcctr resolved taken without a BTB target cannot be), for
     // EX's check
     logic       lar;
+    // set by the core: the direction table's entry read with the word (ppc_core DIRN), for the update in EX
+    logic [1:0] dv;
     // the first uop's GPR result is rA, not rD (logical, shift and rotate
     // ops, update stores): ID's own rd for the early compares without the
     // decoder in front (ppc_core.sv, id_rdf)
@@ -178,6 +180,6 @@ package ppc_pkg;
     // fields for the GPR file's read addresses (ppc_fetchq r_rf)
     logic [2:0] sh;          // rA, rB, rS is a TGPR shadow: MSR[TGPR] and the field < 4
   } pd_t;
-  localparam int PDW = 77;                             // (alu_op_t is 6 bits)
+  localparam int PDW = 79;                             // (alu_op_t is 6 bits)
 
 endpackage
