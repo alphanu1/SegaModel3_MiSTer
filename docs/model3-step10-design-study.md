@@ -21400,4 +21400,4 @@ reads it; the HDMI anchors; the inputs' crossing left direct until it failed hol
 *Board (2026-11-27):* st11_s2 (RBF f4052cd0, main 812a6b4 + this patch, dual, 140 MHz, seed 2). Calibration on
 Auto: SDRAM1 6 1 37 21, SDRAM2 12 1 23 19. VF3, Scud Race and Sega Rally 2 good. Daytona 2 felt to slow down less
 than on dirn140_s3, only at one corner and in multi-car collisions; the patch changes no cycle, so that is placement or
-the run, not a measured gain.
+the run, not a measured gain. Daytona 2's course-guide attract right; the OSD, steering, pedals and buttons right.
