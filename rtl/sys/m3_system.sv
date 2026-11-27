@@ -629,7 +629,7 @@ module m3_system
   // ===========================================================================
   // the bus and its devices
   // ===========================================================================
-  logic        s_req, s_swap, s_zero, s_ack, s_wnext, s_rvalid, s_idle;
+  logic        s_req, s_swap, s_zero, s_ack, s_wnext, s_rvalid;
   logic        s_x, sp_ack, sp_rvalid, xc_ack, xc_rvalid;     // R170: a read of a bank in the extra memory, to m3_xcrom
   logic [31:0] sp_rdata, xc_rdata;
   logic        s_w2, sp_wnext, w2_ack, w2_wnext, w2_rvalid;   // W2: a work-RAM transaction, to the second SDRAM (m3_sdr2)
@@ -739,8 +739,17 @@ module m3_system
     .d_v(dh_v), .d_addr(dh_addr), .d_wdata(dh_data), .d_take(dh_take));
 
   // sys140: the first SDRAM's read-capture calibration (SDR_CAL), on the bus's port while the loader waits (the game
-  // is in reset until the downloads are in, so the bus asks nothing of it)
-  logic        k_req;
+  // is in reset until the downloads are in, so the bus asks nothing of it). area-sys: with W2 one engine calibrates
+  // both SDRAMs, the second first (on m3_sdr2's port, after its probe), then the first; each SDRAM's port also takes
+  // the other's transactions while it is idle (the engine's PARTNER: R203's cross traffic). 128 ms more before the
+  // first download; about 200 ALM less than a calibrator each.
+  localparam int NCAL = W2 ? 2 : 1;
+  logic [NCAL-1:0]       k_req, k_dn, k_ack, k_wnext, k_rvalid, k_idle, k_set, k_start;
+  logic [NCAL-1:0][31:0] k_rdata;
+  logic [NCAL-1:0][4:0]  k_osd;
+  logic [NCAL-1:0][5:0]  k_off, k_last, k_flags;
+  logic [NCAL-1:0][6:0]  k_width;
+  logic        k_busy, k_pb, k_skip2, w2_go, w2_idle;
   logic [1:0]  k_cmd;
   logic [AW:0] k_sa;
   logic [3:0]  k_be, k_wbe;
@@ -748,22 +757,52 @@ module m3_system
   logic [6:0]  cal1_width, cal2_width;
   logic [5:0]  cal1_last, cal2_last;
   logic [5:0]  cal1_flags, cal2_flags;
-  m3_sdr_cal #(.AW(AW), .EN(SDR_CAL), .BASE(27'h000_0000), .TWO_CHIPS(DUAL)) u_cal1 (
-    .clk, .rst(!mem_rst_n), .start(mem_ready), .done(k_done),
+  logic        sp_idle;
+  assign k_ack[0] = sp_ack; assign k_wnext[0] = sp_wnext; assign k_rvalid[0] = sp_rvalid; assign k_rdata[0] = sp_rdata;
+  assign k_idle[0] = sp_idle; assign k_osd[0] = cap1_osd; assign k_set[0] = cap1_settled; assign k_start[0] = mem_ready;
+  generate if (W2) begin : g_k2
+    assign k_ack[NCAL-1] = w2_ack; assign k_wnext[NCAL-1] = w2_wnext; assign k_rvalid[NCAL-1] = w2_rvalid;
+    assign k_rdata[NCAL-1] = w2_rdata; assign k_idle[NCAL-1] = w2_idle; assign k_osd[NCAL-1] = cap2_osd;
+    assign k_set[NCAL-1] = cap2_settled; assign k_start[NCAL-1] = w2_go;
+  end endgenerate
+  m3_sdr_cal #(.AW(AW), .EN(SDR_CAL), .NS(NCAL), .BASE(27'h000_0000), .TWO_CHIPS(DUAL),
+               .BASE_B(SDR_RAM ^ 27'h010_0000), .TWO_B(1'b0)) u_cal (   // B: m3_sdr2's lines (1 MiB past its probe's words)
+    .clk, .rst(!mem_rst_n), .start(k_start), .skip_b(k_skip2), .done(k_dn), .busy(k_busy), .s_pb(k_pb),
     .s_req(k_req), .s_cmd(k_cmd), .s_sa(k_sa), .s_be(k_be), .s_wdata(k_wdata), .s_wbe(k_wbe),
-    .s_ack(sp_ack), .s_wnext(sp_wnext), .s_rvalid(sp_rvalid), .s_rdata(sp_rdata),
-    .osd(cap1_osd), .off(cap1_off), .settled(cap1_settled), .c_width(cal1_width), .c_centre(),
-    .c_last(cal1_last), .c_off(), .c_flags(cal1_flags), .pass_map());
+    .s_ack(k_ack), .s_wnext(k_wnext), .s_rvalid(k_rvalid), .s_rdata(k_rdata), .s_idle(k_idle),
+    .osd(k_osd), .off(k_off), .settled(k_set), .c_width(k_width), .c_centre(),
+    .c_last(k_last), .c_off(), .c_flags(k_flags), .pass_map());
+  assign k_done = k_dn[0];
+  assign cap1_off = k_off[0]; assign cal1_width = k_width[0]; assign cal1_last = k_last[0]; assign cal1_flags = k_flags[0];
   // the SDRAM may take traffic: up (m2_sdram ready) and calibrated (one meaning: usable; mem_ready stays the
   // controller's own)
   assign       sdr1_usable = mem_ready && k_done;
-  wire         k_cal = SDR_CAL && !k_done;
+  // area-sys: while the engine owns the ports (k_busy: until the last SDRAM, the first, is done, so k_cal is k_busy)
+  // its transaction goes to both SDRAMs' ports through one select here, each port its own request
+  wire         k_cal = SDR_CAL && k_busy;
+  wire  [1:0]  b_cmd   = k_cal ? k_cmd : s_cmd;
+  wire  [AW:0] b_sa    = k_cal ? k_sa : s_sa;
+  wire         b_swap  = !k_cal && s_swap, b_zero = !k_cal && s_zero;
+  wire  [3:0]  b_be    = k_cal ? k_be : s_be;
+  wire  [31:0] b_wdata = k_cal ? k_wdata : s_wdata;
+  wire  [3:0]  b_wbe   = k_cal ? k_wbe : s_wbe;
+  // the partner copies kept out of anything in use (k_pb: the second SDRAM is the one under calibration). On the
+  // first SDRAM the second's lines (0x6500000-0x653FFFF) and scratch lines (0x61xxxxx, the fixed CROM's place) all
+  // land at 0x6500000-0x653FFFF with bit 22 set: the work-RAM hole the dual build leaves there. On the second SDRAM the
+  // first's lines and scratch lines (bit 22 set, which with SDR_RAM's top bits would be the work RAM's first 256 KiB)
+  // land at 0x6000000-0x603FFFF with bit 22 clear, below the work RAM, where the old calibrator wrote nothing either
+  // (a VF3 boot on the system bench reads that RAM before it writes it: R206). The engine's own lines are untouched
+  wire         b_x22a  = b_sa[22] | (k_cal && k_pb);
+  wire         b_x22b  = b_sa[22] & !(k_cal && !k_pb);
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (mem_rst_n && SDR_CAL && (k_busy != !k_done)) $fatal(1, "m3_system: the engine busy past the first SDRAM's done");
+`endif
   m3_sdr_port #(.AW(AW), .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .RA(SDR_RA), .RA_TOP(SDR_VRAM), .RA_CONF(SDR_RA_CONF), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ), .PW_DLY(SDR_PW_DLY)) u_sport (
     .clk, .rst(!mem_rst_n), .ra_clr(rst),
-    .s_req(k_cal ? k_req : (s_req && !s_x && !s_w2)), .s_cmd(k_cal ? k_cmd : s_cmd), .s_sa(k_cal ? k_sa : s_sa),
-    .s_swap(!k_cal && s_swap), .s_zero(!k_cal && s_zero), .s_be(k_cal ? k_be : s_be), .s_wdata(k_cal ? k_wdata : s_wdata),
-    .s_wbe(k_cal ? k_wbe : s_wbe), .s_ack(sp_ack), .s_wnext(sp_wnext), .s_rvalid(sp_rvalid),
-    .s_rdata(sp_rdata), .s_idle,
+    .s_req(k_cal ? k_req[0] : (s_req && !s_x && !s_w2)), .s_cmd(b_cmd), .s_sa({b_sa[AW:23], b_x22a, b_sa[21:0]}),
+    .s_swap(b_swap), .s_zero(b_zero), .s_be(b_be), .s_wdata(b_wdata),
+    .s_wbe(b_wbe), .s_ack(sp_ack), .s_wnext(sp_wnext), .s_rvalid(sp_rvalid),
+    .s_rdata(sp_rdata), .s_idle(sp_idle),
     .p_req(p_req[0]), .p_we(p_we[0]), .p_addr(p_addr[0]), .p_din(p_din[0]), .p_be(p_be[0]), .p_long(p_long[0]),
 `ifdef M3_R3B
     .p_dout(p_dout[0]), .p_lo(p_lo[0]), .p_ack(p_ack[0]), .wb_col, .wb_din(sp_wbd), .wb_be(sp_wbb));
@@ -782,19 +821,25 @@ module m3_system
   generate if (W2) begin : g_w2
     logic sd2_ok_q;
     m3_sdr2 #(.AW(AW), .CLK_MHZ(CLK_MHZ), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .T_RCD(T_RCD_C), .T_RP(T_RCD_C),
-              .CAPCLK(SDR_CAPCLK), .CAPPIPE(SDR_CAPPIPE), .OPIPE(SDR_OPIPE), .CAPX(SDR2_CAPX), .CAL(SDR_CAL), .PROBE_SA(SDR_RAM),
+              .CAPCLK(SDR_CAPCLK), .CAPPIPE(SDR_CAPPIPE), .OPIPE(SDR_OPIPE), .CAPX(SDR2_CAPX), .CAL(SDR_CAL), .XCAL(1'b1), .CPROBE(1'b0), .PROBE_SA(SDR_RAM),
               .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ),
               .PW_DLY(SDR_PW_DLY), .BXOR(SDR_BXOR), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdr2 (
       .clk, .clk_cap(clk_cap2), .mem_rst_n, .ra_clr(rst), .en(sd2_en), .ok(sd2_ok_q), .missing(sd2_missing), .info_req(sd2_info_req),
-      .cal_osd(cap2_osd), .cal_off(cap2_off), .cal_settled(cap2_settled), .cal_width(cal2_width), .cal_last(cal2_last),
-      .cal_flags(cal2_flags),
+      .cal_osd(cap2_osd), .cal_off(), .cal_settled(cap2_settled), .cal_width(), .cal_last(), .cal_flags(),
+      // area-sys: the shared engine (its B side); its transactions come on s_* (b_*), with SDR_RAM's top bits as the
+      // bus's (its own lines have them; the A run's partner copies, which this port also takes, land at 0x6000000 on,
+      // below the work RAM: b_x22b)
+      .x_go(w2_go), .x_skip(k_skip2), .x_done(k_dn[NCAL-1]), .x_none(k_flags[NCAL-1][0]), .s_idle(w2_idle),
       // (area130 A) the bus sends only work RAM here (m3_bus: s_w2 is its decode's first case): word form,
       // never a zero read, at SDR_RAM + the low 23 bits, so bits AW:24 are SDR_RAM's; tied as constants
-      .s_req(s_req && s_w2), .s_cmd, .s_sa({SDR_RAM[AW:24], s_sa[23:0]}), .s_swap(1'b0), .s_zero(1'b0), .s_be, .s_wdata, .s_wbe,
+      .s_req(k_cal ? k_req[NCAL-1] : (s_req && s_w2)), .s_cmd(b_cmd), .s_sa({SDR_RAM[AW:24], b_sa[23], b_x22b, b_sa[21:0]}), .s_swap(1'b0),
+      .s_zero(1'b0), .s_be(b_be), .s_wdata(b_wdata), .s_wbe(b_wbe),
       .s_ack(w2_ack), .s_wnext(w2_wnext), .s_rvalid(w2_rvalid), .s_rdata(w2_rdata),
       .rd_lat_sel(sd2_rd_lat_sel), .sd_cs_n(sd2_cs_n), .sd_ras_n(sd2_ras_n), .sd_cas_n(sd2_cas_n), .sd_we_n(sd2_we_n),
       .sd_ba(sd2_ba), .sd_a(sd2_a), .sd_dq_o(sd2_dq_o), .sd_dq_oe(sd2_dq_oe), .sd_dq_i(sd2_dq_i));
     assign sd2_ok = sd2_ok_q;
+    assign cap2_off = k_off[NCAL-1]; assign cal2_width = k_width[NCAL-1]; assign cal2_last = k_last[NCAL-1];
+    assign cal2_flags = k_flags[NCAL-1];
 `ifdef VERILATOR
     always_ff @(posedge clk)
       if (!rst && s_req && s_w2 && (s_swap || s_zero || s_sa[AW:24] != SDR_RAM[AW:24]))
@@ -803,6 +848,7 @@ module m3_system
   end else begin : g_now2
     assign sd2_ok = 1'b1; assign sd2_missing = 1'b0; assign sd2_info_req = 1'b0;
     assign cap2_off = 6'd0; assign cal2_width = '0; assign cal2_last = '0; assign cal2_flags = '0;
+    assign w2_go = 1'b0; assign k_skip2 = 1'b0; assign w2_idle = 1'b1;
     assign w2_ack = 1'b0; assign w2_wnext = 1'b0; assign w2_rvalid = 1'b0; assign w2_rdata = '0;
     // the pins as d130 held them: deselected (NOP), DQ not driven
     assign {sd2_cs_n, sd2_ras_n, sd2_cas_n, sd2_we_n} = 4'b1111;
@@ -1479,7 +1525,7 @@ module m3_system
   assign led = !rst;
 
   /* verilator lint_off UNUSEDSIGNAL */
-  wire _unused = &{1'b0, tg_ready, tg_ovr, s_idle, scsi_busy, r3d_cfg1, x_d[9], y_d[9], n_cull_lo, n_cull_hi, n_poly,
+  wire _unused = &{1'b0, tg_ready, tg_ovr, scsi_busy, r3d_cfg1, x_d[9], y_d[9], n_cull_lo, n_cull_hi, n_poly,
                     n_tex_skip, p_lo[5:3], p_lo[1:0], d_wacc[3], d_wacc[0], d_rvalid[2], d_rvalid[5], fb_late[15:8],
                     d_wacc[6], d_rvalid[6], cfg_flags[7], crom_map, fixed8, sec_key};
   /* verilator lint_on UNUSEDSIGNAL */
