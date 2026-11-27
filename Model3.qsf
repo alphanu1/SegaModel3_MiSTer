@@ -392,3 +392,4 @@ set_instance_assignment -name GLOBAL_SIGNAL "GLOBAL CLOCK" -to "emu:emu|pll:pll|
 set_instance_assignment -name MAX_FANOUT 16 -to "emu:emu|m3_system:sys3|tg_go"
 # sys140: m3_xmem's own reset copy, duplicated
 set_instance_assignment -name MAX_FANOUT 64 -to "emu:emu|m3_system:sys3|rst_xm"
+set_global_assignment -name VERILOG_MACRO "M3_DIRN=1024"

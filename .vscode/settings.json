@@ -27,6 +27,21 @@
   //                           (M3SND_DIR): MIDI writes and audio. Measurement only.
   //   sm3-builds/arcsnd   ppriest's MiSTer Arcade Sound Server, the base for the
   //                           Model 3 sound board on the HPS (D-51).
+  //   sm3-builds/cpi2/tree    worktree of this repository for the CPI items 1 and 2
+  //                           (D-60). Build worktree.
+  //   sm3-builds/c125/tree    worktree: main with CPI items 1 and 2 at 125 MHz. Build worktree.
+  //   sm3-builds/cpi3/tree    worktree: main with CPI items 1 and 2, full MMU replay, at 120 MHz. Build worktree.
+  //   sm3-builds/tclose2/tree worktree: main with the timing closure outside the CPU, at 130 MHz. Build worktree.
+  //   sm3-builds/tclose3/tree worktree: main with timing closure round 1 and CPI items 1 and 2, at 120 MHz. Build worktree.
+  //   sm3-builds/snd/tree     worktree: timing round 2 (b10) for the FPGA sound board pricing (D-62). Build worktree.
+  //   sm3-builds/snd2/tree    worktree: the FPGA sound board wired for the second SDRAM (D-63). Build worktree.
+  //   sm3-builds/area3/tree   worktree: b10 with the audio filter off, for the zero-cycle area pass (D-63). Build worktree.
+  //   sm3-builds/split/tree   worktree: b10 with the audio filter off, the Step 1.x / 2.x RBF split measured (D-64). Build worktree.
+  //   sm3-builds/csplit2/tree worktree: b10 with the clock split, CPU 120 MHz, the rest 130, SDRAM CL 3 (D-52). Build worktree.
+  //   sm3-builds/rpefix2/tree worktree: b10 with the early refetch (RPE) fixed for a page-crossing misaligned access (D-69). Build worktree.
+  //   sm3-builds/c125130/tree worktree: b4 with the clock split, CPU 125 MHz from a second PLL, the rest 130; single and dual SDRAM (D-69). Build worktree.
+  //   sm3-builds/r3dspeed/tree worktree: c125130 (125 MHz everywhere) with the Real3D speed work. Build worktree.
+  //   sm3-builds/ddio/tree    worktree: c125130 with the SDRAM clocks from DDIO output registers and SU_PAIR, 125 / 130 MHz. Build worktree.
   //   tools/sloppc603-ref     SloPPC603, a GPL-2.0+ 603e core under review.
   //   tools/ddr3test-ref      Robert Peip's MiSTerDDR3Test, read for its DDR3 reader.
   //   tools/*-ref             read-only reference clones of other cores.
@@ -35,6 +50,7 @@
   // Listed explicitly as well as excluded from the scan, so opening a file in
   // one of them does not bring its repository back into Source Control.
   "git.ignoredRepositories": [
+    "sm3-builds/memtest256",
     "sm3-builds/mame289-m3",
     "sm3-builds/mame289-r3d",
     "sm3-builds/supermodel",
@@ -47,6 +63,20 @@
     "sm3-builds/supermodel-sb",
     "sm3-builds/supermodel-snd",
     "sm3-builds/arcsnd",
+    "sm3-builds/cpi2/tree",
+    "sm3-builds/c125/tree",
+    "sm3-builds/cpi3/tree",
+    "sm3-builds/tclose2/tree",
+    "sm3-builds/tclose3/tree",
+    "sm3-builds/snd/tree",
+    "sm3-builds/snd2/tree",
+    "sm3-builds/area3/tree",
+    "sm3-builds/split/tree",
+    "sm3-builds/csplit2/tree",
+    "sm3-builds/rpefix2/tree",
+    "sm3-builds/c125130/tree",
+    "sm3-builds/r3dspeed/tree",
+    "sm3-builds/ddio/tree",
     "tools/sloppc603-ref",
     "tools/ddr3test-ref"
   ],

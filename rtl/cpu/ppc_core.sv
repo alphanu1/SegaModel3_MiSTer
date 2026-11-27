@@ -197,6 +197,12 @@ module ppc_core
   // stays on the double unit while FPSCR[UE] = 1, decided in ID (and while an FPSCR instruction is in EX, whose
   // write as it leaves would be after ID's look). 0: every conversion on the double unit, as before
   parameter int CVL = 4,
+  // DIRN (study R208; D-30 as amended): a table of DIRN two-bit counters (a power of two; 0: none), indexed by the
+  // branch's address, that says when a conditional bc goes against the static rule. An entry counts how often the
+  // branch disagreed with the rule (0 ... 3, up on a disagreement, down on an agreement); fetch predicts against
+  // the rule while it is 2 or 3. A table of zeros is the static rule. Timing only: EX resolves every branch as
+  // before, and the look-ahead still overrides the prediction where it resolves the branch. One-word fetch only
+  parameter int DIRN = 0,
   // DS (cpu140, dfront): the double unit's issue spacing (ppc_fpu_fast rule 8): a double-unit op in EX waits DS - 1
   // cycles behind another (fp_wait, dbk_q). 2: the unit's S4a / S4b share one adder pair; 3: its iterative front
   // (ppc_fpu_fma IT); 0: an op every cycle
@@ -807,8 +813,10 @@ module ppc_core
     la_f = {r, d};
   endfunction
   wire  [1:0]  la1 = LA ? la_f(i_data, la_crb, la_ctb, cr_q, ctr1_q) : 2'b00;
+  logic [1:0]  dt_fq;                                  // the direction table's entry for the word arriving (DIRN)
+  wire         pw_dir   = (i_data[15] ^ pw_bo[0]) ^ (DIRN != 0 && dt_fq[1]);
   wire         pw_spred = (pw_op == 6'd18) ||
-                          (pw_op == 6'd16 && ((pw_bo[4] && pw_bo[2]) || (i_data[15] ^ pw_bo[0])));
+                          (pw_op == 6'd16 && ((pw_bo[4] && pw_bo[2]) || pw_dir));
   wire         pw_pred = la1[1] ? (pw_op == 6'd16 && la1[0]) : pw_spred;
   wire  [31:0] pw_tgt  = (i_data[1] ? 32'd0 : f_rsp_pc) + pw_disp;
   // a word the BTB already redirected for (bq_out) makes no soft redirect of
@@ -1271,7 +1279,7 @@ module ppc_core
   // the key bits go with each word (pd_t's bslot, bpp, bsq)
   pd_t pd_w1, pd_w2f;
   always_comb begin
-    pd_w1 = pd_w;   pd_w1.bslot  = 1'b0; pd_w1.bpp  = FETCH2 && rq_pp_q; pd_w1.bsq  = rq_sq_q; pd_w1.lar  = la1[1] && (pw_op == 6'd16 || !la1[0] || (bq_out && !bt_slot && bt_preg));
+    pd_w1 = pd_w;   pd_w1.bslot  = 1'b0; pd_w1.bpp  = FETCH2 && rq_pp_q; pd_w1.bsq  = rq_sq_q; pd_w1.lar  = la1[1] && (pw_op == 6'd16 || !la1[0] || (bq_out && !bt_slot && bt_preg)); pd_w1.dv = dt_fq;
     pd_w2f = pd_w2; pd_w2f.bslot = 1'b1; pd_w2f.bpp = FETCH2 && rq_pp_q; pd_w2f.bsq = rq_sq_q; pd_w2f.lar = la2[1] && (pw2_op == 6'd16 || !la2[0] || (bq_out && bt_slot && bt_preg));
   end
   ppc_fetchq #(.PDW (PDW), .F2 (FETCH2)) u_q (
@@ -5396,5 +5404,34 @@ module ppc_core
   assign rt_fw_idx  = fw_idx;
   assign rt_fw_val  = fw_dat;
   assign rt_dly     = wb_dly;
+
+  // ------------------------------------------------------------ direction table (DIRN)
+  // One M10K, read as a request goes out (its entry is there with the word). The entry travels with the word
+  // through the queue (pd_t's dv) to EX, where a resolved bc updates it. The update is registered: the outcome
+  // into one flip-flop, the write a cycle later.
+  generate
+    if (DIRN != 0) begin : g_dir
+      localparam int DB = $clog2(DIRN);
+      (* ramstyle = "M10K, no_rw_check" *) logic [1:0] dt_f [0:DIRN-1];
+      logic [1:0]    dt_uq, dd_old, dd_new;
+      logic          dd_v, dd_dis;
+      logic [DB-1:0] dd_a;
+      wire           ex_cbc = ex_u.op == OP_BRANCH && ex_u.bkind == BR_BC && !(ex_u.bo[4] && ex_u.bo[2]);
+      always_comb
+        if (dd_dis) dd_new = dd_old == 2'd3 ? 2'd3 : dd_old + 2'd1;
+        else        dd_new = dd_old == 2'd0 ? 2'd0 : dd_old - 2'd1;
+      always_ff @(posedge clk) begin
+        if (f_issue)  dt_fq <= dt_f[fetch_pc[2 +: DB]];
+        if (!ex_hold) dt_uq <= q_pd.dv;
+        dd_v   <= !rst && ex_adv && ex_cbc && !ex_xcm;
+        dd_a   <= ex_u.pc[2 +: DB];
+        dd_old <= dt_uq;
+        dd_dis <= br_taken != (ex_bd[31] ^ ex_u.bo[0]);
+        if (dd_v) dt_f[dd_a] <= dd_new;
+      end
+    end else begin : g_nodir
+      assign dt_fq = 2'd0;
+    end
+  endgenerate
 
 endmodule

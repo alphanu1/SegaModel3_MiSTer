@@ -1,5 +1,31 @@
 # Handoff
 
+## Update (2026-11-27, evening): where everything is
+
+`main` takes branch `dirn`: the branch-direction table (D-90, R209) on, `M3_DIRN=1024` in the qsf. One M10K, +91
+ALM; -3.36% of Daytona 2's race frame and -3.21% of Sega Rally 2's start line on the replay bench, results unchanged.
+Board test dirn140_s3 (RBF 37541dd3, dual, 140 MHz, hold +0.066 ns, setup -4.03 / -3.89 ns): Daytona 2 about the
+same as all1 and its course-guide attract right; Sega Rally 2 no start-line slowdown, one or two in the race, mostly
+through water; Scud Race the same; VF3 good. Calibration SDRAM1 6 1 35 20, SDRAM2 7 1 36 22 (SDRAM2's window 13
+steps wider than on c5_s2's boot). Not a release (D-87).
+
+The study now carries R201 (the CPU kit), R203 (the calibration margin) and R206 (one calibration engine), which went
+into `main` with all1 and calib-shared without their entries, each with its board result.
+
+| Work | Where | State |
+|---|---|---|
+| Everything above | `main` | board-tested |
+| CPU rebuilt for 140 (D-89, R208 draft) | sm3-builds/cpu-fable (NOTES §6-12, proto/ipipe6-9) | integer pipeline with way prediction (route B: 91-92% of loads hit the MRU way) fits 153-160 MHz alone, hold positive; the in-chip probe of v9 running; then the I-cache front end |
+| Real3D area, second pass (R207 draft) | sm3-builds/area-r3d2, patches/area-r3d2-R4-dba80c1.patch | -270 to -400 chip ALM, 0 frame cycles, 0 pixels wrong; DSP 87 -> 106 of 112 pushes 11-12 blocks to the far columns and makes them the Real3D's worst path; packing lone small multipliers two to a block proposed, not built |
+| CPU / Real3D area, first passes (R204, R205 drafts) | sm3-builds/area-cpu, area-r3d | zc2 and A2 on hold |
+| 8-stage single FPU (R202 draft) | sm3-builds/sfpu | bench-proven; +3.75% / +3.44% cycles, needs rebasing |
+| TLB misses made cheaper (D-88) | not started | after the CPU rebuild's current steps |
+| M3_R3EMPTY, M3_R3PF | in `main`, switched off | need area |
+
+Open from the board: Sega Rally 2's slowdowns going through water, Real3D or CPU, to be measured on replay frames
+captured there.
+
+
 ## Update (2026-11-27): where everything is
 
 `main` takes branch `all1` (one board test, all1_s2, RBF c26b7cad, dual, 140 MHz): the CPU kit (conversions on their

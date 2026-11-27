@@ -1140,9 +1140,13 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-81 | (2026-11-26) 140 MHz is the goal, with timing closed at every corner and the course-guide attract right. Area and slack are to be found even where a block has to be rewritten: the CPU core (11,869 ALM by entity in tc130's base_s2), the geometry (7,049) and the rasteriser (7,371) are the big blocks and the worst paths. Rewrites keep full behaviour (D-58) and cost no game speed at 140 in seconds (D-50's rule); an added cycle is priced on the replay bench's race frames. The SDRAM may run on its own clock at 120 MHz if the crossing pays (CAS timing at 140 has no phase that suits both reads and writes on my dual board, D-79). **Same day, on the board:** the contributor's single-SDRAM Daytona 2 core at 140 MHz (CI run 45706511056, setup -4.80 / -4.54 ns, first SDRAM at 2902 ps, second module idle) runs on my dual board with the course-guide attract correct, Daytona 2's track 1 mostly at full speed and Sega Rally 2's track 1 at full speed with no slowdowns. Its logic is further from closure than my 135 MHz builds were, so my 135 failure (D-79) is most likely the dual-SDRAM interface, not logic margin. |
 | D-82 | (2026-11-26) The FPU is redesigned for 140 MHz at today's latencies (single 6, double 12), not deepened: adding stages (single 8 / double 16) makes the whole 140 design about 1.3% slower than 130 today on the race and start-line frames, which D-50 refuses (R196 draft). The new design does the wide shifts in DSPs as multiplies by 2^k, anticipates the leading-zero count beside the add and splits near and far paths, aiming at about 165-170 MHz standalone (the chip costs the FPU about 1.9 ns). Every result stays bit-identical to the 603e manual and IEEE-754 as today's unit gives them (rounding, FPSCR flags, NaN, infinities, denormals, fres / frsqrte), proven against MPFR, the CPU benches and the replay frames. The single-precision unit is prototyped first; it decides whether 140 pays. **Same day, after an independent review (sm3-builds/review140/):** the 9-stage result was the prototype's partition and its 167 MHz constraint (a near/far design with small-step LUT shifts fits 7-8 stages at about 162-164 MHz); most of the FPU stage price is my core's FP scheduling, so a cycle kit comes first: conversions (frsp, fctiw, fctiwz) on their own short port, the FP load word forwarded, fcmpu released from waiting on every FP result, the double unit taking a bypassed operand, and a one-slot FP store buffer (model: -6.3% / -7.3% of the race / start-line frame at today's latencies). With the kit, 140 pays at every FPU depth measured (single 8 / double 16 / conversions 5: about -6.3% / -6.8% in seconds against 130 today). The first proof is the conversion port on today's pipeline. |
 | D-83 | (2026-11-26) The SDRAM read capture is calibrated automatically at power-up: each controller sweeps its own capture clock (R198's capture-clock design, through the PLL's dynamic-phase port) over the whole period against harsh test patterns, before any ROM is loaded, and sets the centre of the widest passing window; the OSD keeps Auto plus manual overrides. Users load and play; nobody tunes phases. On my dual board at 140 MHz (`t5_s1`) the first SDRAM's capture needs +3 steps (149 ps each): 0 sticks at the white screen, +1 and +2 boot with missing or flashing polygons, so marginal reads pass simple tests and the calibration must find the window's edges with stress patterns. |
-| D-84 | (2026-11-26) No pull request is coming from the contributor (github.com/bonna79, issue 2). I pick the changes I want from their fork and bring them into my tree myself, each behind its own macro, proven on my benches and board-tested before it is turned on, and credit them in the main README. Their commits do not enter my history (CLAUDE.md rules 1-2); the review of their fork is sm3-builds/fork-review/NOTES.md. |
+| D-84 | (2026-11-26) No pull request is coming from the contributor (github.com/bonna79, issue 2). I pick the changes I want from their fork and bring them into my tree myself, each behind its own macro, proven on my benches and board-tested before it is turned on, and credit them in the main README. Their commits do not enter my history (my authorship rules); the review of their fork is sm3-builds/fork-review/NOTES.md. |
 | D-85 | (2026-11-26) From the contributor's fork I take, each behind its own macro and off until board-tested: the Real3D DMA moves written straight into the host port (M3_DMADIR), the late start at a missed flip (M3_R3LATE, after a check that CPU frames do not turn into slow motion), the display-list walker's read-ahead (M3_R3PF, after their board results), dropping triangles that cover no pixel (M3_R3EMPTY, after my geometry census shows it exact on VF3, Scud Race and Daytona 2), the sound bridge watchdog at 186 ms (WD_BITS 13, not their 743 ms, which breaks R166's restart guarantee) and the m3_cputest pin fix. Not taken: the 4-way 128-entry data TLB (DT4) does not follow the 603e manual's TLB rules (tlbld ignores SRR1[WAY]; a tlbld outside a miss handler writes a stale way), so it is documented and skipped for now (D-58), although it is worth about -6% on Daytona 2's race; the 8-entry data micro-TLB (-0.6% for about +250 ALM); the next-line I-cache prefetch (slower on both boards); the 384-sample play delay (adds latency); the chip-select hash BXC (no use on the dual board); removing analog VGA (edits sys/). |
 | D-86 | (2026-11-26) An exception to D-57: the double unit's iterative front (R129's form, built as df4 in sm3-builds/dfront, draft R200: one double op every 3 cycles, latency 12, bit-exact) goes in although it costs cycles (+0.01% Daytona 2 race / +0.27% SR2 start line against the conversion port alone), because it pays the conversion port's area and the two together are -2.05% / -3.35% against main at 130. The rule stays for every other area change; a cycle cost is accepted only where it is part of a net gain like this one and is measured on the replay frames. |
+| D-87 | (2026-11-27) No release with negative slack, at any corner; that is not relaxed. Added cycles are allowed wherever the net is a gain in seconds on the race and start-line frames (D-50), and are measured, not assumed. With every cycle-free route giving tenths of a nanosecond against the CPU's 3.5-4.6 ns (R194, R196, R201, R202), area is freed first, across every block, to give the fitter room and to pay for the stages closure needs. |
+| D-88 | (2026-11-27) Daytona 2's TLB cost (the miss handlers take about 6.8% of the race's cycles, about 3,800 misses a frame at about 58 clocks each, R192) is attacked only by making each miss cheaper on the 603e's own TLB: the 64-entry 2-way data TLB, the software miss handler, tlbld writing the way SRR1[WAY] names, all as the manual has them; what is cut is our clocks per miss (exception entry, the handler's fetches, tlbld, rfi). A bigger TLB (the contributor's DT4) and a hidden victim TLB are both rejected: the first breaks the manual's tlbld rules, the second changes how many miss exceptions software sees. |
+| D-89 | (2026-11-27) The CPU is rebuilt for 140 MHz with timing closed in the full chip (draft R208, sm3-builds/cpu-fable): registered holds, forwarding decided at predecode, speculative special registers restored on a flush, a three-stage load, a store buffer, R202's single FP unit. 100 MHz (where today's core closes) is not fast enough; the bar is a closed 140 MHz core made as fast as it can be, every added cycle measured. The branch-direction table that would pay for the extra fetch stages is measured first; putting it in needs a change to D-30. |
+| D-90 | (2026-11-27) D-30 changed: a dynamic branch-direction table (two-bit counters, 1,024 entries, one M10K) is allowed, if the replay bench confirms its gain. It never changes what a program computes; mispredictions are corrected as today, and every result, exception and register value stays as the 603e manual has it. Only branch timing differs from the 603e's static rule, and my core's timing does not match the 603e's anyway (about 3.2 clocks an instruction against its 1.7, different latencies, a different clock). |
 
 ### Open
 
@@ -20690,3 +20694,490 @@ the conversion port (440 ALMs, a cycle win).
 - Room still in the front, not built: T2's adder and its 110 registers go only if the sign of P - A is known before
   c5 (it is not, in the near case); the stopper's 162-way decode and the 162-bit select into R4 are shared with the
   divider's hand-over and stay as they are.
+
+**R201 — The cycle kit's items 1b, 1c and 1d on df4 (D-81, D-82 amended, D-86): the FP load's value
+forwarded (load-use 5 -> 3), fcmpu / fcmpo released from fs_idle, and the double unit taking a bypassed operand in its
+first EX cycle. Together -1.30% of Daytona 2's race frame and -1.54% of Sega Rally 2's start line against df4 at the
+bench's 130 MHz (1.0356 -> 1.0222, 0.7763 -> 0.7644 vblank), bit for bit against the ISS on every CPU bench with the
+scoreboard invariants on. 1b and 1d come out as modelled; 1c is worth a tenth of a point, far under its model, because
+1a had already taken most of the compares' wait. 1e (the FP store slot) is not built: by the stop rule, and it is
+still worth about 2% on both frames by the model run on this core's own traces. The three cost +364 ALUTs (map); in the
+full chip at 140 MHz that does not fit (4,202 of 4,191 LABs). 1b at load-use 4 instead (its last cycle, the WB word,
+was 235 of those ALUTs for -0.21 / -0.08 points) fits: -1.09% / -1.43% for +205 ALUTs (map of the whole), with hold positive on seed 3.**
+
+Work in `sm3-builds/kit/` (`snap/<tag>` each variant's rtl/cpu; `patches/` against cpu-kit c5d4783; `spk/` standalone
+fits and maps of ppc_cpu; `fits/` the full chip; `rep/` the replay bench and its itrace form; `model/` the
+FP model on my traces; `NOTES.md` with every step). Rests on D-48, D-50, D-57, D-58, D-81, D-82 (and its amendment),
+D-86; R196 (draft) §9-10, R200 (draft); review140's model. The 603e manual and PEM are the authority for the FPSCR's
+order and lfs's conversion. Desk and bench only: nothing on the board yet.
+
+*What I believed:*
+- review140's model, on 1bf55dd, % of the busy frame (race / start line): 1b -0.58 to -0.99 / -1.23 to -1.66 (load-use
+  4 to 3), 1c -1.51 / -0.18, 1d -0.35 / -0.55, 1e -3.0 / -3.6; their areas +100-250, +30-60, ~+100, +250-400 ALM.
+- That each item's gain would show on df4 about as the model gave it on 1bf55dd.
+
+*What I know now:*
+
+**1. The items as built** (all in ppc_core.sv; the FPU's files are df4's byte for byte, so its unit bench verdict is
+df4's):
+- 1b, FLF = 2. An FP load's word arrives in WB (c2 for a hit, the load in EX at c0) and the load write slot writes
+  the FPR at c3; its consumer read the file at c4 (load-use 5). Now the slot forwards into ID's capture (load-use 4;
+  ready from registers, WB's answer last in the hazard), and an FPU consumer (multiply-add port, divider, small unit)
+  is let go while its load is in MEM and captures WB's word as it arrives, converted by bit replication (PEM D.6:
+  every lfs word but a denormal converts by wiring; lfd is its two words): load-use 3. Whether the captured word was
+  the load's (WB holds it, its word is here, not an lfs denormal) is registered (ex_flr); if not, EX waits and the
+  operand register is reloaded from the slot when the slot holds that FPR, as ID would have captured it. The slot's
+  FPR is its producer's by the WAW rule. Stores' data and mtfsf's frB stay on load-use 4.
+- 1c, FCR = 1. A compare leaves EX unless a divide is out or another compare's merge is more than a cycle away. Its
+  FPCC / VXSNAN / VXVC go in with the last older FPU result's flags in the cycle that result lands (exception bits
+  ORed: sticky bits commute and FX is set iff some exception bit goes 0 -> 1, either order; FPCC the compare's,
+  after the result's FPRF), or the next cycle if none is outstanding, which is where it went before. Results land in
+  issue order, nothing younger before the last older one: program order. fs_idle waits for the merge, so every
+  FPSCR reader and the precise-mode check see it; in precise mode nothing older is ever outstanding as a compare
+  leaves (every older FP op is held in MEM until its FPSCR update), so precise mode is unchanged.
+- 1d, DBY = 1. The double unit takes fa_x / fb_x / fc_x, the bypass select the other units read, so a bypassed op
+  routed to it issues in its first EX cycle (an early-forwarded one waits one cycle, not two); fo_res no longer goes
+  into the operand registers (fd_l). With df4's iterative front this is R1a's c0 input only.
+
+**2. Cycles** (replay bench, warm frames 2-4, busy vblank at the bench's 130 MHz):
+
+| variant (cumulative) | D2 race 4302 | SR2 start 5620 | step | model (review140, 1bf55dd) |
+|---|---|---|---|---|
+| df4 | 1.0356 | 0.7763 | | |
+| 1b at load-use 4 (FLF = 1) | 1.0295 (-0.60%) | 0.7697 (-0.85%) | | -0.58 / -1.23 |
+| 1b at load-use 3 (FLF = 2) | 1.0273 (-0.81%) | 0.7694 (-0.90%) | -0.81 / -0.90 | -0.99 / -1.66 |
+| + 1c | 1.0262 (-0.91%) | 0.7687 (-0.99%) | -0.11 / -0.09 | -1.51 / -0.18 (in its kit: -0.67 / -0.17) |
+| + 1d | 1.0222 (-1.30%) | 0.7644 (-1.54%) | -0.39 / -0.55 | -0.35 / -0.55 |
+| 1b at load-use 4, 1c, 1d (k1e, the build that fits) | 1.0243 (-1.09%) | 0.7652 (-1.43%) | | |
+
+The race's Real3D word stream is df4's on every variant (md5 d05ddc05...); the start line's follows the CPU's timing.
+1c's wait was small on df4: the race's EX FP wait fell by 4,900 cycles a frame (0.2%), where the model's 1.5% was
+1bf55dd's, whose conversions sat on the 12-cycle double unit in front of the compares. The itrace on the kit's core
+says what is left behind compares: 0.19% / 0.09% of the frames, 0.02% with a divide out.
+
+**3. Proof.** test_cpu (200 seeds) and its profiles (--fpburst, --fpchain, --rdy 30), test_cpu_sub (ISB 0 and 1,
+--snoop 2), the D-cache unit bench, cpuext (--mis, --xpage, --alias, --loops, --dlat 1, --mis --intdrop 100, max wait
+1, --mis --rdy 30) and the 3,000 / 1,000-seed profiles (3,000 seeds each of --mis, --xpage, --mode 1 --xpage, --mode 2 --xpage --mis, --mis --intdrop 100, --mode 1
+--xpage --mis; 1,000 each of --fpburst, --fpchain, --rdy 30, --loops) all PASS on the cumulative k1d2, and the same
+benches but the long profiles' on k1e (load-use 4), with R104_CHECK on (the scoreboard and bypass
+invariants, which no bench script had defined; their ex_fbd check predated 1a's conversion port and is corrected)
+and new checks: a slot forward finds the slot holding its FPR; WB's predicted leave happens; a reload only under EX's
+hold; a WB-word capture equals u_lfs's conversion of the word; the slot's registered single-value bit equals the
+64-bit test; a compare leaves only with no other merge pending and no divide out, and writes FPCC; one FPSCR update a
+cycle. The step-1 guard is silent. Planted faults, each caught: FLF_PLANT (the slot's forward of f7 wrong in bit 0:
+the fast-route check, and FAIL against the ISS), FCR_PLANT (the merge a cycle early, so an older result's FPRF
+overwrites the compare's FPCC: FPSCR 320E4500 against the model's 320E8500 on seed 3). quartus_map --analyze_file of
+ppc_core clean; the bit replication and the one-hot of the highest set bit constant-folded in Quartus 17 as expected.
+
+**4. Area and timing.** quartus_map of the standalone ppc_cpu (deterministic), ALUTs / registers:
+
+| | ppc_cpu | step | review's estimate |
+|---|---|---|---|
+| df4 | 19,475 / 11,979 | | |
+| 1b, load-use 4 | 19,596 / 11,986 | +121 / +7 | |
+| 1b, load-use 3 | 19,831 / 12,012 | +235 / +26 more | +100-250 ALM for 1b |
+| + 1c | 19,858 / 12,022 | +27 / +10 | +30-60 ALM |
+| + 1d | 19,839 / 12,021 | -19 / -1 | ~+100 ALM |
+
+1d is free in area: fo_res no longer goes into the operand registers, which pays for the double unit's select.
+Standalone at 140 MHz (sub_spike, multicorner): k1d2 (all three, load-use 3) seeds 1 / 2 -3.333 / -3.350 and -3.236 /
+-3.635 ns (TNS -7,218 / -6,100 and -6,396 / -5,394), 14,021 / 13,958 ALM, hold +0.081 or more; against df4's three
+seeds -3.237 / -3.273 (TNS -6,995 / -5,784) the mean is 0.05 ns worse at 100 C and 0.22 worse at -40 C with TNS a
+little better; seed 2's -40 C worst is the D-cache's own r_a -> d_idle_q, 1d's new path (fx_a -> the iterative front's
+q1.esum) at -2.85. One seed each of 1b alone (k1b5) -3.178 / -3.545 and 1b + 1c (k1c2) -3.605 / -3.791. The first form
+of 1b was -3.750 / -3.943, its own paths at the top (fl_v into the stfs registers through the reload select, ID's late
+advance into ex_flr); both moved out, cycle for cycle the same. k1e (1b at load-use 4, 1c, 1d: the build that fits the chip) seeds 1 / 2
+-2.852 / -3.293 and -2.894 / -3.103 (TNS -7,037 / -5,947 and -6,948 / -5,868), 13,898 / 13,939 ALM, map 19,680 ALUTs
+(+205 on df4): the worst slack better than df4's mean at both corners, TNS the same at 100 C, 2% worse at -40 C.
+
+The full chip, cpu-kit c5d4783 + the kit at 140 MHz (dual, release, cpu-kit's qsf, seed 1):
+
+| fit | LABs | ALM | clk_sys setup s100 / s-40 | hold least s100 / s-40 / f100 / f-40 |
+|---|---|---|---|---|
+| cpukit_s1 (without the kit) | 4,191 / 4,191 | 41,456 | -3.789 / -4.013 | +0.105 / -0.014 / +0.127 / +0.088 |
+| + 1b (load-use 3), 1c, 1d | does not fit: 4,202 needed | | | |
+| + 1b (load-use 4), 1c, 1d | 4,191 / 4,191 | 41,355 | -4.052 / -4.085 | -0.542 / -0.422 / -0.284 / -0.286 |
+
+| ... seed 2 | 4,191 / 4,191 | 41,281 | -4.203 / -4.233 | -0.042 / -0.025 / -0.037 / -0.070 |
+| ... seed 3 | 4,190 / 4,191 | 41,354 | -4.698 / -4.770 | +0.161 / +0.113 / +0.119 / +0.080 |
+
+The negative holds of seeds 1 and 2 are hps_io registers into the system's own input and FPS registers, not the CPU;
+seed 3 is positive at every corner on every clock (least +0.051 at fast -40 C) and is the board-test build
+(`fits/kit1e_s3_1f1aac81.rbf`, md5 1f1aac811f00e969cf8e9106c176d095). Its worst setup is the texture cache's (-4.70),
+then the CPU core's (-4.58), so the chip at 140 is as far from closure as before; the board test is of behaviour.
+
+**5. What 1e is worth now.** review140's model on itraces of the kit's own core (conversions as their own class,
+load-use 3, compares free but for divides; it reproduces the base to within about 1% of the busy cycles): one store
+slot with a cycle lost per parked store -2.18% / -1.87%, no lost cycle -2.43% / -2.32%, two slots -2.22% / -1.96%, one
+slot with any later access waiting -0.07% / -0.14%. The FP stores' own ID wait is 2.73% / 2.96% of the frames (the
+race's mostly fdivs -> stfs, 1.80%). So 1e is about two thirds of its 1bf55dd figure and still the largest item, and
+only with later loads and stores passing the parked store; that means either answers out of request order at the core
+or a data-late store entry in ppc_dcache. Not started.
+
+*Wrong turns:* a first replay build without the bench's `tree` link; a WB-forward check that compared against the
+slot in EX's first cycle (wrong when EX or WB holds); 1b's first form put the slot's reload select in front of the stfs
+registers and ID's late advance into ex_flr (the standalone fit's two worst families, -3.75 and -2.95 ns; both moved
+out, cycle for cycle the same); I built 1d beside 1c before 1c's result was in, so the stop rule came after 1d had
+been measured; a proof chain and a fit chain started on snapshots I then fixed, stopped by process group and PID.
+
+*Left:*
+- 1e, as above: a design that keeps DSI precise (translate and check before the store parks), compares later accesses
+  against the parked store, keeps sync / eieio, snoops, cache operations, misaligned and cross-page stores and
+  interrupts right. About two days of work and its own proof round.
+- The race's 6,400 mcrfs a frame each take a cycle more than the FPSCR's settling needs (ex_fs2): about 0.28% of the
+  race, not priced on the bench.
+- Area: the chip at 140 has no room for load-use 3's 235 ALUTs; nothing in rtl/cpu was found to pay for it at zero
+  cycles in this round (a shared load-forward value saved 51 ALUTs but cost the race 0.04%: D-48, not taken).
+- The board: kit1e_s3's RBF, the course-guide attract (D2) and both race starts, against cpu-kit's own build.
+
+*Board (2026-11-27):* in main through branch all1 (all1_s2, RBF c26b7cad, dual, 140 MHz). VF3 solid 60; Daytona 2's
+course-guide attract right and 70-80% of track 1 at 60; Sega Rally 2 no start-line slowdown, one slowdown about
+halfway; Scud Race mostly 60, the bridge start line 30. Setup -4.25 / -4.11 ns: not a release (D-87).
+
+**R203 — The SDRAM read calibration's early edge is optimistic; the choice keeps a margin there** (2026-11-27; on
+main aa26365, R198's calibration).
+
+*What I believed (R198 sections 10-11):* the power-up calibration measures the read window the games will see, and
+its centre is the safest phase. *What the board shows* (combo7c_s1, the calibration as merged):
+
+| boot | SDRAM1 readout (applied, code, width, last) | window | VF3 |
+|---|---|---|---|
+| Auto | 3 0 37 21 | -15 .. +21 | runs |
+| manual -3 | 45 0 27 21 | -5 .. +21 | runs |
+| manual -6 | 42 0 37 21 | -15 .. +21 | locks up |
+
+SDRAM2 on Auto: 10 0 23 21, window -1 .. +21 (-15 .. +19 with R198's first patterns: the patterns that no longer
+repeat words found its early edge).
+
+- The OSD's mapping is right: field values 1, 2-15, 16-23 apply 0, +1 .. +14 and 40-47 (-8 .. -1), as the RTL's
+  `man()` gives and the bench reads back for all 24 entries; the board's readouts show 45 for -3 and 42 for -6.
+- So on one boot the test passed -15 .. -1 and VF3 locked at -6: the test is optimistic on SDRAM1's early side by
+  10-12 steps (the games' edge between -5 and -3). From boot to boot the early edge it sees moved 10 steps; the late
+  edge stayed at +21 on every boot and on both SDRAMs, so the late edge is the capture word's transfer into clk_sys,
+  not the SDRAMs' data.
+- The early edge is the data's arrival (tAC, the FPGA's input path), which slows as the parts warm and when outputs
+  switch together. combo_s2's VF3 running a minute at 1488 ps before locking looks like a drift with temperature; the
+  boots' order and temperature were not recorded, so that is the likely cause, not a measured one.
+
+*What changed in m3_sdr_cal:*
+- Hostile traffic: every line read follows a line write of another line's pattern to a scratch line in another bank
+  and 4 MiB on, so each read comes after a bus turnaround, and with both SDRAMs' calibrations running together the
+  other SDRAM writes during about half of each one's reads.
+- Four sweeps, their pass maps intersected; 16 read passes a step.
+- The choice is the middle (rounded up) of [first + 12, min(last, +14)], the early end kept above -8, not the
+  window's centre. The scan makes it: a second run counter counts the steps that passed with the 12 before them
+  passing and that lie in the band. Nothing left after the margin: offset 0 (code 2), then the verify pass.
+- The patterns' hash is one Feistel-like step (for area); words still unique, no equal neighbouring columns.
+- 128 ms a calibration (17.9 M clocks at 140 MHz), before the first download.
+
+*How the margins are chosen:*
+- Early side, 12 steps (1.79 ns): the gap on this board between the test's edge and the games' on one boot (10-12),
+  which also covers the 10-step move from boot to boot. It comes from conditions (temperature, simultaneous switching)
+  that belong to the design, the PCB and the parts' type, not to one part's speed, which the test measures; so it
+  should hold on other boards. One board is not proof.
+- Late side: the limit is STA's, not the board's: the band's top, +14, is where STA's slow 100 C corner still covers
+  the capture word's transfer into clk_sys (the transfer's slack before the band varies 1.87-2.35 ns from fit to fit,
+  +12.6 .. +15.8 steps); the board's +21 is that transfer at room temperature. The SDRAMs' own late edge has never been
+  seen.
+- On this board's readouts: SDRAM1 cold -15 .. +21 gives +6, warm -5 .. +21 gives +11; SDRAM2 -1 .. +21 gives +13. The
+  games have run at SDRAM1 -3 .. +8 and SDRAM2 at 10.
+
+*Proof (bench):* the device model now has an early edge that moves 0-10 steps from sweep to sweep (`--jit`) and one
+that comes 4 steps later within 30 clocks of a write (`--ta`); `--expect rule` replays the rule on the RTL's own pass
+map. On a -15 .. +21 window with the transfer at +22: the turnaround edge is seen only with the writes between reads
+(first -11; without them -15); the moving edge only with the sweeps intersected (first -7 / -6 /
+-5 over three seeds, against -15 / -12 / -6 with one sweep). 108 runs over board-like and synthetic windows, noise,
+narrow / none / all, lost steps: 0 failed; ten planted faults each fail some (no early margin 87, no late cap 63, no
+intersection 8, no hostile traffic 9, one turn of the scan 45, no compare 48, constant data 54, no verify 2, a manual
+offset one off 108, the run's end for its middle 63). The bench's slipping device had been wrong (between two windows it could
+hand back the expected beat); fixed, and no earlier result changed (the false runs were never the widest).
+
+*Fit* `r203_s1` (main aa26365 with this calibrator, dual, seed 1): 41,324 ALM, 4,191 / 4,191 LABs, 536 M10K; setup
+-4.407 / -4.320 ns, hold +0.078 at worst over every clock and corner, recovery +1.605, HDMI +0.030 / -0.028, the capture
+transfers clean with the band; the calibrators 205.8 + 201.6 ALM (R198's last, 202.8 + 198.3). The first try did not fit
+(4,201 LABs: the choice's arithmetic); the choice now comes from the scan. RBF md5 c582109ca0a82587945f6e371162a66d.
+Not yet on the board.
+
+*Left:* whether the hostile traffic moves SDRAM1's early edge on the board (the next readouts say); a cold-boot
+manual -6 timed until VF3 locks (temperature or not); the late side on the board (manual +12 .. +14 after a warm-up);
+a second board for the margin.
+
+*Board (2026-11-27):* in main through branch all1 (all1_s2). On Auto every game boots and runs; readouts SDRAM1
+6 1 36 20, SDRAM2 12 1 22 19.
+
+**R206 — The system side's area at 140 MHz (D-81, D-87): one calibration engine for both SDRAMs, and no start-up
+probe behind it, free about 250 ALMs needed by fitted entity (about 510 ALUTs, 250-300 registers) for no M10K and
+no game cycle; the price is 128 ms more before the first download (the two SDRAMs are calibrated one after the
+other, 256 ms in all), and R203's cross traffic is kept by having the SDRAM not under calibration take the same
+transactions. The chip total moves by the fitter's own noise (−128 and −211 ALM on the final tree's two seeds, −17
+and −68 on earlier steps of it, one of which did not fit at all at 4,194 LABs) and the slack does not improve: the
+fitter spreads the CPU and the rasteriser into the room. Nothing else on the system side
+gives more than a few tens of ALMs without a cycle, an M10K or a behaviour I keep, so the 700 asked of it are not
+there; the Step split (Step 1.x −592 ALM by map estimate, Step 2.x −225, on today's tree) is the one large item left,
+and it is mine to decide (D-64).**
+
+Work in `sm3-builds/area-sys/` (`base`: all1 415baac by `git archive`; `snap/c1`: the shared engine alone; `snap/c5`:
+the final tree; `split_tree`: all1 with R180's switches; `NOTES.md` every step, wrong turns included;
+`area-sys-all1.patch`, md5 8cef0d7c3e9a777a5c83c820572c9bd6, three files, which `patch -p1` takes on all1 and which
+gives `snap/c5`'s RTL exactly). Rests on §8.4, D-42, D-48, D-58, D-62 to D-66, D-81, D-83, D-87, R178, R180, R190,
+R198 and R203. The CPU and the Real3D are being reworked elsewhere and are not touched; sys/ stays stock but for the
+audio-filter patch. Nothing committed. On the board: c5_s2 only (below, *On the board*).
+
+*What I believed:*
+- The two calibrators could share one engine for about 200 ALM at about 12 ms of start-up (R198's note, from before
+  R203 made each calibration 128 ms).
+- R203's cross traffic (the other SDRAM writing during about half of each one's reads) needed both calibrations to
+  run at once.
+- After R110-R190 the system side still had several hundred ALMs of zero-cycle room spread over its blocks, and
+  freed ALMs would show in the fit's total and its slack.
+
+*What I know now:*
+
+**1. The census** (all1_s1's fit by entity, ALMs needed): of the about 6,300 ALM that are mine outside the CPU and
+the Real3D, the largest are the second SDRAM's block (785: controller 380, calibrator 206, port 146), the first
+SDRAM's controller (606), the tile generator (704, 56 M10K), the sound link (682, 135 M10K: 128 of them the DSP's
+two 32 K-word rings, D-55, every set's RBL), m3_bus (677), the first calibrator (209) and port (188), the 53C810
+(305), the security board (211), the inputs (215), the DDR3 arbiter, master and register stage (198 / 168 / 89),
+m3_xmem (200). hps_io (564), audio_out (447), ascal (2,121) and sys_top's own (637) are the framework's.
+
+**2. One engine** (`m3_sdr_cal`, NS 2). The module now takes NS, one or two SDRAMs; NS 1 is the old calibrator
+clock for clock (below). With NS 2 the engine calibrates the second SDRAM (port B, once m3_sdr2 says the module is
+there) and then the first (port A), each run the one-SDRAM run from its own start: the same lines, patterns, sweeps,
+hostile scratch writes, scan and verify pass, with that SDRAM's base and chip rule. The second SDRAM's results
+(width, last step, choice, flags: 25 registers) are kept once its run is over; the first's are the engine's own, as
+they were. Before the first's run the engine clears the scan's registers, as the reset left them for the old one (a
+run with no window sets neither end of it, so the first SDRAM's readout would have shown the second's last step),
+and waits for the first's port to be idle (a partner line write still taking beats would otherwise be counted as its
+first line's). The command fields are shared and each port has its own request;
+in m3_system one select puts the engine's transaction on both SDRAMs' ports while it owns them, so m3_sdr2's own
+select goes. The pass map became a shift register: a step's verdict is shifted in at the step's end (so after step
+47 the map is in place and bit 0 is the next step's old verdict, which the intersection needs), and the scan
+rotates it through two turns (the step under the scan is bit 0). That takes the 48-way write decode and the 48:1
+read select out, for the same map and the same clocks.
+
+R203's cross traffic is kept without two engines: every transaction the engine starts on the SDRAM it calibrates
+also goes to the other SDRAM's port when that port is up, idle (m3_sdr_port's s_idle) and has none of the engine's
+requests pending (PARTNER). Its read data is ignored and its write data is whatever s_wdata shows, so while one
+SDRAM's reads come in the other's bus is driven both ways at full rate, as when both ran their own loops. The order,
+the second SDRAM first, is what makes that safe: during its run the first SDRAM is still empty (the loader waits for
+it), and during the first's run the second is calibrated but nothing uses it (the game is held until the downloads
+are in). The partner copies are kept off anything in use: the engine says which SDRAM is under calibration (s_pb) and
+m3_system moves their bit 22, so on the first SDRAM they land at 0x6500000-0x653FFFF (the work-RAM hole the dual
+build leaves there) and on the second at 0x6000000-0x603FFFF, below the work RAM (the second's addresses keep
+SDR_RAM's top bits, so its DCHIP1 controller sees its second chip only). A missing second SDRAM is skipped and the
+first calibrates alone, as before.
+
+The cost is time: the first download now waits for both runs, 2 x 128 ms = 256 ms after the controllers are up
+(17.9 M clocks each at 140 MHz), where it waited 128 ms. On the system bench the game leaves reset 18,030,020 clocks
+(128.8 ms) later. No game cycle changes: the engine is idle once the downloads begin. While the second SDRAM is
+calibrated the first's offset stays 0 and its readout reads 0 (it showed the running values before).
+
+**3. No probe under the calibration** (`m3_sdr2` CPROBE 0). With the calibration on, the second SDRAM's start-up
+probe decided nothing: ok and missing were already the calibration's (no passing window is a missing module;
+SDRAM2_EN low is missing). It still ran, four words written through the controller's write port and read back twice,
+owning port 0 through a 26-bit address select and the request's OR, and the calibration waited for it. CPROBE 0
+drops it: the calibration starts when the controller is up, and the select, the gates and the controller's write
+port (nothing else on this SDRAM uses it) go at synthesis. A floating bus or an absent module still reads as missing:
+its words (FFFF from the pull-ups, or the last value driven) match no pattern, so no step passes. CPROBE 1, the
+default, is the old block.
+
+**4. Area.** By map (dual, release), all1 against the final tree: the calibrators 807 ALUT / 437 registers -> 371 /
+254, m3_sdr2's own -116 ALUT, its controller -35 / -28 (the write port), its port +29; the emu as a whole 52,536 ->
+52,023 ALUT (-513). The single-SDRAM build (NS 1) maps too: its calibrator 401 -> 307 ALUT. By fit (dual, 140 MHz,
+release; the bases are sys140's all1 fits):
+
+| | all1_s1 | c1_s1 (engine only) | all1_s2 | c4_s2 | c5_s2 (final) | c5_s1 (final) |
+|---|---|---|---|---|---|---|
+| ALMs needed, chip | 41,417 | 41,349 (−68) | 41,501 | 41,484 (−17) | 41,290 (−211) | 41,289 (−128) |
+| the calibration's blocks (calibrators + m3_sdr2) | 994.3 | 778.5 (−215.8) | 996.8 | 755.9 (−240.9) | 742.8 (−254.0) | 745.7 (−248.6) |
+| LABs | 4,191 / 4,191 | 4,190 | 4,191 / 4,191 | 4,191 | 4,191 | 4,190 |
+| setup s100 / sn40 | −4.096 / −4.059 | −4.263 / −4.414 | −4.253 / −4.107 | −4.401 / −4.144 | −4.125 / −4.206 | −4.293 / −4.271 |
+| setup f100 | +0.720 | +0.463 | +0.837 | −0.144 (TNS −0.2) | +0.551 | +0.760 |
+| hold, least s100 / sn40 / f100 / fn40 | −0.254 / −0.142 / −0.150 / −0.172 | +0.119 / +0.004 / +0.121 / +0.076 | +0.141 / +0.099 / +0.096 / +0.065 | +0.134 / +0.099 / +0.095 / +0.070 | +0.206 / +0.215 / +0.098 / +0.078 | −0.497 / −0.362 / −0.269 / −0.259 |
+| capture 1 / 2 setup s100 | −1.033 / −0.029 | −1.101 / −0.551 | −1.008 / −0.699 | −1.331 / −0.693 | −1.525 / −1.171 | −1.350 / +0.050 |
+| HDMI setup s100 | +0.059 | −0.788 | −0.031 | −0.863 | −0.399 | +0.187 |
+| M10K / DSP | 536 / 87 | 536 / 87 | 536 / 87 | 536 / 87 | 536 / 87 | 536 / 87 |
+
+c4_s1 (seed 1, c4: the final tree but for the last fix, three register clears) did not fit: 4,194 LABs of 4,191
+(ALMs needed 41,499, 757 unavailable in partly used LABs), with about 500 ALUTs fewer than all1_s1, which fitted the
+same seed. Where the fits succeeded, the CPU (+99.5 in c1_s1) or the rasteriser (+120.6 in c4_s2) grew with the same
+RTL: the qsf's physical synthesis (register duplication, retiming, LCELL insertion) and the fitter refill whatever room
+there is, so at 99% a few hundred ALMs move the total by its own noise (−17 to −211 here) and buy no setup slack; the
+worst setup is the CPU's in every fit. Hold is seed-dependent as in the bases: negative at every corner in all1_s1 and
+in c5_s1, its worst at fn40 a framework output on clk_hps (70 MHz) into a clk_sys register (all1_s1: hps_io's
+status[9] into m3_fps's avg_q; c5_s1: hps_io's paddle_0[0] into m3_system's pad0_q), positive in the other fits. The
+SDRAM pins' timing is the base's to a few ps in every fit; the capture clocks' internal
+setup is 0.3-0.5 ns worse than both bases' in my fits, cause unknown (the fits keep no database).
+
+**5. The proof.**
+- *NS 1 is the old calibrator.* sys140's calibration bench (tb_cal: m3_sdr_port on m2_sdram with the board's options,
+  and a device whose reads are right only inside a window of capture phases, with slipping, a moving early edge,
+  turnaround and lost stepper steps), R203's 108 runs (board-like windows with fixed answers, the rule replayed on the
+  RTL's own pass map, noise 1-20%, three seeds): every output line identical to the old module's, the done clock
+  included, 0 failed (`logs/sw_old.log`, `sw_new1.log`, and on the final engine `sw_new5.log`).
+- *NS 2* (`bench/cal2_tb.sv`, `tb_cal2.cpp`: the engine on two ports and two controllers as the core has them, the
+  second DCHIP1 with its address forced and the partner copies moved as m3_system does, two devices each with its
+  own random stream; the side under test takes tb_cal's checks, the other has an SDRAM2-like window checked by the
+  rule). The second SDRAM, which runs first: in all 108 runs its line is identical to the one-SDRAM bench's built with
+  its base and chip rule, map, choice, flags, phase, word counts and all (`logs/sw_oldb.log`, `sw_dual_b.log`); the
+  nine `--ta` runs fail in both alike (8 below), and with `--ta-any` it chooses +8 as wanted (36 runs, 0 failed). The
+  first SDRAM, which runs second: 0 failed, and in all 108 runs its line is the one-SDRAM bench's but for the word
+  counters, which also count the partner reads its device served during the second's run (`sw_dual5_a.log`); with
+  PARTNER off, 99 lines identical word counts and all and the nine `--ta` runs identical but for a few in 680,000
+  wrong words (the refresh falls elsewhere against the turnaround window, the run being later), maps and choices
+  identical (`sw_dual5np_a.log`). The other side right by the rule in every run. (This sweep found the first-run
+  state the engine carried into the first SDRAM's run, below.)
+- *Planted faults.* R203's ten on the NS 1 bench, 108 runs each, fail exactly as many runs as in R203: no early
+  margin 87, no late cap 63, no intersection 8, no hostile traffic 9, one turn of the scan 45, no compare 48, constant
+  data 54, no verify 2, the manual offsets one off 108, the run's end for its middle 63. On the new mechanisms (the NS 2
+  bench, seed 1's 36 runs): the scan reading the rotating map's bit 1, 36 of 36; the second SDRAM's choice not kept,
+  21 (those whose choice is not 0); its applied offset taken from the first's choice after the first's run, 33 (30 on
+  the first's side, through the other side's check); the compare on the other port's data, 15 and 15; the first SDRAM
+  first, every run (the second never done; stopped after 5). Two plants fail nothing: the partner without the idle
+  check and the first's run without the quiet-port wait. Both guards are defensive (a request held while the port is
+  busy is taken later with whatever fields show then, still partner traffic; the partner's last transaction was over
+  by the hand-over in every run); they cost a few LUTs and keep the hand-over from resting on timing.
+- *m3_sdr2 whole* (sys140's sdr2 bench: work RAM only, 200,000 transactions x 6, the missing-module plants, CL 3, a
+  data fault), with its own engine (XCAL 0): with CAL 0, logs byte-identical to all1's, pin hashes and clock counts
+  included. With CAL 1, all1 passes its six data runs (ready after the calibration, 16,678,296 clocks), and the
+  three missing-module plants and CL 3 read as missing through the calibration; with CPROBE 0 the same, the six
+  data runs with all1's transaction counts, ready 113 clocks sooner (the probe's time), the probe's four words never
+  written (the bench told `--noprobe`; without it the bench's own check that the probe wrote them fails, as it should).
+- *The system bench* (VF3 from reset, the board's options, the calibration on; all1 60 frames, the new trees 68): c1
+  and c4 give the same trace, access for access (1,131,939, `--exact`), with the boot 18,030,020 clocks later than
+  all1's (rom_loaded 36,320,628 against 18,290,608: one calibration, 128.8 ms at 140 MHz). Against all1's own run,
+  265,835 of 276,406 CPU accesses agree in order and six regions differ from the game's first IRQ-state read on (0x41
+  in all1, 0x03 here): the game leaves reset 7.41 frames later, at another point of the video frame (0.515 of a frame
+  in all1, 0.924 here), so its polls run another way. With all1's download held back by a bench option (tb_m3_system
+  `--dl-at`, bench only) so that its game leaves reset at 36,318,690, 1,938 clocks before the new tree's, all1 gives
+  the new tree's clocks and record count to the record (199,338,730 / 1,131,939) and every region of its accesses in
+  order but one IRQ-state poll in frame 20 (0x01 against 0x0D, 211 / 210 reads of the system registers: the 1,938
+  clocks); every write region, the Real3D's, the I/O's, the tile generator's and the backup RAM's, agrees.
+- *Rule 12:* analyze_file of the three changed files, 0 errors; the new idioms constant-folded by Quartus 17
+  (`cf/cf_top.sv`): RB'(REPS - 1), the loop's 1'(k), the scan position's wrap, the pass map's shift-in and rotation,
+  both partner address moves, man(23), the pass counter's wrap: every value as intended. No new index can pass an
+  array's end. The single-SDRAM build (NS 1) elaborates and maps: its calibrator 401 -> 307 ALUT.
+
+**6. The Step split on today's tree** (R180's switches ported; maps, dual, release):
+
+| map | ALM estimate | ALUT | registers | block bits | DSP |
+|---|---|---|---|---|---|
+| neither (all1's map exactly) | 41,256 | 52,536 | 44,434 | 3,743,032 | 87 |
+| Step 1.x | 40,664 (−592) | 51,813 (−723) | 43,967 (−467) | 3,732,792 (−10,240) | 86 |
+| Step 2.x | 41,031 (−225) | 52,285 (−251) | 44,379 (−55) | 3,743,032 | 87 |
+
+By entity, Step 1.x: the 315-5881 −225 ALUT / −160 registers, m3_bus −223 / −23, the Real3D DMA front end −128 /
+−46, m3_sec −126 / −123, m3_xcrom −59 / −68; Step 2.x: the SCRIPTS −121 / −48, r3d_texup's one-word port −90,
+m3_bus −36. About R180's 569 and 178 by fitted entity.
+
+**7. What is left, priced (desk: read from the RTL and all1_s1's fit, not built):**
+
+| candidate | ALM | M10K | what it costs |
+|---|---|---|---|
+| the MLABs into M10K: m3_xmem's ring (40), m3_xcrom's two queues (40), the two ports' write buffers (40), m3_bus's R3P buffer (30), the 53C810's FIFO (20), m3_ddr3p's read queue (10) | about −180 | +9 to +10 | each is read asynchronously in the clock after its word is written; an M10K reads a registered address, so each wants a clock on its first word or a bypass as wide as the word (64 bits for the ring), which eats the saving; the ports' write buffers are read at the controller's column, which comes from m2_sdram in the same clock |
+| m3_avl_reg's skid slot (109 registers and a 109-bit select) | about −60 | 0 | DDRAM_BUSY back into m3_ddr3p's take: the −2.5 to −2.9 ns paths R198 removed |
+| the calibration readout's BCD (m3_fps) a digit a clock | about −10 | 0 | the readout lags its value a few clocks, once a second |
+| m3_sdr2's missing-module message timer (29 bits) from m3_system's second tick | about −12 | 0 | the message every 4 s instead of 3.8 s |
+| the CROM bank map (16 x 6 registers and its 16:1 select) in an MLAB | about −20 | 0 | the loader writes its sixteen entries in turn |
+| the loader's FIFO 256 deep, address and data in one word | 0 | −1 | ioctl_wait paces the HPS differently (no game cycle) |
+| m3_jtag's device file narrowed from 97 bits to 80 | 0 | −1 | a rework of the chain's word layout |
+| MISTER_SMALL_VBUF (a framework option, not an edit) | a few | 0 | ascal's frame buffer 1 MB a frame |
+| the sound DSP's rings out of M10K (D-63's option A) | (−472 in R176, with the FPGA sound board) | −128 | ring traffic on the second SDRAM beside the CPU's work RAM (D-48, D-66) |
+
+**8. Found on the way:**
+- The calibrators' own paths fail at 140 MHz, before and after: in all1_s1 152 / 130 endpoints (s100 / sn40), worst
+  −2.871 / −3.086 (u_cal1's beat compare, pq -> bad through the pattern generator); all1_s2 122 / 89; c1_s1 63 / 53,
+  worst −2.864 (the last-line test into the step's clear). Start-up logic, so D-87 lets it take stages for nothing
+  in game time; the compare can be pipelined clock-for-clock (register the beat and the expected word, compare a
+  clock later, and let C_NEXT take bad or the pending mismatch). Not done here.
+- tb_cal's turnaround model (`--ta`) counts only writes to chip 0 (`!sd_cs_n`). The second SDRAM's calibration lines
+  are all on chip 1, so on it the turnaround case never fires: the one-SDRAM bench built for the second SDRAM fails
+  R203's nine `--ta` runs with the old RTL as with the new (chosen +6, wanted +8). A bench limit. tb_cal2 has
+  `--ta-any` (either chip): then the second SDRAM chooses +8 as wanted.
+- A system-bench comparison across a later start is not exact: VF3's first read of the IRQ state lands at another
+  point of the video frame and its polls run another way. sys140's t6cal (0.91 M clocks later) agreed by the luck of
+  its phase; this one needed all1 started at the same clock to show it.
+- Hold, seed-dependent in the bases as in my fits: the worst at fn40 is a framework output on clk_hps (70 MHz) into a
+  clk_sys register (hps_io's status[9] into m3_fps's avg_q in all1_s1, its paddle_0[0] into m3_system's pad0_q in
+  c5_s1). Those crossings are timed as synchronous (one VCO) and quasi-static; a closure item for the system side.
+
+**Wrong turns:** the shared engine first carried the second SDRAM's scan state (the window's ends, bend and bend2)
+into the first's run, where the old one started from reset: a first SDRAM with no window would have shown the
+second's last step on the readout; R203's sweep on the first SDRAM found it (39 of 108 runs differed in the centre,
+every one an `out` run), and c5 clears it. The first engine let the second SDRAM's partner copies of the first's scratch lines land in the work
+RAM's first 256 KiB (bit 22 set under SDR_RAM's top bits); moved below the work RAM (c4), though it was not what made
+the trace differ (c1 and c4 give the same trace to the record). My first copy of R203's constant-data fault took only
+one of its two edits (every line the hash) and passed all 108 runs; the hash alone sees every slip. tb_sdr2_eq checks
+that the probe's words were written, so with CPROBE 0 its six data runs failed until it was told (`--noprobe`). Two
+rule-12 analyze_file runs overlapped my c1 fit for a minute, and three of my sims ran together for a few minutes once.
+
+*On the board* (c5_s2, fits/c5_s2_74034a73.rbf, my dual board, 2026-11-27): the games work. The readouts (applied
+offset, code, width, last) are SDRAM1 6 1 36 20 and SDRAM2 12 1 23 19, each R203's rule on its own window: SDRAM1
+first −15, early end −3, late end +14 (clamped), middle +6, as all1 showed with two engines (6 1 36 20); SDRAM2 first
+−3, early end +9, late end +14, middle +12. A first reading of SDRAM1's as 2 1 30 20 would have broken the rule;
+it was a misreading, and nothing was changed for it.
+
+*Left:* the Step split (D-64: mine to decide); the calibrator's own failing paths; whether the 256 ms start-up matters
+(it is before the first download); more board boots of the shared calibration, cold and warm, to see whether the
+partner copies move the first SDRAM's early edge as two engines did (one boot so far matches all1's).
+
+*Board (2026-11-27):* in main through branch calib-shared (c5_s2, RBF 74034a73): every game runs on Auto, readouts
+SDRAM1 6 1 36 20, SDRAM2 12 1 23 19. A second boot, on dirn140_s3 (R209): SDRAM1 6 1 35 20, SDRAM2 7 1 36 22.
+SDRAM2's window was 13 steps wider on that boot and its choice moved from +12 to +7; SDRAM1 is unchanged.
+
+**R209 — The branch-direction table (D-90) in today's core: -3.36% of Daytona 2's race frame and -3.21% of Sega
+Rally 2's start line for one M10K, results unchanged, and on the board no change I can see** (2026-11-27; main
+a7ff0b1 plus ppc_core's DIRN, macro M3_DIRN=1024; work in sm3-builds/cpu-fable, NOTES §6).
+
+*What it is.* One M10K of 1,024 two-bit entries, read at fetch_pc[11:2] as the fetch request goes out, so the entry
+arrives with the word. An entry counts how often that branch went against the 603e's static rule (up on a
+disagreement, down on an agreement). A conditional bc predicts the rule's direction, reversed while its entry is 2 or
+3; a table of zeros is the static rule exactly. The entry rides with the word through the queue (pd_t's dv, PDW 77 ->
+79) into EX; as a conditional bc leaves EX its outcome against the rule goes into one flip-flop and the entry is
+written a cycle later. The look-ahead still overrides the prediction where it resolves a branch at fetch, the BTB's
+check uses the same predicted bit, and EX resolves every branch as before. b, bclr and bcctr are untouched. DIRN = 0
+(the default) gives frame rows identical to main.
+
+*Cycles* (replay bench, warm frames 2-4):
+
+| run | Daytona 2 race 4302 | Sega Rally 2 start 5620 |
+|---|---|---|
+| main, bench clock 130 | 1.0243 vblank | 0.7652 |
+| DIRN = 1024, bench clock 130 | 0.9991 / 1.9944 / 1.0046 | 0.7406 (-3.21%) |
+| main, bench clock 120 | 1.0339 | |
+| DIRN = 1024, bench clock 120 | 0.9992 (-3.36%) | |
+
+At 130 Daytona 2's frame drops inside one vblank, so the game's own pacing takes over and the three-frame mean means
+nothing; at 120 both builds are over a vblank in every frame and the comparison is clean. By cause (frame 2 at 130):
+Daytona 2's redirect cycles 43,634 -> 20,419 and fetch bubbles 237,488 -> 167,514; Sega Rally 2's 20,316 -> 3,769
+and 90,564 -> 40,043. Part of the gain goes back into polling: Daytona 2 retires about 21,000 more instructions a frame
+in its busy window while it waits for its DMA and the Real3D, and time that waits on hardware does not shrink. My
+counts before building said -4.26% / -3.74% (rigid) and -1.9% / -2.3% (scaled).
+
+*Proof that only timing moves.* ppc_core and ppc_cpu against the ISS with DIRN = 1024: test_cpu 200 seeds (652,445
+instructions), --loops 100, --fpchain 100, --rdy 30 100, test_cpu_sub ISB 0 200 seeds and ISB 1 100, all pass. A
+hostile predictor (every conditional bc's predicted direction flipped at random by an LFSR) passes test_cpu 200 seeds
+and --loops 200 seeds, so any table content is safe. Daytona 2's Real3D word stream hashes equal to main's on every
+frame.
+
+*Fits* (140 MHz, dual, release; +91 ALM, +1 M10K):
+
+| fit | ALM | LABs | M10K | system setup s100 / sn40 | least hold |
+|---|---|---|---|---|---|
+| mainb_s1 (a7ff0b1) | 41,289 | 4,190 | 536 | -4.293 / -4.271 | -0.497 |
+| dirn_s1 | 41,380 | 4,190 | 537 | -4.878 / -4.689 | -0.284 |
+| dirn140_s2 | 41,274 | 4,188 | 537 | -4.209 / -4.367 | -0.406 |
+| dirn140_s3 | 41,361 | 4,191 | 537 | -4.027 / -3.885 | +0.066 |
+
+The setup differences are inside the spread seeds of one tree show (R204: 0.7 ns). The table's own failing paths
+(EX's hold into the two flip-flops that take the entry from the queue head, -1.01 ns standalone; the outcome into its
+flip-flop, -0.59) are nowhere near the worst.
+
+*Board* (dirn140_s3, RBF 37541dd3, 2026-11-27): Daytona 2 about the same as all1 (little improvement on track 1),
+course-guide attract right; Sega Rally 2 no start-line slowdown, one or two slowdowns in the race, mostly going through
+water; Scud Race the same; VF3 good. Calibration SDRAM1 6 1 35 20, SDRAM2 7 1 36 22. About 3% of a frame is less than
+I can see on the board; the table is in main as a step toward the rebuilt CPU (D-89, R208 draft), whose extra fetch
+stages it pays for.
+
+*Left:* where Sega Rally 2's water slowdowns come from (the Real3D's translucent polygons or the CPU), on replay
+frames captured there; the table's two failing flip-flop paths go with the rebuilt front end.
