@@ -1147,6 +1147,7 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-88 | (2026-11-27) Daytona 2's TLB cost (the miss handlers take about 6.8% of the race's cycles, about 3,800 misses a frame at about 58 clocks each, R192) is attacked only by making each miss cheaper on the 603e's own TLB: the 64-entry 2-way data TLB, the software miss handler, tlbld writing the way SRR1[WAY] names, all as the manual has them; what is cut is our clocks per miss (exception entry, the handler's fetches, tlbld, rfi). A bigger TLB (the contributor's DT4) and a hidden victim TLB are both rejected: the first breaks the manual's tlbld rules, the second changes how many miss exceptions software sees. |
 | D-89 | (2026-11-27) The CPU is rebuilt for 140 MHz with timing closed in the full chip (draft R208, sm3-builds/cpu-fable): registered holds, forwarding decided at predecode, speculative special registers restored on a flush, a three-stage load, a store buffer, R202's single FP unit. 100 MHz (where today's core closes) is not fast enough; the bar is a closed 140 MHz core made as fast as it can be, every added cycle measured. The branch-direction table that would pay for the extra fetch stages is measured first; putting it in needs a change to D-30. |
 | D-90 | (2026-11-27) D-30 changed: a dynamic branch-direction table (two-bit counters, 1,024 entries, one M10K) is allowed, if the replay bench confirms its gain. It never changes what a program computes; mispredictions are corrected as today, and every result, exception and register value stays as the 603e manual has it. Only branch timing differs from the 603e's static rule, and my core's timing does not match the 603e's anyway (about 3.2 clocks an instruction against its 1.7, different latencies, a different clock). |
+| D-91 | (2026-11-27) One exception to running the games' ROMs unpatched: Le Mans 24's link-mode word (FFED8C4C, 1 = slave in the ROM) is set to 2 (satellite) by its MRA, because the core has no net board and a slave waits for its master there for ever (R211). It is data, not code, and stands for a setting a cabinet on its own gets from its link; Supermodel makes the same change. Supermodel's other Le Mans patch, a fix to the game's own code, is not taken: a cabinet ran with it. A net board in the core (Supermodel's SimNetBoard as the model) would remove this patch; not planned. |
 
 ### Open
 
@@ -21181,3 +21182,40 @@ stages it pays for.
 
 *Left:* where Sega Rally 2's water slowdowns come from (the Real3D's translucent polygons or the CPU), on replay
 frames captured there; the table's two failing flip-flop paths go with the rebuilt front end.
+
+**R211 — Le Mans 24 on the board: a black screen at 0 fps, the game waiting on the net board (its link mode in
+the ROM is slave); past it, a slow menu with no 3D, not yet found** (2026-11-27; MRA from MAME 0.289's ROM_START(lemans24), dirn140_s3).
+
+*What I saw:* the MRA (Scud Race's settings, banks 8-15 mirroring 0-7 as MAME's ROM_COPYs have it) gives a black
+screen and 0 fps on my board.
+
+*How it was found:* Supermodel (the bus-trace build, sm3-builds/supermodel-sys) run on lemans24 for 2,400 frames
+from a fresh NVRAM, twice. With Games.xml's two patches it starts the 3D at about frame 150 and draws (a 197 MB
+trace). Without them, from frame 313 to the end it runs one loop at PC F8BB8 reading C0010114, the net board's IO
+register 0x8A (a 10 GB trace, 400,000 reads in every 400,000-record sample). The word Supermodel patches, FFED8C4C,
+reads 1 in the ROM: slave, in Supermodel's notes (0 master, 1 slave, 2 satellite). A slave waits for its master
+over the link; the core has no net board (Step 1.5's C0 window is only the 53C810's when its BAR says so), so the
+game spins there as in Supermodel. The other patch, FFF3FE38, is an add r4,r4,r4 in a copy loop that Supermodel
+makes an addi r4,r4,4 ("an actual bug in the game's code").
+
+*What changed:* D-91. The MRA writer takes a set's patches by PowerPC address and writes MiSTer's
+`<patch offset>` into index 0; `pack` applies them, so the bench image is the board's. The link-mode word becomes
+2; the code is left as it is.
+
+*Wrong turn:* summarising the 10 GB trace with bustrace.py's whole-file loader took 21.9 GB and the OOM killer
+took the session (2026-11-27 17:50). A trace that size is sampled in chunks, under a memory cap.
+
+*The board with the patched MRA* (same core): past the wait; the menu runs very slowly with no 3D, 14 fps and
+then 0. A new fault, not the net board.
+
+*What the good Supermodel run shows to compare against* (the patched run's 197 MB trace, streamed): the boot ROM
+programs the 53C810 through PCI and uses it at C1000000 from frame 1, as Scud Race Plus (which runs); the tile
+generator from frame 102; the Real3D's DMA from frame 151 (cull_hi 3.1 M writes, texture FIFO 2.1 M, polygon RAM
+37,696); the CPU polls the Real3D status at 84000000 67,797 times (PC F8A6C, from frame 195); from frame 1,204 the
+CPU writes polygon RAM itself, 65,536 words (PC EF264), where the other games use DMA; one probe of C0000000 at
+frame 202 (written DEB00BED, read FFFFFFFF). Nothing it touches is outside what the other games use.
+
+*Left (paused 2026-11-27):* the system bench on lemans24 against that trace, to find the first difference (the
+status polls and the CPU's polygon RAM writes are the first suspects); the gear lever (the driving profile's flag
+bit 0, written in the MRA already, not yet in the core); the game's input test, which settles Supermodel's lever
+codes against MAME's four-speed bits.

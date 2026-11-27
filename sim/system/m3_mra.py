@@ -43,6 +43,12 @@ import xml.etree.ElementTree as ET
 P_GEN, P_DRIVE, P_GUN, P_FISH = 0, 1, 2, 3
 BTN_DRIVE = 'Coin,Start,Test,Service,VR1 Red,VR4 Green,Accel,Brake,Gear Up,Gear Down,VR2 Blue,VR3 Yellow'
 PROF_NAME = {P_GEN: 'generic', P_DRIVE: 'driving', P_GUN: 'analog guns', P_FISH: 'fishing'}
+# the driving profile's flags (configuration byte 21). 0: Model 3's four-speed H shifter, a state stepped by Gear
+# Up / Gear Down (Scud Race, Daytona 2, Sega Rally 2). DRV_LEVER: an up/down lever instead, port C reading
+# Supermodel's 0x50 low while Gear Up is held and 0x60 low while Gear Down is (Le Mans 24, Dirt Devils, ECA);
+# DRV_HARLEY with it, Harley-Davidson's wiring, 0x20 low up and 0x10 low down. A core that does not know a flag
+# ignores it and gives the H shifter, so an MRA written with the flag needs no change when the core learns it.
+DRV_LEVER, DRV_HARLEY = 0x01, 0x02
 
 # MAME 0.289 model3.cpp ROM_START(vf3), (name, ROM_LOAD64_WORD_SWAP offset)
 VF3 = {
@@ -202,8 +208,30 @@ SCUDPLUS = {
     'fixed': [('epr-20092a.17', 6), ('epr-20093a.18', 4), ('epr-20094a.19', 2), ('epr-20095a.20', 0)],
     'vrom': ['mpr-%d.%d' % (19672 + k, 26 + k) for k in range(16)],
 }
+# ROM_START(lemans24) (Step 1.5): Scud Race's layout, three CROMs (CROM3 unpopulated, 00 as MAME's region),
+# sixteen 2 MiB VROMs in IC order. MAME copies CROM0-2 into banks 8-13 (its three ROM_COPYs), so banks 8-15
+# mirror 0-7. The controls are Scud Race's but for the gears: an up/down lever (Supermodel's shiftupdown; MAME
+# gives it Scud Race's four-speed bits, and the game's input test is the judge). The ROM's link mode (the word at
+# FFED8C4C: 0 master, 1 slave, 2 satellite, Supermodel's notes) is 1: a slave waits for its master on the net
+# board, which this core does not have, and spins at F8BB8 reading C0010114 (Supermodel without its patch, study
+# R211). The MRA sets it to 2, a cabinet on its own (D-91): data, not code. Supermodel's second patch, a fix to
+# the game's own code at FFF3FE38, is not applied: a cabinet ran with it.
+LEMANS24 = {
+    'setname': 'lemans24', 'name': 'Le Mans 24 (Japan, Revision B)', 'year': '1997', 'zip': 'lemans24.zip',
+    'category': 'Driving', 'step': 0x15, 'crom_mirror': True, 'idle_in': [0xFF, 0xFF], 'prof': P_DRIVE,
+    'pflg': DRV_LEVER, 'buttons': BTN_DRIVE,
+    'patch': [(0xFFED8C4C, 0x00000002, 'link mode 2 (satellite) for 1 (slave): no net board (D-91)')],
+    'crom': [
+        [('mpr-19857.01', 6), ('mpr-19858.02', 4), ('mpr-19859.03', 2), ('mpr-19860.04', 0)],
+        [('mpr-19861.05', 6), ('mpr-19862.06', 4), ('mpr-19863.07', 2), ('mpr-19864.08', 0)],
+        [('mpr-19865.09', 6), ('mpr-19866.10', 4), ('mpr-19867.11', 2), ('mpr-19868.12', 0)],
+        None,
+    ],
+    'fixed': [('epr-19887b.17', 6), ('epr-19888b.18', 4), ('epr-19889b.19', 2), ('epr-19890b.20', 0)],
+    'vrom': ['mpr-%d.%d' % (19871 + k, 26 + k) for k in range(16)],
+}
 SETS = {'vf3': VF3, 'bassdx': BASSDX, 'daytona2': DAYTONA2, 'scuddxo': SCUDDXO, 'lostwsga': LOSTWSGA, 'srally2': SRALLY2,
-        'spikeofe': SPIKEOFE, 'scudplus': SCUDPLUS}
+        'spikeofe': SPIKEOFE, 'scudplus': SCUDPLUS, 'lemans24': LEMANS24}
 
 # game configuration (index 4) flags, m3_loader.sv
 CF_VROM_X, CF_FIXED8, CF_VROM64 = 1, 2, 4
@@ -246,6 +274,13 @@ class Zips:
             if name in z.namelist():
                 return z.read(name)
         raise KeyError(name)
+
+
+def ppc_image(a):
+    """A fixed-CROM PowerPC address (FFE00000-FFFFFFFF, word aligned) -> its offset in index 0's image (the
+    fixed CROM at SDRAM 0x6000000; the word form puts the PowerPC's 32-bit word at A in little-endian order)."""
+    assert 0xFFE00000 <= a <= 0xFFFFFFFC and a % 4 == 0
+    return 0x6000000 + (a - 0xFFE00000)
 
 
 def mra(args):
@@ -296,8 +331,14 @@ def mra(args):
         mirror = s.get('crom_mirror', False)
         cfg = [step, 0x00] + [b & 7 if mirror else b if b < 8 else 0x80 for b in range(16)] + s.get('idle_in', [0xFF, 0xFF]) \
               + [s.get('prof', P_GEN), s.get('pflg', 0)]
-        w('    <!-- game configuration: step %02X, flags 00, banks 0-7 %sin slots 0-7, idle ports C and D, input profile %02X (%s) -->'
-          % (step, 'and their mirror 8-15 ' if mirror else '', cfg[20], PROF_NAME[cfg[20]]))
+        pf = cfg[21]
+        pfs = ''
+        if pf and cfg[20] == P_DRIVE:
+            pfs = ', profile flags %02X (%s)' % (pf, 'up/down lever' + (', Harley wiring' if pf & DRV_HARLEY else ''))
+        elif pf:
+            pfs = ', profile flags %02X' % pf
+        w('    <!-- game configuration: step %02X, flags 00, banks 0-7 %sin slots 0-7, idle ports C and D, input profile %02X (%s)%s -->'
+          % (step, 'and their mirror 8-15 ' if mirror else '', cfg[20], PROF_NAME[cfg[20]], pfs))
         w('    <rom index="4" md5="none">')
         w('        <part>%s</part>' % ' '.join('%02X' % b for b in cfg))
         w('    </rom>')
@@ -325,6 +366,9 @@ def mra(args):
     w('        </interleave>')
     w('        <!-- 0x6200000  backup RAM, 128 KiB of 00 (Supermodel\'s fresh state; MAME fills FF) -->')
     w('        <part repeat="0x20000">00</part>')
+    for a, v, why in s.get('patch', []):
+        w('        <!-- %08X: %s -->' % (a, why))
+        w('        <patch offset="0x%07X">%s</patch>' % (ppc_image(a), ' '.join('%02X' % b for b in struct.pack('<I', v))))
     w('    </rom>')
     w('</misterromdescription>')
     with open(args.out, 'w') as f:
@@ -492,6 +536,10 @@ def pack_rom(rom, z):
                     if c:
                         blk[ob::width] = d[c - 1::k]
             out += blk
+        elif el.tag == 'patch':
+            o, d = int(el.get('offset'), 0), bytes.fromhex(el.text.strip())
+            assert o + len(d) <= len(out), 'patch past the image'
+            out[o:o + len(d)] = d
     return out
 
 

@@ -1,0 +1,107 @@
+<misterromdescription>
+    <!--
+      Sega Model 3 core for MiSTer FPGA - Copyright (C) 2026 alphanu1
+      SPDX-License-Identifier: GPL-3.0-or-later
+
+      Le Mans 24 (Japan, Revision B). Step 1.5 (study D-46): no sound. From MAME 0.289
+      model3.cpp ROM_START(lemans24); sim/system/m3_mra.py
+      writes it, and packs the same image for the system bench. Index 4, the
+      game configuration (rtl/sys/m3_loader.sv), gives the step and the input profile; the rest of it
+      is the Step 1.0 default but for CROM banks 8-15, which mirror 0-7, and
+      index 0 is laid out as VF3's.
+
+      SDRAM (bytes): 0x0000000 banked CROM, 64 MiB; 0x4000000 VROM, 32 MiB;
+      0x6000000 fixed CROM, 2 MiB; 0x6200000 backup RAM, 128 KiB of 00.
+      Word form: the PowerPC's 32-bit word at A is the little-endian word at
+      SDRAM A. The sound ROMs (68000 program, samples) are not loaded (D-8).
+    -->
+    <name>Le Mans 24 (Japan, Revision B)</name>
+    <setname>lemans24</setname>
+    <rbf>Model3</rbf>
+    <mameversion>0289</mameversion>
+    <year>1997</year>
+    <manufacturer>Sega</manufacturer>
+    <category>Driving</category>
+    <!-- the CPU board's DIP bank, 315-5649 port G (index 254); Reset & apply after a change -->
+    <switches default="7F">
+        <dip name="SW1 (debug)" bits="7" ids="On,Off"/>
+        <dip name="SW2" bits="6" ids="On,Off"/>
+        <dip name="SW3" bits="5" ids="On,Off"/>
+        <dip name="SW4" bits="4" ids="On,Off"/>
+        <dip name="SW5" bits="3" ids="On,Off"/>
+        <dip name="SW6" bits="2" ids="On,Off"/>
+        <dip name="SW7" bits="1" ids="On,Off"/>
+        <dip name="SW8" bits="0" ids="On,Off"/>
+    </switches>
+    <!-- the controls: input profile 01 (driving), rtl/io/m3_inputs.sv -->
+    <buttons names="Coin,Start,Test,Service,VR1 Red,VR4 Green,Accel,Brake,Gear Up,Gear Down,VR2 Blue,VR3 Yellow"/>
+
+    <!-- game configuration: step 15, flags 00, banks 0-7 and their mirror 8-15 in slots 0-7, idle ports C and D, input profile 01 (driving), profile flags 01 (up/down lever) -->
+    <rom index="4" md5="none">
+        <part>15 00 00 01 02 03 04 05 06 07 00 01 02 03 04 05 06 07 FF FF 01 01</part>
+    </rom>
+    <rom index="0" zip="lemans24.zip" md5="none">
+        <!-- 0x0000000  CROM0, 16 MiB (banks 0-1) -->
+        <interleave output="64">
+            <part name="mpr-19858.02" crc="993fa656" map="21000000"/>
+            <part name="mpr-19857.01" crc="82c9fcfc" map="00210000"/>
+            <part name="mpr-19860.04" crc="19a1ddc7" map="00002100"/>
+            <part name="mpr-19859.03" crc="15906869" map="00000021"/>
+        </interleave>
+        <!-- 0x1000000  CROM1, 16 MiB (banks 2-3) -->
+        <interleave output="64">
+            <part name="mpr-19862.06" crc="b0f69ae4" map="21000000"/>
+            <part name="mpr-19861.05" crc="6ddf21b3" map="00210000"/>
+            <part name="mpr-19864.08" crc="c7baab2b" map="00002100"/>
+            <part name="mpr-19863.07" crc="2b2619d0" map="00000021"/>
+        </interleave>
+        <!-- 0x2000000  CROM2, 16 MiB (banks 4-5) -->
+        <interleave output="64">
+            <part name="mpr-19866.10" crc="ede5fc78" map="21000000"/>
+            <part name="mpr-19865.09" crc="b2749d2b" map="00210000"/>
+            <part name="mpr-19868.12" crc="3c43d64f" map="00002100"/>
+            <part name="mpr-19867.11" crc="ae610fc5" map="00000021"/>
+        </interleave>
+        <!-- 0x3000000  CROM3, 16 MiB (banks 6-7) -->
+        <part repeat="0x1000000">00</part>
+        <!-- 0x4000000  VROM block 0, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19871.26" crc="5168e02b" map="00000021"/>
+            <part name="mpr-19872.27" crc="9e65fc06" map="00002100"/>
+            <part name="mpr-19873.28" crc="0b15d7ab" map="00210000"/>
+            <part name="mpr-19874.29" crc="6a28ec89" map="21000000"/>
+        </interleave>
+        <!-- 0x4800000  VROM block 1, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19875.30" crc="a03e1173" map="00000021"/>
+            <part name="mpr-19876.31" crc="c93bb036" map="00002100"/>
+            <part name="mpr-19877.32" crc="b1e3df56" map="00210000"/>
+            <part name="mpr-19878.33" crc="a2acc111" map="21000000"/>
+        </interleave>
+        <!-- 0x5000000  VROM block 2, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19879.34" crc="90c1553f" map="00000021"/>
+            <part name="mpr-19880.35" crc="42504e63" map="00002100"/>
+            <part name="mpr-19881.36" crc="d06985cf" map="00210000"/>
+            <part name="mpr-19882.37" crc="a86f2e2f" map="21000000"/>
+        </interleave>
+        <!-- 0x5800000  VROM block 3, 8 MiB -->
+        <interleave output="64">
+            <part name="mpr-19883.38" crc="12895d6e" map="00000021"/>
+            <part name="mpr-19884.39" crc="711eebfb" map="00002100"/>
+            <part name="mpr-19885.40" crc="d1ae5473" map="00210000"/>
+            <part name="mpr-19886.41" crc="278aae0b" map="21000000"/>
+        </interleave>
+        <!-- 0x6000000  fixed CROM, 2 MiB (FFE00000-FFFFFFFF) -->
+        <interleave output="64">
+            <part name="epr-19888b.18" crc="800d763d" map="21000000"/>
+            <part name="epr-19887b.17" crc="2842bb87" map="00210000"/>
+            <part name="epr-19890b.20" crc="9c16c3cc" map="00002100"/>
+            <part name="epr-19889b.19" crc="d1f7e44c" map="00000021"/>
+        </interleave>
+        <!-- 0x6200000  backup RAM, 128 KiB of 00 (Supermodel's fresh state; MAME fills FF) -->
+        <part repeat="0x20000">00</part>
+        <!-- FFED8C4C: link mode 2 (satellite) for 1 (slave): no net board (D-91) -->
+        <patch offset="0x60D8C4C">02 00 00 00</patch>
+    </rom>
+</misterromdescription>

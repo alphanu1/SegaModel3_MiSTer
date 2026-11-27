@@ -22,6 +22,13 @@ into `main` with all1 and calib-shared without their entries, each with its boar
 | TLB misses made cheaper (D-88) | not started | after the CPU rebuild's current steps |
 | M3_R3EMPTY, M3_R3PF | in `main`, switched off | need area |
 
+`main` 812a6b4 (pushed) also takes branch `scudplus`: Scud Race Plus (scudplus, split on scud.zip), which plays with
+sound on my board on Scud Race's settings; the MRA writer reads `set.zip|parent.zip`. Le Mans 24 (branch `lemans24`,
+not committed yet): black screen at 0 fps on the first MRA, the ROM's link mode being slave and the core having no
+net board (R211); the MRA now sets it to satellite (D-91), which gets it past the wait, but the menu then runs very
+slowly with no 3D (14 fps, then 0). Paused: the next step is the system bench against Supermodel's trace (R211's
+Left). Its MRA already carries the driving profile's lever flag, which the core does not have yet.
+
 Open from the board: Sega Rally 2's slowdowns going through water, Real3D or CPU, to be measured on replay frames
 captured there.
 
