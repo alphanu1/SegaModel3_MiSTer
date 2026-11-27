@@ -200,7 +200,23 @@ module ppc_core
   // DS (cpu140, dfront): the double unit's issue spacing (ppc_fpu_fast rule 8): a double-unit op in EX waits DS - 1
   // cycles behind another (fp_wait, dbk_q). 2: the unit's S4a / S4b share one adder pair; 3: its iterative front
   // (ppc_fpu_fma IT); 0: an op every cycle
-  parameter int DS = 3
+  parameter int DS = 3,
+  // FLF (kit 1b): an FP load's value forwarded to its consumers (see "FP load forward"). 1: from the load write
+  // slot (fl_*) into ID's capture: a consumer leaves ID in the slot's first cycle (load-use 4 where it was 5) or
+  // while the slot waits for the port. 2: also from WB's word as it arrives, for the FPU's own consumers: one
+  // leaves ID while its load is in WB (load-use 3), EX waiting and reloading from the slot where the word was not
+  // the load's. 0: a consumer reads the file the cycle after the slot's write
+  parameter int FLF = 1,
+  // FCR (kit 1c): fcmpu / fcmpo leave EX without waiting for the older FP results (fs_idle): their FPSCR bits
+  // (FPCC, VXSNAN, VXVC) are merged in program order, with the last older result's flags in the cycle it lands
+  // (cm_at; see "compare release"). A compare still waits while a divide is out or another compare's merge is
+  // more than a cycle away. 0: it waits for fs_idle
+  parameter bit FCR = 1'b1,
+  // DBY (kit 1d): the double unit takes its operands through the bypass select (fa_x ... fc_x, as the fast port,
+  // the divider and the small unit do), so a bypassed op routed to it issues in its first EX cycle; an early-
+  // forwarded one waits one cycle (for fo_res), not two. 0: it reads the operand registers, which take fo_res in
+  // a wait cycle (ex_fbd)
+  parameter bit DBY = 1'b1
 )(
   input  logic        clk,
   input  logic        rst,
@@ -350,6 +366,7 @@ module ppc_core
   logic        ex_fma, ex_div, ex_misc, ex_fpw, ex_fcmp, ex_fsu, ex_fpser;
   logic        ex_fst, ex_fpun, ex_c2, ex_frc;
   logic        ex_fsw, ex_fsx, ex_f2c, ex_mw;          // waits: FPSCR settled, FPSCR op, second cycle, WB slot
+  logic        ex_fsc;                                 // FCR: a compare (its own wait, crel)
   logic [2:0]  ex_fsfld;                               // the FPSCR op's field: crfS (mcrfs), else crfD
   logic [2:0]  ex_fsop;
   logic        fp_wait;                                // EX waits on the FPU (below)
@@ -1451,6 +1468,7 @@ module ppc_core
                                          h_x == 10'd134 || h_x == 10'd70 || h_x == 10'd38 || h_x == 10'd64 ||
                                          (q_hi[0] && (h_x == 10'd40 || h_x == 10'd72 || h_x == 10'd136 ||
                                                       h_x == 10'd264 || q_hi[5:1] == 5'd23)));
+  wire       h_fcm   = h_op == 6'd63 && (h_x == 10'd0 || h_x == 10'd32);   // fcmpu, fcmpo (FCR)
   wire       h_mmu   = h_op == 6'd31 && (h_x == 10'd210 || h_x == 10'd242 || h_x == 10'd306 || h_x == 10'd978 ||
                                          h_x == 10'd1010);
   wire       h_mfsr  = h_op == 6'd31 && (h_x == 10'd595 || h_x == 10'd659);
@@ -2975,6 +2993,7 @@ module ppc_core
   logic [31:0] fl_hi, fl_lo;
   logic [63:0] fl_dat;
   wire         fw_wbs = wb_valid && wb_fpw && !wb_isld;          // a small-unit result, written as WB is left
+  wire  [31:0] ldw    = wb_got ? wb_dq : d_rdata;                // WB's word as it is or as it arrives
   wire         fl_go  = FLW && fl_v && !fr_at[0] && !fw_wbs && !wb_blk;
   wire  [63:0] fl_val = fl_sl ? (fl_p2 ? fl_dat : lfs_dbl) : {fl_hi, fl_lo};
   // WB lets an FP load go: with FLW once the slot is free or frees now, else once written (wb_fpok)
@@ -3075,6 +3094,30 @@ module ppc_core
   logic [1:0][2:0] nx_bye, hd_bye;
   wire  [1:0]      nx_boe = {2{FEF && FBYP && SQ5 && FAST && fok}} & {q1_pd.frs, q_pd.frs};
   logic [1:0]      nx_wfr, nx_haz;
+  // FP load forward (FLF). An operand whose FPR the load write slot will hold next cycle is ready for a head that
+  // would leave ID then: the slot keeps it (fl_v, not written this cycle) or WB's FP load enters it as WB is left
+  // (nx_lsw, the part from registers; WB's answer, dvk, comes last). The capture then takes fl_val (registered:
+  // lfs_dbl, fl_dat or the two words). The slot's FPR is its producer's: an FP load leaves ID only once an older
+  // write of its frD has landed (WAW), so nothing older in the slot writes that FPR, and nothing younger than
+  // the slot's load can be past ID while the head is behind it, but EX's uop (checked) and, for entry 1, today's
+  // head (checked)
+  logic [1:0][2:0] nx_lsk, nx_lsw, hd_lsl;
+  logic [1:0]      nx_hzx, nx_hzy;                     // the hazard with WB's slot entry taken / not taken
+  wire             wb_flv = FLF && wb_valid && wb_fl && !(wb_iss && !wb_got && wb_sp1) && (!fl_v || fl_go);
+  (* keep = 1 *) wire dvk = !(wb_valid && wb_iss && !wb_got) || d_valid;   // WB's answer is here (late)
+  logic            fl_svq;                             // the slot's two words are a single value (registered)
+  wire             sv_fl  = fl_sl || fl_svq;            // the slot's value is single
+  // FLF = 2: nx_lwb, MEM's FP load (its writing uop) writes the operand's FPR, for a head of the FPU's own kind
+  // (the multiply-add port, the divider, the small unit; not a store's data, not mtfsf's frB) that would leave
+  // ID next cycle: the head captures WB's word then (wbw: lfs's by bit replication, PEM D.6; lfd's two words).
+  // Checked as it is captured (vok): WB holds that load, its word is here, and it is not an lfs denormal (a
+  // shift, u_lfs's). Otherwise EX waits (ex_flr, a register) and the operand register is reloaded from the slot
+  // in a cycle the slot holds that FPR (fl_rl), as ID would have captured it; EX runs the cycle after. The
+  // head's single-value bit is MEM's load's kind (hd_lws: lfs single, lfd taken as not, ex_fbu)
+  logic [1:0][2:0] nx_lwb, hd_lwq;
+  logic            hd_lws;
+  wire  [1:0]      nx_lok = {2{FLF >= 2 && m.valid && m.fld && !m.fhi}} &
+                            {q1_pd.ffma || q1_pd.fdiv || q1_pd.fmsc, q_pd.ffma || q_pd.fdiv || q_pd.fmsc};
   logic            hd_fz;
   logic            hd_sel, hd_val;
   wire             id_fpw = id_valid && q_pd.fpw;
@@ -3094,18 +3137,35 @@ module ppc_core
         nx_rdy[h][p] = (((nx_hit[h][p] || nx_byp[h][p] || nx_bye[h][p]) && !(FWW && ex_fh && ex_frd == nx_ix[h][p])) ||
                         !f_pn(pend, nx_ix[h][p], fo_clr, fo_tag, fw_wv, fw_wr, ex_fh, ex_frd)) &&
                        !(h == 1 && id_fpw && q_hi[25:21] == nx_ix[h][p]);
+        nx_lsk[h][p] = FLF && fl_v && !fl_go && fl_frd == nx_ix[h][p] && !(ex_fh && ex_frd == nx_ix[h][p]) &&
+                       !(h == 1 && id_fpw && q_hi[25:21] == nx_ix[h][p]);
+        nx_lsw[h][p] = wb_flv && wb_frd == nx_ix[h][p] && !(ex_fh && ex_frd == nx_ix[h][p]) &&
+                       !(h == 1 && id_fpw && q_hi[25:21] == nx_ix[h][p]);
+        nx_lwb[h][p] = nx_lok[h] && m.rd == nx_ix[h][p] && !(ex_fh && ex_frd == nx_ix[h][p]) &&
+                       !(h == 1 && id_fpw && q_hi[25:21] == nx_ix[h][p]);
       end
       nx_wfr[h] = (!f_pn(pend, nx_d[h], fo_clr, fo_tag, fw_wv, fw_wr, ex_fh, ex_frd) ||
                    (((fr_at[1] && fr_ix[1] == nx_d[h]) || (FWW && fr_at[2] && fr_ix[2] == nx_d[h]) ||
                      (FWW && fr_at[3] && fr_ix[3] == nx_d[h])) && !(FWW && ex_fh && ex_frd == nx_d[h])) ||
                    (m_mwb && m.rd == nx_d[h])) &&
                   !(h == 1 && id_fpw && q_hi[25:21] == nx_d[h]);
-      nx_haz[h] = (nx_fua[h] && !nx_rdy[h][0]) || (nx_fub[h] && !nx_rdy[h][1]) ||
-                  (nx_fuc[h] && !nx_rdy[h][2]) || (nx_fpw[h] && !nx_wfr[h]);
+      nx_hzx[h] = (nx_fua[h] && !(nx_rdy[h][0] || nx_lsk[h][0] || nx_lsw[h][0] || nx_lwb[h][0])) ||
+                  (nx_fub[h] && !(nx_rdy[h][1] || nx_lsk[h][1] || nx_lsw[h][1] || nx_lwb[h][1])) ||
+                  (nx_fuc[h] && !(nx_rdy[h][2] || nx_lsk[h][2] || nx_lsw[h][2] || nx_lwb[h][2])) || (nx_fpw[h] && !nx_wfr[h]);
+      nx_hzy[h] = (nx_fua[h] && !(nx_rdy[h][0] || nx_lsk[h][0] || nx_lwb[h][0])) ||
+                  (nx_fub[h] && !(nx_rdy[h][1] || nx_lsk[h][1] || nx_lwb[h][1])) ||
+                  (nx_fuc[h] && !(nx_rdy[h][2] || nx_lsk[h][2] || nx_lwb[h][2])) || (nx_fpw[h] && !nx_wfr[h]);
+      // (nx_hzx = nx_hzy without FLF; WB's answer last)
+      nx_haz[h] = nx_hzx[h] || (nx_hzy[h] && !dvk);
+      for (int p = 0; p < 3; p++) hd_lsl[h][p] = nx_lsk[h][p] || nx_lsw[h][p];
     end
+  logic [1:0][2:0] hd_lsq;                             // hd_lsl, registered as hd_hit is
   wire         id_pop = id_take && !redir_hard_q;
   always_ff @(posedge clk) begin
     hd_hit <= nx_hit;
+    hd_lsq <= hd_lsl;
+    hd_lwq <= nx_lwb;
+    hd_lws <= m.fsl;
     hd_byp <= nx_byp;
     hd_bye <= nx_bye;
     hd_fz  <= id_pop ? nx_haz[1] : nx_haz[0];          // hd_haz chosen by hd_sel, as registered
@@ -3113,6 +3173,8 @@ module ppc_core
     hd_val <= !rst && !redir_hard_q && (id_pop ? q_cnt >= 3'd2 : q_cnt >= 3'd1);
   end
   wire  [2:0]  f_hit_id = {3{hd_val}} & (hd_sel ? hd_hit[1] : hd_hit[0]);
+  wire  [2:0]  f_lsl_id = {3{hd_val}} & (hd_sel ? hd_lsq[1] : hd_lsq[0]);   // FLF: taken from the slot (fl_val)
+  wire  [2:0]  f_lwb_id = {3{hd_val}} & (hd_sel ? hd_lwq[1] : hd_lwq[0]);   // FLF = 2: taken from WB's word
   wire  [2:0]  f_byp_id = {3{hd_val}} & (hd_sel ? hd_byp[1] : hd_byp[0]);   // taken from fo_res in EX (ex_fbl)
   wire  [2:0]  f_bye_id = {3{hd_val}} & (hd_sel ? hd_bye[1] : hd_bye[0]);   // taken from the single unit's R5 (ex_fbe)
   // A head with nothing formed for it (straight from fetch) waits a cycle if it names an FPR, unless
@@ -3167,9 +3229,48 @@ module ppc_core
     wsk_r <= ex_frd;
   end
 
-  wire  [63:0] fa_cap = f_hit_id[0] ? fw_fdt : rf_fa;
-  wire  [63:0] fb_cap = f_hit_id[1] ? fw_fdt : rf_fb;
-  wire  [63:0] fc_cap = f_hit_id[2] ? fw_fdt : rf_fc;
+`ifdef FLF_PLANT
+  wire  [63:0] fl_fwd = fl_val ^ {63'd0, fl_frd == 5'd7};   // planted fault: the slot's forward of f7 wrong in bit 0
+`else
+  wire  [63:0] fl_fwd = fl_val;
+`endif
+  // FLF = 2: WB's word as the double it loads (u_lfs's form for every lfs word but a denormal), and the check
+  wire  [63:0] wbw    = wb_fsl ? {ldw[31], ldw[30], {3{(ldw[30:23] == 8'd0 || ldw[30:23] == 8'hFF) ? ldw[30] : ~ldw[30]}},
+                                  ldw[29:0], 29'd0} : {fhi_q, ldw};
+  wire         wbw_ok = wb_valid && wb_fl && (wb_got || d_valid) && !(wb_fsl && ldw[30:23] == 8'd0 && ldw[22:0] != 23'd0);
+  wire  [2:0]  vok    = {3{wbw_ok}} & {wb_frd == id_fc, wb_frd == id_fb, wb_frd == id_fa};
+  wire  [63:0] fa_cap = f_lwb_id[0] ? wbw : f_lsl_id[0] ? fl_fwd : f_hit_id[0] ? fw_fdt : rf_fa;
+  wire  [63:0] fb_cap = f_lwb_id[1] ? wbw : f_lsl_id[1] ? fl_fwd : f_hit_id[1] ? fw_fdt : rf_fb;
+  wire  [63:0] fc_cps = f_lsl_id[2] ? fl_fwd : f_hit_id[2] ? fw_fdt : rf_fc;   // (a store's: no WB word, stfs below)
+  wire  [63:0] fc_cap = f_lwb_id[2] ? wbw : fc_cps;
+  // EX's reload (FLF = 2): ex_flr[p], operand p's WB word was not its load's; ex_ftg[p] its FPR; fl_rl[p] the slot
+  // holds it now (EX waits while any ex_flr is set, so fl_rl comes only with EX held)
+  logic [2:0]      ex_flr;
+  logic [2:0][4:0] ex_ftg;
+  wire  [2:0]      fl_rl;
+  assign fl_rl[0] = ex_flr[0] && ex_valid && fl_v && fl_frd == ex_ftg[0];
+  assign fl_rl[1] = ex_flr[1] && ex_valid && fl_v && fl_frd == ex_ftg[1];
+  assign fl_rl[2] = ex_flr[2] && ex_valid && fl_v && fl_frd == ex_ftg[2];
+  wire  [2:0]      id_fu3 = {q_pd.fuc, q_pd.fub, q_pd.fua};
+  always_ff @(posedge clk) begin
+    if (rst)          ex_flr <= 3'b000;
+    else if (!f_hold) ex_flr <= {3{FLF >= 2 && id_s0}} & f_lwb_id & id_fu3 & ~vok;   // (a bubble's: never read)
+    else              ex_flr <= ex_flr & ~fl_rl;
+    if (!f_hold) ex_ftg <= {id_fc, id_fb, id_fa};
+  end
+`ifdef VERILATOR
+  // FLF: an operand taken from the slot is the slot's FPR, and the slot is still there; WB's entry was taken
+  always_ff @(posedge clk)
+    if (!rst && id_adv && id_s0) begin
+      for (int p = 0; p < 3; p++)
+        if (f_lsl_id[p] && (p == 0 ? q_pd.fua : p == 1 ? q_pd.fub : q_pd.fuc) &&
+            !(fl_v && fl_frd == (p == 0 ? id_fa : p == 1 ? id_fb : id_fc)))
+          $fatal(1, "FP load forward %0d of %08X without the slot (fl_v %0d fl_frd %0d)", p, q_hi, fl_v, fl_frd);
+      if (fl_v && sv_fl != (fl_sl || fpu_sgl_val({fl_hi, fl_lo}))) $fatal(1, "FP load slot: fl_svq");
+    end
+  always_ff @(posedge clk)
+    if (!rst && wb_flv && dvk && !(wb_adv && wb_fl)) $fatal(1, "FP load forward: WB's load predicted to leave");
+`endif
   // The fast route (fpu_fast_route) for these operands, without testing 64
   // bits after the file's read: each FPR carries !fpu_sgl_val of its value
   // (ppc_fpregfile, written below), the forward's values are tested from
@@ -3187,9 +3288,9 @@ module ppc_core
   logic [FL-1:0] fr_sv;
   wire         sv_by  = fr_sv[1];
   wire         sv_be  = fr_sv[2];                      // ... and an early-forwarded one's, landing the cycle after
-  wire         sv_a   = f_hit_id[0] ? sv_fw : f_byp_id[0] ? sv_by : f_bye_id[0] ? sv_be : !rf_na;
-  wire         sv_b   = f_hit_id[1] ? sv_fw : f_byp_id[1] ? sv_by : f_bye_id[1] ? sv_be : !rf_nb;
-  wire         sv_c   = f_hit_id[2] ? sv_fw : f_byp_id[2] ? sv_by : f_bye_id[2] ? sv_be : !rf_nc;
+  wire         sv_a   = f_hit_id[0] ? sv_fw : f_byp_id[0] ? sv_by : f_bye_id[0] ? sv_be : f_lwb_id[0] ? hd_lws : f_lsl_id[0] ? sv_fl : !rf_na;
+  wire         sv_b   = f_hit_id[1] ? sv_fw : f_byp_id[1] ? sv_by : f_bye_id[1] ? sv_be : f_lwb_id[1] ? hd_lws : f_lsl_id[1] ? sv_fl : !rf_nb;
+  wire         sv_c   = f_hit_id[2] ? sv_fw : f_byp_id[2] ? sv_by : f_bye_id[2] ? sv_be : f_lwb_id[2] ? hd_lws : f_lsl_id[2] ? sv_fl : !rf_nc;
   wire         id_frt = q_pd.frq || (FAST && q_pd.frs && sv_a && (!q_pd.fub || sv_b) && (!q_pd.fuc || sv_c));
   // CVL: the conversion port's route (frsp is q_hi[2] = 0: xo 12; fctiw 14, fctiwz 15)
   wire         id_cvr = (CVL != 0) && q_pd.frc && !(!q_hi[2] && (fpscr_q[5] || (ex_valid && ex_fsx)));
@@ -3239,12 +3340,12 @@ module ppc_core
       ex_fbed <= 1'b0;
     end else if (f_hold) begin
       ex_fbl  <= ex_fbe;                               // (0 without FEF)
-      ex_fbd  <= ex_fbed;
+      ex_fbd  <= !DBY && ex_fbed;
       ex_fbe  <= 3'b000;
       ex_fbed <= 1'b0;
     end else begin
       ex_fbl  <= f_byp_id;
-      ex_fbd  <= f_byp_id != 3'b000 && q_pd.ffma && !id_frt && !id_cvr;   // (the conversion port reads fb_x)
+      ex_fbd  <= !DBY && f_byp_id != 3'b000 && q_pd.ffma && !id_frt && !id_cvr;   // (the conversion port reads fb_x)
       ex_fbe  <= f_bye_id;
       ex_fbed <= f_bye_id != 3'b000 && !id_frt;
     end
@@ -3260,19 +3361,43 @@ module ppc_core
   end
   // (R140) each operand register's enable as two copies, one a half (keep): one enable LUT drove 64 to 75
   // enables with a 2.7 ns route (ppc_cpu spike: op_y -> mis_hold -> f_hold -> fa_q's enable)
-  (* keep = 1 *) wire [5:0] f_en = {{2{!f_hold || fd_l[2]}}, {2{!f_hold || fd_l[1]}}, {2{!f_hold || fd_l[0]}}};
+  (* keep = 1 *) wire [5:0] f_en = {{2{!f_hold || fd_l[2] || fl_rl[2]}}, {2{!f_hold || fd_l[1] || fl_rl[1]}},
+                                     {2{!f_hold || fd_l[0] || fl_rl[0]}}};
+  // (FLF = 2: fl_rl and fd_l never together: a reloading uop's operand is not a bypass of the same operand)
+  wire  [63:0] fa_in = fd_l[0] ? fo_res : fl_rl[0] ? fl_val : fa_cap;
+  wire  [63:0] fb_in = fd_l[1] ? fo_res : fl_rl[1] ? fl_val : fb_cap;
+  wire  [63:0] fc_in = fd_l[2] ? fo_res : fl_rl[2] ? fl_val : fc_cap;
   always_ff @(posedge clk) begin
-    if (f_en[0]) fa_q[31:0]  <= fd_l[0] ? fo_res[31:0]  : fa_cap[31:0];
-    if (f_en[1]) fa_q[63:32] <= fd_l[0] ? fo_res[63:32] : fa_cap[63:32];
-    if (f_en[2]) fb_q[31:0]  <= fd_l[1] ? fo_res[31:0]  : fb_cap[31:0];
-    if (f_en[3]) fb_q[63:32] <= fd_l[1] ? fo_res[63:32] : fb_cap[63:32];
-    if (f_en[4]) fc_q[31:0]  <= fd_l[2] ? fo_res[31:0]  : fc_cap[31:0];
-    if (f_en[5]) fc_q[63:32] <= fd_l[2] ? fo_res[63:32] : fc_cap[63:32];
+    if (f_en[0]) fa_q[31:0]  <= fa_in[31:0];
+    if (f_en[1]) fa_q[63:32] <= fa_in[63:32];
+    if (f_en[2]) fb_q[31:0]  <= fb_in[31:0];
+    if (f_en[3]) fb_q[63:32] <= fb_in[63:32];
+    if (f_en[4]) fc_q[31:0]  <= fc_in[31:0];
+    if (f_en[5]) fc_q[63:32] <= fc_in[63:32];
   end
+`ifdef VERILATOR
+  // FLF = 2: a reload only while EX is held; a checked WB word is u_lfs's value of it (lfs_dbl, the cycle after:
+  // u_lfs registers WB's word every cycle) or lfd's two words
+  logic [2:0]  ck_wbw;
+  logic        ck_sl;
+  logic [63:0] ck_dw;
+  always_ff @(posedge clk) begin
+    if (!rst && fl_rl != 3'b000 && !f_hold) $fatal(1, "FP load reload without EX's hold");
+    if (!rst && (fl_rl & fd_l) != 3'b000) $fatal(1, "FP load reload and a bypass on one operand");
+    ck_wbw <= f_hold ? 3'b000 : {3{id_adv && id_s0}} & f_lwb_id & id_fu3 & vok;   // (EX's first cycle only)
+    ck_sl  <= wb_fsl;
+    ck_dw  <= {fhi_q, ldw};
+    if (!rst && ex_valid && ck_wbw != 3'b000)
+      for (int p = 0; p < 3; p++)
+        if (ck_wbw[p] && (p == 0 ? fa_q : p == 1 ? fb_q : fc_q) != (ck_sl ? lfs_dbl : ck_dw))
+          $fatal(1, "FP load forward from WB: operand %0d %016X against %016X", p,
+                 (p == 0 ? fa_q : p == 1 ? fb_q : fc_q), ck_sl ? lfs_dbl : ck_dw);
+  end
+`endif
   always_ff @(posedge clk)
     if (!f_hold) begin
       ex_svb <= sv_b;
-      ex_fbu <= f_byp_id != 3'b000 || f_bye_id != 3'b000;
+      ex_fbu <= f_byp_id != 3'b000 || f_bye_id != 3'b000 || f_lwb_id != 3'b000;
       ex_ffast <= id_frt;
       ex_ffw   <= id_frt;
       ex_fcvt  <= id_cvr;
@@ -3305,7 +3430,7 @@ module ppc_core
                  .SQ1 (SQ1), .SQ2 (SQ2), .SQ3 (SQ3), .SQ4 (SQ4), .SQ5 (SQ5), .EF (FEF && FBYP && SQ5 && FAST), .SF (FAST), .CV (CVL), .DS (DS)) u_fpu (
     .clk (clk), .rst (rst),
     .f_valid (ex_fma && fp_go), .f_op (fma_op_t'(ex_u.fop)), .f_single (ex_u.fsgl), .f_fast (ex_ffast),
-    .f_ctl (fpscr_q[7:0]), .f_a (fa_x), .f_b (fb_x), .f_c (fc_x), .f_ad (fa_q), .f_bd (fb_q), .f_cd (fc_q), .f_tag (ex_frd),
+    .f_ctl (fpscr_q[7:0]), .f_a (fa_x), .f_b (fb_x), .f_c (fc_x), .f_ad (DBY ? fa_x : fa_q), .f_bd (DBY ? fb_x : fb_q), .f_cd (DBY ? fc_x : fc_q), .f_tag (ex_frd),
     .f_sel (ex_fs), .f_aq (fa_q), .f_bq (fb_q), .f_cq (fc_q), .f_ax (fx_a), .f_bx (fx_b), .f_cx (fx_c), .f_fast_ok (f_fast_ok),
     .f_cvt (ex_fcvt), .f_cvt_ok (f_cvt_ok), .f_dbl_ok (),
     .d_start (d_go), .d_op (div_op_t'(dq_op)), .d_single (dq_sgl), .d_ctl (fpscr_q[7:0]),
@@ -3329,15 +3454,16 @@ module ppc_core
   // the next; the load leaves WB in the next at the earliest (wb_fpok)
   logic        m_got;                                  // MEM's answer arrived in an earlier cycle
   logic [31:0] m_dq;
-  wire  [31:0] ldw = wb_got ? wb_dq : d_rdata;
   ppc_fpu_ldst #(.PIPE (1'b1)) u_lfs (.clk (clk), .lfs_word (ldw), .lfs_dbl (lfs_dbl), .stfs_dbl (64'd0), .stfs_en (1'b1),
                                       .stfs_word ());
   // stfs: from the store operand, a second EX cycle; F1S: its registers load as fc_q does, from fc_q's input
   // (f_en[4], the same enable and select), so stfs_w is fc_q's word in every EX cycle, the first included
   logic [31:0] stfs_w;
-  wire  [63:0] stfs_in = F1S ? (fd_l[2] ? fo_res : fc_cap) : fc_q;
+  // (kit: WB's word (FLF = 2) and the reload are never a store's operand, so the stfs registers take fc_cps, the
+  // capture without them, and load on fc_q's enable without the reload: the slot's fl_v was the worst path into them)
+  wire  [63:0] stfs_in = F1S ? (fd_l[2] ? fo_res : fc_cps) : fc_q;
   ppc_fpu_ldst #(.PIPE (1'b1)) u_stfs (.clk (clk), .lfs_word (32'd0), .lfs_dbl (), .stfs_dbl (stfs_in),
-                                       .stfs_en (F1S ? f_en[4] : 1'b1), .stfs_word (stfs_w));
+                                       .stfs_en (F1S ? (!f_hold || fd_l[2]) : 1'b1), .stfs_word (stfs_w));
 `ifdef VERILATOR
   // F1S: the stfs registers hold fc_q's conversion
   always_ff @(posedge clk)
@@ -3406,10 +3532,34 @@ module ppc_core
   logic m_c2;                                          // MEM holds the same uop as last cycle
   logic fs_idle;
   wire  mfp_hold = m.valid && m.fpser && !m_fsok;
+  // Compare release (FCR). A compare's FPSCR bits are applied cm_at's cycles on from the cycle it leaves EX: in
+  // the cycle the last older FPU result lands (merged with that result's flags: the exception bits ORed, so FX
+  // is set as in program order, and FPCC the compare's, applied after the result's FPRF), or the next cycle if
+  // none is outstanding (as a compare in MEM did). Results land in issue order and nothing younger lands before
+  // the last older one, so this is program order. Older results are in fr_at: a compare is released only with
+  // no divide out (div_out, d_go), whose write is in fr_at once it has handed over. crel: from registers
+  logic [FL-1:0] cm_at;                                // [k]: the compare's bits go in k cycles from now
+  fpu_flags_t    cm_fl;                                // ... its flags (FPCC in fprf[3:0], VXSNAN, VXVC)
+  wire           cm_go = cm_at[0];
+  wire           crel  = FCR && !div_out && !d_go && (cm_at >> 1) == '0;
+  function automatic logic [FL-1:0] f_hib(input logic [FL-1:0] x);   // the highest set bit, one-hot (1 if none)
+    f_hib = FL'(1);
+    for (int k = 0; k < FL; k++) if (x[k]) f_hib = FL'(1) << k;
+  endfunction
+  always_ff @(posedge clk) begin
+    if (rst)                   cm_at <= '0;
+`ifdef FCR_PLANT
+    else if (ex_fcmp && fp_go) cm_at <= f_hib(fr_at >> 2);   // planted fault: a cycle before the last older result
+`else
+    else if (ex_fcmp && fp_go) cm_at <= f_hib(fr_at >> 1);
+`endif
+    else                       cm_at <= cm_at >> 1;
+    if (ex_fcmp && fp_go) cm_fl <= F1C ? ms_flags_c : ms_flags;
+  end
   always_ff @(posedge clk)
     if (rst) fs_idle <= 1'b1;
-    else     fs_idle <= (fr_at >> 1) == '0 && !div_out && !d_go &&
-                        !(ex_valid && (ex_fma || ex_div || (ex_fcmp && fs_idle)) && !mfp_hold);
+    else     fs_idle <= (fr_at >> 1) == '0 && !div_out && !d_go && (cm_at >> 1) == '0 &&
+                        !(ex_valid && (ex_fma || ex_div || (ex_fcmp && (fs_idle || crel))) && !mfp_hold);
 
   // (d_busy is not needed: the divider is busy only inside div_out)
   // EX's FP wait, from few registered inputs (it goes through ex_hold to
@@ -3453,28 +3603,34 @@ module ppc_core
   wire  [FL-1:0] fw_ra = fw_rk | ({FL{ex_fma && fw_go && !ex_ffast && !ex_fcvt}} & (FL'(1) << (FL - 1))) |
                                  ({FL{ex_fma && fw_go &&  ex_ffast}} & (FL'(1) << (LS - 1))) |
                                  ({FL{ex_fma && fw_go &&  ex_fcvt}} & (FL'(1) << (CVQ - 1)));
-  wire  fw_idl = (fr_at >> 1) == '0 && !div_out && !d_go &&
-                 !(ex_valid && (ex_fma || ex_div || (ex_fcmp && fs_idle)) && !mfp_hold);   // fs_idle next
+  wire  fw_idl = (fr_at >> 1) == '0 && !div_out && !d_go && (cm_at >> 1) == '0 &&
+                 !(ex_valid && (ex_fma || ex_div || (ex_fcmp && (fs_idle || crel))) && !mfp_hold);   // fs_idle next
+  // crel next: EX held (no divide or compare leaves) / EX takes ID's uop (EX's divide or compare may leave)
+  wire  crel_h = FCR && !fw_bk && (cm_at >> 2) == '0;
+  wire  crel_t = FCR && !fw_ba && ((ex_fcmp && fw_go) ? (fr_at >> 2) == '0 : (cm_at >> 2) == '0);
   wire  fwk_h   = (ex_fma && fw_bk) || (ex_div && (fw_bk || (fw_rk & FPRE) != '0)) || (ex_fsw && !fw_idl) ||
+                 (ex_fsc && !(fw_idl || crel_h)) ||
                  (ex_fsx && !(ex_valid && ex_fsop != 3'd0 && fs_idle)) || (ex_f2c && !ex_valid) ||
                  (ex_mw && fw_rk[2]);
   wire  fw_n   = (q_pd.ffma && fw_ba) || (q_pd.fdiv && (fw_ba || (fw_ra & FPRE) != '0)) ||
-                 (((h_fser && !q_pd.ifault) || h_rfi || h_mtmsr) && !fw_idl) || q_pd.ffsx || q_pd.ff2c ||
+                 (((h_fser && !(FCR && h_fcm) && !q_pd.ifault) || h_rfi || h_mtmsr) && !fw_idl) ||
+                 (FCR && h_fcm && !q_pd.ifault && !(fw_idl || crel_t)) || q_pd.ffsx || q_pd.ff2c ||
                  (q_pd.fmw && fw_ra[2]);
   always_ff @(posedge clk) fwq <= ex_hold ? fwk_h : fw_n;
   always_comb
-    fp_wait = ex_valid && (fwq || (ex_ffw && ffbl_q) || (ex_fcw && fcbl_q) || (ex_mw && wb_blk) || ex_fbd || ex_fbed ||
+    fp_wait = ex_valid && (fwq || (ex_ffw && ffbl_q) || (ex_fcw && fcbl_q) || (ex_mw && wb_blk) || ex_fbd || ex_fbed || ex_flr != 3'b000 ||
                            (ex_fma && !ex_ffw && !ex_fcw && dbk_q));
 `ifdef VERILATOR
   always_ff @(posedge clk)
     if (!rst && ex_valid && fwq != ((ex_fma && fblk_q) || (ex_div && (fblk_q || fpre_q)) || (ex_fsw && !fs_idle) ||
+                                    (ex_fsc && !(fs_idle || crel)) ||
                                     (ex_fsx && !ex_fs2) || (ex_f2c && !ex_c2) || (ex_mw && fr_at[2])))
       $fatal(1, "fwq against EX's FP wait");
 `endif
 
   // FPSCR: one update a cycle, from the FPU port, a compare in MEM or an FPSCR
   // instruction leaving EX; the waits above keep them apart
-  wire        fs_cmp = m.valid && m.fscmp && !m_c2;     // in its first MEM cycle
+  // (FCR: a compare's bits go in by cm_at, alone or merged with a result's)
   wire        fs_ex  = ex_valid && ex_fsop != 3'd0;
   // Two instances of the FPSCR logic: one applies a result's or a compare's
   // flags to fpscr_q, the other forms an FPSCR instruction's result for
@@ -3482,7 +3638,10 @@ module ppc_core
   fpu_flags_t fs_flags;
   logic [31:0] fs_flg, fs_new;
   logic [3:0]  fs_cr1, fs_crf;
-  assign fs_flags = fo_valid ? fo_flags : m.fflags;
+  always_comb begin
+    fs_flags = fo_valid ? fo_flags : cm_fl;
+    if (fo_valid && cm_go) fs_flags.exc = fo_flags.exc | cm_fl.exc;
+  end
   ppc_fpu_fpscr u_fpscr (
     .op (FS_FLAGS), .fpscr_in (fpscr_q), .flags (fs_flags), .fm (8'd0), .frb_lo (32'd0),
     .fld (3'd0), .imm (4'd0), .bitn (5'd0), .fpscr_out (fs_flg), .cr1 (), .crf ()
@@ -3507,7 +3666,7 @@ module ppc_core
     if (rst) ex_fs2 <= 1'b0;
     else     ex_fs2 <= fs_ex && fs_idle && ex_hold;
     if (rst)                       fpscr_q <= 32'd0;                     // 603e table 4-9
-    else if (fo_valid || fs_cmp)   fpscr_q <= fs_flg;
+    else if (fo_valid || cm_go)    fpscr_q <= cm_go ? {fs_flg[31:16], cm_fl.fprf[3:0], fs_flg[11:0]} : fs_flg;
     else if (fs_ex && fp_go)       fpscr_q <= fs_new_q;
   end
 
@@ -3541,7 +3700,8 @@ module ppc_core
       for (int p = 0; p < 3; p++)
         if (ex_valid && ex_fbl[p] && !(fo_valid && fo_tag == (p == 0 ? ex_u.insn[20:16] : p == 1 ? ex_u.insn[15:11] : ex_u.insn[10:6])))
           $fatal(1, "FP operand bypass %0d without its result (tag %0d)", p, fo_tag);
-      if (ex_valid && ex_fbd != (ex_fma && !ex_ffast && ex_fbl != 3'b000)) $fatal(1, "ex_fbd");
+      // (kit: the conversion port reads fb_x, so a bypassed conversion has no ex_fbd: k1a's route, this check left behind)
+      if (ex_valid && ex_fbd != (!DBY && ex_fma && !ex_ffast && !ex_fcvt && ex_fbl != 3'b000)) $fatal(1, "ex_fbd");
       if (ex_valid && ex_fbd && !f_hold) $fatal(1, "ex_fbd without EX's hold");
       // FEF: an early-forwarded operand is the single unit's R5 now (its write next cycle, a single-unit op's
       // with OE = UE = 0), the uop is a single op of the fast kind, and the selects agree with the bypass's
@@ -3558,14 +3718,18 @@ module ppc_core
       for (int k = 1; k < FL; k++)
         if (fr_at[k] && !pend[fr_ix[k]]) $fatal(1, "FPR %0d not pending with its port write %0d cycles ahead", fr_ix[k], k);
 `endif
-      if (fs_idle && !((fr_at == '0) && !div_out && !d_go && !(m.valid && m.fscmp && !m_c2))) $fatal(1, "fs_idle with FP updates outstanding");
+      if (fs_idle && !((fr_at == '0) && !div_out && !d_go && cm_at == '0)) $fatal(1, "fs_idle with FP updates outstanding");
+      // FCR: a compare leaves with no other compare's bits more than a cycle away, and no divide out; its flags
+      // set FPCC (and nothing but FPCC and the compare's exception bits)
+      if (ex_fcmp && fp_go && ((cm_at >> 1) != '0 || div_out || d_go)) $fatal(1, "compare released with a compare or divide pending");
+      if (ex_fcmp && fp_go && !(F1C ? ms_flags_c.fpcc_we : ms_flags.fpcc_we)) $fatal(1, "compare without FPCC");
       if (fo_valid && fw_wbp)            $fatal(1, "FPR write port: FPU and WB in one cycle");
 `ifdef R104_CHECK
       // (FP load write slot; off in the planted-fault runs)
       if (int'(fo_valid) + int'(fw_wbp) + int'(fl_go) > 1) $fatal(1, "FPR write port: the slot and another writer in one cycle");
       if (fl_go && fl_sl && !fpu_sgl_val(fl_val)) $fatal(1, "FP load slot: lfs value %016X not a single value", fl_val);
 `endif
-      if (int'(fo_valid) + int'(fs_cmp) + int'(fs_ex && fp_go) > 1) $fatal(1, "two FPSCR updates in one cycle: fpu %0d cmp %0d ex %0d (op %0d, m.fpser %0d m_c2 %0d)", fo_valid, fs_cmp, fs_ex && fp_go, ex_fsop, m.fpser, m_c2);
+      if (int'(fo_valid || cm_go) + int'(fs_ex && fp_go) > 1) $fatal(1, "two FPSCR updates in one cycle: fpu %0d cmp %0d ex %0d (op %0d, m.fpser %0d m_c2 %0d)", fo_valid, cm_go, fs_ex && fp_go, ex_fsop, m.fpser, m_c2);
       if (ex_fma && fp_go && d_inj_req && !inj_q) $fatal(1, "multiply-add issued as the divider asks to hand over");
       if (d_go && d_busy)                $fatal(1, "divider started while busy");
       if (fblk_q != (div_out || d_go))   $fatal(1, "fblk_q");
@@ -3576,7 +3740,7 @@ module ppc_core
       if (ex_ffw != ex_ffast || (ex_ffast && !ex_fma)) $fatal(1, "ex_ffw");
       // (with a bypassed operand the route is from its predicted single-value bit: fast only where
       // the values allow it, and not always where they do)
-      if (ex_valid && ex_fma && !ex_ifault && ex_fbe == 3'b000 && (ex_fbu ? (ex_ffast && !rt_ref(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x))
+      if (ex_valid && ex_fma && !ex_ifault && ex_fbe == 3'b000 && ex_flr == 3'b000 && (ex_fbu ? (ex_ffast && !rt_ref(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x))
                                                                 : ex_ffast != rt_ref(fma_op_t'(ex_u.fop), ex_u.fsgl, fa_x, fb_x, fc_x)))
         $fatal(1, "fast route %0d for EX's operands", ex_ffast);
       if (rf_na != !fpu_sgl_val(rf_fa) || rf_nb != !fpu_sgl_val(rf_fb) || rf_nc != !fpu_sgl_val(rf_fc))
@@ -4271,7 +4435,8 @@ module ppc_core
         ex_kmsr    <= {h_kmsr2, h_rfi, h_mtmsr};
         ex_serc    <= h_kmsr2 || h_rfi || h_mtmsr || h_isync || q_pd.ifault ||
                       (id_u.fp && id_s0 && !msr_q[13] && !q_pd.ifault);   // as ex_kmsr, ex_isync, ex_ifault, ex_fpun
-        ex_fsw     <= (h_fser && !q_pd.ifault) || h_rfi || h_mtmsr;
+        ex_fsw     <= (h_fser && !(FCR && h_fcm) && !q_pd.ifault) || h_rfi || h_mtmsr;
+        ex_fsc     <= FCR && h_fcm && !q_pd.ifault;
         ex_fsx     <= q_pd.ffsx;
         ex_f2c     <= q_pd.ff2c;
         ex_mw      <= q_pd.fmw;
@@ -5168,6 +5333,7 @@ module ppc_core
       fl_sl  <= wb_fsl;
       fl_hi  <= fhi_q;
       fl_lo  <= ldw;
+      fl_svq <= fpu_sgl_val({fhi_q, ldw});
       fl_p2  <= 1'b0;
     end else if (fl_v && !fl_go) begin
       fl_p2  <= 1'b1;
