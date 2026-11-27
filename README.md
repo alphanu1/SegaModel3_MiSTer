@@ -10,18 +10,19 @@ An FPGA recreation of Sega's Model 3 arcade board for
 [Model 2](https://github.com/alphanu1/sega-model2-mister) cores on the same
 chip.
 
-**One core runs seven games, on Step 1.0, 1.5 and 2.x boards:**
+**One core runs eight games, on Step 1.0, 1.5 and 2.x boards:**
 
 - **Virtua Fighter 3** (Japan, Revision D)
 - **Sega Bass Fishing Deluxe** (USA)
 - **Scud Race / Sega Super GT** (Deluxe)
+- **Scud Race Plus / Sega Super GT Plus** (Revision A)
 - **The Lost World: Jurassic Park** (Revision A), with light guns from an
   analog stick or a mouse
 - **Daytona USA 2: Battle on the Edge** (Japan, Revision A)
 - **Sega Rally 2**
 - **Spikeout Final Edition**
 
-The first six boot, play and have sound on my MiSTer; Spikeout is newer and
+The first seven boot, play and have sound on my MiSTer; Spikeout is newer and
 so far boots to its attract. It is work in progress, not
 a release: timing does not close yet, so a build can misbehave on another
 board, and the list of what's left is below. There is no `releases/` folder
@@ -102,7 +103,8 @@ release.
    `/media/fat/_Arcade/cores/Model3.rbf`.
 2. Put the MRAs from `mra/` in `/media/fat/_Arcade/` (or a folder inside it).
 3. Put the MAME sets the MRAs name (`vf3.zip`, `bassdx.zip`, `scuddxo.zip`,
-   `lostwsga.zip`, `daytona2.zip`, `srally2.zip`, `spikeofe.zip`) in `/media/fat/games/mame/`.
+   `lostwsga.zip`, `daytona2.zip`, `srally2.zip`, `spikeofe.zip`, and `scudplus.zip`
+   with its parent `scud.zip`) in `/media/fat/games/mame/`.
    The sound server also looks in a set's parent zip.
 4. For sound, install the Arcade Sound Server from my fork's `model3` branch
    and start it. It reads the sound ROMs from the same zips.
