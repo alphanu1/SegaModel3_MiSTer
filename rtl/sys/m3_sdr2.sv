@@ -63,6 +63,8 @@ module m3_sdr2
   parameter bit          OPIPE    = 1'b0,             // sys140: a register stage on the pins (m3_sdr_opipe; m2_sdram XLAT 1)
   parameter int          CAPX     = 0,                // sys140: m2_sdram's CAPX (more capture registers)
   parameter bit          CAL      = 1'b0,             // sys140: the read-capture calibration (m3_sdr_cal) after the probe
+  parameter bit          XCAL     = 1'b0,             // area-sys: the calibration is m3_system's shared engine (x_*), not one here
+  parameter bit          CPROBE   = 1'b1,             // area-sys: with CAL, the start-up probe runs first (0: no probe; see below)
   parameter logic [26:0] PROBE_SA = 27'h640_0000,     // the probe's four words: the work RAM's base (SDR_RAM)
   parameter bit          L16      = 1'b1,
   parameter bit          LW1      = 1'b1,
@@ -91,6 +93,14 @@ module m3_sdr2
   output logic [6:0]    cal_width,
   output logic [5:0]    cal_last,
   output logic [5:0]    cal_flags,
+  // area-sys (XCAL): the shared engine (m3_sdr_cal NS 2, in m3_system), whose transactions come in on s_* (m3_system
+  // selects them there for both SDRAMs' ports at once, so there is no select here): the probe's end (the module
+  // there, or not), this SDRAM's done and no-window flag, and s_idle for the engine's other-SDRAM traffic
+  output logic          x_go,
+  output logic          x_skip,
+  input  logic          x_done,
+  input  logic          x_none,
+  output logic          s_idle,
 
   // the bus's work-RAM transactions (m3_bus s_*, s_w2)
   input  logic          s_req,
@@ -124,18 +134,32 @@ module m3_sdr2
   // the port's s_* until it is done (the bus is held off: ok is still low, so the game is in reset), and then `ok`
   // says the calibration found a passing window (the probe's own reads were at the generated phase, which may be
   // outside it). Without CAL: done from reset, ok the probe's, as before
-  logic        k_req, k_done, k_go;
+  logic        k_req, k_done, k_go, k_own, k_none;
   logic [1:0]  k_cmd;
   logic [AW:0] k_sa;
   logic [3:0]  k_be, k_wbe;
   logic [31:0] k_wdata;
-  m3_sdr_cal #(.AW(AW), .EN(CAL), .BASE(PROBE_SA ^ 27'h010_0000), .TWO_CHIPS(1'b0)) u_cal (   // (1 MiB past the probe's words)
-    .clk, .rst(!mem_rst_n), .start(k_go), .done(k_done),
-    .s_req(k_req), .s_cmd(k_cmd), .s_sa(k_sa), .s_be(k_be), .s_wdata(k_wdata), .s_wbe(k_wbe),
-    .s_ack, .s_wnext, .s_rvalid, .s_rdata,
-    .osd(cal_osd), .off(cal_off), .settled(cal_settled), .c_width(cal_width), .c_centre(),
-    .c_last(cal_last), .c_off(), .c_flags(cal_flags), .pass_map());
-  wire         q_cal = CAL && !k_done;
+  generate if (XCAL) begin : g_xcal
+    // (the engine's lines here are its BASE_B, PROBE_SA ^ 0x100000 as below; m3_system forces the address's top bits)
+    assign k_req = 1'b0; assign k_cmd = '0; assign k_sa = '0; assign k_be = '0; assign k_wbe = '0; assign k_wdata = '0;
+    assign k_done = x_done; assign k_own = 1'b0; assign k_none = x_none;
+    assign cal_off = '0; assign cal_width = '0; assign cal_last = '0; assign cal_flags = '0;
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire _unused_cal = &{1'b0, cal_osd, cal_settled};
+    /* verilator lint_on UNUSEDSIGNAL */
+  end else begin : g_cal
+    m3_sdr_cal #(.AW(AW), .EN(CAL), .BASE(PROBE_SA ^ 27'h010_0000), .TWO_CHIPS(1'b0)) u_cal (   // (1 MiB past the probe's words)
+      .clk, .rst(!mem_rst_n), .start(k_go), .skip_b(1'b0), .done(k_done), .busy(),
+      .s_req(k_req), .s_cmd(k_cmd), .s_sa(k_sa), .s_be(k_be), .s_wdata(k_wdata), .s_wbe(k_wbe),
+      .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle(1'b1),
+      .osd(cal_osd), .off(cal_off), .settled(cal_settled), .c_width(cal_width), .c_centre(),
+      .c_last(cal_last), .c_off(), .c_flags(cal_flags), .pass_map());
+    assign k_own = !k_done; assign k_none = cal_flags[0];
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire _unused_x = &{1'b0, x_done, x_none};
+    /* verilator lint_on UNUSEDSIGNAL */
+  end endgenerate
+  wire         q_cal = CAL && k_own;
   wire         q_req = q_cal ? k_req : s_req;
   wire  [1:0]  q_cmd = q_cal ? k_cmd : s_cmd;
   wire  [AW:0] q_sa  = q_cal ? k_sa : s_sa;
@@ -156,7 +180,7 @@ module m3_sdr2
   m3_sdr_port #(.AW(AW), .L16(L16), .LW1(LW1), .PAIR(PAIR), .RA(1'b0), .PW(PW), .FWD(FWD), .FREQ(FREQ), .PW_DLY(PW_DLY)) u_port (
     .clk, .rst(!mem_rst_n), .ra_clr,
     .s_req(q_req), .s_cmd(q_cmd), .s_sa(q_sa), .s_swap(q_swap), .s_zero(q_zero), .s_be(q_be), .s_wdata(q_wdata), .s_wbe(q_wbe),
-    .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle(),
+    .s_ack, .s_wnext, .s_rvalid, .s_rdata, .s_idle,
     .p_req(sp_req), .p_we(sp_we), .p_addr(sp_addr), .p_din(sp_din), .p_be(sp_be), .p_long(sp_long),
     .p_dout(sp_dout), .p_lo(sp_lo), .p_ack(sp_ack), .wb_col, .wb_din, .wb_be);
 
@@ -176,10 +200,21 @@ module m3_sdr2
     case (i) 2'd0: v = 16'h5AA5; 2'd1: v = 16'h3CC3; 2'd2: v = 16'h0FF0; default: v = 16'h9669; endcase
     ppat = inv ? ~v : v;
   endfunction
+  // area-sys: with CAL the probe's verdict was never used (ok and missing are the calibration's: no passing window is
+  // a missing module, which also catches the pull-ups' FFFF and a floating bus), so with CPROBE 0 there is no probe:
+  // the calibration starts once the controller is up, and the probe's port-0 select and the controller's write port
+  // (nothing else here uses it) go at synthesis
+  localparam bit NOPR = CAL && !CPROBE;
   always_ff @(posedge clk) begin
     if (!mem_rst_n) begin
-      pr_s <= PR_IDLE; pr_act <= 1'b1; pr_wreq <= 1'b0; pr_rreq <= 1'b0; pr_i <= '0; pr_inv <= 1'b0;
+      pr_s <= PR_IDLE; pr_act <= !NOPR; pr_wreq <= 1'b0; pr_rreq <= 1'b0; pr_i <= '0; pr_inv <= 1'b0;
       pr_pass <= 1'b1; pr_d <= '0; ok <= 1'b0; missing <= 1'b0;
+    end else if (NOPR) begin
+      if (mem_ready) pr_s <= PR_DONE;
+      if (pr_s == PR_DONE) begin
+        if (!en_s2) begin ok <= 1'b0; missing <= 1'b1; end                        // no module: no calibration
+        else if (k_done) begin ok <= !k_none; missing <= k_none; end              // no passing window: missing
+      end
     end else case (pr_s)
       PR_IDLE: if (mem_ready) begin
         if (!en_s2) begin pr_s <= PR_DONE; pr_pass <= 1'b0; end
@@ -205,11 +240,13 @@ module m3_sdr2
         pr_act <= 1'b0;
         if (!CAL) begin ok <= pr_pass; missing <= !pr_pass; end
         else if (!en_s2) begin ok <= 1'b0; missing <= 1'b1; end                // no module: no calibration
-        else if (k_done) begin ok <= !cal_flags[0]; missing <= cal_flags[0]; end  // no passing window: missing
+        else if (k_done) begin ok <= !k_none; missing <= k_none; end              // no passing window: missing
       end
     endcase
   end
   assign k_go = (pr_s == PR_DONE) && !pr_act && en_s2;
+  assign x_go = k_go;
+  assign x_skip = (pr_s == PR_DONE) && !pr_act && !en_s2;      // the probe is over and there is no module
   logic [INFO_BIT:0] inf_cnt;
   always_ff @(posedge clk) begin
     if (!missing) begin inf_cnt <= '0; info_req <= 1'b0; end

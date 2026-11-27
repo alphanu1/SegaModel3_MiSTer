@@ -51,54 +51,78 @@
 // `done` is held low until all this is over: m3_system keeps the loader (and so the HPS's downloads, through
 // ioctl_wait) and the game off this SDRAM until then. EN 0: done at once, offset from the OSD alone.
 
+// area-sys (one engine for both SDRAMs): with NS 2 the one engine calibrates the second SDRAM (port B) and then the
+// first (port A), one after the other: 128 ms more before the first download (256 ms in all), and about 200 ALM
+// less than two calibrators. Each run is the one-SDRAM run, transaction for transaction and clock for clock from
+// its start. PARTNER keeps R203's cross traffic, which two calibrations running together gave: every transaction
+// the engine starts on the SDRAM it calibrates also goes to the other SDRAM's port when that port is idle (its
+// address forced into range by the caller; its read data ignored, its write data whatever s_wdata shows), so the
+// other SDRAM's bus switches while this one's reads come in, as when both ran their own loops. The other SDRAM is
+// not yet calibrated (B first: A is still empty) or not yet in use (A second: the game is still held), so nothing
+// it holds is overwritten; the caller moves the partner copies' addresses where nothing is (s_pb says which SDRAM
+// is under calibration). B is skipped (A alone) when skip_b says the module is not there. The second SDRAM's
+// results are kept in registers of their own once its run is over; the first's are the engine's, as before.
+// The pass map is a shift register (a step's verdict shifted in at C_NEXT, the scan a rotation of two turns), so
+// no step decode and no 48:1 select: the same map, the same scan, the same clocks.
+
 module m3_sdr_cal
   import ppc_cache_pkg::*;
 #(
   parameter int          AW        = 26,
   parameter bit          EN        = 1'b1,
+  parameter int          NS        = 1,             // SDRAMs: 1 (port A) or 2 (B, then A)
   parameter int          NL        = 64,            // lines (32 bytes each), a power of two up to 64
   parameter int          REPS      = 16,            // read passes at each step (up to 64)
   parameter int          NSW       = 4,             // sweeps, their pass maps intersected (up to 8)
   parameter bit          HOSTILE   = 1'b1,          // every line read straight after a line write elsewhere
+  parameter bit          PARTNER   = 1'b1,          // NS 2: the other SDRAM takes the same transactions when idle
   parameter int          EDGE_M    = 12,            // steps of margin taken off the window's early edge
   parameter int          NSTEP     = 48,            // PLL steps in a period
   parameter int          BAND_LO   = 8,             // the analysed band: BAND_LO steps below the generated phase
   parameter int          BAND_HI   = 14,            //   to BAND_HI above (BAND_LO + BAND_HI < NSTEP)
   parameter int          WMIN      = 6,             // a window narrower than this is flagged
-  parameter logic [26:0] BASE      = 27'h000_0000,
+  parameter logic [26:0] BASE      = 27'h000_0000,  // port A's lines
   parameter bit          TWO_CHIPS = 1'b1,
+  parameter logic [26:0] BASE_B    = 27'h000_0000,  // port B's (NS 2)
+  parameter bit          TWO_B     = 1'b0,
   parameter int          SETTLE    = 512            // clocks after the phase is there, before the reads
 ) (
-  input  logic          clk,
-  input  logic          rst,           // the memory's reset (PLL lock)
-  input  logic          start,         // the controller is up (m2_sdram ready / m3_sdr2's probe passed)
-  output logic          done,
+  input  logic                clk,
+  input  logic                rst,           // the memory's reset (PLL lock)
+  input  logic [NS-1:0]       start,         // each controller is up (B: m3_sdr2's probe passed, the module there)
+  input  logic                skip_b,        // NS 2: B will not start (no module): A alone
+  output logic [NS-1:0]       done,
+  output logic                busy,          // the engine still owns the ports (some SDRAM not yet done)
+  output logic                s_pb,          // NS 2: B is the SDRAM under calibration (A takes the partner copies)
 
-  // m3_sdr_port's s_* (the bus's side, which m3_system / m3_sdr2 switch to this while !done)
-  output logic          s_req,
-  output logic [1:0]    s_cmd,
-  output logic [AW:0]   s_sa,
-  output logic [3:0]    s_be,
-  output logic [31:0]   s_wdata,
-  output logic [3:0]    s_wbe,
-  input  logic          s_ack,
-  input  logic          s_wnext,
-  input  logic          s_rvalid,
-  input  logic [31:0]   s_rdata,
+  // m3_sdr_port's s_* (the bus's side, which m3_system / m3_sdr2 switch to this while the engine owns them): the
+  // command fields shared, a request each
+  output logic [NS-1:0]       s_req,
+  output logic [1:0]          s_cmd,
+  output logic [AW:0]         s_sa,
+  output logic [3:0]          s_be,
+  output logic [31:0]         s_wdata,
+  output logic [3:0]          s_wbe,
+  input  logic [NS-1:0]       s_ack,
+  input  logic [NS-1:0]       s_wnext,
+  input  logic [NS-1:0]       s_rvalid,
+  input  logic [NS-1:0][31:0] s_rdata,
+  input  logic [NS-1:0]       s_idle,        // PARTNER: the port has nothing in hand (m3_sdr_port s_idle)
 
-  // the capture clock's offset (to the stepper) and its state
-  input  logic [4:0]    osd,           // 0 Auto, 1-23 MAN[osd]
-  output logic [5:0]    off,
-  input  logic          settled,
+  // each capture clock's offset (to the stepper) and its state
+  input  logic [NS-1:0][4:0]  osd,           // 0 Auto, 1-23 MAN[osd]
+  output logic [NS-1:0][5:0]  off,
+  input  logic [NS-1:0]       settled,
 
-  output logic [6:0]    c_width,
-  output logic [5:0]    c_centre,
-  output logic [5:0]    c_last,        // the window's last step (0 .. NSTEP - 1)
-  output logic [5:0]    c_off,
-  output logic [5:0]    c_flags,       // {verify, out, clamped, all, narrow, none}
-  output logic [NSTEP-1:0] pass_map
+  output logic [NS-1:0][6:0]  c_width,
+  output logic [NS-1:0][5:0]  c_last,        // the window's last step (0 .. NSTEP - 1)
+  output logic [NS-1:0][5:0]  c_off,
+  output logic [NS-1:0][5:0]  c_flags,       // {verify, out, clamped, all, narrow, none}
+  output logic [5:0]          c_centre,      // the run's (the bench's)
+  output logic [NSTEP-1:0]    pass_map       // the run's: step j in bit j at every step's start and at the end
 );
   localparam int LB = $clog2(NL);
+  localparam int RB = (REPS > 1) ? $clog2(REPS) : 1;
   // the manual offsets, single steps over the band: OSD 1 is 0, 2-15 are +1 .. +14, 16-23 are -8 .. -1 (as
   // NSTEP - 8 .. NSTEP - 1); 24-31 (not offered) are 0
   function automatic logic [5:0] man(input logic [4:0] o);
@@ -107,12 +131,17 @@ module m3_sdr_cal
     else man = 6'd0;
   endfunction
 
-  // a line's byte address
-  function automatic logic [AW:0] la(input logic [LB-1:0] i);
+  // the SDRAM being calibrated: 0 A, 1 B (always 0 with NS 1)
+  logic          ps;
+  wire           pi = (NS == 2) ? ps : 1'b0;
+  wire           qi = (NS == 2) ? !ps : 1'b0;    // NS 2: the other
+
+  // a line's byte address on SDRAM b
+  function automatic logic [AW:0] la(input logic [LB-1:0] i, input logic b);
     logic [26:0] a, ii;
     ii = 27'(i);
-    a = BASE ^ (ii << 5) ^ (27'(ii[2:1]) << 11) ^ (27'(ii >> 3) << 14);
-    if (TWO_CHIPS) a = a ^ (27'(ii[0]) << 26);
+    a = (b ? BASE_B : BASE) ^ (ii << 5) ^ (27'(ii[2:1]) << 11) ^ (27'(ii >> 3) << 14);
+    if (b ? TWO_B : TWO_CHIPS) a = a ^ (27'(ii[0]) << 26);
     la = a[AW:0];
   endfunction
   // a beat's word
@@ -140,7 +169,7 @@ module m3_sdr_cal
     endcase
   endfunction
 
-  typedef enum logic [3:0] { C_IDLE, C_WREQ, C_WBEAT, C_STEP, C_WAIT, C_SET, C_RREQ, C_RBEAT, C_NEXT, C_SCAN, C_CEN, C_PICK, C_DONE } cs_t;
+  typedef enum logic [3:0] { C_IDLE, C_WREQ, C_WBEAT, C_STEP, C_WAIT, C_SET, C_RREQ, C_RBEAT, C_NEXT, C_SCAN, C_CEN, C_PICK, C_DONE, C_END, C_QA } cs_t;
   logic          ver;             // the verify pass: one more step, at the chosen offset
   logic [2:0]    sw;              // the sweep
   logic          xw, xd;          // HOSTILE: the scratch write under way / done before this line's read
@@ -149,18 +178,19 @@ module m3_sdr_cal
   logic [5:0]    cen;
   // HOSTILE's scratch lines: another bank (byte bit 11) and 4 MiB on (bit 22), so every line read follows a
   // line write of another line's pattern to another bank and row: read-after-write turnaround, both directions of
-  // the bus at full rate, and (the two SDRAMs' calibrations running together) the other SDRAM's writes
+  // the bus at full rate, and (PARTNER) the other SDRAM's bus switching with this one's
   localparam logic [26:0] XOFF = 27'h040_0800;
   cs_t           cs;
   logic [LB-1:0] li;              // the line
-  logic [5:0]    rep;             // the pass
+  logic [RB-1:0] rep;             // the pass
   logic [5:0]    st;              // the step
   logic [9:0]    wt;              // the wait
   logic [1:0]    pq;              // s_wnext one and two clocks back
   logic [2:0]    sb, rb;          // write beat shown, read beat taken
   logic          bad;             // a beat wrong at this step
   logic [6:0]    run, best;       // the scan
-  logic [6:0]    sp;              // its position (0 .. 2 NSTEP - 1)
+  logic [5:0]    sp6;             // its position (0 .. NSTEP - 1), and the turn
+  logic          sp_t;
   logic [5:0]    bend;            // the best window's last step
   logic          flag_none, flag_narrow, flag_all, flag_clamp, flag_out, flag_ver;
   logic [5:0]    chosen;
@@ -169,40 +199,49 @@ module m3_sdr_cal
   // one pattern generator for the writes (the beat shown next) and the reads (the beat taken): never both at once
   // (HOSTILE's scratch lines take another line's pattern, li ^ 2: the other half of the pattern set)
   wire  [31:0]   pw = patt(xw ? li ^ LB'(2) : li, (cs == C_RBEAT) ? rb : sb_n);
-  wire  [AW:0]   xsa = la(li) ^ XOFF[AW:0];
-  wire  [5:0]    sp6 = (sp >= 7'(NSTEP)) ? 6'(sp - 7'(NSTEP)) : sp[5:0];
+  wire  [AW:0]   lsa = la(li, pi);
+  wire  [AW:0]   xsa = lsa ^ XOFF[AW:0];
   // the choice (R203), made on the pass map by the scan, not by arithmetic: a step counts if it passed, the EDGE_M
   // steps before it passed too (the early edge taken EDGE_M steps in: the power-up test sees it up to that much
   // earlier than the games do, cold and quiet) and it lies inside the band (-BAND_LO .. +BAND_HI: STA's limits,
   // the late one where the slow corner puts the capture word's transfer into clk_sys); the widest run of such steps
   // (best2, ending at bend2) is what is left, and the choice its middle (rounded up), as the old centre.
+  // The scan rotates the map, so the step at sp6 is in bit 0.
   wire           inb = (sp6 <= 6'(BAND_HI)) || (sp6 >= 6'(NSTEP - BAND_LO));
-  wire           ok2 = pass_map[sp6] && run >= 7'(EDGE_M) && inb;
+  wire           ok2 = pass_map[0] && run >= 7'(EDGE_M) && inb;
   wire  [6:0]    back = (best2 - 7'd1) >> 1;
   wire  [6:0]    cen_r = {1'b0, bend2} + 7'(NSTEP) - back;
   wire  [5:0]    cen_m = (cen_r >= 7'(NSTEP)) ? 6'(cen_r - 7'(NSTEP)) : cen_r[5:0];
+  // a run starts (C_IDLE, and B's end with NS 2): A when NS 1; with NS 2 once A is up and B is up or known absent
+  wire           go1 = (NS == 1) ? start[0] : (start[0] && (start[NS-1] || skip_b));
+  // PARTNER: the other port takes this transaction too, if its controller is up and it has nothing in hand
+  wire           pt  = (NS == 2) && PARTNER && start[qi] && !s_req[qi] && s_idle[qi] && !s_ack[qi];
+  // the second SDRAM's results, kept once its run is over (the first's are the engine's own)
+  logic [6:0]    rb_width;
+  logic [5:0]    rb_last, rb_off, rb_flags;
 
   assign s_be = 4'hF; assign s_wbe = 4'hF;
 
   always_ff @(posedge clk) begin
     if (rst || !EN) begin
-      cs <= C_IDLE; done <= !EN; s_req <= 1'b0; s_cmd <= MC_LINE_RD; s_sa <= '0; s_wdata <= '0;
+      cs <= C_IDLE; done <= {NS{!EN}}; s_req <= '0; s_cmd <= MC_LINE_RD; s_sa <= '0; s_wdata <= '0; ps <= 1'b0;
       li <= '0; rep <= '0; st <= '0; wt <= '0; pq <= '0; sb <= '0; rb <= '0; bad <= 1'b0;
-      run <= '0; best <= '0; sp <= '0; bend <= '0; pass_map <= '0;
+      run <= '0; best <= '0; sp6 <= '0; sp_t <= 1'b0; bend <= '0; pass_map <= '0;
       flag_none <= 1'b0; flag_narrow <= 1'b0; flag_all <= 1'b0; flag_clamp <= 1'b0; flag_out <= 1'b0; flag_ver <= 1'b0;
       chosen <= '0; ver <= 1'b0; sw <= '0; xw <= 1'b0; xd <= 1'b0; run2 <= '0; best2 <= '0; bend2 <= '0; cen <= '0;
-      off <= 6'd0;
+      rb_width <= '0; rb_last <= '0; rb_off <= '0; rb_flags <= '0;
     end else begin
-      s_req <= s_req && !s_ack;
+      s_req <= s_req & ~s_ack;
       s_wdata <= pw;                     // beat k in s_wdata at t + k + 2 (m3_bus's timing for LW1)
-      pq <= {pq[0], s_wnext};
+      pq <= {pq[0], s_wnext[pi]};
       sb <= sb_n;
       case (cs)
-        C_IDLE: if (start) begin cs <= C_WREQ; li <= '0; end
+        C_IDLE: if (go1) begin cs <= C_WREQ; li <= '0; ps <= (NS == 2) && start[NS-1]; end
 
         // ---- the writes: each line once, a cast-out of eight beats
         C_WREQ: begin
-          s_req <= 1'b1; s_cmd <= MC_LINE_WR; s_sa <= la(li); sb <= '0; pq <= '0;
+          s_req[pi] <= 1'b1; if (pt) s_req[qi] <= 1'b1;
+          s_cmd <= MC_LINE_WR; s_sa <= lsa; sb <= '0; pq <= '0;
           cs <= C_WBEAT;
         end
         C_WBEAT: if (pq[1] && sb == 3'd7) begin
@@ -213,28 +252,31 @@ module m3_sdr_cal
         end
 
         // ---- a step: the phase there, then REPS passes of every line
-        C_STEP: begin off <= st; wt <= '0; bad <= 1'b0; cs <= C_WAIT; end
+        C_STEP: begin wt <= '0; bad <= 1'b0; cs <= C_WAIT; end
         C_WAIT: begin
           wt <= wt + 10'd1;
-          if (wt >= 10'd16 && settled) begin wt <= '0; cs <= C_SET; end
+          if (wt >= 10'd16 && settled[pi]) begin wt <= '0; cs <= C_SET; end
         end
         C_SET: begin
           wt <= wt + 10'd1;
           if (wt == 10'(SETTLE)) begin li <= '0; rep <= '0; cs <= C_RREQ; end
         end
-        C_RREQ: if (HOSTILE && !xd) begin
-            // the scratch line first: the inverted pattern, another bank and row
-            s_req <= 1'b1; s_cmd <= MC_LINE_WR; s_sa <= xsa; sb <= '0; pq <= '0; xw <= 1'b1; cs <= C_WBEAT;
+        C_RREQ: begin
+          s_req[pi] <= 1'b1; if (pt) s_req[qi] <= 1'b1;
+          if (HOSTILE && !xd) begin
+            // the scratch line first: another line's pattern, another bank and row
+            s_cmd <= MC_LINE_WR; s_sa <= xsa; sb <= '0; pq <= '0; xw <= 1'b1; cs <= C_WBEAT;
           end else begin
-            s_req <= 1'b1; s_cmd <= MC_LINE_RD; s_sa <= la(li); rb <= '0; cs <= C_RBEAT;
+            s_cmd <= MC_LINE_RD; s_sa <= lsa; rb <= '0; cs <= C_RBEAT;
           end
-        C_RBEAT: if (s_rvalid) begin
-          if (s_rdata != pw) bad <= 1'b1;
+        end
+        C_RBEAT: if (s_rvalid[pi]) begin
+          if (s_rdata[pi] != pw) bad <= 1'b1;
           rb <= rb + 3'd1;
           if (rb == 3'd7) begin
             xd <= 1'b0;
             if (li != LB'(NL - 1)) begin li <= li + 1'd1; cs <= C_RREQ; end
-            else if (rep != 6'(REPS - 1)) begin li <= '0; rep <= rep + 6'd1; cs <= C_RREQ; end
+            else if (rep != RB'(REPS - 1)) begin li <= '0; rep <= rep + 1'd1; cs <= C_RREQ; end
             else cs <= C_NEXT;
           end
         end
@@ -244,17 +286,20 @@ module m3_sdr_cal
             if (bad) begin flag_ver <= 1'b1; chosen <= 6'd0; end
             cs <= C_DONE;
           end else begin
-            // NSW sweeps: a step passes only if it passed in every one
-            if (sw == 3'd0 || bad) pass_map[st] <= !bad;           // (one shared enable term: cheap)
+            // NSW sweeps: a step passes only if it passed in every one; its verdict shifted in at the top, so after
+            // the step NSTEP - 1 the map is in place again (step j in bit j) and bit 0 is the next step's old one
+            pass_map <= {!bad && (sw == 3'd0 || pass_map[0]), pass_map[NSTEP-1:1]};
             if (st != 6'(NSTEP - 1)) begin st <= st + 6'd1; cs <= C_STEP; end
             else if (sw != 3'(NSW - 1)) begin st <= '0; sw <= sw + 3'd1; cs <= C_STEP; end
-            else begin cs <= C_SCAN; sp <= '0; run <= '0; best <= '0; run2 <= '0; best2 <= '0; end
+            else begin cs <= C_SCAN; sp6 <= '0; sp_t <= 1'b0; run <= '0; best <= '0; run2 <= '0; best2 <= '0; end
           end
         end
 
-        // ---- the widest passing run over two turns (wrap-around), width at most NSTEP
+        // ---- the widest passing run over two turns (wrap-around), width at most NSTEP: the map rotated a step a
+        // clock, so the step at sp6 is in bit 0, and after the two turns the map is in place again
         C_SCAN: begin
-          if (pass_map[sp6]) begin
+          pass_map <= {pass_map[0], pass_map[NSTEP-1:1]};
+          if (pass_map[0]) begin
             if (run < 7'(NSTEP)) run <= run + 7'd1;
             if (run + 7'd1 > best && run < 7'(NSTEP)) begin best <= run + 7'd1; bend <= sp6; end
           end else run <= '0;
@@ -262,8 +307,9 @@ module m3_sdr_cal
             run2 <= run2 + 7'd1;
             if (run2 + 7'd1 > best2) begin best2 <= run2 + 7'd1; bend2 <= sp6; end
           end else run2 <= '0;
-          if (sp == 7'(2 * NSTEP - 1)) cs <= C_CEN;
-          sp <= sp + 7'd1;
+          if (sp_t && sp6 == 6'(NSTEP - 1)) cs <= C_CEN;
+          sp6 <= (sp6 == 6'(NSTEP - 1)) ? 6'd0 : sp6 + 6'd1;
+          if (sp6 == 6'(NSTEP - 1)) sp_t <= 1'b1;
         end
         C_CEN: begin cen <= cen_m; cs <= C_PICK; end       // from the scan's final best2 / bend2
         C_PICK: begin
@@ -281,18 +327,47 @@ module m3_sdr_cal
           end
         end
         C_DONE: begin
-          done <= 1'b1;
-          off <= (osd == 5'd0) ? chosen : man(osd);
+          done[pi] <= 1'b1;
+          cs <= C_END;
+          if (NS == 2 && pi) begin
+            // B is over: its results kept, then A's run from the start
+            rb_width <= best; rb_last <= bend; rb_off <= chosen;
+            rb_flags <= {flag_ver, flag_out, flag_clamp, flag_all, flag_narrow, flag_none};
+            ps <= 1'b0; cs <= C_QA; li <= '0; ver <= 1'b0; chosen <= '0;
+            flag_none <= 1'b0; flag_narrow <= 1'b0; flag_all <= 1'b0; flag_clamp <= 1'b0; flag_out <= 1'b0; flag_ver <= 1'b0;
+            // and the scan's results as the reset leaves them (a run with no window sets neither end, and the readout
+            // shows A's width and last from here on)
+            run <= '0; best <= '0; bend <= '0; run2 <= '0; best2 <= '0; bend2 <= '0;
+          end
         end
+        // NS 2: A's run waits for A's port to finish whatever partner transaction it still has (a write's beats would
+        // otherwise be counted as A's first line's)
+        C_QA: if (!s_req[0] && s_idle[0]) cs <= C_WREQ;
+        C_END: ;
         default: cs <= C_IDLE;
       endcase
     end
-    if (!EN) off <= man(osd == 5'd0 ? 5'd1 : osd);
   end
 
-  assign c_width  = best;
+  // each capture clock's offset: the step under test while its run sweeps, Auto's choice or the OSD's after
+  always_ff @(posedge clk) begin
+    for (int k = 0; k < NS; k++) begin
+      if (!EN) off[k] <= man(osd[k] == 5'd0 ? 5'd1 : osd[k]);
+      else if (rst) off[k] <= 6'd0;
+      else if (cs == C_STEP && pi == 1'(k)) off[k] <= st;
+      else if (done[k] || (cs == C_DONE && pi == 1'(k)))
+        off[k] <= (osd[k] != 5'd0) ? man(osd[k]) : (k == 1 && done[k]) ? rb_off : chosen;
+    end
+  end
+
+  assign busy = EN && !(done[0] && (NS == 1 || done[NS-1] || skip_b));
+  assign s_pb = (NS == 2) && ps;
   assign c_centre = cen;
-  assign c_last   = bend;
-  assign c_off    = chosen;
-  assign c_flags  = {flag_ver, flag_out, flag_clamp, flag_all, flag_narrow, flag_none};
+  always_comb begin
+    c_width[0] = best; c_last[0] = bend; c_off[0] = chosen;
+    c_flags[0] = {flag_ver, flag_out, flag_clamp, flag_all, flag_narrow, flag_none};
+    if (NS == 2) begin
+      c_width[NS-1] = rb_width; c_last[NS-1] = rb_last; c_off[NS-1] = rb_off; c_flags[NS-1] = rb_flags;
+    end
+  end
 endmodule
