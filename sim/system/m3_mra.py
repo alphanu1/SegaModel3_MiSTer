@@ -185,8 +185,25 @@ SPIKEOFE = {
     'nvnote': ['the 93C46. Supermodel reaches the attract from a fresh NVRAM;',
                'the file keeps the settings and records. m3_mra.py nvram converts a'],
 }
+# ROM_START(scudplus) (Step 1.5): a split set on scud (the MRA names both zips, scudplus.zip first). Scud Race's
+# hardware and controls; all four CROMs fitted (64 MiB, banks 0-7). MAME does not mirror banks 8-15 for it (no
+# ROM_COPY, unlike lostwsga), so neither does this. Its 53C810 is at C1000000 in MAME (F9000000 on Scud Race):
+# the core's window follows the game's own PCI BAR1, so nothing changes in the RTL.
+SCUDPLUS = {
+    'setname': 'scudplus', 'name': 'Scud Race Plus - Sega Super GT Plus (Revision A)', 'year': '1997',
+    'zip': 'scudplus.zip|scud.zip',
+    'category': 'Driving', 'step': 0x15, 'idle_in': [0xAF, 0xFF], 'prof': P_DRIVE, 'buttons': BTN_DRIVE,
+    'crom': [
+        [('mpr-19658.01', 6), ('mpr-19659.02', 4), ('mpr-19660.03', 2), ('mpr-19661.04', 0)],
+        [('mpr-19662.05', 6), ('mpr-19663.06', 4), ('mpr-19664.07', 2), ('mpr-19665.08', 0)],
+        [('mpr-19666.09', 6), ('mpr-19667.10', 4), ('mpr-19668.11', 2), ('mpr-19669.12', 0)],
+        [('mpr-20097.13', 6), ('mpr-20098.14', 4), ('mpr-20099.15', 2), ('mpr-20100.16', 0)],
+    ],
+    'fixed': [('epr-20092a.17', 6), ('epr-20093a.18', 4), ('epr-20094a.19', 2), ('epr-20095a.20', 0)],
+    'vrom': ['mpr-%d.%d' % (19672 + k, 26 + k) for k in range(16)],
+}
 SETS = {'vf3': VF3, 'bassdx': BASSDX, 'daytona2': DAYTONA2, 'scuddxo': SCUDDXO, 'lostwsga': LOSTWSGA, 'srally2': SRALLY2,
-        'spikeofe': SPIKEOFE}
+        'spikeofe': SPIKEOFE, 'scudplus': SCUDPLUS}
 
 # game configuration (index 4) flags, m3_loader.sv
 CF_VROM_X, CF_FIXED8, CF_VROM64 = 1, 2, 4
@@ -215,9 +232,25 @@ OFF_MAP = {2: '00000021', 0: '00002100', 6: '00210000', 4: '21000000'}
 SEQ_MAP = ['00000021', '00002100', '00210000', '21000000']
 
 
+class Zips:
+    """A split set's zips, 'set.zip|parent.zip' as the MRA names them: a part is read from the first that has it,
+    as Main's loader does."""
+    def __init__(self, names):
+        self.z = [zipfile.ZipFile(n) for n in names.split('|')]
+
+    def infolist(self):
+        return [i for z in reversed(self.z) for i in z.infolist()]
+
+    def read(self, name):
+        for z in self.z:
+            if name in z.namelist():
+                return z.read(name)
+        raise KeyError(name)
+
+
 def mra(args):
     s = SETS[args.set]
-    z = zipfile.ZipFile(args.zip)
+    z = Zips(args.zip)
     crc = {i.filename: '%08x' % i.CRC for i in z.infolist()}
     if s.get('step', 0x10) >= 0x20:
         return mra_step2(args, s, crc)
@@ -464,7 +497,7 @@ def pack_rom(rom, z):
 
 def pack(args):
     root = ET.parse(args.mra).getroot()
-    z = zipfile.ZipFile(args.zip)
+    z = Zips(args.zip)
     for rom in root.findall('rom'):
         ix = int(rom.get('index'))
         out = pack_rom(rom, z)
