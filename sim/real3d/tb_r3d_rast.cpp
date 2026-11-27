@@ -107,6 +107,8 @@ int main(int argc, char **argv) {
   int ack_lo = 1, ack_hi = 3, ack_p = 0, tack_lo = 1, tack_hi = 3, tack_p = 0, busy = 20, lat_lo = 13, lat_hi = 40, gap = 10, igap = 10;
   unsigned maxrd = 16;
   bool mip = false;
+  bool empty_drop = false;               // --empty: r3d_geo EMPTY_DROP's rule applied to the records (D-85)
+  uint64_t n_empty = 0;
   bool l8key = true, smtx = true;
   unsigned gstep = 0;
   if (char const *e = std::getenv("R3D_PIX")) { g_px = std::atoi(e); if (char const *c = std::strchr(e, ',')) g_py = std::atoi(c + 1); }
@@ -123,6 +125,7 @@ int main(int argc, char **argv) {
     else if (a == "--gap") gap = std::atoi(nx().c_str()); else if (a == "--igap") igap = std::atoi(nx().c_str());
     else if (a == "--maxrd") maxrd = unsigned(std::atoi(nx().c_str()));
     else if (a == "--mip") mip = true;
+    else if (a == "--empty") empty_drop = true;
     else if (a == "--l8key") l8key = std::atoi(nx().c_str()) != 0;
     else if (a == "--sm") smtx = std::atoi(nx().c_str()) != 0;
     else if (a == "--step") gstep = unsigned(std::strtoul(nx().c_str(), nullptr, 16));
@@ -189,6 +192,24 @@ int main(int argc, char **argv) {
       int const l = int(t.pass & 3) * 2 + int(t.alpha & 1);
       if (int64_t(t.buf) <= lastbuf[l]) order_bad++;
       lastbuf[l] = int64_t(t.buf);
+      if (empty_drop) {
+        // r3d_geo EMPTY_DROP (D-85): the record is not sent when, by tb_r3d_geo's rule (the 16.16 vertex to nearest,
+        // ties away, then poly.h's round, clamped to the screen), no row or no column lies between the least and the
+        // greatest vertex; the model still draws every triangle, so any pixel such a record would have drawn shows
+        // as a pixel wrong
+        auto pix = [](float f, int lim) {
+          uint32_t u; std::memcpy(&u, &f, 4);
+          int64_t const v = (u >> 31) ? 0 : std::min<int64_t>(std::llround(std::ldexp(double(f), 16)), 0x3ffffff);
+          int64_t const p = (v >> 16) + ((v & 0xffff) > 0x8000 ? 1 : 0);
+          return int(std::min<int64_t>(p, lim));
+        };
+        int rmin = 1 << 20, rmax = -1, cmin = 1 << 20, cmax = -1;
+        for (int k = 0; k < 3; k++) {
+          int const c = pix(r.fx[k], SCR_W), y = pix(r.fy[k], SCR_H);
+          cmin = std::min(cmin, c); cmax = std::max(cmax, c); rmin = std::min(rmin, y); rmax = std::max(rmax, y);
+        }
+        if (rmin >= rmax || cmin >= cmax) { n_empty++; continue; }
+      }
       if (t.vp >= 0 && t.vp != last_vp) {
         rvp const &v = f.vps[size_t(t.vp)];
         put(v.pass & 3, false); put(v.node[0x20], false); put(v.node[0x22], false); put(v.node[0x23], false);
@@ -465,6 +486,7 @@ int main(int argc, char **argv) {
     return p >= 100 ? v.back() : v[std::min(v.size() - 1, v.size() * size_t(p) / 100)];
   };
   double const F = 1738530.0;   // cycles a 57.52 Hz frame at 100 MHz
+  if (empty_drop) std::printf("  --empty: %" PRIu64 " records not sent (EMPTY_DROP's rule)\n", n_empty);
   std::printf("r3d_rast: %" PRIu64 " frames, %" PRIu64 " shaded pixels, %" PRIu64 " pixels wrong in %" PRIu64 " frames; "
               "%" PRIu64 " port-rule violations, %" PRIu64 " bad addresses, %" PRIu64 " out of order; %" PRIu64 " cycles\n",
               nfr, npx, px_bad, nfail, viol, bad_addr, order_bad, cyc);

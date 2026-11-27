@@ -366,6 +366,15 @@ set_global_assignment -name VERILOG_MACRO "M3_R3B=1"
 # The frame-time measurement in a release build (m3_frame_busy and overlay rows 6-7: each frame against the vblank,
 # split into Real3D DMA wait and the rest; study R188). Board measurement builds only.
 #set_global_assignment -name VERILOG_MACRO "M3_FBUSY_BUILD=1"
+# D-85: changes from the contributor's fork, each off until board-tested (m3_system's header lists them). M3_DMADIR:
+# Step 2 DMA moves write the Real3D straight from the move engine; M3_R3LATE: a frame missed at its flip starts late,
+# not dropped; M3_R3EMPTY: the geometry drops triangles that cover no pixel; M3_R3PF: the display-list walker reads
+# ahead; M3_SND_WD13: the sound bridge's watchdog at 186 ms, not 93
+set_global_assignment -name VERILOG_MACRO "M3_DMADIR=1"
+#set_global_assignment -name VERILOG_MACRO "M3_R3LATE=1"
+#set_global_assignment -name VERILOG_MACRO "M3_R3EMPTY=1"
+#set_global_assignment -name VERILOG_MACRO "M3_R3PF=1"
+set_global_assignment -name VERILOG_MACRO "M3_SND_WD13=1"
 # The core PLL's outputs stay separate counters even when two of them match (SDRAM_CLK and SDRAM2_CLK at the same
 # phase): Quartus would otherwise merge outclk_3 into outclk_2, and Model3.sdc's sd2_pin and the second SDRAM's I/O
 # constraints would then match nothing (c135y_s1, 2026-11-20). As sys/pll_hdmi does for its PLL.

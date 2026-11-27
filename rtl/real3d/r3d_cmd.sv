@@ -42,6 +42,15 @@
 // every flip. A frame is drawn when both came since the last flip and the
 // Real3D can take it (the geometry idle, r3d_mem's banks in step, a store bank
 // free, no upload running); otherwise it is dropped and the last image stays.
+// LATE (D-85, macro M3_R3LATE): a frame the Real3D cannot take at its flip is
+// not dropped. It waits with the host held (sw_wait, as for any draw, so
+// nothing written after the flip reaches it) and begins as soon as the Real3D
+// can take it. A frame whose geometry runs a little past the flip then costs
+// that little, not a whole frame of the geometry idle until the next flip. What
+// the Real3D does with a frame kicked while it is busy is not documented
+// (R189, R191): dropping and starting late are both this core's ways of
+// coping with its own speed. With LATE the frame-busy row's swap wait counts
+// the late waits too.
 //
 // A draw: at the flip, r3d_mem swaps its banks and the geometry starts on
 // bank R (busy until its records are all out), and the rasteriser begins a
@@ -247,6 +256,12 @@ module r3d_cmd #(
                       ((inf_n != 2'd0) ? (4'd1 << inf_q[0]) : 4'd0) | ((inf_n == 2'd2) ? (4'd1 << inf_q[1]) : 4'd0);
   wire  [1:0]  free_i = !used[0] ? 2'd0 : !used[1] ? 2'd1 : !used[2] ? 2'd2 : 2'd3;
   wire         can_start = !g_run && !e_wait && f_ready;
+`ifdef M3_R3LATE
+  localparam bit LATE = 1'b1;
+`else
+  localparam bit LATE = 1'b0;
+`endif
+  logic        sw_late;                   // LATE: the draw waiting began late (it also waits for can_start)
   wire         end_now = e_wait && g_seen && !g_busy && !x_need && !x_run && !(&used);
 
 `ifdef M3_DMAFAST
@@ -281,7 +296,8 @@ module r3d_cmd #(
       b_v <= 1'b0;
 `endif
       pingpong <= 1'b0; cmd_seen <= 1'b0; tg_seen <= 1'b0;
-      g_run <= 1'b0; g_seen <= 1'b0; m_rbusy <= 1'b0; sw_wait <= 1'b0; x_need <= 1'b0; x_run <= 1'b0; e_wait <= 1'b0;
+      g_run <= 1'b0; g_seen <= 1'b0; m_rbusy <= 1'b0; sw_wait <= 1'b0; sw_late <= 1'b0; x_need <= 1'b0; x_run <= 1'b0;
+      e_wait <= 1'b0;
       inf_n <= '0; pend_v <= 1'b0; show_v <= 1'b0; show_buf <= 2'd0; hide <= '0;
       n_draw <= '0; n_drop <= '0; tot <= '0; tot_l <= 23'h7F_FFFF; t3 <= '0;
     end else begin
@@ -316,14 +332,15 @@ module r3d_cmd #(
         cmd_seen <= 1'b0; tg_seen <= 1'b0;
         if (cmd_seen && tg_seen) begin
           if (can_start) sw_wait <= 1'b1;
+          else if (LATE) begin sw_wait <= 1'b1; sw_late <= 1'b1; end
           else n_drop <= n_drop + 16'd1;
         end
       end
       // the swap: once the write held at the flip has gone in and r3d_mem's
       // banks are in step (the host waits meanwhile, so nothing after the flip
-      // reaches the frame)
-      if (sw_wait && !b_v && m_can_swap) begin
-        sw_wait <= 1'b0;
+      // reaches the frame); LATE's draw also waits until the Real3D can take it
+      if (sw_wait && !b_v && m_can_swap && (!sw_late || can_start)) begin
+        sw_wait <= 1'b0; sw_late <= 1'b0;
         m_swap <= 1'b1; m_rbusy <= 1'b1;
         g_start <= 1'b1; g_run <= 1'b1; g_seen <= 1'b0;
         f_begin <= 1'b1; e_wait <= 1'b1;

@@ -110,7 +110,8 @@ module m3_bus_tb
     .pingpong_o(), .pingpong_i(1'b0), .h_go, .h_rdy(h_rdy_i), .h_we, .h_addr(h_addr_o), .h_wdata(h_wdata_o), .h_rv, .h_rdata,
     .r3d_cfg0(), .r3d_cfg1(), .r3d_cfg2(),
     .jt_wr, .jt_wdata, .jt_busy, .jt_tdo, .jt_cfg_we(1'b0), .jt_cfg0('0), .jt_cfg1('0), .jt_cfg2('0),
-    .tr_v(), .tr_master(), .tr_we(), .tr_addr(), .tr_be(), .tr_data(), .tr_nw());
+    .tr_v(), .tr_master(), .tr_we(), .tr_addr(), .tr_be(), .tr_data(), .tr_nw(),
+    .d_v(1'b0), .d_addr(32'd0), .d_wdata(32'd0), .d_take());
 
   m3_sdr_port #(.AW(26), .L16(L16), .LW1(LW1), .PAIR(PAIR), .RA(RA), .PW(PW), .RA_CONF(RA_CONF), .FWD(FWD), .FREQ(FREQ), .PW_DLY(PW_DLY)) u_port (
     .clk, .rst(!rst_n), .ra_clr(1'b0),

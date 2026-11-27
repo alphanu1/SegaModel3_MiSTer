@@ -12,7 +12,7 @@
 //
 // r3d_walker against the reference model's event trace, frame by frame.
 //
-//   Vr3d_walker --dumps DIR --vrom FILE [--lat N] [--stall P] [--frames N] [--seed S]
+//   Vr3d_walker --dumps DIR --vrom FILE [--lat N] [--stall P] [--frames N] [--seed S] [--step HEX]
 //
 // The memory answers a request after 1-3 cycles and returns its words N cycles
 // later, one a cycle; words past the end of a region come back as 0xDEADBEEF
@@ -52,6 +52,7 @@ int main(int argc, char **argv) {
   int lat = 8, stall = 20;
   long max_frames = -1;
   unsigned seed = 1;
+  uint32_t step = 0x10;   // --step HEX: the model's step; 0x15 and later drive step15 (ten-word nodes)
   for (int i = 1; i < argc; i++) {
     std::string const a = argv[i];
     auto nx = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -61,6 +62,7 @@ int main(int argc, char **argv) {
     else if (a == "--stall") stall = std::atoi(nx().c_str());
     else if (a == "--frames") max_frames = std::atol(nx().c_str());
     else if (a == "--seed") seed = unsigned(std::atoi(nx().c_str()));
+    else if (a == "--step") step = uint32_t(std::strtoul(nx().c_str(), nullptr, 16));
   }
   if (dumps.empty()) { std::fprintf(stderr, "need --dumps\n"); return 2; }
   r3d_mem mem;
@@ -77,6 +79,7 @@ int main(int argc, char **argv) {
   std::mt19937 rng(seed);
   Vr3d_walker *t = new Vr3d_walker;
   auto tick = [&]() { t->clk = 0; t->eval(); t->clk = 1; t->eval(); };
+  t->step15 = step >= 0x15;
   t->rst = 1; t->start = 0; t->mem_ack = 0; t->mem_rvalid = 0; t->ev_ready = 0;
   tick(); tick();
   t->rst = 0;
@@ -90,6 +93,7 @@ int main(int argc, char **argv) {
     {
       r3d_geo geo(mem, arith::rtl, false);
       geo.trace = &ref;
+      geo.step = step;
       geo.frame(uint32_t(fi));
     }
     std::vector<std::array<uint32_t, 4>> got;

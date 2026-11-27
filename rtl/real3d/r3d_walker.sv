@@ -63,7 +63,20 @@ module r3d_walker #(
   // place of four MLABs read asynchronously at vp_idx. The word is the same in every clock that uses it: those
   // are S_VP_SEL to S_VP_EMIT, all after the S_VP_NEXT that sets vp_idx, and no write comes after the chain is
   // collected. 0 keeps the MLAB.
-  parameter bit VP_M10K = 1'b0
+  parameter bit VP_M10K = 1'b0,
+  // PF (D-85, macro M3_R3PF in r3d_geo): read ahead. Without it the walker makes one request at a time and the
+  // geometry waits for each (Sega Rally 2's snow-stage spectators: 7% of the engine's time in the walker's
+  // reads). With PF it keeps three buffers: once a node's words are in, its child (a node, the model list's word
+  // or a pointer list's first block) and its sibling are read into buffers 0 and 1 while the geometry works on
+  // the node (its events and its cull test); a single-word read that misses reads its whole aligned block
+  // (PF_BW) into buffer 2, so list scans and the backward list steps take one request a block. A read that finds
+  // its words in a buffer takes them from there; one whose buffer is still being read waits for it. Only
+  // addresses whose words all lie inside their region are read ahead, so MAME's zeroing of invalid addresses is
+  // unchanged (it stays in S_RD). The culling RAM does not change during a walk (r3d_mem's bank R). 0: no
+  // buffers, as before.
+  parameter bit PF = 1'b0,
+  // PF's blocks: 2^PF_BW words (2: four, one SDRAM read on the board's m3v_sdr_rd; 3: eight)
+  parameter int PF_BW = 2
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -95,6 +108,8 @@ module r3d_walker #(
                          EV_MODEL = 3'd5, EV_POP = 3'd6, EV_END = 3'd7, EV_CULLQ = 3'd0;
 
   localparam int RS_N = 1 << RS_LOG2;
+  localparam int PB = PF_BW;
+  localparam logic [2:0] PBL = 3'((1 << PF_BW) - 1);
   localparam int VP_N = 1 << VP_LOG2;
 
   typedef enum logic [4:0] {
@@ -130,9 +145,57 @@ module r3d_walker #(
   logic        rd_okq, rd_l8q, rd_pq;
   logic [2:0]  rd_idx;
 `ifdef VERILATOR
-  always_ff @(posedge clk) if (!rst && st == S_RD_DATA && (rd_pq != rd_past || rd_idx != rd_base + rd_beat))
+  always_ff @(posedge clk) if (!rst && st == S_RD_DATA && !(PF && rd_fill) && (rd_pq != rd_past || rd_idx != rd_base + rd_beat))
     $fatal(1, "walker: the read's tests registered");
 `endif
+
+  // ---- read-ahead buffers (PF) ---------------------------------------------
+  // entry 0 child, 1 sibling (filled by the read-ahead engine), 2 the last single-word read's block
+  logic        pf_act;          // a read-ahead request is out (the port is the engine's)
+  logic        pf_data;         // ... and acknowledged: its words are coming
+  logic [1:0]  pf_cur;          // entry being read (0 or 1)
+  logic        pf_ph;           // Step 1.5 node: 0 word 0, 1 words 3-9
+  logic        pf_kill;         // the entry was given a new address while being read: drop the words
+  logic [2:0]  pf_beat, pf_len, pf_base;
+  logic [2:0]  pe_need;         // entry to be read (0, 1)
+  logic [2:0]  pe_v;            // entry holds its words
+  logic [2:0]  pe_node;         // node (rbuf's layout, eight words), else an aligned block
+  logic [23:0] pe_a [0:2];      // node address, or block address ([PB-1:0] = 0)
+  logic [31:0] pbuf [0:2][0:7];
+  logic        rd_fill;         // S_RD_DATA: a miss read as a block into entry 2
+  logic [2:0]  rd_off;          // the word wanted within that block
+
+  // the read S_RD holds: a node's first read (Step 1.5 word 0, or Step 1.0 words 0-6/7), or one word
+  logic        rd_isnode;
+  logic [2:0]  pe_hit, pe_wait, pe_m, pe_mq;   // pe_mq: pe_m registered in S_RD (S_RDQ tests it)
+  logic        pf_done;         // the read-ahead request's last word is in
+  logic [1:0]  pf_c;            // entry the engine reads next
+  always_comb begin
+    rd_isnode = (rd_ret == S_BLK_RD2) || (rd_ret == S_BLK_GOT && rd_base == 3'd0 && !step15);
+    for (int e = 0; e < 3; e++) begin
+      pe_m[e]    = pe_node[e] ? (rd_isnode && pe_a[e] == rd_addr[23:0])
+                              : (rd_len == 3'd0 && rd_base == 3'd0 && pe_a[e][23:PB] == rd_addr[23:PB]);
+      pe_hit[e]  = PF && st == S_RDQ && rd_okq && pe_v[e] && pe_mq[e];
+      pe_wait[e] = PF && st == S_RDQ && rd_okq && pe_need[e] && pe_mq[e];
+    end
+    pf_done = pf_act && pf_data && mem_rvalid && pf_beat == pf_len;
+    pf_c    = pf_ph ? pf_cur : {1'b0, !pe_need[0]};
+  end
+
+  // read-ahead targets of the node in rbuf, from the link as S_LINK would take it
+  function automatic logic lk_node(input logic [31:0] l);
+    lk_node = l[31:24] == 8'h00 && l != 32'd0 && l != 32'h0080_0800;
+  endfunction
+  function automatic logic lk_list(input logic [31:0] l);
+    lk_list = l[31:24] == 8'h04;
+  endfunction
+  // all of a node's ten words (or the block) inside its region: nothing to zero
+  function automatic logic ok_node(input logic [23:0] a);
+    ok_node = (a[23:18] == 6'b100000) ? !(&a[17:4]) : (a[23:20] == 4'h0) ? !(&a[19:4]) : 1'b0;
+  endfunction
+  function automatic logic ok_blk(input logic [23:0] a);
+    ok_blk = (a[23:18] == 6'b100000) || (a[23:20] == 4'h0);
+  endfunction
 
   // ---- walker state -------------------------------------------------------
   logic [1:0]  pass;
@@ -248,13 +311,39 @@ module r3d_walker #(
   always_ff @(posedge clk)
     if (rs_we) rs_mem[rs_wa] <= {rs_wz, rs_wd};
 
+  // read-ahead targets. Leaving S_BLK_GOT (the node's words in rbuf): entry 0 its child (the model list's
+  // word, a node, or a pointer list's first block, as S_BLK_FRAME and S_LINK take it), entry 1 its sibling
+  // if it has one (else entry 1 keeps what it holds). On Sega Rally 2's snow-stage spectators (geometry bench,
+  // culling latency 25-35 and 12 more a four-word block) the sibling is worth 2%; reading ahead the node of a
+  // list's next entry in S_LST_ENT was slower (its reads held the port), so it is not done
+  logic [1:0]  tset, tok, tnode;
+  logic [23:0] ta [0:1];
+  always_comb begin
+    tset = 2'd0; tok = 2'd0; tnode = 2'd0; ta[0] = '0; ta[1] = '0;
+    if (PF && st == S_BLK_GOT && ev_free) begin
+      tset[0] = 1'b1;
+      if (rbuf[0][3]) begin
+        tok[0] = ok_blk(rbuf[5][23:0]); ta[0] = {rbuf[5][23:PB], {PB{1'b0}}};
+      end else if (lk_node(rbuf[5])) begin
+        tok[0] = ok_node(rbuf[5][23:0]); tnode[0] = 1'b1; ta[0] = rbuf[5][23:0];
+      end else if (lk_list(rbuf[5])) begin
+        tok[0] = ok_blk(rbuf[5][23:0]); ta[0] = {rbuf[5][23:PB], {PB{1'b0}}};
+      end
+      if (rbuf[0][2:0] != 3'd6 && lk_node(rbuf[6])) begin
+        tset[1] = 1'b1; tok[1] = ok_node(rbuf[6][23:0]); tnode[1] = 1'b1; ta[1] = rbuf[6][23:0];
+      end else if (rbuf[0][2:0] != 3'd6 && lk_list(rbuf[6])) begin
+        tset[1] = 1'b1; tok[1] = ok_blk(rbuf[6][23:0]); ta[1] = {rbuf[6][23:PB], {PB{1'b0}}};
+      end
+    end
+  end
+
   // the viewport's word 22, then word 2: one adder
   logic [31:0] vp_wa;
   assign vp_wa = vp_addr_q + ((st == S_VP_SEL) ? 32'd22 : 32'd2);
 
   logic        ev_free;
   assign ev_free = !ev_valid || ev_ready;
-  assign busy = (st != S_IDLE);
+  assign busy = (st != S_IDLE) || pf_act;
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -264,6 +353,9 @@ module r3d_walker #(
       overflow <= 1'b0;
       rs_sp <= '0; rs_spm1 <= '1;
       ldepth <= '0;
+      pf_act <= 1'b0; pf_data <= 1'b0; pf_kill <= 1'b0; pf_ph <= 1'b0; pf_cur <= 2'd0;
+      pe_v <= 3'd0; pe_need <= 3'd0; pe_node <= 3'd0;
+      rd_fill <= 1'b0;
     end else begin
       if (ev_valid && ev_ready) ev_valid <= 1'b0;
 
@@ -286,6 +378,7 @@ module r3d_walker #(
           rd_l8q <= rd_hi ? &rd_addr[17:3] : &rd_addr[19:3];
           rd_pq  <= 1'b0;                                  // beat 0 is never past the end (offset + 0 < 8)
           rd_idx <= rd_base;
+          pe_mq  <= pe_m;                                  // PF: the buffers' address matches, registered as the tests are
           st <= S_RDQ;
         end
         S_RDQ: begin
@@ -293,23 +386,54 @@ module r3d_walker #(
             for (int k = 0; k < 8; k++) rbuf[k] <= 32'd0;
             rd_base <= 3'd0;
             st <= rd_ret;
-          end else if (!mem_req) begin
+          end else if (PF && pe_hit != 3'd0) begin
+            // the words from a buffer: a node's all eight (straight to S_BLK_GOT), else the one word
+            for (int e = 2; e >= 0; e--) if (pe_hit[e]) begin
+              if (pe_node[e]) begin
+                for (int k = 0; k < 8; k++) rbuf[k] <= pbuf[e][k];
+                st <= S_BLK_GOT;
+              end else begin
+                rbuf[0] <= pbuf[e][3'(rd_addr[PB-1:0])];
+                st <= rd_ret;
+              end
+            end
+            rd_base <= 3'd0;
+          end else if (PF && pe_wait != 3'd0) begin
+            // its buffer is being read: wait for it
+          end else if (!mem_req && !pf_act) begin
             mem_req  <= 1'b1;
-            mem_addr <= rd_addr[23:0];
-            mem_len  <= rd_len;
             rd_beat  <= 3'd0;
-          end else if (mem_ack) begin
+            if (PF && rd_len == 3'd0 && rd_base == 3'd0) begin
+              // one word: read its aligned block into entry 2 (inside the region: never past its end)
+              mem_addr <= {rd_addr[23:PB], {PB{1'b0}}};
+              mem_len  <= PBL;
+              rd_fill  <= 1'b1;
+              rd_off   <= 3'(rd_addr[PB-1:0]);
+              pe_v[2]  <= 1'b0;
+              pe_a[2]  <= {rd_addr[23:PB], {PB{1'b0}}};
+            end else begin
+              mem_addr <= rd_addr[23:0];
+              mem_len  <= rd_len;
+              rd_fill  <= 1'b0;
+            end
+          end else if (mem_req && !pf_act && mem_ack) begin
             mem_req <= 1'b0;
             st <= S_RD_DATA;
           end
         end
         S_RD_DATA: if (mem_rvalid) begin
-          // a word past the end of its region reads as zero
-          rbuf[rd_idx] <= rd_pq ? 32'd0 : mem_rdata;
-          rd_idx <= rd_idx + 3'd1;
-          rd_pq <= rd_l8q && ({1'b0, rd_addr[2:0]} + {1'b0, rd_beat} + 4'd1 >= 4'd8);
           rd_beat <= rd_beat + 3'd1;
-          if (rd_beat == rd_len) begin st <= rd_ret; rd_base <= 3'd0; end
+          if (PF && rd_fill) begin
+            pbuf[2][3'(rd_beat[PB-1:0])] <= mem_rdata;
+            if (rd_beat == rd_off) rbuf[0] <= mem_rdata;
+            if (rd_beat == PBL) begin st <= rd_ret; rd_base <= 3'd0; pe_v[2] <= 1'b1; end
+          end else begin
+            // a word past the end of its region reads as zero
+            rbuf[rd_idx] <= rd_pq ? 32'd0 : mem_rdata;
+            rd_idx <= rd_idx + 3'd1;
+            rd_pq <= rd_l8q && ({1'b0, rd_addr[2:0]} + {1'b0, rd_beat} + 4'd1 >= 4'd8);
+            if (rd_beat == rd_len) begin st <= rd_ret; rd_base <= 3'd0; end
+          end
         end
 
         // ---- viewport chain: collect, then draw last to first per pass
@@ -495,13 +619,67 @@ module r3d_walker #(
           st <= rs_top[44] ? S_LINK : S_RET;
         end
 
-        S_END: if (ev_free) begin
+        S_END: if (ev_free && !(PF && pf_act)) begin
           ev_valid <= 1'b1; ev_type <= EV_END;
           st <= S_IDLE;
         end
 
         default: st <= S_IDLE;
       endcase
+
+      // ---- read-ahead engine
+      if (PF) begin
+        if (pf_act) begin
+          if (!pf_data) begin
+            if (mem_ack) begin mem_req <= 1'b0; pf_data <= 1'b1; end
+          end else if (mem_rvalid) begin
+            pbuf[pf_cur][pf_base + pf_beat] <= mem_rdata;
+            pf_beat <= pf_beat + 3'd1;
+            if (pf_beat == pf_len) begin
+              pf_act <= 1'b0; pf_data <= 1'b0;
+              if (pf_kill) begin
+                pf_kill <= 1'b0; pf_ph <= 1'b0;
+              end else if (pe_node[pf_cur] && step15 && !pf_ph) begin
+                pf_ph <= 1'b1;
+              end else begin
+                pf_ph <= 1'b0;
+                pe_v[pf_cur] <= 1'b1; pe_need[pf_cur] <= 1'b0;
+              end
+            end
+          end
+        end else if (pe_need[1:0] != 2'd0 && !mem_req && st != S_RD_DATA && st != S_RD && !(st == S_RDQ && pe_wait == 3'd0) &&
+                     tset == 2'd0) begin
+          // the port is free (a read hands it over only while it waits for a buffer: not in S_RD, and in S_RDQ only
+          // with pe_wait); a node's second part follows its first. Not in the clock new targets are set (tset): a
+          // read started then would take the entry's old address while the entry takes its new one, and its words
+          // would be kept as the new address's (the kill below only sees a read already out). It starts a clock
+          // later instead
+          pf_cur <= pf_c; pf_act <= 1'b1; pf_beat <= 3'd0; mem_req <= 1'b1;
+          if (!pe_node[pf_c]) begin
+            mem_addr <= pe_a[pf_c]; mem_len <= PBL; pf_len <= PBL; pf_base <= 3'd0;
+          end else if (step15 && !pf_ph) begin
+            mem_addr <= pe_a[pf_c]; mem_len <= 3'd0; pf_len <= 3'd0; pf_base <= 3'd0;
+          end else if (step15) begin
+            mem_addr <= pe_a[pf_c] + 24'd3; mem_len <= CULL ? 3'd6 : 3'd5; pf_len <= CULL ? 3'd6 : 3'd5; pf_base <= 3'd1;
+          end else begin
+            mem_addr <= pe_a[pf_c]; mem_len <= CULL ? 3'd7 : 3'd6; pf_len <= CULL ? 3'd7 : 3'd6; pf_base <= 3'd0;
+          end
+        end
+
+        // new read-ahead targets (tset): the entry's old words go; if it is being read, those words are
+        // dropped when they come in
+        for (int e = 0; e < 2; e++) if (tset[e]) begin
+          pe_v[e] <= 1'b0; pe_need[e] <= tok[e]; pe_node[e] <= tnode[e]; pe_a[e] <= ta[e];
+          if (pf_cur == 2'(e)) begin
+            if (pf_act && !pf_done) pf_kill <= 1'b1;
+            else pf_ph <= 1'b0;
+          end
+        end
+
+        if (st == S_IDLE && start) begin
+          pe_v <= 3'd0; pe_need <= 3'd0;
+        end
+      end
     end
   end
 

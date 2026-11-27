@@ -140,7 +140,15 @@ module m3_bus
   // W2 (D-66, D-68): work RAM is on the second SDRAM (m3_sdr2). Its transactions, either master's, go out on the
   // same s_* port with s_w2 set, at the same SDRAM byte address (SDR_RAM + the low 23 bits), and the caller routes
   // them; 0: s_w2 is 0, as before
-  parameter bit          W2         = 1'b0
+  parameter bit          W2         = 1'b0,
+  // DDIR (D-85, M3_DMADIR): m3_scripts' direct words (d_*, a Step 2 move into the host port, m3_scripts DIR) go
+  // to r3d_cmd in a clock no other host-port strobe uses: the R3P buffer's head and the bus's own B_R3D access go
+  // first, and a direct word only goes with the buffer empty, so the CPU's writes posted before the move reach
+  // the Real3D before it. The words are not in the R3P buffer, so no access waits behind them in B_DEC (on the
+  // board they are PCI-to-PCI, behind none of the MPC105's posted writes). They are counted in n_* as every
+  // host-port write is (the counters read h_go), but they are not in the bench trace (tr_*): no bus
+  // transaction carries them. 0: d_take is 0
+  parameter bit          DDIR       = 1'b0
 ) (
   input  logic          clk,
   input  logic          rst,
@@ -276,7 +284,12 @@ module m3_bus
   output logic [31:0]       tr_data,
   // a write into the name table (F10F8000-F10FFFFF), registered beside tr_v: the tile generator's name
   // buffer invalidate, which m3_system formed from the trace's we and address (area, R179)
-  output logic              tr_nw
+  output logic              tr_nw,
+  // DDIR: m3_scripts' direct word (dh_*), d_take in the clock it goes to r3d_cmd
+  input  logic              d_v,
+  input  logic [31:0]       d_addr,
+  input  logic [31:0]       d_wdata,
+  output logic              d_take
 );
 
   function automatic logic [31:0] bswap(input logic [31:0] v);
@@ -1023,11 +1036,15 @@ module m3_bus
   assign irq_enable_o = irq_enable;
   assign crom_bank_o  = crom_bank;
   assign pingpong_o   = pingpong_i;
-  // (with R3P the bus's own strobe is a read, the buffer empty; the buffer's head goes first otherwise)
-  assign h_go    = r3_go || ((bs == B_R3D) && h_rdy);
-  assign h_we    = r3_go ? 1'b1 : cur_w;
-  assign h_addr  = r3_go ? {r3_head[59:52], 2'b00, r3_head[51:32], 2'b00} : addr;
-  assign h_wdata = r3_go ? bswap(r3_head[31:0]) : wd_le;
+  // (with R3P the bus's own strobe is a read, the buffer empty; the buffer's head goes first otherwise; DDIR's
+  // direct word only in a clock neither uses)
+  wire   d_go    = DDIR && d_v && h_rdy && !r3_go && (bs != B_R3D);
+  assign d_take  = d_go;
+  assign h_go    = r3_go || ((bs == B_R3D) && h_rdy) || d_go;
+  assign h_we    = (r3_go || d_go) ? 1'b1 : cur_w;
+  assign h_addr  = r3_go ? {r3_head[59:52], 2'b00, r3_head[51:32], 2'b00} :
+                   d_go  ? {d_addr[31:24], 2'b00, d_addr[21:2], 2'b00} : addr;
+  assign h_wdata = r3_go ? bswap(r3_head[31:0]) : d_go ? bswap(d_wdata) : wd_le;
 
 `ifdef VERILATOR
   // tr_nw against m3_system's old form, from the trace's we and address (R179)
