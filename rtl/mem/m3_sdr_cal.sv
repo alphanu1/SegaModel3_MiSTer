@@ -38,13 +38,16 @@
 // and reports `settled` when the counter is there; after a change the calibration waits 16 clocks and then for
 // `settled`, and 512 more before it reads.
 //
-// Results (static after `done`): the window's width (0-48), its centre and last step, the chosen offset and
-// flags: none (no step passes: the phase stays at 0), narrow (width under WMIN), all (every step passes: the test
-// cannot see an edge, so the phase stays at 0), clamped (the centre was outside the band: the band's step nearest
-// it that passed), out (no step of the window lies inside the band: the phase stays at 0, the timing not being
-// analysed beyond the band), verify (the reads at the chosen offset, after the stepper moved there, went wrong: the
-// sweep's offsets were not where the stepper put the clock; the phase goes back to 0). After done the offset
-// follows the OSD: `osd` 0 is Auto (the chosen offset), 1-23 the manual offsets of MAN (single steps over the band).
+// Results (static after `done`): the window's width (0-48), its last step, the chosen offset and flags: none (no step
+// passes: the phase stays at 0), narrow (width under WMIN), all (every step passes: the test cannot see an edge, so
+// the phase stays at 0), clamped (the window went on past the band's top: the late side held there), out (nothing
+// of the window left inside the band after the early margin: offset 0, then verified like any choice), verify (the reads at the chosen offset, after the stepper moved there, went wrong: the sweep's offsets
+// were not where the stepper put the clock; the phase goes back to 0). After done the offset follows the OSD:
+// `osd` 0 is Auto (the chosen offset), 1-23 the manual offsets of MAN (single steps over the band).
+// R203 (the board: the early edge the test sees moves 10 steps from boot to boot, cold to warm, and lies up to 12
+// steps earlier than where the games fail): NSW sweeps intersected, HOSTILE traffic (each read straight after a
+// write elsewhere), and the choice the middle of [first + EDGE_M, min(last, BAND_HI)] (also held above -BAND_LO),
+// not the window's centre.
 // `done` is held low until all this is over: m3_system keeps the loader (and so the HPS's downloads, through
 // ioctl_wait) and the game off this SDRAM until then. EN 0: done at once, offset from the OSD alone.
 
@@ -54,7 +57,10 @@ module m3_sdr_cal
   parameter int          AW        = 26,
   parameter bit          EN        = 1'b1,
   parameter int          NL        = 64,            // lines (32 bytes each), a power of two up to 64
-  parameter int          REPS      = 32,            // read passes at each step (up to 64)
+  parameter int          REPS      = 16,            // read passes at each step (up to 64)
+  parameter int          NSW       = 4,             // sweeps, their pass maps intersected (up to 8)
+  parameter bit          HOSTILE   = 1'b1,          // every line read straight after a line write elsewhere
+  parameter int          EDGE_M    = 12,            // steps of margin taken off the window's early edge
   parameter int          NSTEP     = 48,            // PLL steps in a period
   parameter int          BAND_LO   = 8,             // the analysed band: BAND_LO steps below the generated phase
   parameter int          BAND_HI   = 14,            //   to BAND_HI above (BAND_LO + BAND_HI < NSTEP)
@@ -121,7 +127,10 @@ module m3_sdr_cal
     sh = (6'(i) >> 2) + 6'(k);
     w = 16'd1 << sh[3:0];                            // modulo 16: never off the word
     h = {ik, 8'h5A, ~ik, 8'hC3} ^ {8'(i), 8'(i) ^ 8'h96, 5'd0, k, 8'd0};
-    h = h ^ (h << 13); h = h ^ (h >> 17); h = h ^ (h << 5);
+    // one Feistel-like step (R203, for area: 16 XORs in place of three xorshifts): the high half kept, the low half
+    // XORed with it rotated by 5; a bijection, so the words stay unique, and no two neighbouring columns of a line
+    // are equal in either column order (tools/patt.py)
+    h = {h[31:16], h[15:0] ^ {h[26:16], h[31:27]}};
     case (i[1:0])
       2'd0:    patt = {~w, w};                                  // walking one, walking zero
       // the DQs toggling each column, the low four bits of each half its column's number ({k, half})
@@ -133,6 +142,15 @@ module m3_sdr_cal
 
   typedef enum logic [3:0] { C_IDLE, C_WREQ, C_WBEAT, C_STEP, C_WAIT, C_SET, C_RREQ, C_RBEAT, C_NEXT, C_SCAN, C_CEN, C_PICK, C_DONE } cs_t;
   logic          ver;             // the verify pass: one more step, at the chosen offset
+  logic [2:0]    sw;              // the sweep
+  logic          xw, xd;          // HOSTILE: the scratch write under way / done before this line's read
+  logic [6:0]    run2, best2;     // the scan of the steps that count (inside the band, EDGE_M after the edge)
+  logic [5:0]    bend2;
+  logic [5:0]    cen;
+  // HOSTILE's scratch lines: another bank (byte bit 11) and 4 MiB on (bit 22), so every line read follows a
+  // line write of another line's pattern to another bank and row: read-after-write turnaround, both directions of
+  // the bus at full rate, and (the two SDRAMs' calibrations running together) the other SDRAM's writes
+  localparam logic [26:0] XOFF = 27'h040_0800;
   cs_t           cs;
   logic [LB-1:0] li;              // the line
   logic [5:0]    rep;             // the pass
@@ -144,22 +162,25 @@ module m3_sdr_cal
   logic [6:0]    run, best;       // the scan
   logic [6:0]    sp;              // its position (0 .. 2 NSTEP - 1)
   logic [5:0]    bend;            // the best window's last step
-  logic [5:0]    cen;
   logic          flag_none, flag_narrow, flag_all, flag_clamp, flag_out, flag_ver;
   logic [5:0]    chosen;
 
   wire  [2:0]    sb_n = (cs == C_WBEAT && pq[1]) ? sb + 3'd1 : sb;
   // one pattern generator for the writes (the beat shown next) and the reads (the beat taken): never both at once
-  wire  [31:0]   pw = patt(li, (cs == C_RBEAT) ? rb : sb_n);
+  // (HOSTILE's scratch lines take another line's pattern, li ^ 2: the other half of the pattern set)
+  wire  [31:0]   pw = patt(xw ? li ^ LB'(2) : li, (cs == C_RBEAT) ? rb : sb_n);
+  wire  [AW:0]   xsa = la(li) ^ XOFF[AW:0];
   wire  [5:0]    sp6 = (sp >= 7'(NSTEP)) ? 6'(sp - 7'(NSTEP)) : sp[5:0];
-  // the centre: the best window's last step less (width - 1) / 2, modulo the period
-  wire  [6:0]    back = (best - 7'd1) >> 1;
-  wire  [6:0]    cen_r = {1'b0, bend} + 7'(NSTEP) - back;
+  // the choice (R203), made on the pass map by the scan, not by arithmetic: a step counts if it passed, the EDGE_M
+  // steps before it passed too (the early edge taken EDGE_M steps in: the power-up test sees it up to that much
+  // earlier than the games do, cold and quiet) and it lies inside the band (-BAND_LO .. +BAND_HI: STA's limits,
+  // the late one where the slow corner puts the capture word's transfer into clk_sys); the widest run of such steps
+  // (best2, ending at bend2) is what is left, and the choice its middle (rounded up), as the old centre.
+  wire           inb = (sp6 <= 6'(BAND_HI)) || (sp6 >= 6'(NSTEP - BAND_LO));
+  wire           ok2 = pass_map[sp6] && run >= 7'(EDGE_M) && inb;
+  wire  [6:0]    back = (best2 - 7'd1) >> 1;
+  wire  [6:0]    cen_r = {1'b0, bend2} + 7'(NSTEP) - back;
   wire  [5:0]    cen_m = (cen_r >= 7'(NSTEP)) ? 6'(cen_r - 7'(NSTEP)) : cen_r[5:0];
-  // inside the band: 0 .. BAND_HI or NSTEP - BAND_LO .. NSTEP - 1
-  localparam int BMID = (BAND_HI + NSTEP - BAND_LO) / 2;   // the middle of the steps outside the band
-  wire           in_band = (cen <= 6'(BAND_HI)) || (cen >= 6'(NSTEP - BAND_LO));
-  wire           above = (cen > 6'(BAND_HI)) && (cen <= 6'(BMID));    // nearer the band's top than its bottom
 
   assign s_be = 4'hF; assign s_wbe = 4'hF;
 
@@ -167,9 +188,9 @@ module m3_sdr_cal
     if (rst || !EN) begin
       cs <= C_IDLE; done <= !EN; s_req <= 1'b0; s_cmd <= MC_LINE_RD; s_sa <= '0; s_wdata <= '0;
       li <= '0; rep <= '0; st <= '0; wt <= '0; pq <= '0; sb <= '0; rb <= '0; bad <= 1'b0;
-      run <= '0; best <= '0; sp <= '0; bend <= '0; cen <= '0; pass_map <= '0;
+      run <= '0; best <= '0; sp <= '0; bend <= '0; pass_map <= '0;
       flag_none <= 1'b0; flag_narrow <= 1'b0; flag_all <= 1'b0; flag_clamp <= 1'b0; flag_out <= 1'b0; flag_ver <= 1'b0;
-      chosen <= '0; ver <= 1'b0;
+      chosen <= '0; ver <= 1'b0; sw <= '0; xw <= 1'b0; xd <= 1'b0; run2 <= '0; best2 <= '0; bend2 <= '0; cen <= '0;
       off <= 6'd0;
     end else begin
       s_req <= s_req && !s_ack;
@@ -186,7 +207,8 @@ module m3_sdr_cal
         end
         C_WBEAT: if (pq[1] && sb == 3'd7) begin
           // the port took the last beat this clock
-          if (li == LB'(NL - 1)) begin cs <= C_STEP; st <= '0; end
+          if (xw) begin xw <= 1'b0; xd <= 1'b1; cs <= C_RREQ; end        // HOSTILE: now the line's read
+          else if (li == LB'(NL - 1)) begin cs <= C_STEP; st <= '0; sw <= '0; end
           else begin li <= li + 1'd1; cs <= C_WREQ; end
         end
 
@@ -200,11 +222,17 @@ module m3_sdr_cal
           wt <= wt + 10'd1;
           if (wt == 10'(SETTLE)) begin li <= '0; rep <= '0; cs <= C_RREQ; end
         end
-        C_RREQ: begin s_req <= 1'b1; s_cmd <= MC_LINE_RD; s_sa <= la(li); rb <= '0; cs <= C_RBEAT; end
+        C_RREQ: if (HOSTILE && !xd) begin
+            // the scratch line first: the inverted pattern, another bank and row
+            s_req <= 1'b1; s_cmd <= MC_LINE_WR; s_sa <= xsa; sb <= '0; pq <= '0; xw <= 1'b1; cs <= C_WBEAT;
+          end else begin
+            s_req <= 1'b1; s_cmd <= MC_LINE_RD; s_sa <= la(li); rb <= '0; cs <= C_RBEAT;
+          end
         C_RBEAT: if (s_rvalid) begin
           if (s_rdata != pw) bad <= 1'b1;
           rb <= rb + 3'd1;
           if (rb == 3'd7) begin
+            xd <= 1'b0;
             if (li != LB'(NL - 1)) begin li <= li + 1'd1; cs <= C_RREQ; end
             else if (rep != 6'(REPS - 1)) begin li <= '0; rep <= rep + 6'd1; cs <= C_RREQ; end
             else cs <= C_NEXT;
@@ -216,9 +244,11 @@ module m3_sdr_cal
             if (bad) begin flag_ver <= 1'b1; chosen <= 6'd0; end
             cs <= C_DONE;
           end else begin
-            pass_map[st] <= !bad;
-            if (st == 6'(NSTEP - 1)) begin cs <= C_SCAN; sp <= '0; run <= '0; best <= '0; end
-            else begin st <= st + 6'd1; cs <= C_STEP; end
+            // NSW sweeps: a step passes only if it passed in every one
+            if (sw == 3'd0 || bad) pass_map[st] <= !bad;           // (one shared enable term: cheap)
+            if (st != 6'(NSTEP - 1)) begin st <= st + 6'd1; cs <= C_STEP; end
+            else if (sw != 3'(NSW - 1)) begin st <= '0; sw <= sw + 3'd1; cs <= C_STEP; end
+            else begin cs <= C_SCAN; sp <= '0; run <= '0; best <= '0; run2 <= '0; best2 <= '0; end
           end
         end
 
@@ -228,32 +258,26 @@ module m3_sdr_cal
             if (run < 7'(NSTEP)) run <= run + 7'd1;
             if (run + 7'd1 > best && run < 7'(NSTEP)) begin best <= run + 7'd1; bend <= sp6; end
           end else run <= '0;
+          if (ok2) begin
+            run2 <= run2 + 7'd1;
+            if (run2 + 7'd1 > best2) begin best2 <= run2 + 7'd1; bend2 <= sp6; end
+          end else run2 <= '0;
           if (sp == 7'(2 * NSTEP - 1)) cs <= C_CEN;
           sp <= sp + 7'd1;
         end
-        C_CEN: begin cen <= cen_m; cs <= C_PICK; end       // from the scan's final best / bend
+        C_CEN: begin cen <= cen_m; cs <= C_PICK; end       // from the scan's final best2 / bend2
         C_PICK: begin
           cs <= C_DONE;
           if (best == 7'd0) begin flag_none <= 1'b1; chosen <= 6'd0; end
           else if (best >= 7'(NSTEP)) begin flag_all <= 1'b1; chosen <= 6'd0; end
           else begin
             flag_narrow <= best < 7'(WMIN);
+            // clamped: the window went on past the band's top (the late side held there)
+            flag_clamp <= best2 != 7'd0 && bend2 == 6'(BAND_HI) && pass_map[BAND_HI + 1];
+            flag_out <= best2 == 7'd0;                            // nothing left after the margin: offset 0
+            chosen <= (best2 == 7'd0) ? 6'd0 : cen;
             // then the verify pass at the chosen offset (C_STEP .. C_NEXT once more)
-            ver <= 1'b1; cs <= C_STEP;
-            if (in_band) begin chosen <= cen; st <= cen; end
-            else if (pass_map[above ? BAND_HI : NSTEP - BAND_LO]) begin
-              // the centre outside the band, the window reaching into it at the nearer end: that end, which passed
-              flag_clamp <= 1'b1;
-              chosen <= above ? 6'(BAND_HI) : 6'(NSTEP - BAND_LO); st <= above ? 6'(BAND_HI) : 6'(NSTEP - BAND_LO);
-            end else if (pass_map[above ? NSTEP - BAND_LO : BAND_HI]) begin
-              // the window reaching into the band at the other end only (a window wider than the steps outside)
-              flag_clamp <= 1'b1;
-              chosen <= above ? 6'(NSTEP - BAND_LO) : 6'(BAND_HI); st <= above ? 6'(NSTEP - BAND_LO) : 6'(BAND_HI);
-            end else begin
-              // the window outside the band: not chosen (the timing is not analysed there); the generated phase
-              flag_out <= 1'b1;
-              chosen <= 6'd0; ver <= 1'b0; cs <= C_DONE;
-            end
+            ver <= 1'b1; st <= (best2 == 7'd0) ? 6'd0 : cen; cs <= C_STEP;
           end
         end
         C_DONE: begin
