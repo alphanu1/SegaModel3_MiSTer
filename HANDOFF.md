@@ -44,6 +44,12 @@ viewport DSP form, divider-lane register; reset MAX_FANOUT 24 and the scaler's D
 (38df6240) good. R4's DSP forms stay out: their paths fail on silicon at 140 (R207 §9). The Real3D still fails by
 2.3-4.5 ns, mostly routing; it needs room in the chip.
 
+Branch `c5a` (R214): the first SDRAM's capture hop closed by moving dl_data's word select after the cap registers
+(no cycle) and siting the cap registers 2-3 LABs out. Board c5a_s1 (ad478af5) good. Decisions D-92 (no Step split),
+D-93 (sign-extending loads a cycle later in the rebuilt CPU), D-94 (download crossing held for room). Main fits by the
+seed now (main 61d5786: one seed of five with hold positive): room in the chip is the limit for every block.
+
+Open from the board: Scud Race's green polygons on the bridge after another Model 3 game (stale memory; R214).
 Open from the board: Sega Rally 2's slowdowns going through water, Real3D or CPU, to be measured on replay frames
 captured there.
 
