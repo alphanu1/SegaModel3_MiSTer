@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
     unsigned lt = rng() % 4 ? 0 : rng() & 0xFF, rt = rng() % 4 ? 0 : rng() & 0xFF;
     unsigned pad = rng() % 8 ? 0 : rng() & 0xFF;
     unsigned idle_c = rng() % 2 ? 0xFF : 0xAF, idle_d = 0xFF;
-    unsigned pflg = rng() & 1;
+    unsigned pflg = rng() & 3;        // bit 0: fishing's MAME wiring / driving's lever; bit 1: the lever's Harley wiring
     t->prof = prof == 4 ? 7 : prof; t->pflg = pflg; t->idle_c = idle_c; t->idle_d = idle_d;
     t->joystick_0 = j0; t->joystick_1 = j1; t->joy_analog = la0; t->joy_analog_1 = la1; t->joy_ranalog = ra0;
     t->trig_lt = lt; t->trig_rt = rt; t->paddle = pad;
@@ -79,7 +79,11 @@ int main(int argc, char **argv) {
     if (prof == 1) {                  // driving: Coin Start Test Service VR1 VR4 Accel Brake GearUp GearDown VR2 VR3
       in0 = 0xFF & ~(B(j0, 4) | B(j1, 4) << 1 | B(j0, 6) << 2 | B(j0, 7) << 3 | B(j0, 5) << 4 | B(j1, 5) << 5);
       static const unsigned gv[5] = {0xF0, 0xA0, 0x90, 0xE0, 0xD0};   // Supermodel shift4: 1 ~0x50, 2 ~0x60, 3 ~0x10, 4 ~0x20
-      in2 = gv[gear] | (0xF & ~(B(j0, 8) | B(j0, 14) << 1 | B(j0, 15) << 2 | B(j0, 9) << 3));
+      // with flag bit 0 the up/down lever (Supermodel's shiftupdown, Gear Up first): 0x50 / 0x60 low, Harley
+      // (bit 1) 0x20 / 0x10 low, nothing held 0xF0; the H shifter's state steps underneath all the same
+      unsigned sh = gv[gear];
+      if (pflg & 1) sh = B(j0, 12) ? ((pflg & 2) ? 0xD0 : 0xA0) : B(j0, 13) ? ((pflg & 2) ? 0xE0 : 0x90) : 0xF0;
+      in2 = sh | (0xF & ~(B(j0, 8) | B(j0, 14) << 1 | B(j0, 15) << 2 | B(j0, 9) << 3));
       in3 = idle_d;
       // steering: the paddle if it moves, the left stick past 12, else the d-pad's ramp (not modelled: skipped)
       int x = sx(lo(la0));
@@ -98,7 +102,7 @@ int main(int argc, char **argv) {
       an[0] = ob(sx(lo(la0))); an[1] = ob(sx(hi(la0))); an[2] = ob(sx(lo(la1))); an[3] = ob(sx(hi(la1)));
     } else if (prof == 3) {           // fishing: Cast Select Reel Start Coin Test Service
       in0 = 0xFF & ~(B(j0, 8) | B(j1, 8) << 1 | B(j0, 9) << 2 | B(j0, 10) << 3 | B(j0, 7) << 4 | B(j1, 7) << 5);
-      in2 = pflg ? (0xFF & ~(B(j0, 4) | B(j0, 5) << 1)) : (0xCF | B(j0, 4) << 4 | B(j0, 5) << 5);
+      in2 = (pflg & 1) ? (0xFF & ~(B(j0, 4) | B(j0, 5) << 1)) : (0xCF | B(j0, 4) << 4 | B(j0, 5) << 5);
       in3 = idle_d;
       an[0] = ob(sx(hi(la0))); an[1] = ob(sx(lo(la0)));
       an[3] = B(j0, 6) ? 0xFF : rt;

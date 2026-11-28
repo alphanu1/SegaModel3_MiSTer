@@ -76,6 +76,8 @@ module m3_sdr2
   parameter bit          BXOR     = 1'b1,
   parameter bit          FDSP     = 1'b1,
   parameter bit          HITRD    = 1'b0,
+  parameter bit          DSPC     = 1'b0,             // m2_sdram DSPC: PRECHARGE / ACTIVATE from S_DISPATCH
+  parameter bit          HRL      = 1'b0,             // m2_sdram HRL: HITRD's read guard loaded a clock later
   parameter int          INFO_BIT = 28                // the OSD message's period: 2^(INFO_BIT+1) clocks (4.1 s at 130 MHz)
 ) (
   input  logic          clk,
@@ -290,7 +292,7 @@ module m3_sdr2
   m2_sdram #(.COL_BITS(10), .NP(NP), .T_REFI(T_REFI), .T_RC(T_RC), .T_RAS(T_RAS), .T_RCD(T_RCD), .T_RP(T_RP), .CAPCLK(CAPCLK), .CAPPIPE(CAPPIPE), .XLAT(OPIPE ? 1 : 0), .CAPX(CAPX), .ACK_HOLD(1),
              .INIT_NOP(CLK_MHZ * 110), .DUAL(1'b1), .MASK_ON_A(1'b1),
              .PRI(P0), .PRI_TOP(P0), .BXOR(BXOR),
-             .WB(P0), .L16(L16 ? P0 : NP'(0)), .PAIR(PAIR ? P0 : NP'(0)), .FDSP(FDSP), .HITRD(HITRD),
+             .WB(P0), .L16(L16 ? P0 : NP'(0)), .PAIR(PAIR ? P0 : NP'(0)), .FDSP(FDSP), .HITRD(HITRD), .DSPC(DSPC), .HRL(HRL),
              .SHD(P0), .DCHIP1(W2_C1)) u_sdram (
     .clk, .clk_cap, .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
     .sd_cke(sd_cke_unused), .sd_cs_n(q_cs_n), .sd_ras_n(q_ras_n), .sd_cas_n(q_cas_n), .sd_we_n(q_we_n), .sd_ba(q_ba),

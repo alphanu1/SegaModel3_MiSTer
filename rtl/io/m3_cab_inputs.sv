@@ -36,6 +36,14 @@
 //     stepped by Gear Up / Gear Down as Model 2's, starting in first gear
 //     (Supermodel's start, and the AF the core's idle port C has read since
 //     R100);
+//   - with the profile's flag bit 0 (lever), an up/down gear lever instead
+//     (Supermodel's shiftupdown: Le Mans 24, Dirt Devils, ECA): port C reads
+//     0x50 low while Gear Up is held and 0x60 low while Gear Down is, nothing
+//     when neither (Gear Up wins when both, as Supermodel's if / else); with
+//     bit 1 as well (harley), Harley-Davidson's wiring, 0x20 low up and 0x10
+//     low down. The H shifter's state still steps underneath, so turning the
+//     flag off mid-game is the H shifter where it left off. LEVER = 0 leaves
+//     the lever out (the H shifter only, as before);
 //   - the four VR (view) buttons are port C bits 3:0, active low (both
 //     emulators); coins, test and service are m3_inputs', on port B;
 //   - Desert Tank's map (is_desert, the turret, the lever) is Model 2 only and
@@ -53,10 +61,13 @@ module m3_cab_inputs #(
   parameter int unsigned SYS_MHZ = 110,
   parameter bit          SENS    = 1'b1,  // "Steering" (sensitivity)
   parameter bit          SMOOTH  = 1'b1,  // "Steering smoothing"
-  parameter bit          WHEEL   = 1'b1   // "Analog control": Wheel A / Wheel B
+  parameter bit          WHEEL   = 1'b1,  // "Analog control": Wheel A / Wheel B
+  parameter bit          LEVER   = 1'b1   // the up/down gear lever (the profile's flag bits 0 / 1)
 ) (
   input  logic        clk,          // clk_sys
   input  logic        rst_n,        // the game reset
+  input  logic        lever,        // the profile's flag bit 0: an up/down lever, not the H shifter
+  input  logic        harley,       // flag bit 1: with lever, Harley-Davidson's wiring
   input  logic [15:0] joystick_0,
   input  logic [15:0] joy_analog,   // left stick (registered by the caller)
   input  logic [15:0] joy_ranalog,  // right stick
@@ -92,13 +103,19 @@ always_ff @(posedge clk or negedge rst_n) begin
 end
 logic [3:0] gearval;                 // port C bits 7:4
 always_comb begin
-	case (gear)
-		3'd1:    gearval = 4'b1010;  // 0x50 low
-		3'd2:    gearval = 4'b1001;  // 0x60 low
-		3'd3:    gearval = 4'b1110;  // 0x10 low
-		3'd4:    gearval = 4'b1101;  // 0x20 low
-		default: gearval = 4'b1111;  // neutral
-	endcase
+	if (LEVER && lever) begin
+		if (gup)      gearval = harley ? 4'b1101 : 4'b1010;   // up: Harley 0x20 low, else 0x50 low
+		else if (gdn) gearval = harley ? 4'b1110 : 4'b1001;   // down: Harley 0x10 low, else 0x60 low
+		else          gearval = 4'b1111;
+	end else begin
+		case (gear)
+			3'd1:    gearval = 4'b1010;  // 0x50 low
+			3'd2:    gearval = 4'b1001;  // 0x60 low
+			3'd3:    gearval = 4'b1110;  // 0x10 low
+			3'd4:    gearval = 4'b1101;  // 0x20 low
+			default: gearval = 4'b1111;  // neutral
+		endcase
+	end
 end
 assign pc = {gearval, ~joystick_0[9], ~joystick_0[15], ~joystick_0[14], ~joystick_0[8]};
 

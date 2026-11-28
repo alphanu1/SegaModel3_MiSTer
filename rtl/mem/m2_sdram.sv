@@ -189,6 +189,18 @@ module m2_sdram #(
   // READ FROM DISPATCH (Model 3, study R112): a read whose row is open issues its first READ from
   // S_DISPATCH instead of a clock later from S_RD. 0: the controller exactly as it was.
   parameter bit            HITRD     = 1'b0,
+  // PRECHARGE AND ACTIVATE FROM DISPATCH (Model 3, the memory-latency work). S_DISPATCH issues the ACTIVATE of a
+  // closed bank itself, and the PRECHARGE of a bank open on another row when that bank may be precharged
+  // (bank_pre_ok, S_MISS's own test), instead of handing each to S_ACT / S_MISS a clock later: one clock on every
+  // transaction whose row is not open. S_MISS is still where a PRECHARGE waits for tRAS or for read data in
+  // flight. 0: the controller exactly as it was.
+  parameter bit            DSPC      = 1'b0,
+  // HITRD'S READ GUARD LOADED A CLOCK LATER (Model 3, the memory-latency work). With HITRD the READ issued from
+  // S_DISPATCH loaded that bank's read guard (rd_bank_cnt, rd_ok) there, behind the row comparator: 25 failing
+  // endpoints at 140 MHz. HRL 1 notes the READ and its bank in four registers (hr_q, hr_b) and loads the guard the
+  // clock after with the count one less; bank_pre_ok also reads hr_q for that one clock, so the permission to
+  // PRECHARGE is the same in every clock (checked in the bench against the old load). 0: loaded in S_DISPATCH.
+  parameter bit            HRL       = 1'b0,
   // ONE READ REGISTER FOR SEVERAL PORTS (Model 3, the bridges pass). The ports set in SHD get their p_dout
   // from one 64-bit register, loaded with every delivery, instead of one register each. Only for a port
   // that takes p_dout in the cycles its p_lo or p_ack is high and never after (the delivery and its strobe
@@ -1064,6 +1076,8 @@ module m2_sdram #(
   // the very cycle the counter is loaded, which is what made a registered
   // summary of the counters unsafe.
   logic [NB-1:0] rd_ok;  // rd_bank_cnt[b] == 0
+  logic          hr_q;   // HRL: a READ went out from S_DISPATCH last clock
+  logic [BW-1:0] hr_b;   //      its bank
   wire [NB-1:0] bank_pre_ok;
   // Explicit genvar + generate: Quartus 17.0 rejects the inline
   // `for (genvar ...)` form that Verilator accepts, with "syntax error near
@@ -1071,7 +1085,7 @@ module m2_sdram #(
   genvar gb;
   generate
     for (gb = 0; gb < NB; gb = gb + 1) begin : g_bank_pre
-      assign bank_pre_ok[gb] = ras_ok[gb] && rd_ok[gb];
+      assign bank_pre_ok[gb] = ras_ok[gb] && rd_ok[gb] && !(HRL && hr_q && hr_b == BW'(gb));
     end
   endgenerate
 
@@ -1191,6 +1205,7 @@ module m2_sdram #(
       bank_open <= '0;
       for (int b = 0; b < NB; b++) begin bank_row[b] <= '0; ras_cnt[b] <= '0; end
       ras_ok <= '1; rd_ok <= '1;       // R410: idle out of reset
+      hr_q <= 1'b0;
       tag_v <= '0; tag_p <= '0; tag_w <= '0; tag_last <= '0; tag_pr <= '0; cap <= '0; pb_r <= 1'b0;
       ack_cnt <= '0; wack_cnt <= '0; inflight <= '0; wr_inflight <= 1'b0;
       for (int b = 0; b < NB; b++) rd_bank_cnt[b] <= '0;
@@ -1281,6 +1296,13 @@ module m2_sdram #(
             rd_bank_cnt[b] <= rd_bank_cnt[b] - 1'b1;
             if (rd_bank_cnt[b] == 4'd1) rd_ok[b] <= 1'b1;   // R410
           end
+        // HRL: the guard of the READ S_DISPATCH issued last clock, one count on (a READ from S_RD this clock, below,
+        // loads the full count over it, as it did over the old load's first step)
+        hr_q <= 1'b0;
+        if (HRL && hr_q) begin
+          rd_bank_cnt[hr_b] <= 4'(cap_depth - 1);
+          rd_ok[hr_b]       <= 1'b0;
+        end
 
         // Saturating: it only has to say "long enough", not how long.
         if (!wr_pend || wr_inflight)  wr_wait <= '0;
@@ -1561,12 +1583,21 @@ module m2_sdram #(
               tag_last[cap_depth-1] <= (rd_total == 4'd1);
               tag_pr[cap_depth-1]   <= rd_pair;
             end
+            // DSPC: the row register takes the transaction's row in every dispatch, whatever is decided: on a hit it is
+            // the row it holds; a closed bank is opened on it here; a bank open on another row is closed (here or in
+            // S_MISS) and S_ACT writes this row again, and nothing reads bank_row between (row_hit, its one reader,
+            // is this state's). So the 104 row registers' enable is the state and the bank's decode alone, not the
+            // open flags' select (xfer_addr -> bank_open -> bank_row: 77-104 endpoints at -1.2 ns in DSPC's first fits)
+            if (DSPC) bank_row[tbank] <= trow;
             if (row_hit && HITRD && !is_write) begin
               // R112: the first READ now (S_RD's first column: rd_issued is 0 here)
               cmd        <= C_READ;
               tag_v[cap_depth-1]    <= 1'b1; tv_set = 1'b1;
-              rd_bank_cnt[tbank]    <= cap_depth;
-              rd_ok[tbank]          <= 1'b0;
+              if (HRL) begin hr_q <= 1'b1; hr_b <= tbank; end
+              else begin
+                rd_bank_cnt[tbank]  <= cap_depth;
+                rd_ok[tbank]        <= 1'b0;
+              end
               rd_issued  <= 4'd1; wb_col <= 4'd2;
               if (rd_total == 4'd1) state <= S_IDLE;
               else begin
@@ -1576,7 +1607,27 @@ module m2_sdram #(
               end
             end
             else if (row_hit)           state <= is_write ? S_WR : S_RD;
-            else if (!bank_open[tbank]) state <= S_ACT;
+            else if (!bank_open[tbank]) begin
+              if (DSPC) begin
+                // (S_ACT's body, a clock sooner; tba, trow and tbank are xfer_addr's, as there)
+                cmd       <= C_ACT;
+                sd_ba     <= tba;
+                sd_a      <= 13'(trow);
+                bank_open[tbank] <= 1'b1;
+                ras_cnt[tbank]   <= 4'(T_RAS - 1);
+                ras_ok[tbank]    <= 1'b0;
+                wait_cnt  <= 4'(T_RCD - 1);
+                state     <= S_RCD;
+              end else state <= S_ACT;
+            end else if (DSPC && bank_pre_ok[tbank]) begin
+              // (S_MISS's body, a clock sooner, on tbank: dsp_bank is loaded with it at this edge)
+              cmd                 <= C_PRE;
+              sd_ba               <= tbank[1:0];
+              sd_a                <= 13'h000;
+              bank_open[tbank]    <= 1'b0;
+              wait_cnt            <= 4'(T_RP - 1);
+              state               <= S_PRE_XFER;
+            end
             else                        state <= S_MISS;
           end
 

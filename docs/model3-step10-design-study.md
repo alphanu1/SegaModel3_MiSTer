@@ -21443,3 +21443,223 @@ PRECHARGE / ACTIVATE from dispatch (needs the pin probe for tRAS, tRC and CAS-to
 first), a row policy, a second read while one streams, the other two 140 MHz registers; tRCD / tRP on the first SDRAM's
 pins (probed on the second only); the buttons' crossing (hold -0.019 ns on one fit), to get a register inside
 m3_inputs with the gear-lever change.
+
+**R213 — The SDRAM side's latency after R212, with my Model 2's SDRAM bench and a protocol monitor on the
+pins as the proof. The controller issues the PRECHARGE or the ACTIVATE of a transaction whose row is not open from
+S_DISPATCH (DSPC): -0.57% of Daytona 2's race frame and -0.25% of Sega Rally 2's start line on the board-like
+bench, no protocol violation on either bench. READ-from-dispatch's read guard is loaded a clock later (HRL) and
+DSPC's row registers load without the open flags, both for timing and both the same clock for clock. The buttons,
+the video and the download port now cross between clk_hps and clk_sys through a falling-edge register with sites,
+the buttons with one clock of latency (approved), the other two with none; every crossing of the two clocks is
+listed. Desk, bench and fits only: nothing on the board, nothing committed.**
+
+Work in `sm3-builds/sys-timing/` (`base3`: main 3fbcbc2 by `git archive`; `tree`: the work; `lat/tree_ds`: DSPC
+alone, as first fitted; `lat/tree_cmb2`: the candidate with everything on; `NOTES.md` sections M1-M9 every step;
+`lat/lat-work-3fbcbc2.patch`: every switch off but the crossings; `lat/lat-cmb2-3fbcbc2.patch`: the candidate).
+Rests on D-48, D-57, D-58, D-81, D-87; R187, R198, R203, R210, R212; cpu-fable's sections 17-23 for the board-like
+bench and the list (A to E).
+
+*What I believed:*
+- R212: tRCD / tRP 2 gives 3 clocks at the pins, measured by a probe that counted two spacings on the second
+  SDRAM alone.
+- A shorter dispatch was the kind of change m2_sdram's own notes warn about (R387, R409 / R410), to be made only
+  with more than the Model 3 device model, which checks no protocol timing.
+
+*What I know now:*
+
+**1. Two proofs I did not have.**
+- *My Model 2's SDRAM bench on Model 3's controller* (`lat/m2bench`, `tools/m2b.sh`: Model 2's harness, device
+  model and tb_m2_sdram at its 6d49b69a). The device model checks tRCD, tRAS, tRP, tRC, tRRD, tWR, an access with
+  no row, the refresh interval, DQ driven both ways, a read cut by a PRECHARGE and retention. Its harness gave the
+  controller and the model the same numbers; my copy takes them apart: the controller as a 140 MHz build has it
+  (T_RCD = T_RP 2, T_RC 9, T_RAS 6), the model with the part's needs in clocks at 140 MHz (tRCD = tRP 3, tRC 9,
+  tRAS 6, tWR 2, CL 2). Plain part (11 ports) and the 128 MB dual module (13 ports), two runs each.
+  **Main 3fbcbc2: 0 fails, 0 violations, 0 tag faults in eight runs** (1.79-2.17 M checks each; with and without
+  HITRD and FDSP). R212's tRCD / tRP 2 holds against a model that wants 3 clocks.
+- *The same device model as a passive monitor on both SDRAMs' pins in the board-like bench* (`lat/bench_brd`:
+  sdram_module on each, two 64 MB chips, the part's needs at 140 MHz), on the games' traffic. Main 3fbcbc2, Daytona 2
+  race 4302 and Sega Rally 2 start 5620: the first SDRAM 0 violations; the second one flag, the refresh interval,
+  before the run's first pin event (the monitor counts from clock 0 through the controller's 15,400-clock
+  bring-up: the monitor's start). This covers tRCD / tRP on the first SDRAM's pins, which R212's probe did not.
+
+**2. DSPC** (m2_sdram, m3_sdr2, m3_system SDR_DSPC; off by default). S_DISPATCH issues the ACTIVATE of a closed
+bank itself and the PRECHARGE of a bank open on another row when bank_pre_ok allows; otherwise S_MISS as before,
+where a PRECHARGE waits for tRAS or for read data in flight. One clock on every transaction whose row is not open.
+
+| board-like bench, 140 MHz, warm frames 2-4 | Daytona 2 race 4302 | Sega Rally 2 start 5620 | first beat, I / D fills |
+|---|---|---|---|
+| main 3fbcbc2 | 1.0448 | 0.7724 | 18.17 / 19.11 |
+| with DSPC | 1.0388 (-0.57%) | 0.7705 (-0.25%) | 17.68 / 18.53 |
+
+- Model 2's bench with DSPC, HITRD and FDSP: 0 fails, 0 violations, 0 tag faults in four runs, and more done in the
+  same bench time (1.90 M / 2.22 M checks against 1.80 M / 2.11 M).
+- Both monitors as on main; the games' Real3D word streams (frames 2-4) are main's.
+- The system bench (main's options, the calibration on), VF3 from reset, 60 frames: the same 1,131,363 bus records
+  and 2,696,157 CPU reads as main in 175,001,130 clocks (main 177,434,890); a line fill's first beat 17.73 -> 17.10.
+
+**3. What DSPC cost in the fit, and the two changes for it** (no cycle either).
+First fits (DSPC alone on 3fbcbc2, 140 MHz, dual, release):
+
+| fit | system setup s100 / sn40 | hold (least, four corners) | capture 1 / 2 | HDMI |
+|---|---|---|---|---|
+| ds_s1 | -4.399 / -4.330 | +0.245 / +0.120 / +0.131 / +0.059 | +0.487 / +0.287 | +0.080 / -0.228 |
+| ds_s2 | -4.557 / -4.235 | +0.116 / +0.109 / +0.101 / +0.041 | +0.466 / +0.303 | +0.416 / +0.128 |
+| xds_s3 (the CPU's and the Real3D's paths relaxed) | -2.372 / -2.530 | -0.676 / -0.573 / -0.400 / -0.386 | +0.459 / +0.325 | -0.167 / -0.120 |
+
+The dispatch stage's registers on the failing list, with DSPC against without (the experiment fit; in brackets
+the true fits): the first SDRAM's bank_row 15 against 0 (77 and 104 against 6), bank_open 8 against 0 (9 and 8),
+ras_cnt 10 against 0, cmd 1 against 0 (3 against 1), the second SDRAM's sd_a 11 against 0; and HITRD's own
+rd_bank_cnt 37-65 with or without. Worst -1.17 in the experiment.
+- **HRL** (SDR_HRL): HITRD's READ from S_DISPATCH loaded that bank's read guard there, behind the row comparator. Now
+  S_DISPATCH notes the READ and its bank in four registers and the guard is loaded the clock after with the count
+  one less; bank_pre_ok reads the note for that one clock. Model 2's bench with HRL 0 and 1: the same output to the
+  count; the board-like bench: the same frame.
+- **The row registers' load without the open flags** (inside DSPC): bank_row[tbank] takes the transaction's row
+  in every S_DISPATCH clock. On a hit it is the row it holds; a closed bank is opened on it there; a bank open on
+  another row is closed and S_ACT writes this row again, and bank_row's one reader is S_DISPATCH's own row_hit. Not
+  bit-exact inside; Model 2's bench gives the first form's output to the count and the board-like bench the same
+  frame.
+Their fit is the candidate's (below).
+
+**4. The crossings between clk_hps and clk_sys, all of them** (`tools/xing.tcl` on a fit's database: 299
+endpoints). R210 staged the options, the calibration's targets and the analog inputs. Since then two more direct
+ones failed hold in a fit: the buttons (joystick_0[4] -> m3_inputs, -0.019) and the video (vq -> vh, -0.39 to
+-0.68).
+- *The buttons* (Model3.sv M3_BTNQ, m3_system INP_BQ): a clk_sys falling-edge register, then a clk_sys register in
+  g_inputs in front of m3_inputs. **One clk_sys edge of latency (7.1 ns at 140 MHz)**, which I approved: they went
+  into m3_inputs' logic with no register of their own.
+- *The video* (M3_VIDQ) and *the download port* (M3_DLQ): one clk_sys falling-edge register each, no latency. No
+  bench covers them (they are in Model3.sv); the reasoning:
+  - video: vq and vce change only on clk_sys's rising edge, and vh / vh_ce take them at clk_hps's rising edges,
+    which are clk_sys rising edges. vq_n / vce_n copy vq / vce half a clk_sys clock after each rising edge, so at
+    the next rising edge they hold what vq / vce held just before it: vh and vh_ce load the same values at the same
+    clk_hps edges as when they read vq / vce themselves. The pixel's enable (two clk_sys clocks, one of which ends
+    on a clk_hps edge: R198) is seen once as before.
+  - download: hps_io's ioctl fields change only on clk_hps's rising edges (clk_sys rising edges). io_n copies them
+    half a clk_sys clock later; io_*_q at the next clk_sys rising edge load what the fields held just before that
+    edge, as when they read hps_io directly. The strobe's one-clock pulse (io_wr_q and not io_wr_d) falls in the
+    same clk_sys clock.
+  - in both, the first hop is half a clk_sys period inside or across the clocks (2.2 ns across), which is why the
+    three registers of each bit have sites side by side; the fits' setup on those registers is the check.
+- Each bit's three registers have sites side by side (video 89 sites, download 183, buttons 96; the far ends on
+  hps_io's registers are sites, not edits of sys/).
+- Still direct, six endpoints whose far ends are inside sys/: io_dl_q -> io_ack / rack, m3_sdr2's info_req ->
+  hps_io, cfg_prof -> hps_io's io_dout, gp_outr -> ioe_s (+0.29 ns at least where I read them).
+
+**5. The candidate, and what the chip had room for.** `lat/tree_cmb2` was 3fbcbc2 + DSPC + HRL + the gear lever's
+patch + the three crossings, each behind its switch. m3_inputs' bench on it (five seeds): 557,690-557,743 checks
+each, 0 fail. The system bench of its m3_system: VF3, 60 frames from reset, the same run as DSPC alone clock for
+clock (175,001,130 clocks, 1,131,363 bus records; main 177,434,890); Daytona 2, 40 frames, the same again
+(128,759,690 clocks). Quartus analysis of every changed file: 0 errors, 0 warnings.
+- *It did not fit.* First the fitter refused my sites on hps_io's download address (a counter with a load: four
+  of its registers do not fit one ALM's inputs; a site list is checked by nothing before the fitter, a quarter of
+  an hour in). With those sites out it asked for 4,224 and 4,212 LABs of 4,191 (two seeds). Synthesis has the
+  candidate at +62 ALM and +152 registers on the DSPC tree, 6 to 8 LABs; the rest is the sites: 341 more
+  registers in 13 LABs of their own, 66 of them hps_io's registers pulled away from the LUTs that load them. **On
+  a chip with no LAB spare a row of pinned registers costs its LAB**; R210's 377 sites went in while there was
+  room, and I had not counted these.
+- *What fits:* without the video's and the download's crossings (M3_VIDQ 0, M3_DLQ 0; their registers now inside
+  `generate if`) the fitter asked for 4,192 LABs at one seed and fitted at another; with the sites also off
+  hps_io's joystick registers (jb_n and j0_q / j1_q keep their two rows) it fits at every seed tried, 4,189 LABs.
+  That is `lat/tree_cmb5`, `lat/lat-cmb5-3fbcbc2.patch`. The unpinned first hop has the pinned one's setup (+0.48
+  against +0.50 ns), so those 32 sites bought nothing.
+- *Its fits* (system setup slow 100 / slow -40 / fast 100; least hold at the four corners; LABs):
+  cmb5_s1 -5.474 / -4.935 / -0.887, hold +0.143 / +0.017 / +0.095 / **-0.005**, 4,189;
+  cmb5_s2 -4.557 / -4.031 / -0.504, hold +0.138 / +0.014 / +0.104 / +0.009, 4,189 (HDMI +0.115 / +0.244);
+  xcmb4_s3 (CPU and Real3D relaxed) -1.325 / -1.506, 611 endpoints, hold +0.112 / +0.086 / +0.092 / +0.040.
+  cmb5_s1's hold miss is the second SDRAM's write data into its pin stage (clk_sys to clk_sys, 5 ps), not a
+  crossing and not DSPC's. cmb5_s2 is the DSPC tree's seed 2 again as a fit (19,167 failing endpoints against
+  19,344).
+- *The dispatch stage's registers.* In the experiment fits the two controllers' failing endpoints are 45 / 5
+  (main), 95 / 32 (DSPC as first written), 37 / 2 (DSPC + HRL + the row registers' form): bank_row 0 / 15 / 0,
+  the read guard 27 / 62 / 0, and what stays of DSPC's own is bank_open 8 and the ACTIVATE's address and command
+  10. Under the true constraints the read guard's count falls the same way (73-80 to 37-44) and bank_row does
+  not (104 of 104 in three fits of four, with or without the form): there the controller sits where the CPU's
+  paths leave it and xfer_addr -> bank_row itself is 2 to 3 ns short.
+- *The buttons' crossing* (28 of the 32 bits are in the netlist): hps_io's register -> jb_n +0.48 / +0.55 ns of
+  setup at the slow corners, jb_n -> j0_q / j1_q +0.74, j_q -> m3_inputs +0.22, hold 2.8 ns or more on both hops,
+  on no failing list in three fits.
+- The video's and the download's crossings are written, switched off and unfitted. They cost about 20 LABs with
+  their sites, and the paths they stage had positive hold in every fit under the true constraints (the video's
+  +0.039 at the least, in cmb5_s2).
+
+**6. Item D's pin stage on the second SDRAM alone** (m3_system SDR2_OPIPE, default = SDR_OPIPE: nothing changes).
+The second SDRAM's command and address pins are one cluster on the bottom edge (X62-80 Y0, A8 at X89 Y4) with its
+DQ at X78-86, so its controller can sit by them and drive the I/O cells' registers itself; the first SDRAM's pins
+run from X8 to X82 with three on the top edge, so its stage stays. Board-like bench with the stage off on top of
+DSPC + HRL: Daytona 2 -0.74%, Sega Rally 2 -0.59% CPU clocks a frame, both pin monitors as before. One clock off
+every command of the second SDRAM, none added anywhere. On the system bench (VF3, 60 frames) the CPU's 276,462
+compared accesses agree in order with the candidate's run. **The fit does not hold it for nothing:** the
+controller's own registers become the I/O cells', and the paths into them (sd_a, cmd, sd_dq_o) are 76 failing
+endpoints at -2.13 ns in the experiment fit against 2 with the stage, and under the true constraints the worst
+paths of the chip at one seed (-5.66 ns, d5_s1) and inside it at the other (-3.22, d5_s2). Held with that price;
+`lat/tree_d5` has it on.
+
+**7. The capture registers' hop into clk_sys has a hold window, and the second SDRAM's is a third as wide.** With
+CAPX 0 (R212) the transfer from the capture clock into clk_sys starts at the pinned dq_r. Its hold is checked
+against the calibration band's early side (8 steps, 1.190 ns). Capture 2's generated phase is 1190 ps and capture
+1's 1488 ps, so capture 2 launches 0.3 ns nearer the clk_sys edge its hold is checked at. Per endpoint in ds_s1
+(`tools/capwin.tcl`): capture 2 needs the slow-corner data delay between about 1.7 and 3.0 ns on all 96 paths,
+capture 1 between 0.45 and 2.5 ns. The fitter gets there by padding each path; my fits have +0.12 to +0.13 ns of
+hold at the fast corner on capture 2 in most (+0.04 to +0.15 over my eleven fits), and another fit of the
+same RTL (seed 3, elsewhere) missed one path by 0.234 ns. **And capture 1 misses the other side: its setup fails in
+seven of my eleven fits of this base, 4 to 16 endpoints, by 0.2 to 1.3 ns** (dq_r -> cap / dl_data; since CAPX 0).
+I had read capture 1 in two fits that pass and filed the others' endpoints under the controller. At the phase the
+first SDRAM calibrates to (+6 of a band analysed to +14) the same paths have 1.19 ns more, and the build I
+board-tested has none; by the constraint as written they fail. A site pair cannot set a delay. What gives the margin on every seed is the
+phase: capture 2's generated phase at 1488 ps, as capture 1's. The earlier phase was chosen in R198, when two more
+registers sat between the pins and this hop. On the board the second SDRAM's calibration sits at +12 / +13 of a
+band whose top is +14: it wants a later phase anyway. Needs the PLL from the IP tool and a fit. Not done.
+
+**8. Item C, the row policy: no change, and a counter of mine that said otherwise for an hour.** I counted the
+second SDRAM's read bursts on the board-like bench by what the pins did before each (row open / ACTIVATE /
+PRECHARGE + ACTIVATE) and by the quiet time before the transaction. Daytona 2's race, about five frames: 38,717
+find the row open, 18,711 an ACTIVATE (the banks the refresh closed), 28,586 a PRECHARGE and an ACTIVATE; Sega
+Rally 2's start 50,006 / 9,129 / 9,743. By quiet time (8-31, 32-127, 128 clocks or more) the row-open reads are
+25,410 / 11,045 / 2,141 against 17,552 / 8,235 / 2,546 that pay the PRECHARGE (Daytona 2), and 35,928 / 10,528 /
+3,436 against 7,069 / 1,704 / 890 (Sega Rally 2): a bank left open is wanted on the same row more often than on
+another at every quiet time, even only past 128 clocks on Daytona 2.
+- The first form of the counter took a hit's quiet time from a register written in the same clock, so it filed
+  every hit under "under 8 clocks", and I read that as "a row is hit only back to back" and built a precharge of
+  the last transaction's bank after N quiet clocks on it (m2_sdram IPRE). Its protocol is right (the second-SDRAM
+  port bench passes its six traffic runs with it, both pin monitors clean on the games' traffic); its price is
+  not: N = 8, 20, 40 give Daytona 2 -0.09 / -0.10 / -0.04% and Sega Rally 2 +0.41 / +0.39 / +0.26% CPU clocks a
+  frame. The prices were right and the table wrong; I found the counter's error only by reading it again after
+  explaining the prices away. IPRE is 0 and not in the candidate.
+
+**9. Sites for capture 1's registers: accepted on the fourth try, and beside dq_r is the wrong place.** I gave the
+first SDRAM's 96 capture registers sites by their dq_r (in its LAB, the LAB above and one beside). The fitter
+refused three lists a quarter of an hour apart, each for a rule its own placements had been showing me: an ALM that
+holds the pin registers takes nothing else; dl_data's upper word leaves its ALM no input for a second register;
+a LAB takes one sync clear, and dl_data's words have two; with cap[k]'s clock enables, no more than two of the
+four kinds share a LAB. With one register to an ALM and the kinds in LABs of their own it fits (4,190-4,191 LABs).
+It did not do what I wanted: in the experiment fit capture 1's setup still fails (12 endpoints, -1.040 ns), and the
+failing registers are the ones in dq_r's own LAB. Such a hop needs about 1.25 ns of delay for hold, the router
+leaves the LAB and comes back to make it, and it lands anywhere from 1.7 to 3.6 ns; at one seed it undershot
+instead (hold -0.064). The registers two and three LABs away have 1.7 to 2.4 ns as routed, every one inside the
+window. So I moved all 96 two to three LABs out (`tools/capsites2.py`; the fitter took that list at the first
+try). Better and still not closed: in the experiment fit the delays are 1.58 to 3.41 ns, the 48 cap registers and
+dl_data's upper word all inside the window, and four of dl_data[31:0] outside it (-0.841 ns); at seed 1 under the
+true constraints -0.987; at seed 2 the router ran 50 minutes without ending and I stopped it. dl_data's low words
+take dq_r through their word-select LUT, and a site on the register fixes neither the LUT nor the padding on the
+net into it. Over five fits with sites: one pass. Without: two passes in the four databases I have read. Sites do
+not close this hop and neither list should go in; what is left is the band top the setup side is analysed at
+(+14 steps, where the first SDRAM calibrates to +6) or a register stage again (a cycle).
+- A hole in my reading, found here: the failing lists give one path an endpoint, so under the true constraints a
+  capture hop hides behind any worse path into the same register. Section 7's "seven of eleven" is a lower bound,
+  and a fit whose database is gone is not known to pass. The fit script now reads both capture hops and the four
+  corners' least hold from the database of every fit.
+
+*Not done:* the rest of the list. D's pin stage is a fit
+question with the controller's command registers pinned by the pins. A and E wait for the CPU's rework.
+
+*Board (2026-11-28):* cmb5_s2 (RBF 17851f89; main 3fbcbc2 + DSPC + HRL + the row-register form + the buttons'
+crossing + the gear lever, the video and download crossings off): Daytona 2 good, no speed difference I can see
+against l2_s1, gears and attract right; VF3, Scud Race, Sega Rally 2 good. Merged.
+
+*Decided the same morning:* the second SDRAM's pin stage off (item D, d5_s2) not now: its controller's paths became
+the chip's worst in other fits. The video crossing left out; the download crossing wanted if its sites cost less.
+Capture 1's setup: dl_data's select moved after the cap registers (no cycle) with sites 2-3 LABs out, the first
+SDRAM's band top lowered as the fallback; capture 2's generated phase (1488 ps) or band is for later, written here so
+it is not lost. The Real3D's clip pool in MLAB dropped (R211's sibling work, sm3-builds/area-r3d2); the double unit's
+thirteenth clock not taken.

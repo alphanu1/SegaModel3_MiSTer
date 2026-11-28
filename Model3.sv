@@ -234,9 +234,21 @@ reg        io_wr_q = 1'b0, io_wr_d = 1'b0;
 reg        io_dl_q = 1'b0;
 reg [15:0] io_ix_q, io_do_q;
 reg [26:0] io_a_q;
+// sys-timing: the download port's fields through a register on clk_sys's falling edge first (io_n), as the analog
+// inputs: hps_io's registers (clk_hps) straight into io_*_q had their hold check at the common edge of the two
+// globals (+0.19 ns at worst in the fit I read them in; the video's transfer the other way failed it there). The
+// io_*_q registers take the same values at the same clk_sys edges as before: nothing is added. The three registers
+// of each bit have sites side by side in the qsf. M3_DLQ 0: direct.
+localparam bit M3_DLQ = 1'b0;
+wire [60:0] io_h = {hio_wr, hio_download, hio_index, hio_addr, hio_dout};
+(* preserve *) reg [60:0] io_n;
+generate if (M3_DLQ) begin : g_dlq
+	always @(negedge clk_sys) io_n <= io_h;
+end endgenerate
+wire [60:0] io_x = M3_DLQ ? io_n : io_h;
 always @(posedge clk_sys) begin
-	io_wr_q <= hio_wr; io_wr_d <= io_wr_q;
-	io_dl_q <= hio_download; io_ix_q <= hio_index; io_a_q <= hio_addr; io_do_q <= hio_dout;
+	io_wr_q <= io_x[60]; io_wr_d <= io_wr_q;
+	io_dl_q <= io_x[59]; io_ix_q <= io_x[58:43]; io_a_q <= io_x[42:16]; io_do_q <= io_x[15:0];
 end
 assign ioctl_wr       = io_wr_q & ~io_wr_d;
 assign ioctl_download = io_dl_q;
@@ -423,16 +435,28 @@ wire [71:0] ain_h = {joy_l0, joy_l1, joy_r0, joy_lt0, joy_rt0, paddle0};
 (* preserve *) reg [71:0] ain_n;
 always @(negedge clk_sys) ain_n <= ain_h;
 wire [71:0] ain = M3_AINQ ? ain_n : ain_h;
+// sys-timing: the buttons (joystick_0 / 1 [15:0]) the same way, with one clock of latency: they went from hps_io's
+// registers into m3_inputs' logic with no register of their own, and that direct transfer failed hold in one fit
+// (joystick_0[4], -0.019 ns). A register on clk_sys's falling edge here (jb_n) and a clk_sys register in m3_system
+// (g_inputs' j0_q / j1_q, INP_BQ) in front of m3_inputs: the buttons reach m3_inputs one clk_sys edge (7.1 ns at
+// 140 MHz) later than before. The three registers of each bit have sites side by side in the qsf. M3_BTNQ 0: direct.
+localparam bit M3_BTNQ = 1'b1;
+(* preserve *) reg [31:0] jb_n;
+generate if (M3_BTNQ) begin : g_btnq
+	always @(negedge clk_sys) jb_n <= {joystick_1[15:0], joystick_0[15:0]};
+end endgenerate
+wire [15:0] jb0 = M3_BTNQ ? jb_n[15:0]  : joystick_0[15:0];
+wire [15:0] jb1 = M3_BTNQ ? jb_n[31:16] : joystick_1[15:0];
 wire [2:0] sdr_cap1 = (opt[15:14] == 2'd1) ? 3'd1 : (opt[15:14] == 2'd2) ? 3'd3 : 3'd2;
 `ifdef M3_CPU_SDR2
 wire [2:0] sdr_cap2 = (opt[17:16] == 2'd1) ? 3'd1 : (opt[17:16] == 2'd2) ? 3'd3 : 3'd2;
 `else
 wire [2:0] sdr_cap2 = 3'd2;
 `endif
-m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN), .SDR_BXOR(1'b1), .SDR_L16(1'b1), .SDR_LW1(1'b1),
+m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN), .INP_BQ(M3_BTNQ), .SDR_BXOR(1'b1), .SDR_L16(1'b1), .SDR_LW1(1'b1),
             .SDR_PAIR(1'b1), .SDR_PW(1'b1),
             .BUS_FAST(1'b1), .BUS_R3P(1'b1), .SDR_FREQ(1'b1), .SDR_FWD(1'b1), .SDR_FDSP(1'b1),
-            .SDR_PW_DLY(8), .ISB(1'b1), .W2(CPU_SDR2), .SDR_CAPCLK(1'b1), .SDR_CAPPIPE(1'b1), .DDR_OREG(1'b1), .SDR_OPIPE(1'b1), .SDR2_CAPX(0), .SDR_HITRD(1'b1), .SDR_TRCD(2),
+            .SDR_PW_DLY(8), .ISB(1'b1), .W2(CPU_SDR2), .SDR_CAPCLK(1'b1), .SDR_CAPPIPE(1'b1), .DDR_OREG(1'b1), .SDR_OPIPE(1'b1), .SDR2_CAPX(0), .SDR_HITRD(1'b1), .SDR_DSPC(1'b1), .SDR_HRL(1'b1), .SDR_TRCD(2),
             .SDR_CAL(1'b1)) sys3
 (
 	.clk(clk_sys), .clk_cap1(clk_cap1), .clk_cap2(clk_cap2), .mem_rst_n(mem_rst_n), .reset(RESET | status[0] | buttons[1]),
@@ -450,7 +474,7 @@ m3_system #(.CLK_HZ(SYS_HZ), .CPI_MON(1'b0), .INPUTS(INPUTS), .INP_LEAN(INP_LEAN
 	.DDRAM_DOUT(DDRAM_DOUT), .DDRAM_DOUT_READY(DDRAM_DOUT_READY),
 	.ce_pix(ce_pix), .v_hs(v_hs), .v_vs(v_vs), .v_hblank(v_hb), .v_vblank(v_vb),
 	.v_r(v_r), .v_g(v_g), .v_b(v_b), .overlay_en(~opt[0]), .fps_en(opt[1]), .fps_avg(opt[5:4]),
-	.joystick_0(joystick_0[15:0]), .joystick_1(joystick_1[15:0]), .joy_l0(ain[71:56]), .joy_l1(ain[55:40]), .joy_r0(ain[39:24]),
+	.joystick_0(jb0), .joystick_1(jb1), .joy_l0(ain[71:56]), .joy_l1(ain[55:40]), .joy_r0(ain[39:24]),
 	.joy_lt0(ain[23:16]), .joy_rt0(ain[15:8]), .paddle0(ain[7:0]),
 	.st_pedswap(opt[6]), .st_ssens(opt[8:7]), .st_ssm(opt[10:9]), .st_rsteer(opt[11]),
 	.st_wheel(opt[13:12]), .inp_drive(inp_drive),
@@ -501,11 +525,21 @@ always @(posedge clk_sys) begin
 	vce <= {vce[0], ce_pix};
 	if (ce_pix) vq <= {v_r, v_g, v_b, v_hs, v_vs, ~(v_hb | v_vb), 1'b0};
 end
+// sys-timing: and a register on clk_sys's falling edge between the two (vq_n, vce_n): vq -> vh direct had its hold
+// check at the common edge of the two globals and failed it in one fit (-0.39 to -0.68 ns). vh and vh_ce take the
+// same values at the same clk_hps edges as before (vq and vce change only on clk_sys's rising edge): nothing is
+// added. The three registers of each bit have sites side by side in the qsf. M3_VIDQ 0: direct.
+localparam bit M3_VIDQ = 1'b0;
+(* preserve *) reg [27:0] vq_n;
+(* preserve *) reg [1:0]  vce_n;
+generate if (M3_VIDQ) begin : g_vidq
+	always @(negedge clk_sys) begin vq_n <= vq; vce_n <= vce; end
+end endgenerate
 reg  [27:0] vh;
 reg         vh_ce = 1'b0;
 always @(posedge clk_hps) begin
-	vh_ce <= |vce;
-	vh    <= vq;
+	vh_ce <= M3_VIDQ ? |vce_n : |vce;
+	vh    <= M3_VIDQ ? vq_n : vq;
 end
 assign CLK_VIDEO = clk_hps;
 assign CE_PIXEL  = vh_ce;
