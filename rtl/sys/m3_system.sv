@@ -173,6 +173,9 @@ module m3_system
   parameter bit          SDR_DSPC    = 1'b0,
   //   SDR_HRL      m2_sdram HRL: HITRD's read guard loaded a clock later (cycle-exact)
   parameter bit          SDR_HRL     = 1'b0,
+  //   SDR_DLSEL    m2_sdram DLSEL, both SDRAMs: the delivery's word select after the capture slots (the same data
+  //                at the same edges; dq_r reaches straight registers only)
+  parameter bit          SDR_DLSEL   = 1'b0,
   //   SDR_PW_DLY   with SDR_PW: a posted line write waits this many clocks before its bursts unless needed (m3_sdr_port PW_DLY)
   parameter int          SDR_PW_DLY  = 0,
   //   BUS_R3P      m3_bus: writes to the Real3D's host port posted in an eight-word buffer, the bus freed (m3_bus R3P)
@@ -479,10 +482,10 @@ module m3_system
              .PRI(SDR_PRI), .PRI_CAP(SDR_PRI_CAP), .AGE(SDR_AGE), .AGE_T(SDR_AGE_T), .BXOR(SDR_BXOR),
              .L16({{(NSP-1){1'b0}}, SDR_L16}), .PAIR({{(NSP-1){1'b0}}, SDR_PAIR}),
 `ifdef M3_R3B
-             .WB(NSP'(6'b010001)), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD), .DSPC(SDR_DSPC), .HRL(SDR_HRL),
+             .WB(NSP'(6'b010001)), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD), .DSPC(SDR_DSPC), .HRL(SDR_HRL), .DLSEL(SDR_DLSEL),
              .SHD(SDR_SHD ? NSP'(6'b101111) : NSP'(0))) u_sdram (   // R101, R144: the bus (port 0) and r3d_mem (port 4) write in bursts
 `else
-             .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD), .DSPC(SDR_DSPC), .HRL(SDR_HRL),
+             .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD), .DSPC(SDR_DSPC), .HRL(SDR_HRL), .DLSEL(SDR_DLSEL),
              .SHD(SDR_SHD ? NSP'(6'b101111) : NSP'(0))) u_sdram (   // port 0 (the bus) writes in bursts (R101)
 `endif
     .clk, .clk_cap(clk_cap1), .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
@@ -867,7 +870,7 @@ module m3_system
     m3_sdr2 #(.AW(AW), .CLK_MHZ(CLK_MHZ), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .T_RCD(T_RCD_C), .T_RP(T_RCD_C),
               .CAPCLK(SDR_CAPCLK), .CAPPIPE(SDR_CAPPIPE), .OPIPE(SDR_OPIPE), .CAPX(SDR2_CAPX), .CAL(SDR_CAL), .XCAL(1'b1), .CPROBE(1'b0), .PROBE_SA(SDR_RAM),
               .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ),
-              .PW_DLY(SDR_PW_DLY), .BXOR(SDR_BXOR), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD), .DSPC(SDR_DSPC), .HRL(SDR_HRL)) u_sdr2 (
+              .PW_DLY(SDR_PW_DLY), .BXOR(SDR_BXOR), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD), .DSPC(SDR_DSPC), .HRL(SDR_HRL), .DLSEL(SDR_DLSEL)) u_sdr2 (
       .clk, .clk_cap(clk_cap2), .mem_rst_n, .ra_clr(rst), .en(sd2_en), .ok(sd2_ok_q), .missing(sd2_missing), .info_req(sd2_info_req),
       .cal_osd(cap2_osd), .cal_off(), .cal_settled(cap2_settled), .cal_width(), .cal_last(), .cal_flags(),
       // area-sys: the shared engine (its B side); its transactions come on s_* (b_*), with SDR_RAM's top bits as the
