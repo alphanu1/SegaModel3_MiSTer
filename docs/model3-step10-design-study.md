@@ -1147,6 +1147,9 @@ Local copies of the Real3D documents, for reading only and not committed:
 | D-88 | (2026-11-27) Daytona 2's TLB cost (the miss handlers take about 6.8% of the race's cycles, about 3,800 misses a frame at about 58 clocks each, R192) is attacked only by making each miss cheaper on the 603e's own TLB: the 64-entry 2-way data TLB, the software miss handler, tlbld writing the way SRR1[WAY] names, all as the manual has them; what is cut is our clocks per miss (exception entry, the handler's fetches, tlbld, rfi). A bigger TLB (the contributor's DT4) and a hidden victim TLB are both rejected: the first breaks the manual's tlbld rules, the second changes how many miss exceptions software sees. |
 | D-89 | (2026-11-27) The CPU is rebuilt for 140 MHz with timing closed in the full chip (draft R208, sm3-builds/cpu-fable): registered holds, forwarding decided at predecode, speculative special registers restored on a flush, a three-stage load, a store buffer, R202's single FP unit. 100 MHz (where today's core closes) is not fast enough; the bar is a closed 140 MHz core made as fast as it can be, every added cycle measured. The branch-direction table that would pay for the extra fetch stages is measured first; putting it in needs a change to D-30. |
 | D-90 | (2026-11-27) D-30 changed: a dynamic branch-direction table (two-bit counters, 1,024 entries, one M10K) is allowed, if the replay bench confirms its gain. It never changes what a program computes; mispredictions are corrected as today, and every result, exception and register value stays as the 603e manual has it. Only branch timing differs from the 603e's static rule, and my core's timing does not match the 603e's anyway (about 3.2 clocks an instruction against its 1.7, different latencies, a different clock). |
+| D-92 | (2026-11-28) No Step 1.x / Step 2.x split (D-64 not taken). Priced on 61d5786 (R207 §11, sm3-builds/area-r3d2): the Step 2.x build, which carries Daytona 2 and Sega Rally 2, frees 37-51 ALM in the chip with no timing change; Step 1.x frees about 340 ALM, 2 M10K and 1 DSP where the games already run; two builds would double every release's fits and board tests. (D-91 is on branch lemans24, Le Mans 24's link mode.) |
+| D-93 | (2026-11-28) In the rebuilt CPU (D-89), the sign-extending loads (lha, lhax, and the byte-reversed loads if they share the select level) take one cycle more as a class, so the common loads lose the data-dependent level on the D RAM -> M2 word path. Priced on the replay traces at +0.10% / +0.07% (Daytona 2 race / Sega Rally 2 start; +0.19% on Daytona 2 with the byte-reversed loads) for an estimated 0.4-0.6 ns; the predicted way in the RAM address (+0.35-0.69%) is the fallback. |
+| D-94 | (2026-11-28) The download port's clk_hps -> clk_sys crossing (M3_DLQ, its registers sited in pairs) is wanted but held: with R214's cap sites it fits at one seed of three (4,195 / 4,201 LABs needed at the others) and that fit fails hold elsewhere. It goes in when the chip has room. |
 
 ### Open
 
@@ -22058,3 +22061,35 @@ Every RTL change below gives bench logs byte-identical to untouched main's (whol
 flag, r3d_cmd's VROM flag from the registered decode, the fog viewport's products on one DSP block, the divider
 lane's merged register; rst_rast / rst_geo MAX_FANOUT 24 and the scaler's 13 DSP blocks pinned far): the 3D good in
 every game. Merged on top of main 7593767. Decided the same morning: the clip pool in MLAB dropped.
+
+**R214 — The first SDRAM's capture hop closed without the cycle R212 removed: the delivery's word select moved after
+the cap registers (5a), the cap registers sited two to three LABs from their pins** (2026-11-28; main 61d5786; work
+in sm3-builds/sys-timing, NOTES M30-M38).
+
+*What was wrong:* since R212 took the second SDRAM's extra capture register out (CAPX 0), the first SDRAM's capture
+hop failed setup on most seeds, down to -1.28 ns (about -0.09 ns at the phase the calibration chooses on my board).
+Sites beside dq_r did not fix it (the router pads a hop inside one LAB up to its hold limit and lands anywhere from
+1.7 to 3.6 ns), and sites two to three LABs out fixed every direct register but not dl_data's low words, which took
+dq_r through a LUT (the delivery's word select).
+
+*What changed (DLSEL; m2_sdram, m3_sdr2, m3_system SDR_DLSEL, on in Model3.sv):* three select bits are registered at
+the delivery edge and the delivery is formed from cap[0..3] one clock later, when pd_q / pd_sh used to load dl_data;
+cap[3] is kept; dl_data's 64 registers go. No cycle is added. The 64 cap registers have sites 2-3 LABs from their dq_r
+(18 LABs).
+
+*Proof:* an assertion of the new delivery against today's dl_data on every delivery, with the switch off and on:
+Model 2's SDRAM bench (four runs each, 0 fails, 0 violations; a wrong select planted fires in all four), the port bench
+(six traffic runs, five planted conditions fail as meant), the board-like bench (frame for frame), the system bench
+(VF3 60 frames identical off and on).
+
+*Fits (140 MHz, dual):* c5a_s1 capture 1 +0.263 / +0.413 ns, hold positive at every corner (+0.089 at least);
+c5a_s2 capture 1 passes but the fit is poor (geometry detours to -8.3 ns); c5a_s3 does not fit (4,196 LABs). Main
+61d5786 alone gave hold positive at one seed of five (one did not route): the chip fits by the seed now.
+
+*Board (2026-11-28, c5a_s1, RBF ad478af5):* Daytona 2, VF3, Scud Race, Sega Rally 2 good.
+
+*Open, seen on the same board:* Scud Race shows green polygons at the start on the bridge when it is loaded after
+another Model 3 game, and not from a clean boot with Scud Race first. A long-standing issue: Scud Race reads memory it
+does not write itself and finds the previous game's data, in the DDR3 extra memory or the Real3D's own memories
+(texture, polygon), which keep their contents across a game change. A real board starts them at power-on and
+Supermodel at zero; clearing the regions a game does not load, at the download (not at reset), is the likely fix.
