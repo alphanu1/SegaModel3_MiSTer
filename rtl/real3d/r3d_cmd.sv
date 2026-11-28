@@ -194,6 +194,9 @@ module r3d_cmd #(
 
 `ifdef M3_DMAFAST
   wire  b_mem = hd_mem, b_tex = hd_tex, b_cmd = hd_cmd;
+  // 0x90 against 0x94, the two addresses hd_tex stands for, is bit 26: the texture port's VROM flag takes two
+  // registers, not the byte's compare (b_hi -> the compare -> r3d_texup's enables, 110 failing endpoints at 140 MHz)
+  wire  b_90  = hd_tex && !b_hi[2];
   assign m_reg   = hd_8c ? 2'd0 : hd_8e ? 2'd1 : 2'd2;
   assign m_addr  = hd_8e ? {2'd0, b_a[19:2]} : b_a[21:2];
 `ifdef VERILATOR
@@ -206,13 +209,17 @@ module r3d_cmd #(
   wire  b_mem = (b_hi == 8'h8C) || (b_hi == 8'h8E) || (b_hi == 8'h98);
   wire  b_tex = (b_hi == 8'h90) || (b_hi == 8'h94);
   wire  b_cmd = (b_hi == 8'h88);
+  wire  b_90  = (b_hi == 8'h90);
   assign m_reg   = (b_hi == 8'h8C) ? 2'd0 : (b_hi == 8'h8E) ? 2'd1 : 2'd2;
   assign m_addr  = (b_hi == 8'h8E) ? {2'd0, b_a[19:2]} : b_a[21:2];
 `endif
   assign m_valid = b_v && b_mem;
   assign m_data  = b_d;
   assign t_valid = b_v && b_tex;
-  assign t_vrom  = (b_hi == 8'h90);
+  assign t_vrom  = b_90;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (!rst && b_v && b_90 != (b_hi == 8'h90)) $fatal(1, "r3d_cmd: the VROM flag from the registered decode");
+`endif
   assign t_data  = b_d;
   assign t_flush = b_v && b_cmd && t_ready;
 

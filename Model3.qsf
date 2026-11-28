@@ -98,8 +98,8 @@ set_instance_assignment -name MAX_FANOUT 16 -to rack
 # The geometry's and the rasteriser's resets (m3_system's preserved copies of rst_s[2]; rst_geo alone fans out to
 # about 3,000 registers): copied at the same stage, at most 200 loads each, so every copy deasserts in the same
 # clock as the one it replaces (a reset tree, no stage added)
-set_instance_assignment -name MAX_FANOUT 200 -to "emu:emu|m3_system:sys3|rst_geo"
-set_instance_assignment -name MAX_FANOUT 200 -to "emu:emu|m3_system:sys3|rst_rast"
+set_instance_assignment -name MAX_FANOUT 24 -to "emu:emu|m3_system:sys3|rst_geo"
+set_instance_assignment -name MAX_FANOUT 24 -to "emu:emu|m3_system:sys3|rst_rast"
 set_instance_assignment -name MAX_FANOUT 200 -to "emu:emu|m3_system:sys3|rst_s[2]"
 set_instance_assignment -name MAX_FANOUT 200 -to "emu:emu|m3_system:sys3|rst_cpu"
 set_instance_assignment -name MAX_FANOUT 200 -to "emu:emu|m3_system:sys3|rst_r3"
@@ -852,3 +852,22 @@ set_instance_assignment -name MAX_FANOUT 16 -to "emu:emu|m3_system:sys3|tg_go"
 # sys140: m3_xmem's own reset copy, duplicated
 set_instance_assignment -name MAX_FANOUT 64 -to "emu:emu|m3_system:sys3|rst_xm"
 set_global_assignment -name VERILOG_MACRO "M3_DIRN=1024"
+
+# The scaler's 13 DSP blocks are held in the two far columns (X54, X86), rows 20-35, where the fitter puts most of
+# them anyway. That leaves the two near columns (X20, X32: 78 blocks) to the Real3D, whose block paths do not close
+# from a far column at 140 MHz (study R207: r3_s2's reciprocal in a far column put specks on the screen). The CPU's
+# and the sound's blocks are free. If ascal's multiplier names change these lines stop matching: the fit report's
+# DSP Block Details must show no r3d_ block in X54 or X86.
+set_location_assignment DSP_X86_Y35_N0 -to "ascal:ascal|Add227~8"
+set_location_assignment DSP_X54_Y35_N0 -to "ascal:ascal|Add228~8"
+set_location_assignment DSP_X86_Y33_N0 -to "ascal:ascal|Add229~8"
+set_location_assignment DSP_X54_Y33_N0 -to "ascal:ascal|Add230~8"
+set_location_assignment DSP_X86_Y30_N0 -to "ascal:ascal|Add231~8"
+set_location_assignment DSP_X54_Y30_N0 -to "ascal:ascal|Add232~8"
+set_location_assignment DSP_X86_Y28_N0 -to "ascal:ascal|Add170~8"
+set_location_assignment DSP_X54_Y28_N0 -to "ascal:ascal|Add171~8"
+set_location_assignment DSP_X86_Y26_N0 -to "ascal:ascal|Add172~8"
+set_location_assignment DSP_X54_Y26_N0 -to "ascal:ascal|Add173~8"
+set_location_assignment DSP_X86_Y24_N0 -to "ascal:ascal|Add168~8"
+set_location_assignment DSP_X54_Y24_N0 -to "ascal:ascal|Add169~8"
+set_location_assignment DSP_X86_Y22_N0 -to "ascal:ascal|Mult14~8"

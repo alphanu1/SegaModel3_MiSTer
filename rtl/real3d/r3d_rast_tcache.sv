@@ -63,7 +63,8 @@ module r3d_rast_tcache #(
   parameter int DB   = 6,    // log2 pixels ahead
   parameter int FB   = 3,    // log2 fills in flight
   parameter int PW   = 32,
-  parameter bit GATE = 1'b1  // 1: a fill waits only for earlier readers of its slot
+  parameter bit GATE = 1'b1, // 1: a fill waits only for earlier readers of its slot
+  parameter bit MZR  = 1'b1  // 1: "no bank missing" registered from the misses' next value (below)
 ) (
   input  logic          clk,
   input  logic          rst,
@@ -269,10 +270,15 @@ module r3d_rast_tcache #(
     mbh = miss & (~miss + 4'd1);
     mb = mbh[0] ? 2'd0 : mbh[1] ? 2'd1 : mbh[2] ? 2'd2 : 2'd3;
   end
-  wire mneed = miss != 4'd0;
+  // MZR: "no bank missing" as a register of its own, from the misses' next value (the same terms, reduced before
+  // the edge): a_done and a_go, which fan out into A's rows and every A enable, take one register in place of the
+  // four through a LUT (miss -> the reduce -> a_done: 542 of the Real3D's failing endpoints at 140 MHz)
+  logic mz;
+  wire mneed = MZR ? !mz : (miss != 4'd0);
 `ifdef VERILATOR
   always_ff @(posedge clk) if (!rst && a_v) for (int b = 0; b < 4; b++)
     if (miss[b] != (a_use[b] && !a_ok[b] && !a_hit[b])) $fatal(1, "tcache: the misses registered");
+  always_ff @(posedge clk) if (!rst && a_v && mz != (miss == 4'd0)) $fatal(1, "tcache: no bank missing, registered");
 `endif
   logic [WB-1:0] way_e [4];
   always_comb for (int b = 0; b < 4; b++) way_e[b] = a_ok[b] ? a_way[b] : a_hway[b];
@@ -585,6 +591,9 @@ module r3d_rast_tcache #(
       if (a_go) miss <= c_use & ~c_hit;
       else if (sw_nz) ;
       else if (alloc) miss <= miss & ~dup;
+      if (a_go) mz <= (c_use & ~c_hit) == 4'd0;
+      else if (sw_nz) ;
+      else if (alloc) mz <= (miss & ~dup) == 4'd0;
       // W, Wq
       w_v <= alloc; w_set <= a_set_mb; w_way <= vic; w_tg <= a_tag_mb; w_base <= a_rowe[mb];
       for (int b = 0; b < 4; b++) a_wm[b] <= a_go ? (set_of(c_ln[b]) == a_set_mb) : a_ss[b][mb];

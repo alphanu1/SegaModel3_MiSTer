@@ -21663,3 +21663,398 @@ Capture 1's setup: dl_data's select moved after the cap registers (no cycle) wit
 SDRAM's band top lowered as the fallback; capture 2's generated phase (1488 ps) or band is for later, written here so
 it is not lost. The Real3D's clip pool in MLAB dropped (R211's sibling work, sm3-builds/area-r3d2); the double unit's
 thirteenth clock not taken.
+
+**R207 — The Real3D at 140 MHz (D-81, D-87), area and timing: the DSP forms that freed 400 ALM (R4) failed on my
+board because their paths missed timing, not because their logic was wrong; what went into main is five small
+bit-identical changes and two qsf items (cb1), and the Real3D is still 2.3-4.5 ns from closing, mostly routing in a
+full chip.** Sections 1-8 are the first reading as written at the time; sections 9-10 overturn its conclusion.
+
+*First reading (2026-11-27), superseded by §9-10:* The Real3D's area, second pass (D-81, D-87): the room R205 said was gone is in the 25 idle DSP
+blocks, not in the LUTs. Four rasteriser units did serial or LUT arithmetic that a hard multiplier does in a
+clock: the edge walker's first-row products (a two-bit-a-clock multiply in three 54-bit three-input adders), the
+interpolants' three wide right shifts (u, v, the shade), the intake converter's shift and the fog viewport's
+colour products. Moved into DSP blocks, between the blocks' own registers, they take 388-403 ALM off the Real3D by
+entity and 268-397 off the chip in the full fits at 140 MHz (four fits, seeds 1 and 2, against all1 at the same
+seed), for 19 DSP blocks (87 -> 106 of 112), no M10K, and no clock of any frame: every bench frame's cycle counts
+and pixels are dba80c1's. It is not 1,500, the geometry gave nothing at no cycle, and the DSP blocks are not
+free either: at 106 of 112 a fit puts 11-12 of the rasteriser's blocks in the two far columns, and the unit that
+gets them has the Real3D's worst paths (-3.7 to -4.3 ns in the four fits, where the base's Real3D worst is -3.4
+and -3.9); standalone every changed unit is as fast as it was or faster.
+
+Work in `sm3-builds/area-r3d2/` (`base`: dba80c1 by `git archive`, its rtl/real3d byte for byte all1's; `snapR4`:
+the kept rtl/real3d; `patches/area-r3d2-R4-dba80c1.patch` (md5 5d00466b) against dba80c1, made by
+`patches/mk_*.py` and checked to give the snapshot; `patches/A2x-items-1-2-5.patch`: R205's r3d_div_lane,
+r3d_fp_mul and r3d_mem items, which apply on top; `NOTES.md`, every round and wrong turn; `cfold/`, `desk/`,
+`prof/`, `rejected/`). Rests on §8.4, D-48, D-50, D-58, D-81, D-87, R99, R110, R130, R131, R185, R191, R197,
+R205. Desk, bench and fits only: nothing on the board, nothing committed. Only rtl/real3d is touched: four
+files, all in the rasteriser.
+
+*What I believed* (R205):
+- Every remaining item in the Real3D is tens of ALM a block; the cycle-free room is about 140 ALM.
+- The rasteriser is the Real3D's critical half on 51 of VF3's 400 frames and 109 of 200 Daytona 2 attract
+  frames, so a rasteriser cycle is not free.
+- Two VPU lanes cost the geometry 44% at least (R99's bound).
+- A DSP block does not pay for a shift (the adders' normalise and sticky both came out larger).
+
+*What I know now:*
+
+**1. R205's claims, checked.**
+- *"Tens of ALM a block": wrong.* It looked for LUTs to trim and tried the DSP blocks on the one place they lose
+  (a 27-bit normalise behind a leading-one search, already a 4:1 and an 8:1 select). The wide shifts and the
+  serial multiply were not looked at as multiplies. The edge walker alone gives 176-184 ALM by entity, the
+  interpolants 146-160.
+- *"The rasteriser is the critical half on 51 / 109 frames": the counts reproduce (`tools/gr.py` on its own
+  logs), the reading does not hold.* The geometry and the replay are not rivals for one budget: a frame's
+  geometry runs from its flip, its replay after the geometry's last record (`r3d_cmd`'s `end_now`), the next
+  frame's geometry beside that replay. What a frame can lose is the geometry passing the next flip (a dropped
+  frame) or geometry + replay passing a vblank (the image a vblank later). On VF3's 400 frames at 140 MHz the
+  geometry is at most 0.62 vblank, the replay 0.52, the sum 0.95, and no frame is within 2% of a boundary; on
+  Daytona 2's 200 common frames the geometry is at most 0.93 (0.977 over all 676), the replay up to 1.42, the
+  sum over one vblank on 77 and one frame within 2% of a boundary. The rule I worked to is stricter than either
+  reading anyway: no bench frame's geometry clocks and no frame's replay clocks may grow.
+- *"Two lanes cost +44% at least": the size is right, the argument was not one.* R99's figure assumes nothing
+  is rescheduled. I rescheduled every kernel for two physical lanes (`desk/sched_exp.py`, the generator's own
+  list scheduler with a word taking two issue slots): TL 151 -> 287 clocks, SETUP44 168 -> 313, PROJ 79 -> 121,
+  the latency-bound kernels +5 to +11%. With the kernels' measured shares (below) that is +55% / +52% of the
+  engine's kernel time on VF3 / Daytona 2, about +44% / +41% of the geometry. The large kernels are issue-bound
+  (TL issues 136 words in 151 clocks), so two lanes cannot hide in the waits. Four lanes on two shared adders
+  (real adds are 62% of words) fail the same way: TL has 96 add words, each then two clocks of the adders.
+- *"The geometry is Sega Rally 2's frame with 2% left": not checked* (the Sega Rally 2 dumps are deleted); it
+  does not bear on what I kept, which leaves the geometry's files and clocks alone.
+
+**2. Where the area and the time are** (all1_s2 = dba80c1's RTL, ALMs needed by entity): Real3D 15,474: the
+geometry 6,698 (own 2,763; VPU 2,467 = own 906 + four adders 229-245 + four multipliers 89-91 + the divide 243;
+facing test 627; walker 532), the rasteriser 7,688 (front 1,328 = divider 551 + edge 773; interpolants 1,011;
+texture cache 1,006; Z band 756; store 639; Z walk 577; texel 387 + 275; band 309; intake 299; fog viewport
+266; colour 159), r3d_texup 601, r3d_mem 360, r3d_cmd 127. The chip's 41,501 ALMs are 17,073 with LUTs and
+registers, 16,225 LUTs alone, 6,752 registers alone and 1,250 memory. DSP 87 of 112, M10K 536 of 553.
+
+The geometry's duty cycles (`prof/geo_prof2.sv` bound into the geometry bench, 50 VF3 and 52 Daytona 2 frames;
+shares of the geometry's busy clocks):
+
+| | VF3 | Daytona 2 |
+|---|---|---|
+| engine running a kernel | 80.5% | 79.9% |
+| words issued | 42.0% | 40.6% |
+| MAC words on all four lanes | 99.5% | 99.8% |
+| pure products, of words | 37.9% | 38.9% |
+| facing unit running / issuing | 33.4 / 22.1% | 27.8 / 16.0% |
+| TL + TL3 | 23.6% | 20.5% |
+| SETUP4 / 44 / 2 / 22 | 9.7 / 5.9 / 1.8 / 1.2% | 10.2 / 7.8 / 0.8 / 0.5% |
+| MM / MODEL / CULLU / CULLT / CLIP | 7.1 / 5.2 / 6.8 / 5.1 / 5.8% | 8.5 / 6.7 / 8.1 / 6.2 / 2.5% |
+| PROJ / PROJ3 / PROJ1 | 5.3 / 2.3 / 0.6% | 6.1 / 1.5 / 0.4% |
+
+The rasteriser's duty cycles are R131's (the pixel units have a pixel in 25-48% of a replay, the divider is busy
+28-31%, the edge's product 10-12%); what the first-row product is worth to a frame I measured again in 6.
+
+**3. The changes kept** (each with its old form checked beside it under VERILATOR, every clock; standalone fits
+at 140 MHz, seed 1; full fits by entity over r3_s1 / r3_s2 / r4_s1 / r4_s2):
+
+| # | Change (file, parameter) | Why the frame is the same | standalone | full fit by entity |
+|---|---|---|---|---|
+| E | r3d_rast_edge `PD`, `PDW`: the three first-row values x + offset x slope (mod 2^54) from five 18 x 18 multiplies an edge (the offset's halves by the slope's three parts, the pairs that meet summed in the block), made off stage 0's registers while the pair waits there; the walk registers load them whole. The serial multiply's three-input adders, shifted slopes and shifted offsets go | `PDW`: the walk starts on the clock the serial product would have ended on (the offsets' 16 bit-pair flags shifted a pair a clock, as the product shifted the offsets), so the spans leave on their old clocks (the one exception in 4) | 991 -> 817 ALM, 1,232 -> 1,021 ALUT, +9 DSP; setup +0.130 / -0.015 -> +1.016 / +0.785 | 771-773 -> 588-597: -176 to -184 |
+| I | r3d_rast_interp `DSH`: the u, v and shade right shifts (66 bits by 0-130, 32 kept; 41 by 0-73, 31 kept) as 24-bit parts times 2^(23 - B) in eight 24 x 24 multiplies, three product bits a result bit chosen by A (shift = 24 A + B) | the same stages: the parts and the power in the blocks' input registers where the byte shift's registers were, the blocks' output registers as the out stage, the sign after them (r3d_rast registers o_u / o_v / o_shade at once) | 1,371 -> 1,136 ALM, +8 DSP; setup +0.053 / -0.073 -> +0.160 / -0.118 | 1,011-1,021 -> 861-868: -146 to -160 |
+| T | r3d_rast_intake `DSH`: the converter's 53-bit right shift (39 kept) as one 24 x 24 multiply; a parameter's shift counts formed a field ahead | between the F and S stages' registers, the select into the round | 356 -> 317 ALM, +1 DSP; setup +1.548 / +1.719 -> +1.942 / +1.963 | 299 -> 265-284: -15 to -35 |
+| F | r3d_rast_fogvp `DFC`: the fog colour's three 8 x 8 products on one multiplier, a channel a clock in the divide's first steps, in place of the shift-add multiplier | fc is complete at step 5 and read at step 25 as before | 318 -> 273 ALM, +1 DSP; setup +1.432 / +1.369 -> +0.749 / +0.390 (the worst paths are the divide's, untouched) | 265-266 -> 229-237: -29 to -36 |
+
+**4. The proof** (on snapR4, the files the R4 fits read).
+- *Whole rasteriser* (rbuild / rastb, MIP 1: VF3, Bass Fishing and Daytona 2 at port profile p0, VF3 at p1, 400
+  frames each): VF3 p0, Bass Fishing and VF3 p1 **byte-identical to dba80c1's logs**; Daytona 2's identical in
+  every FRAME and STALL line (replay, binning, every port count, 0 pixels wrong) with three more lines, the
+  edge's own "a late start" (below). The same on the tree with R205's three items (tR4A).
+- *Divider and front* (the Makefile's div100 / front100: the two games' triangles, 2 M random divides, 200,000
+  synthetic triangles): 6 of 6 identical, front_syn with late-start lines. *Edge* (edge100: VF3 and Bass
+  Fishing at bands 16 and 0, 200,000 synthetic triangles, 20% gaps and stalls): every span right, 5 of 5 logs
+  identical but for held-offer lines (below). *Interpolants* (MIP 1 and plain: VF3 and Bass Fishing 400 frames,
+  3 M random pixels): 6 of 6 byte-identical, 0 wrong. *Intake* (plain and MIP): 5 of 5. *Fog viewport* (3 x 1 M
+  records): 3 of 3.
+- *The one exception to "every span on its old clock".* The products are ready three clocks after stage 0 takes
+  a pair. A pair whose two offsets are both under 16 (2^-12 px: a serial product of one or two clocks) that
+  reaches an idle walker within a clock of stage 0 starts one or two clocks late. The edge says so as it happens
+  (VERILATOR): VF3 and Bass Fishing 0; Daytona 2's 400 frames 3 clocks; the front bench's 200,000 synthetic
+  triangles 16-31 pairs, 27-53 clocks, of 2.1 M pairs (`rejected/edge_counts`, the same file with counters). No
+  frame's replay count moved. Stage 0 also refuses a pair for two clocks after it loads (the products read x
+  from stage 0 two clocks after the offsets): r3d_rast_div never offers one sooner (0 behind it); the edge's own
+  bench, which offers a pair straight after one with no rows, is held 512-1,024 clocks in 1.2-5.5 M pairs.
+- *Geometry*: VF3's 400 and Daytona 2's 676 frames on the tree with R205's items (its r3d_fp_mul is the
+  geometry's only changed file): both logs **byte-identical to dba80c1's**, every triangle field equal to the model on
+  every frame, every frame's cycles equal. R4 itself changes no file of the geometry or the write path.
+- Rule 12: `quartus_map --analyze_file` of the four files, 0 errors (1 warning each, as base). The new idioms
+  constant-folded on Quartus 17.0's map (`cfold/cf`: 55 cases: the edge's product with wraps, a 32-bit offset
+  and negative slopes; the interpolants' and the shade's shifts at 21 counts across every A and B boundary; the
+  product from its parts; the intake's shift at 11 counts; the fog round), each output the idiom XOR its
+  expected value: all 1,758 bits stuck at GND. No new array index. The Makefile's lint lines for these files
+  give what they give on dba80c1 (`tools/lint.sh`).
+
+**5. The full fits** (dual SDRAM, release, 140 MHz, dba80c1's qsf and PLL; system clock, ns; Real3D = the five
+tops by entity; the base fits are all1's, the same tree but for rtl/real3d's four files):
+
+| fit | ALM / LABs / DSP | setup s100 / sn40 / f100 / fn40 | TNS s100 | hold s100 / sn40 / f100 / fn40 | Real3D ALM | Real3D worst (s100) |
+|---|---|---|---|---|---|---|
+| all1_s1 (sys140, the base for seed 1) | 41,417 / 4,191 / 87 | -4.096 / -4.059 / +0.720 / +1.788 | -19,825 | -0.254 / -0.142 / -0.150 / -0.172 | 15,482 | -3.85 (r3d_texup) |
+| r3_s1 (R3: R4 before its two path fixes) | **41,149** / 4,188 / 106 | -4.363 / -4.035 / +0.772 / +1.743 | -20,085 | +0.197 / +0.132 / +0.139 / +0.072 | -387.9 | -3.69 (the ring's M10K -> r3d_rast's colour products, two of whose blocks are in X54) |
+| r4_s1 (R4) | **41,046** / 4,182 / 106 | -4.411 / -4.333 / 0.000 / +1.425 | -21,635 | +0.153 / +0.045 / +0.089 / +0.023 | -400.7 | -3.94 (the edge, six of its nine blocks in X54 / X86) |
+| all1_s2 (area-r3d, the base for seed 2) | 41,501 / 4,191 / 87 | -4.253 / -4.107 / +0.837 / +1.774 | -19,415 | +0.141 / +0.099 / +0.117 / +0.071 | 15,474 | -3.41 (the store) |
+| r3_s2 (R3) | **41,104** / 4,189 / 106 | -4.673 / -4.722 / -0.550 / +1.117 | -21,897 | -0.371 / -0.259 / -0.177 / -0.184 (one endpoint, hps_io's) | -402.7 | -4.05 (the interpolants, nine of their blocks in X54 / X86) |
+| r4_s2 (R4) | **41,139** / 4,189 / 106 | -4.613 / -4.225 / -0.403 / +1.200 | -22,081 | -0.414 / -0.318 / -0.212 / -0.208 (one endpoint, hps_io's) | -390.5 | -4.31 (the edge, six of its blocks in X54 / X86) |
+| r4i_s1 (R4 without the edge item: 97 blocks) | 41,247 / 4,190 / 97 | -4.695 / -4.401 / -0.062 / +1.309 | -21,254 | +0.149 / +0.106 / +0.126 / +0.058 | -249.6 | -4.12 (the colour stage, two of its blocks in X86) |
+
+On the chip that is -268 / -371 at seed 1 and -397 / -362 at seed 2 (M10K 536 in every fit). By entity (r3_s1 /
+r4_s1 / r3_s2 / r4_s2): the edge -183.7 / -182.3 / -175.9 / -184.3, the interpolants -159.5 / -152.5 / -146.3 /
+-145.2, the intake -22.1 / -15.0 / -34.9 / -26.0, the fog viewport -29.2 / -36.1 / -28.8 / -30.3; the untouched
+blocks move by placement (the geometry -17 to +44, r3d_mem -9 to -14).
+
+- The chip's worst is the CPU's in every fit (u_core -4.0 to -4.7).
+- Hold: r3_s2's miss is one endpoint, hps_io's joystick_l_analog_0 -> m3_system's jl0_q, the system side's
+  (all1_s1's is the same kind: hps_io's status -> the FPS counter). The Real3D's registers hold in every fit.
+- **The DSP columns.** The device's 112 blocks are in four columns, 39 + 39 near the Real3D (X20, X32) and 34
+  in X54 and X86. The base (87 used) has every Real3D block in the near two. At 106 the Real3D wants 81 of those
+  78 sites (and the sound 2, the CPU some of its 9), and each fit sends 11-12 rasteriser blocks to the far
+  columns. The unit that gets them has the Real3D's worst paths that seed: r3d_rast's old colour products in
+  r3_s1 (the ring's M10K into them, -3.69), the interpolants in r3_s2 (the reciprocal's r -> r13, the product
+  blocks' input register, -4.05), the edge in r4_s1 (z_y1 -> the blocks' offset registers -3.94, in a fit whose
+  router reported congestion and took 41 minutes for 21-24) and again in r4_s2 (z_x1b -> st12 -4.31). The sum of
+  negative slack is 1-14% worse than the base's at the same seed in all four. Standalone every changed block is
+  as fast as it was or faster (3), so this is where the blocks are put, not what they are. Leaving the edge
+  item out (r4i_s1, 97 blocks) does not end it: five Real3D blocks are still far and the colour stage's old
+  products have the worst path (-4.12). The base has 75 of the near columns' 78 sites taken already.
+- **The fitter leaves 20 blocks half used.** 131 multipliers sit in the 106 blocks: 34 small ones (18 of 9 x
+  9, where a block holds three; 16 of 18 x 18, where it holds two) each have a block alone: the texel filter's
+  12, the colour stage's 8, the CPU's 3, the edge's 3, r3d_rast's 3. `cfold/dsp3` (five small multipliers
+  alone in the device: five blocks) and `cfold/dsp120` (120 where there are 112 blocks: it fits, eight blocks
+  holding two) show the fitter shares a block only when it has run out. Packed, the chip would use 86 blocks and
+  the Real3D's would all sit in the near columns again. The fitter's own two-in-a-block form is in
+  `cfold/dsp120/two_in_one_block.vo.txt` (the atom in m18x18_full mode, both multipliers used): written that way
+  in the RTL, the Real3D's 29 lone small multipliers would take 15 blocks, 14 fewer, which is most of the 19.
+- **A fit is still a lottery at this fill.** The tree with R205's three items on R3 (tR3A), whose map estimate
+  is the smallest of all (40,794 ALM; all1 41,256, R3 40,806), did not fit at seed 1: 4,202 LABs of 4,191, in the
+  one fit where the fitter's combinational resynthesis acted (716 ps estimated). I did not fit the combination
+  again; its benches are in 4.
+
+**6. Wrong turns and what was priced and left.**
+- *The edge with no wait* (`PDW` 0, the first form): the walk starts when the products are ready, 4 clocks
+  after stage 0 takes the pair instead of 9-14. The edge bench's clocks a frame nearly halve, but the whole
+  rasteriser's replay is only 0.09-0.15% shorter in sum (the front is the divider's, 19 clocks a pair: the
+  product was already hidden behind the next divide), and 2 / 40 / 21 of 400 frames (VF3 / Bass Fishing / Daytona
+  2) are *longer*, by up to 0.26%: spans leaving earlier change the stalls behind them. "No frame slower" fails,
+  so the kept form waits.
+- *The late starts were hidden from me for two rounds.* My first check printed them from a `final` block, and
+  the benches never run those (my geometry profile had shown me that an hour before). I wrote "none in the
+  benches" on that. The byte-identical logs were true, but the count was not known until the edge printed as it
+  went. Priced and not built: the products made before stage 0 (offsets from the divider's fields two stages
+  ahead, slopes straight off the lanes), which has no late start and no held offer, but needs the edge's fields
+  steady a clock before it takes them (its own bench does not) and a second offset subtract (about +30 ALM).
+- *The interpolants took five forms.* Parts registered straight off the product, or off pu14: Quartus takes those
+  registers into the product's multiplier as pipeline stages and the 39-bit partial-product adder runs into the
+  shift blocks (-4.7 and -2.9 ns standalone). Parts gated to stop that: the registers stay, but a block's input
+  register to its product and through the result bits' logic is 7.2 ns (-0.4 / -0.7). Kept: the product written
+  as its two partial products (as Quartus builds it anyway), their sum into the shift blocks' input registers,
+  the blocks' output registers as the out stage, the result bits and the sign after them. The first full fit
+  then showed the count's add, its split by 24 and its decode in one stage at -3.02 ns (the block's worst was
+  -2.51): the split moved a stage ahead.
+- *Two more paths worse than their blocks had* in the R3 fits: the edge's wait as a count (the offsets' subtract,
+  an OR, a 16-way priority into a register: -2.57) and the intake's count (the coefficient's select, an add, the
+  split and the decode: -3.01). R4 makes the first the serial product's own shift test on 16 flags and forms the
+  second a field ahead.
+- *Sign-and-magnitude slopes into the edge* (the divider's three 54-bit negates gone): the XOR does not fold
+  into the three-addend adder, 109 -> 178 ALUT an edge by `quartus_map`: +207 against -162. Not built.
+- *The Z walk's normalising shifts in DSP blocks* (`rejected/zspan_dsh`): 702 -> 633 ALM standalone for 4 blocks,
+  setup +1.12 / +0.93 -> +0.24 / +0.07 (the power's decode behind the leading-one search). Not kept.
+- *The slope divider on DSP blocks*: its lanes are 396 of its 886 ALUTs; the differences, magnitudes, negates
+  and the fields riding beside stay, and a reciprocal needs the normaliser the lanes were built to avoid plus a
+  table and 4-5 blocks, for 16 clocks against 19 at best. Not built.
+- *The geometry*: nothing at no cycle. Its own logic is six machines' selects with no item above 136 LUTs
+  (R130), the VPU's own is operand and write-back selects at one LUT a bit, the adders' shifts are already in
+  blocks or cheaper in LUTs (R205), and it has no wide shifter or serial multiply left. The trades stay shut:
+  two lanes and shared adders above; the facing unit on the pool costs 1.4-9.3% (R130) with nothing to pay it.
+- *Found on the way, not area* (desk only): pure products written past the adder (+8 where a MAC is +14, those
+  that write a lane register or the broadcast file) shorten MM 64 -> 58, MODEL 124 -> 112, CULLU 61 -> 55, CULLT
+  46 -> 40, SMFR 126 -> 108, SETUP4 123 -> 118, SETUP2 117 -> 111 (`desk/vl.py`; TL, PROJ and the pair kernels
+  keep their schedules): 3.1% (VF3) and 3.6% (Daytona 2) of the geometry's busy clocks by the kernels' shares,
+  for a third source in each lane's result select and a second control tap. A speed item for the geometry-bound
+  frames; it does not pay for an area trade (R130's shared facing adder is -198 ALM for +1.4 to +5.7%).
+- My first lint of the new files came after the first full fit: three kinds of warning that make the
+  Makefile's lint targets fail. Fixed with pragmas and a renamed function argument (no logic changed), and the
+  fits and benches run again.
+
+**7. What it costs and what is left.**
+- DSP: 106 of 112 (edge 9, interpolants 8, intake 1, fog viewport 1): about 20 ALM a block by entity. Each item
+  is a parameter (`PD`, the two `DSH`, `DFC`) and can be left out; the interpolants alone are 8 blocks for
+  -146 to -160, the edge alone 9 for -176 to -184.
+- Timing: no new path is among the Real3D's worst when its blocks sit in the near columns; when they do not,
+  the paths into and out of them are (5). Packing the 34 lone small multipliers would end that and give back 20
+  blocks; Quartus 17 will not do it unasked, so it means placing them or writing them as the block's own
+  two- and three-multiplier forms. That is the next step I would take before spending the last six blocks (the
+  Z walk would take four).
+- The viewer (rtl/viewer/m3v_raster.sv) instantiates the intake and the interpolants with the defaults, so it
+  takes the DSP forms too; it registers the interpolants' outputs as r3d_rast does.
+- Beyond this the Real3D has no large zero-cycle item that I can find. What R205 listed stands for the LUTs
+  (its three other items, about -100; MLABs to M10K at about 17 ALM a block with each read made a clock early).
+
+**8. The same day, second round: the small multipliers two to a block, on afb2e8f, with R205's three items.**
+I took the step 7 names. `r3d_mul2` (new) is two independent 18 x 18 multipliers in one DSP block: the Cyclone V
+atom in m18x18_full under Quartus (its own macro ALTERA_RESERVED_QIS), a four-line model for every simulator
+(Verilator and iverilog). The atom cannot be simulated here and Quartus does not fold through it, so it is written
+from Quartus's own: the fitter's paired atoms out of the post-fit netlists of 120 inferred multipliers in the
+112-block device, in four forms (unsigned / signed, with / without input registers, on an enable: `cfold/dspt`),
+and r3d_mul2 fitted in the same four forms has every parameter and every control port equal to them
+(`cfold/mul2t`: 8 multipliers, 4 blocks). Behind each module's `DP2`: the texel filter's twelve products in six
+blocks, the colour stage's eight small ones in four, two of r3d_rast's three colour products in one, the edge's two
+lowest products of edges 1-2 and 1-3 in one: 12 blocks back, 94 used. The tree also carries R205's r3d_div_lane,
+r3d_fp_mul and r3d_mem items as written (they have no switch of their own).
+- *Proof* (tree t6): whole rasteriser 4 x 400 frames, 0 pixels wrong, FRAME and STALL lines base's (Daytona 2 with
+  the three late-start lines); edge, divider / front, texel, colour, interpolants, intake, fog viewport unit benches
+  identical to base; every packed product equal to its inferred statement on every clock; geometry VF3 400 and
+  Daytona 2 676 frames byte-identical; sr2path 24 of 24 files identical, all PASS; analyze_file clean.
+- *Fits* (dual, release, 140 MHz, against afb2e8f's own fits at the same seeds):
+
+| seed | ALM (base) | LABs | DSP | setup s100 / sn40 | TNS s100 (base) | Real3D by entity | Real3D blocks far | Real3D worst (base) |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 40,853 (41,380): -527 | 4,190 | 94 | -7.948 / -7.271 | -18,528 (-19,740) | -555 | 8 | -7.95, old logic (-3.78) |
+| 2 | 40,798 (41,274): -476 | 4,189 | 94 | -4.846 / -4.776 | -21,692 (-20,322) | -384 | 4 | -3.68, no DSP path (-3.68) |
+| 3 | 40,903 (41,361): -458 | 4,188 | 94 | -4.529 / -4.380 | -23,553 (-21,792) | -485 | 0 | -3.67, no DSP path (-3.44) |
+
+  All three fit; hold is positive at every corner in all three. In seeds 2 and 3 the Real3D's worst is no longer a
+  DSP path and is about the base's. In seed 1 the fitter put the scaler's blocks in the near columns and eight of
+  the Real3D's far (interp sps14 -> hs -4.40), and one family of old logic, r3d_rast's t_full -> the store's oq_hr,
+  is at -7.95 (33 endpoints; -2.4 to -3.4 elsewhere): one seed's placement, in the fit with the best TNS of the six.
+- Patches against afb2e8f: `patches/area-r3d2-R4-pack-A2x-afb2e8f.patch` (the fitted tree) and
+  `patches/area-r3d2-R4-pack-afb2e8f.patch` (without R205's items); they add r3d_mul2.sv to files.qip, the viewer's
+  qsf and the Makefile's lists (the Makefile's targets not run).
+
+*How established:* `sm3-builds/area-r3d2/NOTES.md`, its runs, fits and logs.
+
+## 9. Board result (2026-11-27): R4 fails, not accepted
+
+I put r4_s1 (R4 alone) and p6_s3 (R4 + packing + A2x) on the board. Both are wrong in Daytona 2: r4_s1 splits
+polygons at horizontal seams, p6_s3 has scattered wrong texels, a dotted edge and a 1-pixel vertical line. Every
+bench is byte-identical to base in both trees.
+
+- What I believed: benches equal to base in every triangle field and pixel, plus constant folds of each new
+  arithmetic form, were enough to take R4 to a fit.
+- What I know now: they were not. The folds were combinational; the registered forms as Quartus maps them into DSP
+  blocks were never compared with the model, and R4 adds several hundred failing endpoints on DSP input and output
+  registers (edge 387 to -3.94 ns in r4_s1, interp 155 to -3.10 ns in p6_s3) in the units where the pictures break.
+- Board, same day: r3_s1 (the edge's PD, the shifts, the fog products; no packing) is clean in Daytona 2 and VF3.
+  r3_s2, the same logic on another seed, shows black and white single-pixel specks all over the road and walls in
+  Daytona 2's attract, worse on corners, where the interpolants change more from pixel to pixel and the slow paths
+  are exercised harder. Same logic, clean on one placement and wrong on the other: the faults are timing. r3_s2's
+  Real3D worst is -4.05 ns in the interpolants (199 of the new DSP-path registers fail, to -2.88); r3_s1's new
+  paths are at -2.07 or better. r3_s2's one hold miss is in hps_io, outside the Real3D.
+- Finding: the registers I put on DSP-block paths fail on silicon at slacks the base's ALM paths survive (base runs
+  with -3.0 in the edge and -4.2 to -4.4 chip-wide). For R4's DSP paths negative slack is not tolerable at all:
+  they have to close with margin at 140 MHz in the full chip whichever column the fitter gives the block.
+- The logic test: lc100_s1, the whole set (R4, the packing, A2x) on afb2e8f at 100 MHz (the PLL's M counter 84 ->
+  60 alone: VCO 600 MHz, every output the same angle, 48 steps to a period as the calibration assumes). Every path
+  into and out of a Real3D DSP block is positive at both slow corners (+0.8 to +4.1 ns), hold positive at all four.
+  On the board it runs at about 30 fps and same-scene screenshots against dirn140_s3 show no specks, no seams and
+  no difference in texture sharpness or filtering. So the set's logic is right on silicon, the two later changes
+  and the packing primitive included; what fails at 140 is timing alone.
+- The same in simulation: R4's edge, intake and fog viewport as post-map netlists in the raster bench give 1,600
+  frames with 0 pixels wrong and every line equal to the RTL's.
+- The rule for 140 MHz (2026-11-27): the Real3D's DSP blocks are held in the two near columns by constraint, and a
+  block I add or change uses its own input and output registers with a plain ALM register on each side: no logic
+  and no combinational enable at the block. Measured in the 100 MHz fit: route between an ALM and a near block
+  2.1-3.6 ns each way even three columns apart, 5.5 ns to a far column, block input 0.21-0.34 ns, output register
+  0.70-0.74 ns, an enable 0.92 ns, an unregistered operand through the multiplier 3.55 ns. A register-to-block hop
+  is 3.2-3.8 ns near (about +3 at 140) and about 6 ns far. Standalone, R4's units closed at 140 by only +0.2 to
+  +1.0 ns, and the full chip takes 1-3 ns off that.
+- What the rule costs each unit, and what I dropped:
+  | unit | saved in the p6 fits | the rule adds | kept |
+  |---|---|---|---|
+  | interpolants, shifts as multiplies | -149 to -171 ALM | 2 pipeline stages, about 640 registers | no: a loss |
+  | edge, first-row products | -178 to -183 | 2 clocks (5, not 3), about 334 registers; more late starts | no: -13 to -95 at best |
+  | intake, the converter's shift | -7 to -16 | 1 stage, about 87 registers | no: a loss |
+  | fog viewport, products on one multiplier | -32 to -39 | 24 registers, no clock (fc complete at step 7, read at 25) | yes |
+  | packing, two multipliers to a block | DSP blocks | none where both operands are registers already | the texel's u lerp and the colour's shade and alpha products only |
+  | A2x | -70 to -130 | nothing | yes |
+  I had told myself the edge's offsets could be formed on the divider's side for no clock: that path (o_y2 ->
+  z_c21) is already at -2.2 to -2.6 ns at 140, so they need a register of their own.
+- The packing, corrected: the base's inferred blocks use no pre-adder (I misread the fit report). They take the
+  operand registers as the block's input registers where the operand is a register. Two multipliers whose operand
+  goes in unregistered are 1-3 ns slower in one block than apart (the blend's pair from the ring's M10K: -3.2 to
+  -3.4 ns in p6_s2 and p6_s3, where the inferred ones close), so only fully registered pairs are packed.
+- r3_s2's worst interpolant path, -4.05 ns, was the reciprocal's output into r13: base logic in a far column
+  because my set had added blocks. The column constraint is for that.
+- The reduced set (fog viewport, six packed atoms, A2x, the scaler's column pins; t7 on 812a6b4), seeds 1-3 at 140:
+  none fits. The fitter wants 4,200 / 4,201 / 4,219 LABs and the device has 4,191. No Real3D block went to a far
+  column in the attempts, and the chip has 82 DSP blocks (main 87).
+- What I believed: A2x's -70 to -130 ALM by entity in the p6 fits was a saving I could carry into any set.
+- What I know now: against main's map report the set has 108 more LUTs and 326 fewer registers. A2x's two larger
+  items trade registers for LUTs (r3d_fp_mul: the geometry +121 LUT, -105 registers; r3d_mem: +67 LUT, +126
+  registers for 256 MLAB bits), and at 99% fill the LUT count decides whether the design packs. r3a_s1 (R3 + A2x)
+  had failed the same way at 4,202 LABs and I read it as one seed's luck; the p6 fits packed only because R4 took
+  about 500 ALM out. Those two items are out. A change that lowers map's ALM estimate by adding LUTs is not an
+  area saving on this chip.
+- I launched those three fits before reporting them, against the agreement: report first, every time.
+- Rule for next time: a change that moves arithmetic into DSP registers gets a post-map netlist run in the bench
+  and a board test before any area number is quoted as won.
+
+Nothing of R4, the packing or A2x goes to main until this is settled.
+
+## 10. Closing the Real3D at 140 MHz: census and first measurements (2026-11-28)
+
+- What I believed: the Real3D fails at 140 by a list of deep paths that can be rewritten one by one.
+- What I know now, from main's own fit (base_s3 = dirn140_s3) and four measurement fits with the CPU's own paths
+  given two clocks (never builds; sm3-builds/area-r3d2/fits/xcpu_s3, xm2_s3, xm2_s1, xm4_s3):
+  - Main: 6,975 Real3D endpoints fail; the mean failing path is 4.1 LUT levels, 2.46 ns of cells and 4.86 ns of
+    interconnect over 12 LABs. 19% are deep (6 or more levels, or 3.4 ns of cells). 2,396 have three levels or
+    fewer and still fail.
+  - With the fitter working for the Real3D (CPU relaxed) 4,861 to 6,821 still fail by seed, worst -2.9 to -4.5 ns;
+    28% would fail with their logic cut to one LUT. The worst are register-to-M10K paths with no logic and 9-10 ns
+    of route (the clip pool, the VPU's microcode ROM) in one seed and absent in the next: M10K is at 537 of 553.
+  - Seed noise of one tree: 1,960 endpoints and 1.4 ns between seeds 1 and 3. A single fit shows nothing smaller
+    than a named family of several hundred endpoints.
+- What worked, cycle-exact: rst_rast / rst_geo at MAX_FANOUT 24 in the qsf (954 failing endpoints to 21 and 42);
+  the interpolants' mip level in two stages (8 LUT levels before; every bench log byte-identical to main's).
+- What did not: MAX_FANOUT on a register whose fan-out is behind a LUT makes no copies (the intake's o_valid, the
+  texture cache's miss: the fit was identical to the one without). The clip pool in MLAB frees 7 M10K for 142 ALM
+  and showed no gain inside the noise. The scaler's DSP pins keep the Real3D's blocks in the near columns but do
+  not bring the colour unit's blocks beside its registers.
+- The Real3D's memories: about 229 of the chip's 537 M10K by the report's per-memory count (an upper figure), 51%
+  full by bits; 70 memories of 2,176 bits or fewer take 84 blocks because a block is at most 40 bits wide. As MLAB
+  they would be about 183 LABs, and the LABs are full.
+- So closing the Real3D at 140 needs the chip less full as well as the deep paths rewritten; neither alone does it.
+
+### 10.1 The night's batches (2026-11-28; all measurement fits with the CPU's own paths at two clocks, seeds 1 and 3)
+
+Every RTL change below gives bench logs byte-identical to untouched main's (whole-rasteriser bench, four sets,
+1,600 frames; the unit and system-path benches where they apply). A gain counts only if it shows on both seeds.
+
+| batch | change | its family, seed 1 / seed 3 | chip |
+|---|---|---|---|
+| reference (xm2) | reset MAX_FANOUT 24, scaler DSP pins, the mip level in two stages | | 6,821 / 4,861 Real3D endpoints, worst -4.46 / -3.08 |
+| 1 | the texture cache's "no bank missing" as a register from the misses' next value | 618 -> 310 / 559 -> 149 endpoints, a LUT level shorter; its worst 0.7-0.8 ns worse | 5,281 / 6,562 |
+| 2 | r3d_cmd's VROM flag from the registered decode and one address bit | 164 -> 28 / none before or after: not proven by the rule | 5,872 / 4,703 |
+| 3 | the fog viewport's products on one DSP block; the divider lane's merged register | fog viewport -28 / -36 ALM, divider -24 / -20 | -55 / -79 ALM, 2-3 LABs; 5,124 / 5,453 |
+
+- Over these fits the Real3D's failing endpoints run 4,703 to 6,821 and its worst -2.30 to -4.46 ns in no order
+  that follows the changes: fixes of this size are below what a seed pair resolves in the totals.
+- Two runs measured nothing, both because I had not confirmed the mechanism first. MAX_FANOUT on the intake's
+  o_valid and the texture cache's miss made no copies (a register's own loads were few; the fan-out is behind a
+  LUT). PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION off changed nothing: the ~DUPLICATE registers (3,243 in the chip)
+  are the router's, under ROUTER_LCELL_INSERTION_AND_LOGIC_DUPLICATION, as the fit report's Fitter Netlist
+  Optimizations table says; 784 more are register-packing copies.
+- The clip pool in MLAB (main's switch, bench-identical) frees 7 M10K for 142 ALM and showed no timing gain inside
+  the noise. Left out.
+- The scaler's DSP pins are not a lock: two of eleven distinct fits (one placement, with and without the router copies) still put a Real3D block in a far column.
+- No debug or statistics logic is left in a release build's Real3D. The five fp adders (1,191 ALM) already carry
+  my area and speed forms with their measurements (both shifts in DSP: -316 ALM and slower, off; the align shift
+  in DSP: -154 ALM, on); I found no bit-exact, same-latency form that is smaller without undoing a speed form.
+- Left alone after reading the source: the intake's o_valid (its fan-out also takes the same clock's o_ready), the
+  Z band's range mux after P (deliberate, for the C stage's pass bits). Not attempted: the fp add after the
+  multiply, the Z band's sb_q, r3d_tex's rp.
+- The router's logic duplication off (ROUTER_LCELL_INSERTION_AND_LOGIC_DUPLICATION; a valid run, no router rows in
+  the table): 3,177 / 3,243 registers fewer, the same ALM and LAB counts, 111 / 138 fewer failing Real3D endpoints
+  on an unchanged placement, the worst 0.23 ns worse on one seed and 0.29 better on the other. The copies sit in
+  free flip-flops: neither an area nor a timing lever.
+- Candidate cb1 (3fbcbc2 + the five RTL changes + the two qsf items; every bench log identical to main's on that
+  exact tree), true constraints, seeds 1 and 2: hold positive at every corner on every clock (+0.065 and +0.042
+  least), every Real3D DSP block in the near columns, the fog viewport's block's paths all positive; clk_sys
+  -4.68 / -4.44 against main's -4.11 (same tree, seed 1) and -4.41 (21d9028, seed 2). Main's equal inside a seed's
+  noise, not an improvement. Not board-tested when this was written.
+
+*Board (2026-11-28):* cb1_s2 (RBF 38df6240; 3fbcbc2 + the mip-level split, the texture cache's registered no-miss
+flag, r3d_cmd's VROM flag from the registered decode, the fog viewport's products on one DSP block, the divider
+lane's merged register; rst_rast / rst_geo MAX_FANOUT 24 and the scaler's 13 DSP blocks pinned far): the 3D good in
+every game. Merged on top of main 7593767. Decided the same morning: the clip pool in MLAB dropped.
