@@ -41,6 +41,7 @@ module r3d_div_lane #(
 );
 
   logic [53:0] n_r;
+  logic [53:0] q4;               // R4's quotient
   logic [31:0] d_r;
   logic [33:0] d3_r;           // R4: 3 d
   logic [4:0]  k_r;
@@ -72,7 +73,7 @@ module r3d_div_lane #(
     if (!busy) begin
       if (!hold) begin
         r <= r0;
-        q <= 54'd0;
+        if (R4) q4 <= 54'd0;
       end
     end else if (R4) begin
       logic [33:0] x;
@@ -81,10 +82,10 @@ module r3d_div_lane #(
       s1 = {1'b0, x} - {3'b000, d_r};
       s2 = {1'b0, x} - {2'b00, d_r, 1'b0};
       s3 = {1'b0, x} - {1'b0, d3_r};
-      if (!s3[34])      begin r <= s3[31:0]; q <= {q[51:0], 2'd3}; end
-      else if (!s2[34]) begin r <= s2[31:0]; q <= {q[51:0], 2'd2}; end
-      else if (!s1[34]) begin r <= s1[31:0]; q <= {q[51:0], 2'd1}; end
-      else              begin r <= x[31:0];  q <= {q[51:0], 2'd0}; end
+      if (!s3[34])      begin r <= s3[31:0]; q4 <= {q4[51:0], 2'd3}; end
+      else if (!s2[34]) begin r <= s2[31:0]; q4 <= {q4[51:0], 2'd2}; end
+      else if (!s1[34]) begin r <= s1[31:0]; q4 <= {q4[51:0], 2'd1}; end
+      else              begin r <= x[31:0];  q4 <= {q4[51:0], 2'd0}; end
 `ifdef VERILATOR
       begin
         logic [32:0] t1, t2;
@@ -99,12 +100,44 @@ module r3d_div_lane #(
 `endif
     end else begin
       logic [32:0] t1, t2;
-      t1 = step(r, n_r[53], d_r);
-      t2 = step(t1[31:0], n_r[52], d_r);
+      t1 = step(r, nq[53], d_r);
+      t2 = step(t1[31:0], nq[52], d_r);
       r   <= t2[31:0];
-      q   <= {q[51:0], t1[32], t2[32]};
     end
   end
+  // (area-r3d, R4 = 0) the dividend and the quotient in one register, nq: each step takes the dividend's next two
+  // bits off the top and puts two quotient bits in at the bottom, so after the lane's nb2 steps nq holds the
+  // quotient (19 steps: the dividend's 16 low bits, zeros, have risen to the top; 27: all 54 bits are quotient). It
+  // follows the inputs while the lane is idle and q is not held (hold: the divider's busy or o_valid, registers),
+  // so it holds the start's dividend at the first step. n_r and q were two 54-bit registers.
+  logic [53:0] nq;
+  always_ff @(posedge clk) begin
+    if (!busy) begin
+      if (!hold) nq <= n;
+    end else begin
+      logic [32:0] t1, t2;
+      t1 = step(r, nq[53], d_r);
+      t2 = step(t1[31:0], nq[52], d_r);
+      nq <= {nq[51:0], t1[32], t2[32]};
+    end
+  end
+  assign q = R4 ? q4 : nq;
+`ifdef VERILATOR
+  // the old pair, beside it: n_r as before, q_o the quotient register
+  logic [53:0] q_o;
+  always_ff @(posedge clk)
+    if (!busy) begin if (!hold) q_o <= 54'd0; end
+    else begin
+      logic [32:0] a1, a2;
+      a1 = step(r, n_r[53], d_r); a2 = step(a1[31:0], n_r[52], d_r);
+      q_o <= {q_o[51:0], a1[32], a2[32]};
+    end
+  // (a lane started with nb2 = 0, dy = 0, keeps its dividend: its slope is 0 whatever q holds, r3d_rast_div's zero)
+  logic c_ran;                              // the lane's last start ran steps
+  always_ff @(posedge clk) if (rst) c_ran <= 1'b0; else if (!busy && start) c_ran <= nb2 != 5'd0;
+  always_ff @(posedge clk) if (!R4 && !rst && c_ran && hold && !busy && q_o != nq) $fatal(1, "div_lane: the quotient in the dividend's register");
+  always_ff @(posedge clk) if (!R4 && !rst && busy && nq[53:52] != n_r[53:52]) $fatal(1, "div_lane: the dividend's next bits");
+`endif
 
   // the dividend and the divisor follow the inputs while the lane is idle, so they hold the start's when it
   // starts; only q, r and k_r wait on start (it fanned out to 140 enables a lane, the edge's state through the

@@ -29,7 +29,15 @@
 // One record at a time: i_ready falls from the last word until the result
 // (about 28 cycles).
 
-module r3d_rast_fogvp (
+module r3d_rast_fogvp #(
+  // DFC = 1 (study R207): the fog colour's three 8 x 8 products on one multiplier in a DSP block, a channel a clock
+  // from the divide's first three steps. The block's registers run free and have a plain register on each side
+  // (dm_cs before the input register, dm_q after the output register: no logic and no enable at the block), so
+  // the round into fc is four clocks after a channel's step (steps 4-6), in
+  // place of the shift-add multiplier (8 steps a channel: its accumulator, the operand a step ahead and the
+  // rounding register). fc is complete at step 7 and read at step 25, as before.
+  parameter bit DFC = 1'b1
+) (
   input  logic               clk,
   input  logic               rst,
   input  logic               i_valid,
@@ -91,8 +99,33 @@ module r3d_rast_fogvp (
   endfunction
   logic [15:0] mt_q;
   wire [15:0] acc_n = acc + mt_q;
+  (* multstyle = "dsp" *) logic [15:0] dm_p;     // DFC: the product, in the block's output register
+  logic [7:0]  dm_c, dm_a;                       // its operands, in the input registers
+  (* preserve, dont_retime *) logic [7:0]  dm_cs;                            // the channel, a register before the block
+  (* preserve, dont_retime *) logic [15:0] dm_q;                             // the product, a register after the block
+  wire [16:0]  dm_r = 17'(dm_q) + 17'(dm_q >> 8) + 17'd128;
+  generate if (DFC) begin : g_dfc
+    always_ff @(posedge clk) begin
+      dm_cs <= (cnt[1:0] == 2'd0) ? col[23:16] : (cnt[1:0] == 2'd1) ? col[15:8] : col[7:0];
+      dm_c  <= dm_cs;
+      dm_a  <= amb;
+      dm_p  <= dm_c * dm_a;
+      dm_q  <= dm_p;
+    end
+  end else begin : g_ndfc
+    assign dm_cs = '0; assign dm_c = '0; assign dm_a = '0; assign dm_p = '0; assign dm_q = '0;
+  end endgenerate
 `ifdef VERILATOR
-  always_ff @(posedge clk) if (!rst && busy && cnt < 5'd24 && mt_q != mterm(cnt, col, amb)) $fatal(1, "fogvp: the step's operand a step ahead");
+  always_ff @(posedge clk) if (!rst && !DFC && busy && cnt < 5'd24 && mt_q != mterm(cnt, col, amb)) $fatal(1, "fogvp: the step's operand a step ahead");
+  // DFC against the three products formed outright, as the result leaves
+  always_ff @(posedge clk) if (!rst && DFC && busy && cnt == 5'd25) begin
+    logic [23:0] x;
+    for (int c = 0; c < 3; c++) begin
+      logic [15:0] p; logic [16:0] rr;
+      p = 16'(col[8 * (2 - c) +: 8]) * 16'(amb); rr = 17'(p) + 17'(p >> 8) + 17'd128; x[8 * (2 - c) +: 8] = rr[15:8];
+    end
+    if (x != fc) $fatal(1, "fogvp: the colour's products in the block");
+  end
 `endif
   // a channel's product is rounded the cycle after its last step (the round's add after the
   // step's was a -40C path); the last channel's goes straight to o_fc
@@ -139,8 +172,11 @@ module r3d_rast_fogvp (
 `ifdef VERILATOR
             if (mlt[23] != (ma < {1'b1, z[22:0]})) $fatal(1, "fogvp: the record's compare as a borrow");
 `endif
-            q <= '0; cnt <= '0; acc <= '0;
-            mt_q <= mterm(5'd0, (k == 3'd2) ? i_data[23:0] : col, (k == 3'd4) ? i_data[23:16] : n25[23:16]);
+            q <= '0; cnt <= '0;
+            if (!DFC) begin
+              acc <= '0;
+              mt_q <= mterm(5'd0, (k == 3'd2) ? i_data[23:0] : col, (k == 3'd4) ? i_data[23:16] : n25[23:16]);
+            end
             busy <= 1'b1;
           end
         end
@@ -148,22 +184,29 @@ module r3d_rast_fogvp (
         // a quotient bit, and a multiplier step
         if (rge) begin q <= {q[23:0], 1'b1}; r <= rsub[24:0] << 1; end
         else begin q <= {q[23:0], 1'b0}; r <= r << 1; end
-        af_v <= 1'b0;
-        if (af_v)
-          case (af_c)
-            2'd0: fc[23:16] <= pr[15:8];
-            2'd1: fc[15:8]  <= pr[15:8];
-            default: fc[7:0] <= pr[15:8];
-          endcase
-        if (cnt < 5'd24) begin
-          acc <= acc_n;
-          if (cnt[2:0] == 3'd7) begin
-            acc <= '0;
-            af <= acc_n; af_c <= cnt[4:3]; af_v <= 1'b1;
+        if (DFC) begin
+          // steps 0-2 pick a channel (g_dfc above); its product's round into fc four steps on (steps 4-6)
+          if (cnt == 5'd4) fc[23:16] <= dm_r[15:8];
+          if (cnt == 5'd5) fc[15:8]  <= dm_r[15:8];
+          if (cnt == 5'd6) fc[7:0]   <= dm_r[15:8];
+        end else begin
+          af_v <= 1'b0;
+          if (af_v)
+            case (af_c)
+              2'd0: fc[23:16] <= pr[15:8];
+              2'd1: fc[15:8]  <= pr[15:8];
+              default: fc[7:0] <= pr[15:8];
+            endcase
+          if (cnt < 5'd24) begin
+            acc <= acc_n;
+            if (cnt[2:0] == 3'd7) begin
+              acc <= '0;
+              af <= acc_n; af_c <= cnt[4:3]; af_v <= 1'b1;
+            end
           end
+          mt_q <= mterm(cnt + 5'd1, col, amb);
         end
         cnt <= cnt + 5'd1;
-        mt_q <= mterm(cnt + 5'd1, col, amb);
         if (cnt == 5'd24) begin
           // q holds 24 bits; this cycle's bit is the last (the guard). K is formed for both
           // roundings side by side and chosen by the round-up bit last (study R109): the guard's

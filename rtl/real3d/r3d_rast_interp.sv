@@ -43,7 +43,11 @@
 /* verilator lint_off UNUSEDSIGNAL */
 module r3d_rast_interp #(
   parameter int TW = 8,
-  parameter bit MIP = 1'b0
+  parameter bit MIP = 1'b0,
+  // LV2S = 1: the mip level in two stages (the Z word's fields and the table, then the subtract and the clamps),
+  // written into its line an en later. The line is read eleven entries behind, so the level a pixel leaves with
+  // is the same word in the same clock; one stage was 8 LUT levels (ex2 -> lv2r, -1.5 to -3.2 ns at 140 MHz)
+  parameter bit LV2S = 1'b1
 ) (
   input  logic               clk,
   input  logic               rst,
@@ -199,6 +203,7 @@ module r3d_rast_interp #(
     endcase
   endfunction
   logic [3:0] lv2;
+  logic [15:0] zl2;
   always_comb begin
     logic [7:0]  ze;
     logic [5:0]  zm;
@@ -207,10 +212,22 @@ module r3d_rast_interp #(
     if (!pos2 || ex2 <= 10'sd0) begin ze = 8'd0; zm = 6'd0; end
     else if (ex2 >= 10'sd255) begin ze = 8'd255; zm = 6'd63; end
     else begin ze = ex2[7:0]; zm = m2[22:17]; end
-    d = $signed({1'b0, lk2}) - $signed({1'b0, ze, log2t(zm), 1'b0});
+    zl2 = {ze, log2t(zm)};
+    d = $signed({1'b0, lk2}) - $signed({1'b0, zl2, 1'b0});
     if (!MIP || d[17]) lv2 = 4'd0;
     else if (d[16:8] >= {5'd0, lvm2}) lv2 = lvm2;
     else lv2 = d[11:8];
+  end
+  // LV2S: the same from the fields registered (zl2a, lk2a, lvm2a: the entry one en back)
+  logic [15:0] zl2a;
+  logic [16:0] lk2a;
+  logic [3:0]  lvm2a, lv2b;
+  always_comb begin
+    logic signed [17:0] d;
+    d = $signed({1'b0, lk2a}) - $signed({1'b0, zl2a, 1'b0});
+    if (!MIP || d[17]) lv2b = 4'd0;
+    else if (d[16:8] >= {5'd0, lvm2a}) lv2b = lvm2a;
+    else lv2b = d[11:8];
   end
 
   localparam int DB = TW + 9 + 9 + 1 + 42 + 42 + 42 + 9 + 10 + 10 + 9 + 6 + 1 + 1 + 1;
@@ -240,7 +257,11 @@ module r3d_rast_interp #(
   (* ramstyle = "MLAB, no_rw_check" *) logic [3:0] dlv [16];
   logic [3:0] lv2r, lvq;
   always_ff @(posedge clk) begin
-    if (en) begin lv2r <= MIP ? lv2 : 4'd0; dlv[dwp - 4'd1] <= lv2r; end
+    if (en) begin
+      zl2a <= zl2; lk2a <= lk2; lvm2a <= lvm2;
+      lv2r <= !MIP ? 4'd0 : LV2S ? lv2b : lv2;
+      dlv[dwp - (LV2S ? 4'd2 : 4'd1)] <= lv2r;
+    end
     lvq <= dlv[dwp_n];
   end
   always_ff @(posedge clk) begin

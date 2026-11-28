@@ -39,6 +39,11 @@ Open on main: capture 1's setup fails on some seeds since CAPX 0 (worst -1.28 ns
 phase): dl_data's select after the cap registers plus sites is next, the first SDRAM's band top the fallback (R213 §9,
 sm3-builds/sys-timing NOTES M30). Capture 2's hold is thin (+0.04 ns at worst): its phase is for later.
 
+Branch `cb1` (R207): the Real3D's proven small set (mip-level split, registered no-miss flag, VROM flag, fog
+viewport DSP form, divider-lane register; reset MAX_FANOUT 24 and the scaler's DSP pins in the qsf). Board cb1_s2
+(38df6240) good. R4's DSP forms stay out: their paths fail on silicon at 140 (R207 §9). The Real3D still fails by
+2.3-4.5 ns, mostly routing; it needs room in the chip.
+
 Open from the board: Sega Rally 2's slowdowns going through water, Real3D or CPU, to be measured on replay frames
 captured there.
 
