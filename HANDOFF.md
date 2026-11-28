@@ -49,6 +49,12 @@ Branch `c5a` (R214): the first SDRAM's capture hop closed by moving dl_data's wo
 D-93 (sign-extending loads a cycle later in the rebuilt CPU), D-94 (download crossing held for room). Main fits by the
 seed now (main 61d5786: one seed of five with hold positive): room in the chip is the limit for every block.
 
+For later (R215): four small cycle-free, bit-identical Real3D geometry items, benched (VF3 400 / Daytona 2 676 frames
+identical), about -60 to -110 ALM and -1 M10K in a fit: the VPU divider's two delay lines in one block, one int16
+converter shared, the set-up port's y-sort as integer keys, and (needs a fit) the side-memory write data from the
+result register. Patch sm3-builds/r3d-study/patches/r3d-study-V1-V4-446aa80.patch (md5 daaffaf4). To ride with the
+next Real3D batch; not worth a fit alone. The Real3D is otherwise lean: the room for 140 MHz is the CPU rebuild's.
+
 Open from the board: Scud Race's green polygons on the bridge after another Model 3 game (stale memory; R214).
 Open from the board: Sega Rally 2's slowdowns going through water, Real3D or CPU, to be measured on replay frames
 captured there.

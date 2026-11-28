@@ -22093,3 +22093,88 @@ another Model 3 game, and not from a clean boot with Scud Race first. A long-sta
 does not write itself and finds the previous game's data, in the DDR3 extra memory or the Real3D's own memories
 (texture, polygon), which keep their contents across a game change. A real board starts them at power-on and
 Supermodel at zero; clearing the regions a game does not load, at the download (not at reset), is the likely fix.
+
+**R215 — The Real3D built another way, priced block by block: at zero cycles and bit-identical it is lean. Its
+largest structures are the arithmetic the exact spec needs, the selects its six concurrent machines need, and
+R197's 140 MHz structures; the M10Ks are set by ports and widths. What I found that is cycle-free is four small
+items: in one map of the geometry -120 ALUTs, -130 registers, -113 ALM estimated and -1 M10K, with one more M10K
+estimated. Every lever above a few hundred ALM costs cycles or DSP timing margin, which the rules exclude, so the
+fitter's room at 140 MHz has to come from the CPU rebuild (D-89), not from the Real3D.** (2026-11-28; on 446aa80.
+Study, maps and benches only: no fit, nothing on the board, nothing committed.)
+
+Work in `sm3-builds/r3d-study/` (`tree`: 446aa80 by `git archive`; `var_v1..v3`, `var_all` the variants;
+`patches/r3d-study-V1-V4-446aa80.patch`, md5 daaffaf4; `NOTES.md` every step and wrong turn; `desk/` the
+censuses). Rests on §8.4, D-48, D-50, D-58, D-81, D-87, D-89; R98, R99, R109, R130, R131, R197, R205, R207.
+
+*What I believed:*
+- The CPU rebuild frees 2,200-3,100 ALM because it is a different structure, not a tweak; the Real3D's area work had
+  only ever been local tweaks of tens of ALM, so a different structure for its big blocks might free as much.
+- The geometry top's own 2,802 ALM, "the polygon and matrix state machines", was the most likely place: machines
+  with duplicated datapaths that one shared datapath could replace.
+
+*What I know now:*
+
+**1. Where the LUTs go.** I counted each LUT where its value goes, not where Quartus named it (a post-map netlist of
+r3d_geo standalone as m3_system builds it; each LUT followed forward to the registers, memories and blocks its cone
+ends in, and shared among them). The geometry top's 4,323 LUTs and 2,883 registers (4,199 and 3,143 in the chip):
+
+| machine | LUT | registers |
+|---|---|---|
+| polygon machine (assembly, outcodes, clip, the clip pool's words, the projection queue) | 1,268 | 828 |
+| main (viewport, matrices, culling, frame start) | 729 | 533 |
+| decoder (headers, vertex slots, the staging conversion) | 718 | 816 |
+| the engine's external port (four lanes' write word, the broadcast word, addresses) | 626 | 253 |
+| set-up port (the y sort, the gather, the kernel grant) | 416 | 273 |
+| emitter | 233 | 108 |
+
+By kind: FP compares about 590 (outcodes, the y sort, the culling radius four times), format conversions about 380,
+the engine port's selects 626, state about 420, the decoder's slot bookkeeping about 300, datapath registers' selects
+about 560, address adders about 150. No structure is above 9% of the top. The largest, the external port's 358-LUT
+write select, is the data the machines hand the pool, and every one of its sources is used. The machines do not
+duplicate a datapath: each one's registers hold its own values, and they run at once. The same census of the
+rasteriser's units finds every large group to be a shift, compare or adder of the width the exact arithmetic needs
+(the interpolants' 66-bit products, the edge's 54-bit walk, the Z walk's 42-bit planes) or one of R197's timing
+structures (the Z band's four hull tests, 310 LUTs, R197 Z8), and the register-move census finds no delay line in
+registers that an MLAB could hold.
+
+**2. The cycle-free items** (r3d_geo standalone maps; the top's own count moves 30-40 LUTs between maps of
+unchanged files):
+
+| item | change | map | proof so far |
+|---|---|---|---|
+| V1 | the set-up port's y sort compared as keys: flt(a, b) is key(a) < key(b), key = a[31] ? ~a : {1, a[30:0]}, with +0 and -0 made equal: one carry chain a compare | -59 to -92 LUT | 20,000,256 pairs equal in iverilog, the planted fault (no zero term) caught; Quartus 17 folds 256 special pairs to the expected values |
+| V2 | one int16 converter for the viewport words and u: M_VPW runs only after M_VPD has waited for the polygon machine, so P_C never meets it | -105 to -149 LUT | checked every clock under VERILATOR |
+| V3 | the side memories' word from the lane's result register: a MAC write-back never meets an idle engine (gen_ucode.py ends a kernel the clock after its last write) | -128 registers | checked every clock under VERILATOR |
+| V4 | the divide's two eight-clock lines (25 and 15 bits) in one 40-bit block | -1 M10K | exact by construction |
+| V5 | the VPU's write-back line and the face's tag line (25 + 8 bits, both ten clocks) in one block | -1 M10K (est., not built) | |
+
+V1-V4 in one map: -120 ALUTs, -130 registers, -113 ALM estimated, -1 M10K. Geometry bench, as m3_system builds it,
+with the checks on: VF3's 400 frames and Daytona 2's 676, both logs byte-identical to main's (every frame's clocks,
+every triangle field equal to the model), no check fired.
+
+**3. Priced and not taken.** The store's nx / nxp in one block: -1 M10K for +39 LUTs (a test module), an exchange,
+not a saving. The clip pool written without its 263 write registers: the outcode compares, the int16 conversions and
+an M10K's output would run into the pool's M10K input, the worst kind of path in this chip (R207 §10). The texture
+cache's tags written a way at a time: an entry is 11 bits and an M10K byte at most 10. The side memories and the
+broadcast banks in fewer blocks: four lanes written in one clock, or two reads at two addresses, so the block count
+is set by width at 32 deep. The VPU's addend lines read late: the micro-code's schedule assumes the +1 read, a
+cycle change. The micro-code ROM in five blocks: 883 x 60 bits need six.
+
+**4. The large levers are all outside the rules** (this study's measurements and earlier ones): two VPU lanes -1,500
+to -1,800 ALM for +41 to +44% geometry (R99, R207); the facing unit's adder on lane 3 -198 ALM for +1.06 to +5.7%
+(R130); its whole multiply-add -457 ALM est. for +3.6 to +9.3% (R130); the edge's product on the walk's adders -123
+ALM for about +0.8% replay (R131); R4's DSP forms, which under R207's margin rule are a loss or cost the edge two
+clocks a pair; R197's timing structures given back (+382 ALM in the rasteriser and +78 in the geometry top bought
+the paths they fix).
+
+*How established:* `sm3-builds/r3d-study/NOTES.md` (sections 1-5), `desk/geo0_cone_all.txt`,
+`desk/rast0_cone_top_*.txt`, `desk/*_chain.txt`, `desk/r3d_rams_xm2_s3.txt`, `maps/`, `desk/v1chk`, `desk/nxchk`,
+`runs/`.
+
+*Wrong turns:* my first two cone counts were wrong (an empty last port read as a net sent every LUT to every output;
+unescaped cell names without a space were missed, 340 LUTs read as unloaded); fixed until the totals came back to the
+map's own.
+
+*Next:* V1, V2 and V4 can ride with the next Real3D batch (geometry files only, so the geometry bench is their
+whole proof, with a fit for the LUT count); V3 and V5 only after a fit shows their registers' paths into the blocks
+close. None of them is worth a fit on its own.
