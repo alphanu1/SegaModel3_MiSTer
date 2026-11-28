@@ -28,6 +28,10 @@ hold positive at every corner on its three final fits, the clk_hps / clk_sys cro
 is not closed: it needs room from the CPU and Real3D work (R210's experiment fit). HDMI still fails on 6 of 10 fits.
 Board: st11_s2 (f4052cd0) good in VF3, Scud Race, Sega Rally 2, Daytona 2.
 
+Branch `lat` (R212): SDR2_CAPX 0, SDR_TRCD 2 (3 clocks at the pins), SDR_HITRD 1: -1.8% of Daytona 2's race frame
+on the board-like bench. Board l2_s1 (09d8c477): Daytona 2 track 1 at 90-95% full speed, collisions without slowdown,
+one corner left; VF3, Scud Race, Sega Rally 2 good; calibration 6 1 37 21 / 13 1 23 22.
+
 Open from the board: Sega Rally 2's slowdowns going through water, Real3D or CPU, to be measured on replay frames
 captured there.
 
