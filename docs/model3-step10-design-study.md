@@ -21401,3 +21401,45 @@ reads it; the HDMI anchors; the inputs' crossing left direct until it failed hol
 Auto: SDRAM1 6 1 37 21, SDRAM2 12 1 23 19. VF3, Scud Race and Sega Rally 2 good. Daytona 2 felt to slow down less
 than on dirn140_s3, only at one corner and in multi-car collisions; the patch changes no cycle, so that is placement or
 the run, not a measured gain. Daytona 2's course-guide attract right; the OSD, steering, pedals and buttons right.
+
+**R212 — The CPU's first-word latency on the SDRAM side, round 1: three settings worth -1.8% of Daytona 2's race
+frame, and on my board Daytona 2's track 1 at 90-95% full speed** (2026-11-28; main 21d9028; work in
+sm3-builds/sys-timing, NOTES L1-L9; the miss path traced clock by clock in sm3-builds/cpu-fable NOTES 19-23).
+
+*Why:* a contributor's counters on their single-SDRAM board showed the CPU waiting on fetch about 20% and on data
+about 16% of its cycles, with about 23 clocks from request to first word, and the SDRAM idle about 90% of the time:
+latency, not bandwidth. The replay bench, set up as the board build is (both SDRAMs' 140 MHz pipeline registers and
+tRCD / tRP from the clock), gives about 0.9% of Daytona 2's race frame for each clock of first-word latency; the plain
+bench had been about 5% short of the board.
+
+*What was believed, and what is known now:* R198 took SDR_TRCD = 3 as three clocks at the pins and two as 14.3 ns. A
+probe on the second SDRAM's pins shows the controller gives one clock more than its parameter: 3 gives 4 clocks from
+PRECHARGE to ACTIVATE and from ACTIVATE to READ (28.6 ns at 140 MHz), 2 gives 3 clocks (21.4 ns).
+
+*What changed* (Model3.sv parameters, and the second SDRAM's dq_r given the sites its extra register had):
+
+| setting | Daytona 2 race 4302 | Sega Rally 2 start 5620 | first word I / D (clocks) |
+|---|---|---|---|
+| r11 (21d9028), board-like bench, 140 MHz | 1.0643 | 0.7831 | 20.32 / 21.31 |
+| SDR2_CAPX 0: the second SDRAM's extra capture register gone | -0.74% | -0.63% | 19.32 / 20.45 |
+| SDR_TRCD 2: 3 clocks at the pins | -0.68% | -0.22% | 19.76 / 20.47 |
+| SDR_HITRD 1: READ from dispatch on an open row | -0.36% | -0.48% | 19.70 / 20.94 |
+| all three | **-1.77%** | **-1.21%** | 18.16 / 19.20 |
+
+Daytona 2's Real3D word stream is unchanged; the bench with the direction table off, so these are differences at one
+setting. CAPX 0 needs no register once the second SDRAM's dq_r are pinned part-way to their pins (R210): capture 2
++0.26 to +0.33 ns in three fits. HITRD adds one failing family in the first SDRAM's controller (rd_bank_cnt, 25
+endpoints at -0.82 ns in the experiment fit), the size of the system side's other misses.
+
+*Fit:* l2_s1 (RBF 09d8c477), dual, 140 MHz: system setup -4.11 ns (the CPU's), hold +0.080 at least, capture +0.40 /
++0.29, HDMI -0.52.
+
+*Board (2026-11-28, l2_s1):* calibration on Auto SDRAM1 6 1 37 21, SDRAM2 13 1 23 22. Daytona 2: track 1 at about
+90-95% full speed, no slowdown in collisions, one corner left; attract right. VF3, Scud Race, Sega Rally 2 good. The
+best Daytona 2 so far (all1: 70-80%).
+
+*Left:* the rest of the latency proposal: the caches' fills beside the bus (with the CPU's rework), the controller's
+PRECHARGE / ACTIVATE from dispatch (needs the pin probe for tRAS, tRC and CAS-to-PRECHARGE and Model 2's tb_m2_sdram
+first), a row policy, a second read while one streams, the other two 140 MHz registers; tRCD / tRP on the first SDRAM's
+pins (probed on the second only); the buttons' crossing (hold -0.019 ns on one fit), to get a register inside
+m3_inputs with the gear-lever change.
