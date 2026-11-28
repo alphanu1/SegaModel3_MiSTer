@@ -36,7 +36,8 @@
 //   1 DRIVING (Scud Race, Daytona USA 2; DRIVE): m3_cab_inputs -- C the VR
 //     buttons and the four-speed shifter, D FF, ADC 0 steering, 1 accelerator,
 //     2 brake. J as Daytona's on Model 2 (m3_cab_inputs); coin 2 is joystick
-//     1's Coin.
+//     1's Coin. Flags bit 0: an up/down gear lever instead of the shifter
+//     (Le Mans 24), with bit 1 Harley-Davidson's wiring of it (m3_cab_inputs).
 //   2 GUN (The Lost World; GUN): Supermodel's analog guns, the path the game
 //     takes with no serial gun board (study R133, m3_io SER_ST 0x00). ADC 0
 //     P1 X, 1 P1 Y, 2 P2 X, 3 P2 Y, each 0x80 + the stick's axis (left 0x00,
@@ -121,7 +122,7 @@ module m3_inputs #(
   wire [7:0] dr_c, dr_st, dr_ac, dr_br;
   generate if (DRIVE) begin : g_drive
     m3_cab_inputs #(.SYS_MHZ(SYS_MHZ), .SENS(!LEAN), .SMOOTH(!LEAN), .WHEEL(!LEAN)) u_cab (
-      .clk, .rst_n, .joystick_0(j0), .joy_analog, .joy_ranalog, .paddle,
+      .clk, .rst_n, .lever(pflg[0]), .harley(pflg[1]), .joystick_0(j0), .joy_analog, .joy_ranalog, .paddle,
       .st_pedswap, .st_ssens, .st_ssm, .st_rsteer, .st_wheel,
       .trig_rt, .trig_lt,
       .pc(dr_c), .steer(dr_st), .accel(dr_ac), .brake(dr_br));
@@ -167,7 +168,7 @@ module m3_inputs #(
   end
 
   /* verilator lint_off UNUSEDSIGNAL */
-  wire _unused = &{1'b0, pflg[7:1], j1[15:12]};
+  wire _unused = &{1'b0, pflg[7:2], j1[15:12]};
   /* verilator lint_on UNUSEDSIGNAL */
 
 endmodule

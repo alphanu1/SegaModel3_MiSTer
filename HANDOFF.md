@@ -32,6 +32,13 @@ Branch `lat` (R212): SDR2_CAPX 0, SDR_TRCD 2 (3 clocks at the pins), SDR_HITRD 1
 on the board-like bench. Board l2_s1 (09d8c477): Daytona 2 track 1 at 90-95% full speed, collisions without slowdown,
 one corner left; VF3, Scud Race, Sega Rally 2 good; calibration 6 1 37 21 / 13 1 23 22.
 
+Branch `cmb5` (R213): DSPC (PRECHARGE / ACTIVATE from dispatch, -0.57% / -0.25% on the board-like bench), HRL and
+the row-register form for its timing, the buttons' clk_hps / clk_sys crossing (one clk_sys edge), the up/down gear
+lever (profile flag bits 0 / 1; Le Mans 24's MRA already sets it). Board cmb5_s2 (17851f89) good in every game.
+Open on main: capture 1's setup fails on some seeds since CAPX 0 (worst -1.28 ns; about -0.09 at the calibrated
+phase): dl_data's select after the cap registers plus sites is next, the first SDRAM's band top the fallback (R213 §9,
+sm3-builds/sys-timing NOTES M30). Capture 2's hold is thin (+0.04 ns at worst): its phase is for later.
+
 Open from the board: Sega Rally 2's slowdowns going through water, Real3D or CPU, to be measured on replay frames
 captured there.
 

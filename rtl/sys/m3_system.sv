@@ -169,6 +169,10 @@ module m3_system
   parameter bit          SDR_FWD     = 1'b0,
   parameter bit          SDR_FDSP    = 1'b0,
   parameter bit          SDR_HITRD   = 1'b0,
+  //   SDR_DSPC     m2_sdram DSPC: the PRECHARGE / ACTIVATE of a transaction whose row is not open from S_DISPATCH
+  parameter bit          SDR_DSPC    = 1'b0,
+  //   SDR_HRL      m2_sdram HRL: HITRD's read guard loaded a clock later (cycle-exact)
+  parameter bit          SDR_HRL     = 1'b0,
   //   SDR_PW_DLY   with SDR_PW: a posted line write waits this many clocks before its bursts unless needed (m3_sdr_port PW_DLY)
   parameter int          SDR_PW_DLY  = 0,
   //   BUS_R3P      m3_bus: writes to the Real3D's host port posted in an eight-word buffer, the bus freed (m3_bus R3P)
@@ -180,6 +184,9 @@ module m3_system
   parameter bit          INP_DRIVE   = 1'b1,
   parameter bit          INP_GUN     = 1'b1,
   parameter bit          INP_FISH    = 1'b1,
+  //   INP_BQ       the buttons (joystick_0 / joystick_1) through a register here before m3_inputs, as the analog
+  //                axes have (jl0_q ...): the second half of Model3.sv's crossing for them (one clock of latency)
+  parameter bit          INP_BQ      = 1'b0,
   parameter bit          INP_LEAN    = 1'b0,       // the driving block without "Steering", "Steering smoothing", "Analog control"
   //   TG_TIMING    m3_bus: the tile generator's bus timing, tile RAM and palette writes at the board's rate (R152)
   parameter bit          TG_TIMING   = 1'b1,
@@ -472,10 +479,10 @@ module m3_system
              .PRI(SDR_PRI), .PRI_CAP(SDR_PRI_CAP), .AGE(SDR_AGE), .AGE_T(SDR_AGE_T), .BXOR(SDR_BXOR),
              .L16({{(NSP-1){1'b0}}, SDR_L16}), .PAIR({{(NSP-1){1'b0}}, SDR_PAIR}),
 `ifdef M3_R3B
-             .WB(NSP'(6'b010001)), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD),
+             .WB(NSP'(6'b010001)), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD), .DSPC(SDR_DSPC), .HRL(SDR_HRL),
              .SHD(SDR_SHD ? NSP'(6'b101111) : NSP'(0))) u_sdram (   // R101, R144: the bus (port 0) and r3d_mem (port 4) write in bursts
 `else
-             .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD),
+             .WB({{(NSP-1){1'b0}}, 1'b1}), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD), .DSPC(SDR_DSPC), .HRL(SDR_HRL),
              .SHD(SDR_SHD ? NSP'(6'b101111) : NSP'(0))) u_sdram (   // port 0 (the bus) writes in bursts (R101)
 `endif
     .clk, .clk_cap(clk_cap1), .rst_n(mem_rst_n), .ready(mem_ready), .rd_lat_sel,
@@ -860,7 +867,7 @@ module m3_system
     m3_sdr2 #(.AW(AW), .CLK_MHZ(CLK_MHZ), .T_REFI(T_REFI_C), .T_RC(T_RC_C), .T_RAS(T_RAS_C), .T_RCD(T_RCD_C), .T_RP(T_RCD_C),
               .CAPCLK(SDR_CAPCLK), .CAPPIPE(SDR_CAPPIPE), .OPIPE(SDR_OPIPE), .CAPX(SDR2_CAPX), .CAL(SDR_CAL), .XCAL(1'b1), .CPROBE(1'b0), .PROBE_SA(SDR_RAM),
               .L16(SDR_L16), .LW1(SDR_LW1), .PAIR(SDR_PAIR), .PW(SDR_PW), .FWD(SDR_FWD), .FREQ(SDR_FREQ),
-              .PW_DLY(SDR_PW_DLY), .BXOR(SDR_BXOR), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD)) u_sdr2 (
+              .PW_DLY(SDR_PW_DLY), .BXOR(SDR_BXOR), .FDSP(SDR_FDSP), .HITRD(SDR_HITRD), .DSPC(SDR_DSPC), .HRL(SDR_HRL)) u_sdr2 (
       .clk, .clk_cap(clk_cap2), .mem_rst_n, .ra_clr(rst), .en(sd2_en), .ok(sd2_ok_q), .missing(sd2_missing), .info_req(sd2_info_req),
       .cal_osd(cap2_osd), .cal_off(), .cal_settled(cap2_settled), .cal_width(), .cal_last(), .cal_flags(),
       // area-sys: the shared engine (its B side); its transactions come on s_* (b_*), with SDR_RAM's top bits as the
@@ -903,13 +910,15 @@ module m3_system
   generate if (INPUTS) begin : g_inputs
     logic [15:0] jl0_q, jl1_q, jr0_q;
     logic  [7:0] lt0_q, rt0_q, pad0_q;
+    logic [15:0] j0_q, j1_q;       // INP_BQ: the buttons' first clk_sys register
     always_ff @(posedge clk) begin
       jl0_q <= joy_l0; jl1_q <= joy_l1; jr0_q <= joy_r0;
       lt0_q <= joy_lt0; rt0_q <= joy_rt0; pad0_q <= paddle0;
+      j0_q <= joystick_0; j1_q <= joystick_1;
     end
     m3_inputs #(.SYS_MHZ(CLK_MHZ), .DRIVE(INP_DRIVE), .GUN(INP_GUN), .FISH(INP_FISH), .LEAN(INP_LEAN)) u_inputs (
       .clk, .rst_n(!rst), .prof(cfg_prof), .pflg(cfg_pflg), .idle_c(cfg_in2), .idle_d(cfg_in3),
-      .joystick_0, .joystick_1, .joy_analog(jl0_q), .joy_ranalog(jr0_q), .joy_analog_1(jl1_q), .paddle(pad0_q),
+      .joystick_0(INP_BQ ? j0_q : joystick_0), .joystick_1(INP_BQ ? j1_q : joystick_1), .joy_analog(jl0_q), .joy_ranalog(jr0_q), .joy_analog_1(jl1_q), .paddle(pad0_q),
       .trig_rt(rt0_q), .trig_lt(lt0_q),
       .st_pedswap, .st_ssens, .st_ssm, .st_rsteer, .st_wheel,
       .in0(io_in0), .test_b_n(io_test_b_n), .service_b_n(io_service_b_n), .in2(io_in2), .in3(io_in3), .an(io_an),
