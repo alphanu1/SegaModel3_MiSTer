@@ -201,6 +201,16 @@ module m2_sdram #(
   // clock after with the count one less; bank_pre_ok also reads hr_q for that one clock, so the permission to
   // PRECHARGE is the same in every clock (checked in the bench against the old load). 0: loaded in S_DISPATCH.
   parameter bit            HRL       = 1'b0,
+  // THE DELIVERY'S WORD SELECT AFTER THE CAPTURE SLOTS (Model 3, the capture hop at 140 MHz). The arriving word is
+  // written into cap[its index] at the same edge the delivery stage (dl_data) is loaded, so a clock later the four
+  // slots hold what dl_data holds; DLSEL 1 forms the delivery from the slots and three select bits registered at
+  // that edge, and p_dout's registers load it in the clock they loaded dl_data: the same data at the same edges.
+  // dq_r then reaches four registers a bit, all straight (cap[0..3]), instead of six with a LUT in front of two
+  // (dl_data's word select: the registers that kept the capture clock's transfer into clk failing after sites).
+  // dl_data's 64 registers have no reader left and go; cap[3], which nothing read before, stays. Holds for the
+  // burst lengths the controller issues (1, 2, 4, 8, 16 words and pair reads ending on an odd word: checked in
+  // the bench against dl_data in every delivery). 0: dl_data.
+  parameter bit            DLSEL     = 1'b0,
   // ONE READ REGISTER FOR SEVERAL PORTS (Model 3, the bridges pass). The ports set in SHD get their p_dout
   // from one 64-bit register, loaded with every delivery, instead of one register each. Only for a port
   // that takes p_dout in the cycles its p_lo or p_ack is high and never after (the delivery and its strobe
@@ -1031,7 +1041,16 @@ module m2_sdram #(
   // p_dout: a register a port, or with SHD one for those ports (pd_sh, loaded with every delivery)
   logic [NP-1:0][63:0] pd_q;
   logic [63:0]         pd_sh;
-  always_ff @(posedge clk) if (dl_v) pd_sh <= dl_data;
+  // DLSEL: the delivery from the slots. dls_p3: a pair read ending at word 3 (words 2-3); dls_1: a single word;
+  // dls_4: four words (a four-word read, or either half of a longer one)
+  logic                dls_p3, dls_1, dls_4;
+  wire [63:0]          dl_w = {dls_4 ? cap[3] : 16'd0, dls_4 ? cap[2] : 16'd0,
+                               dls_1 ? 16'd0 : (dls_p3 ? cap[3] : cap[1]), dls_p3 ? cap[2] : cap[0]};
+  wire [63:0]          dl_x = DLSEL ? dl_w : dl_data;
+`ifdef VERILATOR
+  always_ff @(posedge clk) if (rst_n && dl_v && dl_w != dl_data) $fatal(1, "m2_sdram: DLSEL's delivery is not dl_data");
+`endif
+  always_ff @(posedge clk) if (dl_v) pd_sh <= dl_x;
   genvar gd;
   generate
     for (gd = 0; gd < NP; gd = gd + 1) begin : g_pdout
@@ -1211,6 +1230,7 @@ module m2_sdram #(
       for (int b = 0; b < NB; b++) rd_bank_cnt[b] <= '0;
       p_ack <= '0; wr_ack <= 1'b0; pd_q <= '0;
       dl_v <= 1'b0; dl_p <= '0; dl_data <= '0;   // R557
+      dls_p3 <= 1'b0; dls_1 <= 1'b0; dls_4 <= 1'b0;
       dl_lo <= 1'b0; p_lo <= '0;                  // R787
       grant <= '0; grant_is_wr <= 1'b0; rr_mask <= '1;                  // R498
       pri_run <= '0;                                                    // R574
@@ -1352,6 +1372,7 @@ module m2_sdram #(
             dl_p  <= tag_p[0];
             dl_v  <= 1'b1;
             dl_lo <= 1'b0;
+            dls_p3 <= tag_pr[0] && tag_w[0][1]; dls_1 <= !tag_pr[0] && tag_w[0][1:0] == 2'd0; dls_4 <= !tag_pr[0] && tag_w[0][1];
           end else if (tag_pr[0] ? tag_w[0][0] : (tag_w[0][1:0] == 2'd3)) begin   // R107: every fourth word of a long read (8 or 16), every second of a pair read
             // R787: WORD 3 OF AN EIGHT-WORD READ (a four-word read's word 3 is
             // its last). Words 0-3 go to the stage now, before words 4-6
@@ -1362,6 +1383,7 @@ module m2_sdram #(
             dl_p    <= tag_p[0];
             dl_v    <= 1'b1;
             dl_lo   <= 1'b1;
+            dls_p3  <= tag_pr[0] && tag_w[0][1]; dls_1 <= 1'b0; dls_4 <= !tag_pr[0];
           end
         end
         // R557: the stage's delivery. Bursts complete several cycles apart
@@ -1370,7 +1392,7 @@ module m2_sdram #(
         p_lo <= '0;                                   // R787: one cycle
         if (dl_v) begin
           dl_v            <= 1'b0;
-          for (int k = 0; k < NP; k++) if (!SHD[k] && dl_p == PW'(k)) pd_q[k] <= dl_data;   // SHD: pd_sh, below
+          for (int k = 0; k < NP; k++) if (!SHD[k] && dl_p == PW'(k)) pd_q[k] <= dl_x;   // SHD: pd_sh, below
           if (dl_lo) p_lo[dl_p] <= 1'b1;              // R787: the first half, no ack
           else begin
             p_ack[dl_p]   <= 1'b1;
